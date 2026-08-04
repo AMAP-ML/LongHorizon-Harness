@@ -4,100 +4,72 @@
 
 ### Advancing Long-Horizon Agents for Real-World Tasks
 
+**像人一样操作整台计算机。跨桌面 App 与命令行持续工作数十个小时。**
+
+**状态不漂移。进度可验证。复杂任务做到底。**
+
 <p align="center">
 <a href="https://lh-harness.pages.dev"><img src="https://img.shields.io/badge/🌐-Website-1f6feb.svg?style=flat-square" alt="Website" /></a>
 <a href="https://arxiv.org/abs/2608.01964"><img src="https://img.shields.io/badge/arXiv-2608.01964-b31b1b.svg?style=flat-square" alt="arXiv 2608.01964" /></a>
 <a href="https://github.com/AMAP-ML/LongHorizon-Harness"><img src="https://img.shields.io/badge/GitHub-Repository-181717.svg?style=flat-square&logo=github&logoColor=white" alt="GitHub repository" /></a>
 <img src="https://img.shields.io/badge/🤗-Trajectory_Coming_Soon-ffce00.svg?style=flat-square" alt="Hugging Face trajectory" />
-<img src="https://img.shields.io/badge/🤗_Daily_Papers-Coming_Soon-ff8800.svg?style=flat-square" alt="Daily Papers" />
+<a href="https://huggingface.co/papers/2608.01964"><img src="https://img.shields.io/badge/🤗_Daily_Papers-2608.01964-ff8800.svg?style=flat-square" alt="Hugging Face Daily Papers" /></a>
 <a href="./LICENSE"><img src="https://img.shields.io/badge/License-MIT-2ea44f.svg?style=flat-square" alt="MIT License" /></a>
 </p>
 
 [![Python](https://img.shields.io/badge/python-≥3.10-blue?logo=python&logoColor=white)](https://www.python.org/)
-[![Agents](https://img.shields.io/badge/backends-Claude%20Code%20|%20Codex%20|%20OpenClaw-8A2BE2)](#agent-与-mcp)
-[![Benchmarks](https://img.shields.io/badge/benchmarks-WeaveBench%20|%20OSWorld%202.0%20|%20Terminal--Bench%202.1-orange)](#实验结果)
+[![Agents](https://img.shields.io/badge/backends-Claude%20Code%20|%20Codex%20|%20OpenClaw-8A2BE2)](#任意模型任意-agent-后端)
+[![Benchmarks](https://img.shields.io/badge/benchmarks-WeaveBench%20|%20OSWorld%202.0%20|%20Terminal--Bench%202.1-orange)](#数百个真实任务规模化验证)
 
-[使用方法](#使用方法) · [核心能力](#核心能力) · [工作原理](#工作原理) · [实验结果](#实验结果) · [项目主页](https://lh-harness.pages.dev) · [English](README.md)
+[Usage](#一条命令全程可见) · [What You Get](#桌面-app-与命令行一个连续任务) · [How It Works](#三个角色一份可信状态) · [Results](#数百个真实任务规模化验证) · [Project Website](https://lh-harness.pages.dev) · [English](README.md)
 
 <br>
-<img src="assets/quickstart.gif" alt="通过命令行安装并运行 LongHorizon-Harness" width="720">
+<img src="assets/quickstart.gif" alt="Install and run LongHorizon-Harness from the command line" width="720">
 
 </div>
 
-> **跨桌面软件与命令行持续自主工作，长时间运行也不丢失任务状态，真正把复杂任务做到底。**
+> **模型决定 Agent 一轮能做什么。LongHorizon-Harness 决定这些工作能否被验证、保存并持续积累，直到任务真正完成。**
 
-**适配 Claude Code、Codex 与 OpenClaw，一键安装，即刻使用。**
+**支持 Claude Code、Codex 和 OpenClaw。一条命令安装，开箱即用。**
 
-**LongHorizon-Harness 将长程执行组织为一系列经过独立审计的任务状态转移。** 它把任务状态作为显式记录维护在执行上下文之外，只使用从真实环境中独立验证的事实更新状态，并始终根据当前记录和原始目标确定下一个子任务。
+LongHorizon-Harness 是一套面向长程任务的执行、状态管理和结果验证系统。它不训练新模型，也不替换现有 Agent，而是运行在 Codex、Claude Code 等系统之上，帮助 Agent 在真实电脑环境中长时间自主运行，持续推进复杂任务。
 
-Manage-Execute-Audit（MEA）循环将三种职责结构隔离：Manager 维护任务状态并定义下一个子任务；Executor 在全新上下文中执行该子任务；只读 Auditor 独立检查环境，再由 Manager 根据审计结果进入下一轮。轻量级 `AgentAdapter` 保留现有系统的原生 Agent 循环，并允许三个角色使用可互换的模型与 Harness 后端。
-
-```text
-Independently Audited Task-State Transitions
-
-Task → Manager → Subtask Contract → Fresh-context Executor
-          ↑                                          ↓
-          └── Audit Report ← Read-only Auditor ← Environment
-```
-
-> **第一次使用？** 不需要先理解 Manager、Executor、Auditor 或所有 CLI 参数。安装后给出任务即可；默认配置会自动拆解、执行、审计并继续下一轮。需要观察或介入时，加上 `--dashboard`。
-
-## Overview Video
+## 视频演示
 
 https://github.com/user-attachments/assets/ca8b77ce-9220-4d85-a272-b346009b2454
 
 <p align="center"><a href="assets/promotional_video_1440p.mp4"><strong>打开宣传视频（1440p MP4）</strong></a></p>
 
-## 使用方法
+## 三个角色。一份可信状态。
 
-### 快速安装
+LongHorizon-Harness 将规划、执行和验收彼此分离，避免让同一个不断增长的上下文同时承担所有工作。
 
-使用 `pip` 安装：
+| | 角色 | 唯一职责 |
+|---|---|---|
+| 🧭 | **项目经理** | 维护最初目标、可信进度和下一步计划 |
+| ⚡ | **执行者** | 每轮使用全新上下文，专注完成一项明确任务 |
+| 🔍 | **独立验收员** | 独立检查真实环境中的文件、界面、日志和测试 |
 
-```bash
-pip install lh-harness
-```
+只有通过独立验收的结果才会进入长期状态。即使上下文刷新、操作失败或交付不合格，系统仍会保留此前已经验证的进展，并从缺失部分继续推进。
 
-也可以使用 `uv` 安装为独立的 CLI 工具：
+## 桌面 App 与命令行。一个连续任务。
 
-```bash
-uv tool install lh-harness
-```
+LongHorizon-Harness 同时支持 GUI 和 CLI 工作流。
 
-LongHorizon-Harness 需要 Python 3.10+，以及至少一个 Agent runtime：`claude`、`codex` 或 `openclaw`。
-
-### 快速开始
-
-```bash
-lh-harness run \
-  --task "检查当前目录，总结里面有哪些文件。"
-```
-
-任务也可以从文件加载。加上 Dashboard，即可实时监控运行并在关键决策点介入：
-
-```bash
-lh-harness run --task @task.md --dashboard
-```
-
-默认情况下，每次运行的数据都会写入独立的 `runs/<run-id>/`，其中包含工作区目录、事件流、逐轮审计记录和最终报告。
-
-### 常用参数
-
-| 参数 | 说明 |
+| 🖥️ 操作桌面 | ⌨️ 使用命令行 |
 |---|---|
-| `--task` | 任务文本，或 `@task.md` |
-| `--agent` | `claude_code` / `codex` / `openclaw` |
-| `--env` | `local` / `ssh://...` / `docker://...` |
-| `--max-rounds` | 最大 MEA 轮数，CLI 默认 30 |
-| `--dashboard` | 启动实时监控与人工介入 |
+| 🌐 点击、输入、滚动和浏览 | 💻 编写和修改代码 |
+| 📊 操作表格 | ▶️ 运行命令和脚本 |
+| 📄 编辑文档 | 📦 安装依赖和环境 |
+| 🎨 使用设计软件 | 🔧 配置和调试系统 |
+| 🧊 操作 3D 工具 | 📁 处理文件和数据 |
 
-每次运行隔离在 `runs/<run-id>/`，其中包含工作区、最终报告、事件流和逐轮审计记录。
+一个任务可以先在浏览器中收集信息，再通过命令行处理数据，接着在桌面软件中生成交付物，最后回到命令行验证或调试。整个过程中，目标、进度和证据始终由同一套状态管理系统维护。
 
-### Agent 与 MCP
+<details>
+<summary><strong>🖱️ 接入计算机操作 MCP 服务</strong></summary>
 
-LongHorizon-Harness 不替换底层 Agent 循环，只负责编排角色与任务状态。仓库内置 **Claude Code**、**Codex CLI**、**OpenClaw** 适配器，也可以通过 `AgentAdapter` 接入其他后端；不同角色可选择不同 Agent 和模型。
-
-GUI 能力由外部 MCP server 提供，Harness 不内置或默认启用特定 `computer-use` 实现：
+GUI 操作由兼容的外部计算机操作 MCP 服务提供。LongHorizon-Harness 默认不内置或启用特定的计算机操作实现。
 
 ```bash
 lh-harness run --task @task.md --agent claude_code \
@@ -105,160 +77,178 @@ lh-harness run --task @task.md --agent claude_code \
   --mcp-add-dir /path/to/your/mcp/files
 ```
 
-也可使用 `LH_HARNESS_CLAUDECODE_MCP_CONFIG` 和 `LH_HARNESS_CLAUDECODE_ADD_DIRS`。未配置时，Claude Code adapter 不会添加 MCP 参数。
+也可以使用 `LH_HARNESS_CLAUDECODE_MCP_CONFIG` 和 `LH_HARNESS_CLAUDECODE_ADD_DIRS`。未提供配置时，Claude Code 适配器不会添加 MCP 参数。
 
-执行环境支持 `local`、`ssh://user@host:port` 和 `docker://container`。外部 MCP 配置及其路径必须在 Agent 实际执行的环境中可见。
+</details>
 
-### Dashboard
+## 任意模型。任意 Agent 后端。
 
-```bash
-lh-harness run --task @task.md --dashboard      # 实时监控当前 run
-lh-harness dashboard --runs-root ./runs         # 浏览运行中及已完成的 run
-```
+LongHorizon-Harness 不绑定特定模型或 Agent 后端。现有模型和 Agent 可以通过配置接入，无需改变原来的工作方式。
 
-Dashboard 使用 Python 标准库实现，提供：
-
-- 实时查看轮次、角色轨迹和审计产物。
-- 在任务完成、阻塞、等待用户输入或连续失败时触发 `human gate`（人工确认节点）。
-- 将人工回答和补充指令注入下一轮 Manager。
-
-## 核心能力
-
-| 能力 | 它是什么 | 为什么重要 |
+| | 层级 | 支持选项 |
 |---|---|---|
-| 📋 **Explicit task state** | 在执行上下文之外显式维护需求、产物和环境事实 | 任务状态不会被不断增长的执行历史淹没 |
-| 🔍 **Independently verified facts** | 任务状态只由 Auditor 从真实环境独立验证的事实更新 | 错误的自我评估不会直接成为后续决策的前提 |
-| 🧭 **Dynamic decomposition under the original goal** | Manager 根据当前任务状态定义带依赖、约束和验收标准的下一个子任务 | 每一轮都从已验证进展出发，同时保持原始目标不变 |
-| 🧠 **Fresh-context execution** | Executor 每轮只执行当前子任务，交互历史在轮末丢弃 | 只有紧凑、已验证的任务状态跨轮持续存在 |
-| 🔌 **Interchangeable backends** | `AgentAdapter` 保留原生 Agent 循环，并支持 Claude Code、Codex、OpenClaw 等后端 | 无需修改底层 Agent，即可为每个角色配置不同模型和后端 |
-| 🖥️ **Run anywhere** | 同一套 CLI 支持 Local、SSH 和 Docker，也能接入外部 MCP 服务 | 从本地开发扩展到远程主机和隔离环境 |
-| 📊 **Live control plane** | Web Dashboard 展示轮次、轨迹和审计产物，并提供 `human gate` | 任务不再是无法观察、无法干预的黑盒 |
-| 📁 **Complete run record** | 每个 run 保存事件、角色输入输出、审计链和最终报告 | 失败可定位，结果可复盘，实验可复现 |
+| 🧠 | **模型** | Claude、GPT、Qwen，以及 Agent 后端提供的其他模型 |
+| 🤖 | **Agent 后端** | Claude Code、Codex CLI、OpenClaw，以及自定义 `AgentAdapter` 实现 |
+| 🎛️ | **角色分配** | 项目经理、执行者和验收员可以分别使用不同模型或后端 |
+| 🖥️ | **执行环境** | 本地、`ssh://user@host:port` 和 `docker://container` |
 
-**你继续使用熟悉的 Agent、模型和工具。LongHorizon-Harness 负责长程协调。**
+轻量级 `AgentAdapter` 会保留每个 Agent 原生的执行循环，同时让 LongHorizon-Harness 在外层协调角色边界、可信任务状态和跨轮进度。
 
----
+三个角色既可以使用同一个模型，也可以组合不同模型和后端，在效果、速度和成本之间进行权衡。
 
-## 为什么需要 LongHorizon-Harness？
+## 数百个真实任务。规模化验证。
 
-长程执行的困难不只在某一个步骤，而在于能否跨越一长串相互依赖的动作持续保持连贯进展。论文总结了三个反复出现的问题：
+LongHorizon-Harness 不只展示了几个精心挑选的成功案例。
 
-- 🔁 **Compounding errors and goal drift**：早期动作或决策中的错误不断累积，扭曲后续选择，并逐渐使 Agent 偏离原始目标。
-- 🧠 **Context rot**：随着交互历史增长，相关信息越来越难以检索和使用，长上下文不再等于可靠状态。
-- 📋 **Task-state loss**：Agent 难以持续恢复、保留和更新需求、已完成动作、产物以及从环境中发现的事实。
+我们让它在数百个覆盖 GUI、CLI 和混合电脑环境的复杂任务中持续工作：
 
-现有 Harness 的两个结构性限制进一步放大了这些问题：任务执行和任务状态管理共享同一个持续增长的上下文；任务执行和完成评估仍然耦合在同一个 Agent 中。LongHorizon-Harness 将任务状态移到执行之外，并用独立环境审计解除这种耦合。
+| 任务领域 | 具体内容 |
+|---|---|
+| 🌐 **Web 前端** | 开发、修复和验证网站与 Web 应用，结合浏览器交互、开发者工具和代码修改完成任务 |
+| 📊 **数据分析与可视化** | 处理数据、生成图表与仪表盘，并检查分析结果和可视化交付物 |
+| 🛠️ **运维与调试** | 排查日志、网络、性能和服务故障，完成系统配置、诊断与修复 |
+| 🎨 **设计与图像处理** | 编辑视觉素材、匹配设计稿、处理图像并验证最终视觉效果 |
+| 🎮 **游戏与交互** | 构建、操作和调试游戏或交互式应用，检查交互逻辑与运行结果 |
+| 📄 **文档与演示** | 编辑文档和演示文稿，处理内容、格式、引用、布局和最终交付 |
+| 🧊 **空间推理** | 完成涉及空间关系、几何结构、精确放置和 3D 操作的任务 |
+| 🖥️ **桌面与系统设置** | 操作桌面应用、文件和系统设置，完成跨软件的配置与管理工作 |
+| 🔬 **研究与教育** | 完成文献研究、课程作业、教学材料、表单和研究支持工作流 |
+| 🎬 **创意制作** | 制作演示、视频、音频及其他多媒体内容，并完成跨工具的素材处理 |
+| ⚙️ **工程与计算** | 使用 CAD、EDA、科学软件、开发工具和云端或 DevOps 工具链完成专业任务 |
+| 🎫 **个人服务** | 处理活动票务、日常服务、游戏和视觉搜索等面向个人用户的工作流 |
+| 🏛️ **行政与合规** | 完成办公、法律、政策敏感表单、机构流程和安全相关的提交任务 |
+| 💼 **商业与金融** | 处理市场分析、采购、贷款、销售、报销和其他需要跨应用核对的企业工作流 |
+| 🏥 **医疗健康** | 完成医疗质控、保险、免疫记录和结构化健康表单等工作流 |
 
----
-
-## 工作原理
-
-LongHorizon-Harness 通过 **Manage-Execute-Audit 循环**，把长任务组织成一串被独立审计的状态转移。
-
-<div align="center">
-<img src="assets/mea_main.png" alt="MEA 循环总览" width="100%">
-<br><em>每一轮由三个结构隔离的角色依次完成一次状态转移；审计报告是唯一的跨轮记忆。</em>
-</div>
-
-三个角色各自只承担一种责任：
+### 模型相同。执行后端相同。只改变 Harness。
 
 <table>
 <tr>
-<td width="33%" valign="top">
-
-### 🧠 Manager
-**状态转移**
-
-维护全局任务状态，根据审计报告生成下一个子任务契约。
-
+<td align="center" width="33%">
+<h2>约 50% → 约 80%</h2>
+<strong>GUI + CLI 任务完成率</strong><br>
+<sub>WeaveBench</sub>
 </td>
-<td width="33%" valign="top">
-
-### ⚡ Executor
-**状态变更动作**
-
-在全新上下文中执行一个边界明确的子任务，是唯一负责修改环境的角色。
-
+<td align="center" width="33%">
+<h2>3 倍</h2>
+<strong>长时间桌面任务完整完成率</strong><br>
+<sub>OSWorld 2.0</sub>
 </td>
-<td width="33%" valign="top">
-
-### 🔍 Auditor
-**状态捕获**
-
-只读检查真实环境，独立确认完成状态、证据和剩余缺口。
-
+<td align="center" width="33%">
+<h2>69.7% → 77.2%</h2>
+<strong>代码与命令行任务成功率</strong><br>
+<sub>Terminal-Bench 2.1 · token 减少 24%</sub>
 </td>
 </tr>
 </table>
 
-> **关键约束**：Manager 只能依据审计报告更新任务状态；Executor 的自述不能直接成为“已完成”的事实。
-
-### With vs Without LongHorizon-Harness
-
-| 现有 Harness | LongHorizon-Harness |
-|---|---|
-| 任务执行和任务状态管理共享同一个增长中的上下文 | 任务状态作为显式记录维护在执行上下文之外 |
-| 执行历史与任务状态一起持续累积 | Executor 每轮使用全新上下文，轮末丢弃交互历史 |
-| Agent 执行子任务并自行判断是否完成 | 只读 Auditor 独立检查真实环境状态 |
-| 自我评估可能被记录为事实并传播到后续决策 | 只有独立验证的事实才能更新任务状态并决定下一步 |
-
----
-
-## 实验结果
-
-我们在三个长程 benchmark 上评测 LongHorizon-Harness，覆盖三条互补的难度轴：**跨界面协调**（WeaveBench，114 任务，每个任务都要 GUI+CLI 联动）、**真实专业复杂度下的长程状态管理**（OSWorld 2.0，108 任务，人类完成时间中位数 1.6 小时）、**纯 CLI 能力**（Terminal-Bench 2.1）。
-
-完整实验设置、结果表和案例轨迹见 [LongHorizon-Harness 项目主页](https://lh-harness.pages.dev)。
-
 <div align="center">
-<img src="assets/harness_perf.png" alt="跨 benchmark 与 backbone 的性能提升" width="70%">
+<img src="assets/harness_perf.png" alt="不同评测和模型上的性能提升" width="72%">
 </div>
 
-### 同一 backbone、同一执行后端，只换 Harness
+<details>
+<summary><strong>📊 完整评测结果与实验设置</strong></summary>
 
-| Benchmark | 指标 | Claude Code | **LongHorizon-Harness** | 提升 |
+| 评测 | 指标 | Claude Code | **LongHorizon-Harness** | 提升 |
 |---|---|:-:|:-:|:-:|
-| **WeaveBench** (114 任务) | PassRate | 51.8 | **80.7** | **+28.9** |
+| **WeaveBench**（114 个任务） | PassRate | 51.8 | **80.7** | **+28.9** |
 | **WeaveBench** | Overall | 0.702 | **0.835** | +0.133 |
-| **OSWorld 2.0** (108 任务) | Binary | 2.8 | **8.3** | **3.0×** |
+| **OSWorld 2.0**（108 个任务） | Binary | 2.8 | **8.3** | **3.0 倍** |
 | **OSWorld 2.0** | Partial | 21.5 | **35.2** | **+13.7** |
 | **Terminal-Bench 2.1** | 成功率 | 69.7 | **77.2** | **+7.5** |
 
-<sub>Backbone 均为 Qwen 3.7-Plus，执行后端均为 Claude Code。</sub>
+<sub>所有结果均使用 Qwen 3.7-Plus 作为基础模型，并使用 Claude Code 作为执行后端。</sub>
 
-### 关键结论
+</details>
 
-- **跨模型有效**：OSWorld 2.0 的 34 任务子集上，Claude Opus 4.7 的 Binary 从 20.0 提升到 34.3。
-- **跨领域有效**：WeaveBench 八个领域全部提升，其中 Design `+60.0`、Spatial/3D `+50.0`。
-- **协调成本较小**：Manager 仅占总 token 的 2.0%–8.1%；Terminal-Bench 2.1 上总 token 反而减少 24%。
-- **跨场景保持一致增益**：显式任务状态管理同时改善跨界面执行、长程桌面工作流和纯命令行任务中的持续进展。
+完整实验设置、结果表格和案例轨迹可在 [LongHorizon-Harness 项目主页](https://lh-harness.pages.dev) 查看。
 
-论文实验使用每角色 20 turns、Executor 1800s、Manager/Auditor 300s，以及最多 25 个 MEA 轮次；CLI 默认 `--max-rounds=30`，复现时请显式设置实验参数。
+## 一条命令。全程可见。
 
----
+安装 LongHorizon-Harness：
+
+```bash
+uv tool install lh-harness
+```
+
+LongHorizon-Harness 需要 Python 3.10+，以及至少一个 Agent 运行时：`claude`、`codex` 或 `openclaw`。
+
+运行一个任务：
+
+```bash
+lh-harness run \
+  --task "检查当前目录并总结其中的文件。"
+```
+
+从文件加载较长任务并打开 Dashboard：
+
+```bash
+lh-harness run --task @task.md --dashboard
+```
+
+Dashboard 会展示每一轮的任务规划、执行结果、审计证据和返工原因。当任务完成、受阻、需要输入或连续失败时，系统也会提供人工介入节点。
+
+| 📋 规划 | ⚡ 执行 | 🔍 验收 | ♻️ 返工 |
+|:---:|:---:|:---:|:---:|
+| 下一步做什么 | Agent 做了什么 | 真实环境证明了什么 | 为什么需要继续执行 |
+
+每次运行都会保存在独立的 `runs/<run-id>/` 目录中。完整的任务状态和审计轨迹让 Agent 的推进过程可以被检查、恢复和复现。
+
+| 运行记录 | 保存内容 |
+|---|---|
+| 📋 **任务状态** | 最初目标、需求、可信进度和剩余工作 |
+| 🧾 **事件流** | 整个运行过程中发生的事件 |
+| 🔍 **验收报告** | 每一轮的证据和验收结论 |
+| 🧠 **角色轨迹** | 项目经理、执行者和验收员的输入与输出 |
+| 📁 **工作区** | 执行过程中产生的文件和交付物 |
+| ✅ **最终报告** | 经过验证的任务结果 |
+
+<details>
+<summary><strong>⚙️ 其他安装方式与常用 CLI 参数</strong></summary>
+
+使用 `pip` 安装：
+
+```bash
+pip install lh-harness
+```
+
+Dashboard 命令：
+
+```bash
+lh-harness run --task @task.md --dashboard      # 监控正在运行的任务
+lh-harness dashboard --runs-root ./runs         # 浏览已完成和正在运行的任务
+```
+
+| 参数 | 说明 |
+|---|---|
+| `--task` | 任务文本或 `@task.md` |
+| `--agent` | `claude_code`、`codex` 或 `openclaw` |
+| `--env` | `local`、`ssh://...` 或 `docker://...` |
+| `--max-rounds` | 规划、执行与验收循环的最大轮数；CLI 默认为 30 |
+| `--dashboard` | 启动实时监控和人工介入功能 |
+
+</details>
 
 ## 评测复现
 
-`eval/` 提供两个 benchmark 的冻结复现套件：
+`eval/` 提供两个固定版本的评测复现套件：
 
-| 目录 | Benchmark | 说明 |
+| 目录 | 评测 | 说明 |
 |---|---|---|
-| [`eval/WeaveBench-harness/`](eval/WeaveBench-harness/) | WeaveBench（114 任务） | GUI+CLI 混合任务与复现 skill |
-| [`eval/OSWorldv2-harness/`](eval/OSWorldv2-harness/) | OSWorld-V2（108 任务） | 对齐官方 release 的 hybrid runner |
+| [`eval/WeaveBench-harness/`](eval/WeaveBench-harness/) | WeaveBench（114 个任务） | GUI + CLI 混合任务及复现 Skill |
+| [`eval/OSWorldv2-harness/`](eval/OSWorldv2-harness/) | OSWorld-V2（108 个任务） | 与官方版本对齐的混合运行器 |
 
-具体环境配置、实验参数和启动命令见各目录中的 `README.md` 或 `README.zh-CN.md`。其中嵌套的 `cua_harness` 包是用于评测的冻结兼容副本；新的集成应使用 `src/lh_harness/`。
-
----
+环境配置、参数和启动命令请查看各目录中的 `README.md` 或 `README.zh-CN.md`。其中的 `cua_harness` 包是用于评测的固定兼容副本；新的集成应使用 `src/lh_harness/`。
 
 ## 引用
 
 ```bibtex
 @article{longhorizonharness2026,
-      title={LongHorizon-Harness: Advancing Long-Horizon Agents for Real-World Tasks},
-      author={Ziyu Ma and Hailang Huang and Shun Zou and Yong Wang and Shidong Yang and Yiming Hu and Fei Wei and XiangXiang Chu},
-      journal={arXiv preprint arXiv:2608.01964},
-      year   = {2026},
-      url    = {https://arxiv.org/abs/2608.01964}
+  title={LongHorizon-Harness: Advancing Long-Horizon Agents for Real-World Tasks},
+  author={Ziyu Ma and Hailang Huang and Shun Zou and Yong Wang and Shidong Yang and Yiming Hu and Fei Wei and XiangXiang Chu},
+  journal={arXiv preprint arXiv:2608.01964},
+  year   = {2026},
+  url    = {https://arxiv.org/abs/2608.01964}
 }
 ```
 
@@ -266,8 +256,6 @@ LongHorizon-Harness 通过 **Manage-Execute-Audit 循环**，把长任务组织�
 
 <div align="center">
 
-**🧠 显式任务状态 · 🔍 独立审计 · ⚡ 全新上下文执行**
-
-把长程执行变成一串被独立审计的状态转移。
+**操作整台计算机。保存可信进展。持续工作，直到任务真正完成。**
 
 </div>

@@ -4,100 +4,72 @@
 
 ### Advancing Long-Horizon Agents for Real-World Tasks
 
+**Operate the whole computer like a human. Work across desktop apps and the command line for dozens of hours.**
+
+**No state drift. Verifiable progress. Complex tasks carried through to completion.**
+
 <p align="center">
 <a href="https://lh-harness.pages.dev"><img src="https://img.shields.io/badge/🌐-Website-1f6feb.svg?style=flat-square" alt="Website" /></a>
 <a href="https://arxiv.org/abs/2608.01964"><img src="https://img.shields.io/badge/arXiv-2608.01964-b31b1b.svg?style=flat-square" alt="arXiv 2608.01964" /></a>
 <a href="https://github.com/AMAP-ML/LongHorizon-Harness"><img src="https://img.shields.io/badge/GitHub-Repository-181717.svg?style=flat-square&logo=github&logoColor=white" alt="GitHub repository" /></a>
 <img src="https://img.shields.io/badge/🤗-Trajectory_Coming_Soon-ffce00.svg?style=flat-square" alt="Hugging Face trajectory" />
-<img src="https://img.shields.io/badge/🤗_Daily_Papers-Coming_Soon-ff8800.svg?style=flat-square" alt="Daily Papers" />
+<a href="https://huggingface.co/papers/2608.01964"><img src="https://img.shields.io/badge/🤗_Daily_Papers-2608.01964-ff8800.svg?style=flat-square" alt="Hugging Face Daily Papers" /></a>
 <a href="./LICENSE"><img src="https://img.shields.io/badge/License-MIT-2ea44f.svg?style=flat-square" alt="MIT License" /></a>
 </p>
 
 [![Python](https://img.shields.io/badge/python-≥3.10-blue?logo=python&logoColor=white)](https://www.python.org/)
-[![Agents](https://img.shields.io/badge/backends-Claude%20Code%20|%20Codex%20|%20OpenClaw-8A2BE2)](#agents-and-mcp)
-[![Benchmarks](https://img.shields.io/badge/benchmarks-WeaveBench%20|%20OSWorld%202.0%20|%20Terminal--Bench%202.1-orange)](#results)
+[![Agents](https://img.shields.io/badge/backends-Claude%20Code%20|%20Codex%20|%20OpenClaw-8A2BE2)](#any-model-any-agent-backend)
+[![Benchmarks](https://img.shields.io/badge/benchmarks-WeaveBench%20|%20OSWorld%202.0%20|%20Terminal--Bench%202.1-orange)](#hundreds-of-real-tasks-measured-gains)
 
-[Usage](#usage) · [What You Get](#what-you-get) · [How It Works](#how-it-works) · [Results](#results) · [Project Website](https://lh-harness.pages.dev) · [简体中文](README.zh-CN.md)
+[Usage](#one-command-full-visibility) · [What You Get](#desktop-apps-and-cli-one-continuous-task) · [How It Works](#three-roles-one-trusted-state) · [Results](#hundreds-of-real-tasks-measured-gains) · [Project Website](https://lh-harness.pages.dev) · [简体中文](README.zh-CN.md)
 
 <br>
 <img src="assets/quickstart.gif" alt="Install and run LongHorizon-Harness from the command line" width="720">
 
 </div>
 
-> **Across desktop apps and the command line, agents can work autonomously for the long haul without losing track of task state, carrying complex work all the way to completion.**
+> **The model determines what an agent can do in one round. LongHorizon-Harness determines whether that work can be verified, preserved, and continued until the task is actually complete.**
 
 **Works with Claude Code, Codex, and OpenClaw. One-command install, ready to run.**
 
-**LongHorizon-Harness organizes long-horizon execution as a sequence of independently audited task-state transitions.** It maintains task state as an explicit record outside execution, updates that record only with facts independently verified from the environment, and derives each next subtask from the current record and the original goal.
+LongHorizon-Harness is an execution, state-management, and result-verification system for long-horizon tasks. It does not train a new model or replace an existing agent. It runs on top of systems such as Codex and Claude Code, helping agents operate autonomously in real computer environments for extended periods and continuously move complex tasks forward.
 
-The Manage-Execute-Audit (MEA) loop structurally separates three responsibilities: the Manager maintains task state and defines the next subtask; the Executor performs that subtask in a fresh context; and a read-only Auditor independently inspects the environment before the Manager begins the next round. A lightweight `AgentAdapter` preserves the native agent loops of existing systems while allowing interchangeable model and harness backends for all three roles.
-
-```text
-Independently Audited Task-State Transitions
-
-Task → Manager → Subtask Contract → Fresh-context Executor
-          ↑                                          ↓
-          └── Audit Report ← Read-only Auditor ← Environment
-```
-
-> **New to LongHorizon-Harness?** You do not need to understand every role or CLI option first. Install it, provide a task, and the default configuration will repeatedly manage, execute, and audit it. Add `--dashboard` when you want live visibility or human intervention.
-
-## Overview Video
+## Video Demo
 
 https://github.com/user-attachments/assets/ca8b77ce-9220-4d85-a272-b346009b2454
 
 <p align="center"><a href="assets/promotional_video_1440p.mp4"><strong>Open the promotional video (1440p MP4)</strong></a></p>
 
-## Usage
+## Three roles. One trusted state.
 
-### Quick Installation
+LongHorizon-Harness separates planning, execution, and verification so that one growing context is not responsible for everything.
 
-Install with `pip`:
+| | Role | One responsibility |
+|---|---|---|
+| 🧭 | **Manager** | Maintains the original goal, verified progress, and next step |
+| ⚡ | **Executor** | Starts each round with a fresh context and focuses on one clearly defined task |
+| 🔍 | **Auditor** | Independently inspects files, interfaces, logs, and tests in the real environment |
 
-```bash
-pip install lh-harness
-```
+Only results that pass independent verification enter persistent task state. Even when the context is refreshed, an action fails, or a deliverable does not pass inspection, the system retains previously verified progress and continues from what remains.
 
-Or install as an isolated CLI tool with `uv`:
+## Desktop apps and CLI. One continuous task.
 
-```bash
-uv tool install lh-harness
-```
+LongHorizon-Harness supports both GUI and CLI workflows.
 
-LongHorizon-Harness requires Python 3.10+ and at least one agent runtime: `claude`, `codex`, or `openclaw`.
-
-### Quick Start
-
-```bash
-lh-harness run \
-  --task "Inspect the current directory and summarize its files."
-```
-
-Tasks can also be loaded from a file. Add the Dashboard to monitor the run and intervene at key decision points:
-
-```bash
-lh-harness run --task @task.md --dashboard
-```
-
-By default, each run writes its data to an isolated `runs/<run-id>/` directory containing the workspace directory, event stream, round-by-round audit records, and final report.
-
-### Common Options
-
-| Option | Description |
+| 🖥️ Operate the desktop | ⌨️ Work in the terminal |
 |---|---|
-| `--task` | Task text or `@task.md` |
-| `--agent` | `claude_code`, `codex`, or `openclaw` |
-| `--env` | `local`, `ssh://...`, or `docker://...` |
-| `--max-rounds` | Maximum number of MEA rounds; the CLI default is 30 |
-| `--dashboard` | Start live monitoring and human intervention |
+| 🌐 Click, type, scroll, and browse | 💻 Write and modify code |
+| 📊 Operate spreadsheets | ▶️ Run commands and scripts |
+| 📄 Edit documents | 📦 Install dependencies and environments |
+| 🎨 Use design software | 🔧 Configure and debug systems |
+| 🧊 Operate 3D tools | 📁 Process files and data |
 
-Each run is isolated under `runs/<run-id>/`, including its workspace, final report, event stream, and round-by-round audit records.
+One task can begin in a browser, move to the command line for data processing, continue in desktop software to produce an artifact, and return to the terminal for validation or debugging. The goal, progress, and evidence remain under the same state-management system throughout.
 
-### Agents and MCP
+<details>
+<summary><strong>🖱️ Connect a computer-use MCP server</strong></summary>
 
-LongHorizon-Harness does not replace the underlying agent loop; it orchestrates roles and task state around it. The repository includes adapters for **Claude Code**, **Codex CLI**, and **OpenClaw**. Additional backends can implement `AgentAdapter`, and each role may use a different agent and model.
-
-GUI capabilities are provided by an external MCP server. The harness does not include or enable a specific computer-use implementation by default:
+GUI interaction is supplied through a compatible external computer-use MCP server. LongHorizon-Harness does not bundle or enable a specific computer-use implementation by default.
 
 ```bash
 lh-harness run --task @task.md --agent claude_code \
@@ -107,114 +79,75 @@ lh-harness run --task @task.md --agent claude_code \
 
 You can also use `LH_HARNESS_CLAUDECODE_MCP_CONFIG` and `LH_HARNESS_CLAUDECODE_ADD_DIRS`. When no configuration is supplied, the Claude Code adapter does not add MCP arguments.
 
-Execution environments include `local`, `ssh://user@host:port`, and `docker://container`. External MCP configuration files and exposed paths must be visible in the environment where the agent actually runs.
+</details>
 
-### Dashboard
+## Any model. Any agent backend.
 
-```bash
-lh-harness run --task @task.md --dashboard      # Monitor a live run
-lh-harness dashboard --runs-root ./runs         # Browse completed and active runs
-```
+LongHorizon-Harness is not tied to a specific model or agent backend. Existing models and agents connect through configuration without changing their original workflows.
 
-The Dashboard is implemented with the Python standard library and provides:
-
-- Live views of rounds, role trajectories, and audit artifacts.
-- Human gates when a task completes, becomes blocked, needs user input, or fails repeatedly.
-- Injection of human answers and supplemental instructions into the next Manager round.
-
-## What You Get
-
-| Capability | What it is | Why it matters |
+| | Layer | Supported choices |
 |---|---|---|
-| 📋 **Explicit task state** | Requirements, artifacts, and environment facts are maintained outside the execution context | Task state is not buried in an ever-growing interaction history |
-| 🔍 **Independently verified facts** | Task state is updated only with facts independently verified by the Auditor from the real environment | Incorrect self-assessments do not become premises for later decisions |
-| 🧭 **Dynamic decomposition under the original goal** | The Manager defines the next subtask from current task state, including dependencies, constraints, and acceptance criteria | Every round starts from verified progress without losing the original objective |
-| 🧠 **Fresh-context execution** | The Executor performs only the current subtask, and its interaction history is discarded at the end of the round | Only compact, verified task state persists across rounds |
-| 🔌 **Interchangeable backends** | `AgentAdapter` preserves native agent loops and supports backends such as Claude Code, Codex, and OpenClaw | Different models and backends can be assigned to each role without modifying the underlying agent |
-| 🖥️ **Run anywhere** | The same CLI supports local, SSH, and Docker environments, with optional external MCP services | Move from local development to remote machines and isolated environments |
-| 📊 **Live control plane** | The Web Dashboard exposes rounds, trajectories, audit artifacts, and human gates | Long-running tasks are observable and interruptible rather than opaque |
-| 📁 **Complete run record** | Every run stores events, role inputs and outputs, the audit chain, and a final report | Failures can be diagnosed, outcomes reviewed, and experiments reproduced |
+| 🧠 | **Models** | Claude, GPT, Qwen, and other models exposed by an agent backend |
+| 🤖 | **Agent backends** | Claude Code, Codex CLI, OpenClaw, and custom `AgentAdapter` implementations |
+| 🎛️ | **Role assignment** | The Manager, Executor, and Auditor can each use a different model or backend |
+| 🖥️ | **Execution environments** | Local, `ssh://user@host:port`, and `docker://container` |
 
-**Keep using the agents, models, and tools you already know. LongHorizon-Harness handles long-horizon coordination.**
+A lightweight `AgentAdapter` preserves each agent's native execution loop while LongHorizon-Harness coordinates role boundaries, verified task state, and cross-round progress around it.
 
----
+Use one model for all three roles, or combine different models and backends to balance quality, speed, and cost.
 
-## Why LongHorizon-Harness?
+## Hundreds of real tasks. Measured gains.
 
-The difficulty of long-horizon execution lies not only in any individual step, but in sustaining coherent progress across a long sequence of interdependent actions. The paper identifies three recurring challenges:
+LongHorizon-Harness is not demonstrated only on a handful of carefully selected success cases.
 
-- 🔁 **Compounding errors and goal drift:** Errors in early actions or decisions accumulate, distort later choices, and gradually steer the agent away from its original objective.
-- 🧠 **Context rot:** As interaction history grows, relevant information becomes harder to retrieve and use; a longer context does not guarantee a reliable task state.
-- 📋 **Task-state loss:** Agents struggle to continuously recover, retain, and update requirements, completed actions, produced artifacts, and facts discovered from the environment.
+We ran it on hundreds of complex tasks across GUI, CLI, and mixed computer environments:
 
-Two structural limitations in existing harnesses amplify these problems: task execution and task-state management share the same growing context, while task execution and completion assessment remain coupled in the same agent. LongHorizon-Harness moves task state outside execution and separates completion assessment through independent environment auditing.
+| Task domain | What the tasks involve |
+|---|---|
+| 🌐 **Web Frontend** | Developing, fixing, and validating websites and web applications through browser interaction, developer tools, and code changes |
+| 📊 **Data Analysis & Visualization** | Processing data, producing charts and dashboards, and checking analytical results and visual deliverables |
+| 🛠️ **Operations & Debugging** | Investigating logs, networks, performance, and service failures; configuring, diagnosing, and repairing systems |
+| 🎨 **Design & Image Processing** | Editing visual assets, matching design references, processing images, and verifying final visual quality |
+| 🎮 **Games & Interaction** | Building, operating, and debugging games or interactive applications; checking interaction logic and runtime behavior |
+| 📄 **Documents & Presentations** | Editing documents and slide decks, including content, formatting, references, layout, and final delivery |
+| 🧊 **Spatial Reasoning** | Completing tasks involving spatial relationships, geometry, precise placement, and 3D operations |
+| 🖥️ **Desktop & System Settings** | Operating desktop applications, files, and system settings across multi-application workflows |
+| 🔬 **Research & Education** | Completing literature research, coursework, teaching materials, forms, and research-support workflows |
+| 🎬 **Creative Production** | Producing presentations, video, audio, and other media while coordinating assets across tools |
+| ⚙️ **Engineering & Computing** | Using CAD, EDA, scientific software, development tools, and cloud or DevOps toolchains |
+| 🎫 **Personal Services** | Handling event ticketing, everyday services, games, and visual-search workflows |
+| 🏛️ **Administration & Compliance** | Completing office, legal, policy-sensitive form, institutional, and safety-aware submission workflows |
+| 💼 **Business & Finance** | Handling market analysis, procurement, loans, sales, reimbursements, and cross-application enterprise workflows |
+| 🏥 **Healthcare** | Completing medical quality-control, insurance, immunization, and structured health-form workflows |
 
----
-
-## How It Works
-
-LongHorizon-Harness uses a **Manage-Execute-Audit loop** to organize a long task as a sequence of independently audited state transitions.
-
-<div align="center">
-<img src="assets/mea_main.png" alt="Overview of the Manage-Execute-Audit loop" width="100%">
-<br><em>Each round applies three structurally isolated roles; audit reports are the only cross-round memory.</em>
-</div>
-
-Each role has one responsibility:
+### Same model. Same execution backend. Only the harness changes.
 
 <table>
 <tr>
-<td width="33%" valign="top">
-
-### 🧠 Manager
-**State transition**
-
-Maintains global task state and produces the next subtask contract from audit reports.
-
+<td align="center" width="33%">
+<h2>~50% → ~80%</h2>
+<strong>GUI + CLI completion</strong><br>
+<sub>WeaveBench</sub>
 </td>
-<td width="33%" valign="top">
-
-### ⚡ Executor
-**State-changing action**
-
-Performs one bounded subtask in a fresh context and is the only role that modifies the environment.
-
+<td align="center" width="33%">
+<h2>3×</h2>
+<strong>Full desktop-task completion</strong><br>
+<sub>OSWorld 2.0</sub>
 </td>
-<td width="33%" valign="top">
-
-### 🔍 Auditor
-**State capture**
-
-Inspects the real environment through read-only interaction and independently records completion, evidence, and remaining gaps.
-
+<td align="center" width="33%">
+<h2>69.7% → 77.2%</h2>
+<strong>Code + CLI success</strong><br>
+<sub>Terminal-Bench 2.1 · 24% fewer tokens</sub>
 </td>
 </tr>
 </table>
 
-> **Core constraint:** The Manager updates task state from audit reports. The Executor's self-report cannot directly establish that work is complete.
-
-### With vs. Without LongHorizon-Harness
-
-| Existing harnesses | LongHorizon-Harness |
-|---|---|
-| Task execution and task-state management share one growing context | Task state is maintained as an explicit record outside execution |
-| Execution history and task state accumulate together | The Executor starts from a fresh context each round and discards its interaction history afterward |
-| The agent executes a subtask and assesses its own completion | A read-only Auditor independently inspects the resulting environment state |
-| Self-assessments can be recorded as facts and propagate into later decisions | Only independently verified facts update task state and determine the next step |
-
----
-
-## Results
-
-We evaluate LongHorizon-Harness on three long-horizon benchmarks spanning complementary difficulty axes: **cross-interface coordination** on WeaveBench (114 tasks, each combining GUI and CLI interaction), **long-horizon state management under realistic professional complexity** on OSWorld 2.0 (108 tasks, with a median human completion time of 1.6 hours), and **pure CLI competence** on Terminal-Bench 2.1.
-
-Full experimental settings, result tables, and case trajectories are available on the [LongHorizon-Harness project website](https://lh-harness.pages.dev).
-
 <div align="center">
-<img src="assets/harness_perf.png" alt="Performance gains across benchmarks and backbones" width="70%">
+<img src="assets/harness_perf.png" alt="Performance gains across benchmarks and backbones" width="72%">
 </div>
 
-### Same Backbone, Same Execution Backend, Only the Harness Changes
+<details>
+<summary><strong>📊 Full benchmark results and experimental settings</strong></summary>
 
 | Benchmark | Metric | Claude Code | **LongHorizon-Harness** | Gain |
 |---|---|:-:|:-:|:-:|
@@ -226,16 +159,75 @@ Full experimental settings, result tables, and case trajectories are available o
 
 <sub>All rows use Qwen 3.7-Plus as the backbone and Claude Code as the execution backend.</sub>
 
-### Key Findings
+</details>
 
-- **Generalizes across models:** On a 34-task OSWorld 2.0 subset, LongHorizon-Harness raises Claude Opus 4.7 binary completion from 20.0 to 34.3.
-- **Improves across domains:** All eight WeaveBench domains improve, including `+60.0` points in Design and `+50.0` points in Spatial/3D.
-- **Coordination remains lightweight:** The Manager accounts for only 2.0%–8.1% of total tokens; on Terminal-Bench 2.1, total token use decreases by 24%.
-- **Delivers consistent gains across settings:** Explicit task-state management improves sustained progress in cross-interface workflows, professional desktop tasks, and pure command-line environments.
+Full result tables and case trajectories are available on the [LongHorizon-Harness project website](https://lh-harness.pages.dev).
 
-The paper experiments use 20 turns per role, 1,800 seconds for the Executor, 300 seconds for the Manager and Auditor, and a maximum of 25 MEA rounds. The CLI defaults to `--max-rounds=30`; set the experimental parameters explicitly when reproducing paper results.
+## One command. Full visibility.
 
----
+Install LongHorizon-Harness:
+
+```bash
+uv tool install lh-harness
+```
+
+LongHorizon-Harness requires Python 3.10+ and at least one agent runtime: `claude`, `codex`, or `openclaw`.
+
+Run a task:
+
+```bash
+lh-harness run \
+  --task "Inspect the current directory and summarize its files."
+```
+
+Run a longer task from a file and open the Dashboard:
+
+```bash
+lh-harness run --task @task.md --dashboard
+```
+
+The Dashboard shows every round's plan, execution result, audit evidence, and reason for rework. It also provides human gates when a task completes, becomes blocked, needs input, or fails repeatedly.
+
+| 📋 Plan | ⚡ Execution | 🔍 Audit | ♻️ Rework |
+|:---:|:---:|:---:|:---:|
+| What happens next | What the agent did | What the environment proves | Why another round is needed |
+
+Every run is stored in an isolated `runs/<run-id>/` directory. The complete task state and audit trail make the agent's progress inspectable, recoverable, and reproducible.
+
+| Run record | What it preserves |
+|---|---|
+| 📋 **Task state** | Original goal, requirements, verified progress, and remaining work |
+| 🧾 **Event stream** | What happened throughout the run |
+| 🔍 **Audit reports** | Evidence and acceptance decisions for every round |
+| 🧠 **Role trajectories** | Manager, Executor, and Auditor inputs and outputs |
+| 📁 **Workspace** | Files and artifacts produced during execution |
+| ✅ **Final report** | The verified outcome of the task |
+
+<details>
+<summary><strong>⚙️ Installation alternatives and common CLI options</strong></summary>
+
+Install with `pip`:
+
+```bash
+pip install lh-harness
+```
+
+Dashboard commands:
+
+```bash
+lh-harness run --task @task.md --dashboard      # Monitor a live run
+lh-harness dashboard --runs-root ./runs         # Browse completed and active runs
+```
+
+| Option | Description |
+|---|---|
+| `--task` | Task text or `@task.md` |
+| `--agent` | `claude_code`, `codex`, or `openclaw` |
+| `--env` | `local`, `ssh://...`, or `docker://...` |
+| `--max-rounds` | Maximum number of Manage-Execute-Audit rounds; the CLI default is 30 |
+| `--dashboard` | Start live monitoring and human intervention |
+
+</details>
 
 ## Evaluation Reproduction
 
@@ -248,17 +240,15 @@ The paper experiments use 20 turns per role, 1,800 seconds for the Executor, 300
 
 See each directory's `README.md` or `README.zh-CN.md` for environment setup, parameters, and launch commands. The nested `cua_harness` packages are frozen compatibility copies used for evaluation; new integrations should use `src/lh_harness/`.
 
----
-
 ## Citation
 
 ```bibtex
 @article{longhorizonharness2026,
-      title={LongHorizon-Harness: Advancing Long-Horizon Agents for Real-World Tasks},
-      author={Ziyu Ma and Hailang Huang and Shun Zou and Yong Wang and Shidong Yang and Yiming Hu and Fei Wei and XiangXiang Chu},
-      journal={arXiv preprint arXiv:2608.01964},
-      year   = {2026},
-      url    = {https://arxiv.org/abs/2608.01964}
+  title={LongHorizon-Harness: Advancing Long-Horizon Agents for Real-World Tasks},
+  author={Ziyu Ma and Hailang Huang and Shun Zou and Yong Wang and Shidong Yang and Yiming Hu and Fei Wei and XiangXiang Chu},
+  journal={arXiv preprint arXiv:2608.01964},
+  year   = {2026},
+  url    = {https://arxiv.org/abs/2608.01964}
 }
 ```
 
@@ -266,8 +256,6 @@ See each directory's `README.md` or `README.zh-CN.md` for environment setup, par
 
 <div align="center">
 
-**🧠 Explicit Task State · 🔍 Independent Auditing · ⚡ Fresh-Context Execution**
-
-Long-horizon execution as a sequence of independently audited task-state transitions.
+**Operate the whole computer. Preserve verified progress. Keep working until the task is done.**
 
 </div>
