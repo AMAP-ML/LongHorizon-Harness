@@ -1,0 +1,8 @@
+=== hermes turn (try=0) ===
+I reached the maximum iterations (90) but couldn't summarize. Error: Error code: 500 - {'error': {'message': 'Responses websocket ended without a terminal response', 'type': 'error'}}
+AGENT_TURN_EXIT=0 try=0
+RETRIES_USED=0
+AGENT_EXIT=0
+
+[hermes_agent] AGENT_EXIT=0
+[hermes_agent] RETRIES_USED=0

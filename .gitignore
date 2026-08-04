@@ -1,0 +1,36 @@
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+
+# Local environments
+.venv/
+venv/
+env/
+
+# Build artifacts
+build/
+dist/
+*.egg-info/
+
+# Local run outputs
+runs/
+logs/
+results/
+tmp/
+
+# Secrets and local overrides
+.env
+*.env
+env.local.sh
+*.local.sh
+*.mcp.json
+
+# Editor/system
+.DS_Store
+.idea/
+.vscode/

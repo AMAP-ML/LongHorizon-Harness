@@ -1,0 +1,4 @@
+interface:
+  display_name: "Setup OSWorld"
+  short_description: "Provision OSWorld-V2 and CUA overlay"
+  default_prompt: "Use $setup-osworld to provision this OSWorld-V2 checkout after clone, including the selected provider, optional website/GitLab servers, CUA-Harness overlay when present, verification, and final exports."

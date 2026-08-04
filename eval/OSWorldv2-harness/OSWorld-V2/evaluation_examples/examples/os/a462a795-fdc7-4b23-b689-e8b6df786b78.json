@@ -1,0 +1,35 @@
+{
+  "id": "a462a795-fdc7-4b23-b689-e8b6df786b78",
+  "snapshot": "os",
+  "instruction": "Could you please help me to switch to the user 'Charles' with password of 'Ex@mpleP@55w0rd!'? ONE THING KEEP IN MIND, YOU SHOULD NEVER OR LOGOUT THE MACHINE OR SHUTDOWN THE MACHINE.",
+  "source": "https://ubuntu.com/tutorials/command-line-for-beginners#5-moving-and-manipulating-files",
+  "config": [
+    {
+      "type": "execute",
+      "parameters": {
+        "command": "echo {CLIENT_PASSWORD} | sudo -S su - charles",
+        "shell": true
+      }
+    },
+    {
+      "type": "execute",
+      "parameters": {
+        "command": [
+          "python",
+          "-c",
+          "import pyautogui; import time; pyautogui.click({SCREEN_WIDTH_HALF}, {SCREEN_HEIGHT_HALF}); time.sleep(0.5);"
+        ]
+      }
+    }
+  ],
+  "trajectory": "trajectories/",
+  "related_apps": [
+    "os"
+  ],
+  "evaluator": {
+    "func": "infeasible"
+  },
+  "proxy": false,
+  "fixed_ip": false,
+  "possibility_of_env_change": "low"
+}

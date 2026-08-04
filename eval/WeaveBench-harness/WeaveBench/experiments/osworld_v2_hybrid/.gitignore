@@ -1,0 +1,22 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.ipynb_checkpoints/
+
+# Large runtime assets — never commit (download / build separately, see README)
+*.tar.gz
+*.qcow2
+*.zip
+
+# Raw run outputs — keep only the aggregated files under results/codex_hybrid_gpt55/
+results/osworld_v2_inject/
+**/pyautogui/
+**/screenshots/
+**/agent.log
+*.log
+
+# Secrets / local endpoints
+*.env
+my_api.json
+litellm_api.json

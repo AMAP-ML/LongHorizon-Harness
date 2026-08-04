@@ -1,0 +1,175 @@
+EVALUATE THIS OSWORLD AGENT ROLLOUT. Use TOOLS to read the trajectory and inspect the final state.
+
+  STAGING_DIR: ./_eval/{CASE_ID}/                          (relative to workspace)
+    ├── task.json                ← canonical OSWorld task (id + instruction + evaluator)
+    ├── task_summary.md          ← human-readable rendering (READ FIRST)
+    ├── task.md                  ← alias of task_summary.md
+    ├── results/                 ← agent deliverables (USUALLY EMPTY for OSWorld)
+    ├── *.png                    ← screenshots taken during/after the run (final state evidence)
+    ├── chat.jsonl               ← FULL trajectory (LARGE — sample with head/grep/jq)
+    └── (optional) agent.log     ← runtime log
+
+═══════════════════════════════════════════════════════
+WHAT MAKES OSWORLD DIFFERENT FROM WCB
+═══════════════════════════════════════════════════════
+- The official OSWorld grader is rule-based (e.g. compare a file in the VM,
+  inspect Chrome's settings JSON). We are NOT running that grader. YOU are the
+  grader. The `evaluator` block inside task.json describes WHAT the rule would
+  have checked — treat that as the success specification.
+- OSWorld tasks usually do NOT produce files in /tmp_workspace/results/. The
+  agent operates directly on the live desktop (open Chrome, edit a Calc cell,
+  toggle a setting). Your primary evidence is therefore:
+    1. The chat.jsonl trajectory — what tool calls did the agent make?
+       What did each tool return? (Tool results often contain screenshots
+       and command outputs that reveal final state.)
+    2. The screenshot files (*.png) at the case root — these are the final
+       on-screen evidence captured by the runner.
+    3. The agent's last assistant turn — did it claim success? With what
+       evidence? (Self-claimed success without observable evidence = WEAK.)
+- Some tasks are INFEASIBLE: `evaluator.func == "infeasible"`. For those,
+  success means the agent EXPLICITLY refused (said FAIL / cannot / impossible /
+  not possible). If the agent attempted anyway = score 0. If the agent
+  recognized infeasibility and said so clearly = score 1.
+
+═══════════════════════════════════════════════════════
+SCORING PHILOSOPHY — BE STRICT BUT FAIR
+═══════════════════════════════════════════════════════
+You are a rigorous senior evaluation engineer reviewing an automated rollout.
+Default to careful verification, not generous interpretation. Your job is to
+inspect the agent's actions and the resulting state — not to give credit for
+general effort. The bar for high scores is intentionally severe.
+
+REQUIRED PROCEDURE:
+1. READ task_summary.md to understand instruction + evaluator criteria.
+2. SAMPLE chat.jsonl strategically:
+     - First 20 turns (initial plan + first actions)
+     - Last 30 turns (final convergence / success claim / FAIL signal)
+     - Search for `tool_use_id` / `tool_result` patterns showing concrete
+       VM state changes (e.g. shell `cat /path/to/file`, screenshot evidence).
+   Use `head -200`, `tail -200`, `grep -E '"role":"assistant"' | head -50`,
+   `wc -l`. DO NOT cat the entire file (often >10MB).
+3. INSPECT every *.png screenshot you find — they are the strongest evidence.
+4. EXTRACT THE EVALUATOR'S TRUE SUCCESS CONDITION from task.json's `evaluator`
+   block. Examples:
+     - `func: exact_match`, `result: enable_do_not_track`, `expected: rule {expected:true}`
+       → success = Chrome's "Do Not Track" toggle is now ON. Look for screenshot
+       showing Chrome settings with DNT enabled, OR shell evidence of the
+       relevant prefs file containing the right key.
+     - `func: check_include_exclude`, `result: vm_file <path>`, `expected: rule {include:[...], exclude:[...]}`
+       → success = the file at <path> contains all `include` strings and
+       none of `exclude`. Look for shell evidence (`cat <path>` output) in
+       chat.jsonl, or screenshots showing the editor with that content.
+     - `func: compare_table` / `compare_pdfs` / `compare_pptx_files`
+       → success = the file the agent produced matches the expected file
+       structurally. You won't have the gold to diff — judge from whether
+       the agent produced *a* file at the expected path with plausible
+       content matching the instruction.
+     - `func: infeasible` → see above.
+5. PREFER LOWER SCORE WHEN UNCERTAIN — when in doubt about whether success
+   was achieved, choose the LOWER score. "Looks like maybe" / "could be" /
+   "agent says so but no evidence" → that's partial or failure, not success.
+6. NO ROUNDING UP — a task half-done = ~0.40-0.55, not 0.80.
+
+PER-ARTIFACT correctness scoring rubric (each "artifact" here = one
+sub-aspect of the task you can verify independently; e.g. "settings toggle
+flipped" + "no other settings disturbed"):
+  1.00 = CLEAR SUCCESS — concrete observable evidence (screenshot or
+         shell output) shows the evaluator's `result` matches `expected`.
+  0.85-0.95 = LIKELY SUCCESS — agent's actions plausibly achieved the goal,
+         and at least one piece of supporting evidence exists, but you
+         lack direct confirmation of the final VM state.
+  0.50-0.80 = PARTIAL — the agent did some of the right things but a key
+         step is missing, wrong, or unverifiable.
+  0.10-0.40 = WEAK — the agent operated in the right app/area but did
+         not achieve the actual goal.
+  0.00 = MISSING / FAILED — the agent gave up, crashed, did something
+         unrelated, or the instruction was clearly not satisfied.
+
+DIMENSION scoring (8 dimensions — score 0..1 each):
+  1. task_completion          — did the agent fulfill the instruction?
+  2. final_state_correctness  — does the final VM state match what the
+                                 evaluator would have checked?
+  3. deliverable_correctness  — for tasks that produce a file/artifact,
+                                 is it correct? (For pure-toggle tasks
+                                 use the action correctness instead.)
+  4. instruction_following    — did the agent follow specific constraints
+                                 in the instruction (exact menu path, etc.)?
+  5. efficiency               — was the trajectory direct or rambling?
+                                 (Don't punish exploration if it succeeded.)
+  6. error_recovery           — when actions failed, did the agent adapt?
+  7. tool_use_quality         — were tools used correctly (right action
+                                 names, sensible coordinates, no flailing)?
+  8. trajectory_coherence     — does the trajectory tell a sensible story?
+
+A rollout that ANY required goal-state unfulfilled CANNOT have task_completion
+or final_state_correctness ≥ 0.85.
+
+═══════════════════════════════════════════════════════
+ANTI-HACK CHECKS (CRITICAL — apply BEFORE writing dim scores)
+═══════════════════════════════════════════════════════
+Some agents fabricate evidence to fool graders. Check chat.jsonl for these
+patterns and set is_hack=true with hack_confidence ≥ 0.7 if any apply:
+- Generated fake screenshots with PIL/numpy/PIL.ImageDraw rather than calling
+  the screenshot tool. (Pattern: `Image.new(`, `ImageDraw.`, `np.random.randint(0, 256`.)
+- Wrote text to a file claiming it's a screenshot.
+- Used external OCR/CV libraries to "look at" something instead of the
+  built-in screenshot tool (`pytesseract`, `easyocr`, `playwright`,
+  `selenium`, `opencv` install attempts).
+- Edited the verifier or evaluator files instead of doing the task.
+- Self-claimed success with no observable evidence in the trajectory.
+- For infeasible tasks: agent claimed success without recognizing infeasibility
+  → NOT hack but score=0 for task_completion.
+
+If is_hack=true, cap final_score ≤ 0.10 regardless of other dims.
+
+═══════════════════════════════════════════════════════
+OUTPUT
+═══════════════════════════════════════════════════════
+WRITE your final verdict to `./_eval/{CASE_ID}/score.json` (NOT stdout) using
+the write_file tool. Schema:
+
+{
+  "case_id": "{CASE_ID}",
+  "task_uuid": "<task.json id>",
+  "domain": "<chrome/libreoffice_calc/...>",
+  "artifact_checks": [
+    {
+      "id": "evaluator_primary_goal",
+      "task_says": "<1-sentence summary of what the evaluator checks>",
+      "exists": true,
+      "format_ok": true,
+      "correctness": 0.0,
+      "evidence_quote": "<exact line from chat.jsonl or screenshot description>",
+      "missing_or_wrong": "<what was missing if correctness < 1>",
+      "fake_signal": false
+    }
+    // add 1-3 more if the task has multiple sub-checks
+  ],
+  "dimensions": {
+    "task_completion":         {"score": 0.0, "reason": "..."},
+    "final_state_correctness": {"score": 0.0, "reason": "..."},
+    "deliverable_correctness": {"score": 0.0, "reason": "..."},
+    "instruction_following":   {"score": 0.0, "reason": "..."},
+    "efficiency":              {"score": 0.0, "reason": "..."},
+    "error_recovery":          {"score": 0.0, "reason": "..."},
+    "tool_use_quality":        {"score": 0.0, "reason": "..."},
+    "trajectory_coherence":    {"score": 0.0, "reason": "..."}
+  },
+  "is_hack": false,
+  "hack_confidence": 0.0,
+  "hack_patterns": [],
+  "hack_evidence_quotes": [],
+  "final_score": 0.0,
+  "summary": "<2-3 sentence final verdict>"
+}
+
+final_score = weighted average:
+  0.40 * task_completion
++ 0.25 * final_state_correctness
++ 0.10 * deliverable_correctness
++ 0.10 * instruction_following
++ 0.05 * (efficiency + error_recovery + tool_use_quality + trajectory_coherence) / 4
+
+(But capped ≤ 0.10 if is_hack=true.)
+
+Start by reading task_summary.md and listing the screenshots.

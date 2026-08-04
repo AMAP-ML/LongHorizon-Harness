@@ -1,0 +1,47 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Node / package managers
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# Local experiment assets and outputs
+WeaveBench/cache/
+WeaveBench/results/
+WeaveBench/logs/
+WeaveBench/judge_agent_test/
+
+# Large VM/runtime artifacts if created outside the default cache path
+*.qcow2
+*.tar.gz
+
+# Local environment and secrets
+.env
+.env.*
+.local/
+*.key
+*.pem
+
+# Editor / OS noise
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
+*~

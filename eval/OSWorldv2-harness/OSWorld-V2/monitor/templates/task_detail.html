@@ -1,0 +1,308 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+    <title>Task Detail: {{ task_id }}</title>
+    <link rel="icon" href="/static/favicon.png" type="image/x-icon">
+    <link rel="shortcut icon" href="/static/favicon.png" type="image/x-icon">
+    <link rel="apple-touch-icon" href="/static/favicon.png">
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/5.15.4/css/all.min.css">
+    <link rel="stylesheet" href="/static/task_detail.css">
+    <script src="https://cdn.jsdelivr.net/npm/marked@12.0.0/marked.min.js"></script>
+</head>
+<body>
+    <div class="container">
+        <a href="/?action_space={{ action_space }}&observation_type={{ observation_type }}&model_name={{ model_name }}" class="back-link"><i class="fas fa-arrow-left"></i> Back to Home</a>
+        <h1>Task Detail <span class="task-id">{{ task_id }}</span></h1>
+        <div class="trajectory-toolbar">
+            <div class="trajectory-toolbar-main">
+                <div class="trajectory-toolbar-label"><i class="fas fa-route"></i> Trajectory</div>
+                <div class="trajectory-tabs">
+                    {% for trajectory in trajectories %}
+                    {% set trajectory_display = trajectory.status.result if trajectory.status.result is not none else trajectory.status.status %}
+                    <a
+                        href="/task/{{ task_type }}/{{ task_id }}?action_space={{ action_space }}&observation_type={{ observation_type }}&model_name={{ model_name }}&trajectory_id={{ trajectory.id }}"
+                        class="trajectory-tab{% if trajectory.id == selected_trajectory_id %} active{% endif %}"
+                    >
+                        <span class="trajectory-tab-name">{{ trajectory.id }}</span>
+                        <span class="trajectory-tab-meta">{{ trajectory_display }}</span>
+                        <span class="trajectory-tab-time">{{ trajectory.status.last_update or 'No timestamp' }}</span>
+                    </a>
+                    {% endfor %}
+                </div>
+            </div>
+            <div class="trajectory-toolbar-meta">
+                <span class="trajectory-pill current"><i class="fas fa-eye"></i> Current: {{ selected_trajectory_id }}</span>
+                {% if trajectories|length > 1 %}
+                <span class="trajectory-pill"><i class="fas fa-layer-group"></i> {{ trajectories|length }} trajectories</span>
+                {% endif %}
+            </div>
+        </div>
+        <div class="task-info">
+            <h2><i class="fas fa-info-circle"></i> Basic Information</h2>
+            <dl>
+                <dt>Task ID</dt>
+                <dd>{{ task_id }}</dd>
+                <dt>Trajectory ID</dt>
+                <dd>{{ selected_trajectory_id }}</dd>
+                <dt>Task Type</dt>
+                <dd>{{ task_type }}</dd>
+                <dt>Instruction</dt>
+                <dd>{{ task_info.instruction }}</dd>
+                <dt>Status</dt>
+                <dd class="status status-{{ task_status.status|lower|replace(' ', '-')|replace('(', '')|replace(')', '') }}">
+                    {{ task_status.status }}
+                    {% if task_status.status == 'Error' %}
+                    <span class="tooltip">
+                        <i class="fas fa-question-circle"></i>
+                        <span class="tooltip-text">Error occurred during task execution</span>
+                    </span>
+                    {% elif task_status.status == 'Done (Message Exit)' %}
+                    <span class="tooltip">
+                        <i class="fas fa-question-circle"></i>
+                        <span class="tooltip-text">Task completed with a message exit condition</span>
+                    </span>
+                    {% elif task_status.status == 'Done (Max Steps)' %}
+                    <span class="tooltip">
+                        <i class="fas fa-question-circle"></i>
+                        <span class="tooltip-text">Maximum steps reached, task completed</span>
+                    </span>
+                    {% elif task_status.status == 'Done (Thought Exit)' %}
+                    <span class="tooltip">
+                        <i class="fas fa-question-circle"></i>
+                        <span class="tooltip-text">Task completed with a thought exit condition</span>
+                    </span>
+                    {% endif %}
+                </dd>
+                <dt>Current Step</dt>
+                <dd>{{ task_status.progress }}</dd>
+                <dt>Last Update</dt>
+                <dd>{{ task_status.last_update or 'None' }}</dd>
+                {% if task_status.log_data and task_status.log_data.exit_condition %}
+                <dt>Exit Condition</dt>
+                <dd class="exit-condition">
+                    {{ task_status.log_data.exit_condition }}
+                </dd>
+                {% endif %}
+                {% if task_status.status == 'Done (Message Exit)' and task_status.log_data and task_status.log_data.last_message %}
+                <dt>Exit Message</dt>
+                <dd class="exit-message">
+                    {{ task_status.log_data.last_message }}
+                </dd>
+                {% endif %}
+                <dt>Result</dt>
+                <dd>{{ task_status.result if task_status.result is not none else 'Task not completed' }}</dd>
+                
+                {% if task_status.status.startswith('Done') %}
+                <dt>Recording</dt>
+                <dd id="recording-container">
+                    <div class="video-player">
+                        <video id="task-recording" controls playsinline webkit-playsinline
+                               preload="metadata" width="100%" controlslist="nodownload">
+                            <source src="/task/{{ task_type }}/{{ task_id }}/recording?action_space={{ action_space }}&observation_type={{ observation_type }}&model_name={{ model_name }}&trajectory_id={{ selected_trajectory_id }}" type="video/mp4">
+                            Your browser does not support the video tag.
+                        </video>
+                        <div id="video-status" class="video-status">Loading video...</div>
+                    </div>
+                </dd>
+                {% endif %}
+            </dl>
+        </div>
+        <div class="task-analysis" id="analysis-section">
+            <h2><i class="fas fa-file-alt"></i> Trajectory Analysis Report</h2>
+            <div id="analysis-content" class="analysis-loading">
+                <i class="fas fa-spinner fa-spin"></i> Loading analysis...
+            </div>
+        </div>
+
+        <div class="task-steps">
+            <h2><i class="fas fa-list-ol"></i> Execution Steps</h2>
+            <div id="steps-container">
+                {% if task_status.steps %}
+                    {% for step in task_status.steps %}
+                        <div class="step-card{% if step.action == 'ASK_USER' %} step-card-ask-user{% endif %}">
+                            <div class="step-header">
+                                <div class="step-title">
+                                    <i class="fas {% if step.action == 'ASK_USER' %}fa-comments{% else %}fa-check-circle{% endif %}"></i>
+                                    Step {{ step.step_num }}
+                                </div>
+                                <div class="step-time"><i class="far fa-clock"></i> {{ step.action_timestamp }}</div>
+                            </div>
+                            {% if step.response %}
+                                <div class="step-thinking">
+                                    <div class="step-section-label"><i class="fas fa-brain"></i> Thinking</div>
+                                    <div class="step-thinking-content">{{ step.response }}</div>
+                                </div>
+                            {% elif task_status.log_data and task_status.log_data.agent_responses and loop.index0 < task_status.log_data.agent_responses|length %}
+                                <div class="step-thinking">
+                                    <div class="step-section-label"><i class="fas fa-brain"></i> Thinking</div>
+                                    <div class="step-thinking-content">{{ task_status.log_data.agent_responses[loop.index0] }}</div>
+                                </div>
+                            {% endif %}
+                            {% if step.question %}
+                                <div class="step-ask-user-question">
+                                    <div class="step-section-label"><i class="fas fa-question-circle"></i> Ask User</div>
+                                    <div class="step-ask-user-content">{{ step.question }}</div>
+                                </div>
+                            {% endif %}
+                            {% if step.user_answer %}
+                                <div class="step-ask-user-answer">
+                                    <div class="step-section-label"><i class="fas fa-reply"></i> User Reply</div>
+                                    <div class="step-ask-user-content">{{ step.user_answer }}</div>
+                                </div>
+                            {% endif %}
+                            {% if step.action != 'ASK_USER' %}
+                                <div class="step-action">
+                                    <div class="step-section-label action-toggle" onclick="toggleAction(this)">
+                                        <i class="fas fa-play-circle"></i> Action
+                                        <i class="fas fa-chevron-down action-chevron"></i>
+                                    </div>
+                                    <pre class="step-action-content">{% if step.action is mapping and step.action.command %}{{ step.action.command }}{% elif step.action is mapping and step.action.action %}{{ step.action.action }}{% elif step.action is string %}{{ step.action }}{% elif step.Error %}Error: {{ step.Error }}{% elif step.action is mapping %}{{ step.action|tojson(indent=2) }}{% else %}{{ step|tojson(indent=2) }}{% endif %}</pre>
+                                </div>
+                            {% endif %}
+                            {% if step.screenshot_file %}
+                                <div>
+                                    <img src="/task/{{ task_type }}/{{ task_id }}/screenshot/{{ step.screenshot_file }}?action_space={{ action_space }}&observation_type={{ observation_type }}&model_name={{ model_name }}&trajectory_id={{ selected_trajectory_id }}" 
+                                            alt="Step {{ step.step_num }} Screenshot" class="step-image">
+                                </div>
+                            {% endif %}
+                        </div>
+                    {% endfor %}
+                {% else %}
+                    <div class="no-steps"><i class="far fa-frown"></i> No step data available</div>
+                {% endif %}
+            </div>
+        </div>
+    </div>
+    <button class="fab fab-refresh" onclick="refreshPage()" title="Refresh"><i class="fas fa-sync-alt"></i></button>
+    <script>
+        function refreshPage() {
+            window.location.reload();
+        }
+
+        function toggleAnalysisDetail(el) {
+            const content = el.parentElement.querySelector('.analysis-detail-content');
+            const chevron = el.querySelector('.analysis-chevron');
+            if (content.style.display === 'none') {
+                content.style.display = 'block';
+                chevron.classList.remove('fa-chevron-right');
+                chevron.classList.add('fa-chevron-down');
+            } else {
+                content.style.display = 'none';
+                chevron.classList.remove('fa-chevron-down');
+                chevron.classList.add('fa-chevron-right');
+            }
+        }
+
+        function toggleAction(label) {
+            const pre = label.parentElement.querySelector('.step-action-content');
+            const chevron = label.querySelector('.action-chevron');
+            if (pre.classList.contains('collapsed')) {
+                pre.classList.remove('collapsed');
+                chevron.classList.remove('rotated');
+            } else {
+                pre.classList.add('collapsed');
+                chevron.classList.add('rotated');
+            }
+        }
+        
+        // Load analysis markdown
+        fetch('/api/task/{{ task_type }}/{{ task_id }}/analysis?action_space={{ action_space }}&observation_type={{ observation_type }}&model_name={{ model_name }}&trajectory_id={{ selected_trajectory_id }}')
+            .then(r => r.json())
+            .then(data => {
+                const container = document.getElementById('analysis-content');
+                if (data.content) {
+                    const html = marked.parse(data.content);
+                    // Split at "Recommendations for Task Improvement" heading
+                    const marker = '<h2';
+                    const parts = html.split(marker);
+                    let beforeRec = '';
+                    let recAndAfter = '';
+                    let found = false;
+                    for (let i = 0; i < parts.length; i++) {
+                        if (!found && parts[i].match(/^[^>]*>.*Recommendations?\s*(for\s*Task\s*Improvement)?/i)) {
+                            found = true;
+                            recAndAfter = marker + parts.slice(i).join(marker);
+                            break;
+                        }
+                        beforeRec += (i > 0 ? marker : '') + parts[i];
+                    }
+                    if (found) {
+                        container.innerHTML =
+                            '<div class="analysis-collapsed-section">' +
+                                '<div class="analysis-toggle" onclick="toggleAnalysisDetail(this)">' +
+                                    '<i class="fas fa-chevron-right analysis-chevron"></i> ' +
+                                    '<span>Full Analysis Detail (click to expand)</span>' +
+                                '</div>' +
+                                '<div class="analysis-detail-content" style="display:none;">' + beforeRec + '</div>' +
+                            '</div>' +
+                            '<div class="analysis-recommendations">' + recAndAfter + '</div>';
+                    } else {
+                        container.innerHTML = html;
+                    }
+                    container.className = 'analysis-body';
+                } else {
+                    container.innerHTML = '<p class="no-analysis"><i class="far fa-frown"></i> No analysis report available for this task.</p>';
+                    container.className = '';
+                }
+            })
+            .catch(() => {
+                const container = document.getElementById('analysis-content');
+                container.innerHTML = '<p class="no-analysis"><i class="far fa-frown"></i> Failed to load analysis report.</p>';
+                container.className = '';
+            });
+
+        // Handle video player with enhanced mobile support
+        document.addEventListener('DOMContentLoaded', function() {
+            const videoElement = document.getElementById('task-recording');
+            const videoStatus = document.getElementById('video-status');
+            
+            if (videoElement) {
+                // Function to update status on successful video load
+                function updateSuccessStatus() {
+                    videoStatus.textContent = 'Recording available';
+                    videoStatus.className = 'video-status video-success';
+                }
+                
+                // Multiple event listeners for different browser implementations
+                // The 'loadeddata' event might not fire on all mobile browsers
+                videoElement.addEventListener('loadeddata', updateSuccessStatus);
+                videoElement.addEventListener('loadedmetadata', updateSuccessStatus);
+                videoElement.addEventListener('canplay', updateSuccessStatus);
+                
+                // Error handling for video
+                videoElement.addEventListener('error', function(e) {
+                    console.error('Video error:', e);
+                    videoStatus.textContent = 'Recording not available';
+                    videoStatus.className = 'video-status video-error';
+                });
+                
+                // Timeout for slow connections or browser issues
+                setTimeout(function() {
+                    // If video is playable but events didn't fire correctly
+                    if (videoElement.readyState >= 2 && videoStatus.textContent === 'Loading video...') {
+                        updateSuccessStatus();
+                    }
+                }, 2000);
+                
+                // Directly check video source availability with fetch API
+                fetch('/task/{{ task_type }}/{{ task_id }}/recording?action_space={{ action_space }}&observation_type={{ observation_type }}&model_name={{ model_name }}&trajectory_id={{ selected_trajectory_id }}', {method: 'HEAD'})
+                    .then(function(response) {
+                        if (response.ok && videoStatus.textContent === 'Loading video...') {
+                            // If HEAD request succeeds but video events haven't fired
+                            setTimeout(updateSuccessStatus, 500);
+                        }
+                    })
+                    .catch(function() {
+                        // Network error or CORS issue
+                        if (videoStatus.textContent === 'Loading video...') {
+                            videoStatus.textContent = 'Recording check failed';
+                            videoStatus.className = 'video-status video-error';
+                        }
+                    });
+            }
+        });
+    </script>
+</body>
+</html>

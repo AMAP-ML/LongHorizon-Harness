@@ -1,0 +1,140 @@
+# Lite-CLI prepped variant of wildclawbench-ubuntu:v1.2.
+#
+# Pre-installs sudo + creates the `user` (uid 1000) account so that
+# DockerLiteEnv can boot a per-task container without needing apt at runtime
+# (which is fragile when archive.ubuntu.com is unreachable from the host LAN).
+#
+# WCB 2026-05-21: Also pre-installs the heavy pip / apt / npm dependencies
+# that 27 warmup-timeout tasks were trying to download mid-run (torch /
+# tensorboard / streamlit / scikit-learn / chromium / mermaid-cli / drawio
+# / ...). All pip pkgs go to SYSTEM python3 (`pip3 install --break-system-
+# packages`) because run_deep_search_in_osworld.py:486 rewrites
+# `/home/user/miniconda3/envs/eval/bin/pip` -> `pip3` before exec-ing the
+# warmup, so even if the upstream qcow2 bakes torch into the conda env the
+# warmup never sees it. The system pip + system apt are the only places a
+# pre-install actually helps.
+#
+# Build:
+#   docker build -f desktop_env/providers/docker_lite/Dockerfile.lite \
+#                -t wildclawbench-ubuntu:v1.2-lite .
+FROM wildclawbench-ubuntu:v1.2
+
+ENV DEBIAN_FRONTEND=noninteractive \
+    http_proxy= https_proxy= HTTP_PROXY= HTTPS_PROXY=
+
+# Repoint apt to a working mirror (the image's stale http_proxy points at a
+# host that this LAN cannot reach, and archive.ubuntu.com is also blocked).
+RUN set -e; \
+    chmod 1777 /tmp; \
+    sed -i \
+      -e 's@http://archive.ubuntu.com/ubuntu/@http://mirrors.aliyun.com/ubuntu/@g' \
+      -e 's@http://security.ubuntu.com/ubuntu/@http://mirrors.aliyun.com/ubuntu/@g' \
+      /etc/apt/sources.list; \
+    if ls /etc/apt/sources.list.d/*.sources >/dev/null 2>&1; then \
+      for f in /etc/apt/sources.list.d/*.sources; do mv "$f" "$f.disabled"; done; \
+    fi; \
+    apt-get update && \
+    apt-get install -y --no-install-recommends sudo && \
+    rm -rf /var/lib/apt/lists/*
+
+# Create user `user` (uid 1000) with NOPASSWD sudo and the standard test
+# password used by the SimpAgent stack.
+RUN set -e; \
+    if ! id user >/dev/null 2>&1; then useradd -m -s /bin/bash -u 1000 user; fi; \
+    echo 'user:password' | chpasswd; \
+    if ! getent group sudo >/dev/null 2>&1; then groupadd sudo; fi; \
+    usermod -aG sudo user; \
+    install -d -m 0750 /etc/sudoers.d; \
+    printf '%s\n' 'user ALL=(ALL) NOPASSWD: ALL' > /etc/sudoers.d/99-user; \
+    chmod 0440 /etc/sudoers.d/99-user; \
+    install -d -o user -g user -m 0755 /home/user /home/user/.openclaw \
+        /home/user/.openclaw/agents/main/agent \
+        /home/user/.openclaw/agents/main/sessions; \
+    touch /home/user/.openclaw_bootstrap.done; \
+    chown user:user /home/user/.openclaw_bootstrap.done
+
+CMD ["/bin/bash"]
+
+# ============================================================================
+# WCB 2026-05-21: pre-install heavy warmup deps so EN bench warmup is fast.
+# Without these, 27 warmup_timeout cases in 5/19 EN run hit the 30min ceiling
+# because `pip install torch tensorboard …` had to go out to pypi via a proxy
+# that this LAN can't reach.
+# ============================================================================
+
+# 1) APT deps that warmup invokes (tesseract, chromium, jq, ...). chromium-
+#    browser on jammy is a transitional pkg for snap, so install firefox-esr
+#    style chromium-browser-only via apt (~280MB but cached after first build).
+RUN set -e; \
+    sed -i \
+      -e 's@http://archive.ubuntu.com/ubuntu/@http://mirrors.aliyun.com/ubuntu/@g' \
+      -e 's@http://security.ubuntu.com/ubuntu/@http://mirrors.aliyun.com/ubuntu/@g' \
+      /etc/apt/sources.list; \
+    apt-get update; \
+    apt-get install -y --no-install-recommends \
+      tesseract-ocr \
+      sqlite3 \
+      jq \
+      libxml2-utils \
+      tree \
+      imagemagick \
+      ; \
+    rm -rf /var/lib/apt/lists/*
+
+# 2) Heavy pip pkgs (system python3 — the one run_deep_search.py:486 routes
+#    warmup `pip` to). CPU-only torch wheel from PyTorch CDN (smaller +
+#    avoids GPU deps). Aliyun mirror for PyPI to dodge the LAN egress.
+RUN set -e; \
+    PIP_INDEX_URL="https://mirrors.aliyun.com/pypi/simple/" \
+    PIP_EXTRA_INDEX_URL="https://download.pytorch.org/whl/cpu" \
+    pip3 install --no-cache-dir --break-system-packages \
+      'torch==2.4.1+cpu' \
+      tensorboard \
+      streamlit \
+      plotly \
+      bokeh \
+      scikit-learn \
+      ydata-profiling \
+      duckdb \
+      pandas \
+      pyarrow \
+      'polars>=0.20,<1.5' \
+      flask \
+      faker \
+      pytesseract \
+      pillow \
+      numpy \
+      scipy \
+      requests \
+      pyyaml \
+      blinker \
+      websocket-client \
+      prometheus_client \
+      opentelemetry-api \
+      opentelemetry-sdk \
+      opentelemetry-exporter-otlp-proto-http \
+      trimesh \
+      pymeshlab \
+      manifold3d \
+      playwright \
+      chrome-devtools-protocol \
+      pdfplumber \
+      scikit-image \
+      'jupyterlab>=4' \
+      pixelmatch \
+      lpips \
+      || (echo "WARNING: pip install partial fail — some pkgs missing" >&2 ; true)
+
+# 3) NPM globals used by mermaid/svgo/drawio-style warmups
+RUN set -e; \
+    npm config set registry https://registry.npmmirror.com; \
+    npm install -g --no-audit --no-fund \
+      @mermaid-js/mermaid-cli \
+      svgo \
+      || (echo "WARNING: npm global install partial fail" >&2 ; true)
+
+# 4) Marker so audit scripts can confirm this layer is in the image
+RUN date -u +%FT%TZ > /etc/wcb_lite_warmup_baked
+
+# 5) Sanity: import the heavy ones to fail-fast at build if a wheel is missing
+RUN python3 -c "import torch, tensorboard, streamlit, sklearn, ydata_profiling, duckdb, polars, pandas, pyarrow, pytesseract, PIL, numpy, scipy, requests, yaml, prometheus_client; print('lite warmup deps OK')"

@@ -1,0 +1,51 @@
+cff-version: 1.2.0
+title: "WeaveBench: A Long-Horizon, Real-World Benchmark for Computer-Use Agents with Hybrid Interfaces"
+message: "If you use WeaveBench in your research, please cite it as follows."
+type: software
+authors:
+  - family-names: Li
+    given-names: Wanli
+  - family-names: Zhou
+    given-names: Bowen
+  - family-names: Yang
+    given-names: Yifan
+  - family-names: Yu
+    given-names: Yunyao
+  - family-names: Li
+    given-names: Dongsheng
+  - family-names: Xu
+    given-names: Zhou
+  - family-names: Shan
+    given-names: Caihua
+date-released: 2026-06-05
+version: "0.1.0"
+license: MIT
+repository-code: "https://github.com/weavebench/WeaveBench"
+url: "https://weavebench.github.io"
+keywords:
+  - benchmark
+  - computer-use-agent
+  - hybrid-interface
+  - long-horizon
+  - GUI
+  - CLI
+  - trajectory-aware-judge
+preferred-citation:
+  type: article
+  title: "WeaveBench: A Long-Horizon, Real-World Benchmark for Computer-Use Agents with Hybrid Interfaces"
+  authors:
+    - family-names: Li
+      given-names: Wanli
+    - family-names: Zhou
+      given-names: Bowen
+    - family-names: Yang
+      given-names: Yifan
+    - family-names: Yu
+      given-names: Yunyao
+    - family-names: Li
+      given-names: Dongsheng
+    - family-names: Xu
+      given-names: Zhou
+    - family-names: Shan
+      given-names: Caihua
+  year: 2026

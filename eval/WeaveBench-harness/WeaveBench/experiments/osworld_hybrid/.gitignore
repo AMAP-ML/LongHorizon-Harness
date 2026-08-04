@@ -1,0 +1,23 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.ipynb_checkpoints/
+
+# Large runtime assets — never commit (download separately, see README)
+*.tar.gz
+*.qcow2
+*.zip
+wcb_assets/
+wcb_warmup_cache_v1*/
+
+# Run outputs / logs
+results_osworld_*/
+Eyeson_bench/
+logs/
+*.log
+
+# Secrets / local endpoints
+*.env
+my_api.json
+litellm_api.json

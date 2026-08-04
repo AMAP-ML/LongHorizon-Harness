@@ -1,0 +1,53 @@
+WeaveBench
+Copyright (c) 2026 Wanli Li and contributors
+
+This product includes adaptations and integrations of third-party software
+distributed under their respective licenses. WeaveBench itself is released
+under the MIT License (see LICENSE). The following third-party components
+are referenced or required at runtime; their copyright remains with their
+respective owners.
+
+1. OSWorld (https://github.com/xlang-ai/OSWorld) — MIT License.
+   The contents of `weavebench/desktop_env/` are derived from the OSWorld
+   `desktop_env/` Python package. We bundle the `controllers/`, the `docker/`
+   KVM provider, the `providers/base.py` abstraction, the `actions.py`
+   keyboard table, the `server/` in-VM Flask shim, and the top-level
+   `desktop_env.py` entry point — with two modifications:
+     (a) the OSWorld `evaluators/` subpackage is *stripped*, since WeaveBench
+         tasks embed their own `## Grader` Python block and do not need
+         OSWorld's evaluator pipeline. A small inlined `compare_urls` helper
+         keeps `controllers/setup.SetupController` functional.
+     (b) optional third-party imports (`playwright`, `pydrive`, `dotenv`,
+         `requests_toolbelt`, `aws.proxy_pool`, …) are wrapped in
+         `try/except ImportError` so missing optional deps no longer break
+         `import`.
+   Cloud providers (`aws`, `azure`, `aliyun`, `gcp`, `virtualbox`, `vmware`,
+   `volcengine`) are also stripped — only `docker` (KVM/qcow2) and our
+   `docker_lite` (headless container) are bundled. Install upstream OSWorld
+   separately if you need any of the other providers.
+   We additionally contribute the `providers/docker_lite/` subpackage which
+   adds a fully headless (no X server) Docker variant used for CLI ablation.
+
+2. WildClawBench (https://github.com/internlm/WildClawBench) — the
+   four harness adapters (`openclaw_agent.py`, `codex_agent.py`,
+   `claudecode_agent.py`, `hermes_agent.py`), the GUI plugin under
+   `assets/computer_tool_plugin/`, the wire-layer patches under
+   `assets/{openclaw,codex,claudecode,hermes}_patches/`, and the
+   trajectory-aware judge under `eval/agent_judge/` are derived from
+   WildClawBench's harness staging ground.
+
+3. OpenAI Codex CLI (https://github.com/openai/codex) — Apache-2.0.
+   `codex.tar.gz` repackages the `@openai/codex` npm package + Node runtime
+   for in-VM use; the original license terms apply.
+
+4. Claude Code (https://github.com/anthropics/claude-code) — see upstream
+   terms. `claudecode.tar.gz` repackages the `@anthropic-ai/claude-code` npm
+   package for in-VM use.
+
+5. Hermes (Nous Research, https://hermes-agent.nousresearch.com) — see
+   upstream terms. `hermes.tar.gz` repackages the published Hermes 0.14.0
+   wheel + its Python 3.11 interpreter for in-VM use.
+
+6. Model Context Protocol (modelcontextprotocol.io) — MIT License.
+   `hermes_mcp_wheels.tar.gz` is a snapshot of `mcp==1.27.1` and its
+   transitive dependencies, redistributed unchanged for offline install.

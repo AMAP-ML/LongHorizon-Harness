@@ -1,0 +1,36 @@
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.egg-info/
+.eggs/
+.pytest_cache/
+.mypy_cache/
+.venv/
+.env
+
+# Local cache populated by scripts/download_assets.sh.
+# These tarballs are hosted on HuggingFace (huggingface.co/datasets/wanlilll/WeaveBench)
+# and must NOT be committed back into git.
+cache/
+*.tar.gz
+*.qcow2
+# ...except the small fixture tarballs shipped with weavebench-demo:
+!examples/fixtures/**/*.tar.gz
+
+# Task rollout outputs
+results/
+rollout*/
+_run_logs/
+
+# Editor noise
+.vscode/
+.idea/
+*.swp
+.DS_Store
+
+# Backups
+*.bak
+*.bak.*
+build/
+weavebench.egg-info/

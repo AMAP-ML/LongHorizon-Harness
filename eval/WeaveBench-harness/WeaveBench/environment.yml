@@ -1,0 +1,21 @@
+name: weavebench
+channels:
+  - conda-forge
+dependencies:
+  - python=3.11
+  # System-level pieces conda installs faster than pip on most hosts:
+  - lxml>=4.9
+  - psutil>=5.9
+  - filelock>=3.12
+  # Everything else via pip (LLM SDKs + huggingface_hub + WeaveBench):
+  - pip
+  - pip:
+      - openai>=1.40
+      - huggingface_hub>=0.24
+      - tqdm>=4.66
+      - requests>=2.31
+      - gymnasium>=0.29
+      - docker>=7.0
+      - flask>=3.0
+      # Install WeaveBench itself from the local checkout:
+      - -e .

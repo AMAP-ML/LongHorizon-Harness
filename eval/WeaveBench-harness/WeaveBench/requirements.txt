@@ -1,0 +1,24 @@
+# WeaveBench host-side runtime requirements.
+# Mirrors [project.dependencies] in pyproject.toml. Use this if you prefer
+#   pip install -r requirements.txt
+# over
+#   pip install -e .
+# Both install the same set; with `pip install -e .` you don't need this file.
+
+# --- LLM client (only one — all 4 harnesses route through OpenRouter via the
+#     OpenAI SDK; Claude / Gemini / GPT etc. are model ids on OpenRouter, not
+#     separate SDK installs) ---
+openai>=1.40
+
+# --- Dataset / asset download ---
+huggingface_hub>=0.24
+tqdm>=4.66
+requests>=2.31
+
+# --- Bundled OSWorld desktop_env (KVM/Docker provider + Flask shim) ---
+gymnasium>=0.29
+docker>=7.0
+psutil>=5.9
+filelock>=3.12
+lxml>=4.9
+flask>=3.0

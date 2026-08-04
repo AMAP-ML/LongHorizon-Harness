@@ -1,0 +1,62 @@
+# Local secrets
+.env
+*.env
+env.sh
+env.local.sh
+*.local.sh
+load_env.sh
+api_key.py
+my_api.json
+litellm_api.json
+dataimpulse_proxy_config.json
+
+# Runtime output
+cache/
+cache_runs/
+results/
+logs/*
+!logs/.gitkeep
+**/cache/
+**/cache_runs/
+**/results/
+**/result*/**/*
+**/__pycache__/
+*.py[cod]
+*.log
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+
+# VM and large local artifacts
+*.qcow2
+*.qcow2.*
+*.zip
+*.tar.gz
+*.vmdk
+*.ova
+*.img
+vm_data/
+docker_vm_data/
+vmware_vm_data/
+.vms/
+
+# Gated benchmark files; download locally with OSWorld-V2/scripts/tools/download_osworld_v2_tasks.py.
+OSWorld-V2/evaluation_examples/task_class/task_*.py
+
+# Local Python environments / package build output
+.venv/
+venv/
+env/
+build/
+dist/
+*.egg-info/
+
+# Frontend / tool caches
+node_modules/
+
+# Editor/system
+.DS_Store
+.vscode/
+.idea/

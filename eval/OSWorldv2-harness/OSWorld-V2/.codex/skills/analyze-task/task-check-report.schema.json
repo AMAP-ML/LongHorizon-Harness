@@ -1,0 +1,268 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://osworld-v2.local/check-task/task-check-report.schema.json",
+  "title": "OSWorld Task Check Report",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "report_version",
+    "tasks",
+    "summary"
+  ],
+  "properties": {
+    "report_version": {
+      "type": "string"
+    },
+    "generated_at": {
+      "type": "string"
+    },
+    "tasks": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/task"
+      }
+    },
+    "summary": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "total_tasks",
+        "feasible_tasks",
+        "infeasible_tasks",
+        "tasks_with_evaluator_issues"
+      ],
+      "properties": {
+        "total_tasks": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "feasible_tasks": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "infeasible_tasks": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "tasks_with_evaluator_issues": {
+          "type": "integer",
+          "minimum": 0
+        }
+      }
+    }
+  },
+  "$defs": {
+    "setupArtifact": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "kind",
+        "path",
+        "summary"
+      ],
+      "properties": {
+        "kind": {
+          "type": "string"
+        },
+        "path": {
+          "type": "string"
+        },
+        "source": {
+          "type": "string"
+        },
+        "summary": {
+          "type": "string"
+        },
+        "inspected": {
+          "type": "boolean"
+        }
+      }
+    },
+    "issue": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "severity",
+        "message"
+      ],
+      "properties": {
+        "severity": {
+          "type": "string",
+          "enum": [
+            "low",
+            "medium",
+            "high"
+          ]
+        },
+        "message": {
+          "type": "string"
+        },
+        "evidence": {
+          "type": "string"
+        }
+      }
+    },
+    "task": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "task_id",
+        "task_path",
+        "task_format",
+        "instruction",
+        "feasibility",
+        "evaluation",
+        "setup_summary",
+        "recommendations"
+      ],
+      "properties": {
+        "task_id": {
+          "type": "string"
+        },
+        "task_path": {
+          "type": "string"
+        },
+        "task_format": {
+          "type": "string",
+          "enum": [
+            "python_task_class",
+            "json_task_config"
+          ]
+        },
+        "instruction": {
+          "type": "string"
+        },
+        "snapshot": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "related_apps": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "setup_summary": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "actions",
+            "agent_visible_artifacts"
+          ],
+          "properties": {
+            "actions": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
+            "agent_visible_artifacts": {
+              "type": "array",
+              "items": {
+                "$ref": "#/$defs/setupArtifact"
+              }
+            }
+          }
+        },
+        "feasibility": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "verdict",
+            "reasoning",
+            "blocking_reasons",
+            "suggested_trajectory"
+          ],
+          "properties": {
+            "verdict": {
+              "type": "string",
+              "enum": [
+                "feasible",
+                "infeasible"
+              ]
+            },
+            "reasoning": {
+              "type": "string"
+            },
+            "blocking_reasons": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
+            "suggested_trajectory": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            }
+          }
+        },
+        "evaluation": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "checked",
+            "run_attempted",
+            "alignment_with_instruction",
+            "issues"
+          ],
+          "properties": {
+            "checked": {
+              "type": "boolean"
+            },
+            "run_attempted": {
+              "type": "boolean"
+            },
+            "metric_or_function": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "alignment_with_instruction": {
+              "type": "string",
+              "enum": [
+                "aligned",
+                "partially_aligned",
+                "misaligned"
+              ]
+            },
+            "positive_case": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "negative_case": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "issues": {
+              "type": "array",
+              "items": {
+                "$ref": "#/$defs/issue"
+              }
+            }
+          }
+        },
+        "alignment_issues": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "recommendations": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      }
+    }
+  }
+}

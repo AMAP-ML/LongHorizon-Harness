@@ -1,0 +1,84 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>LongHorizon-Harness Dashboard</title>
+  <link rel="icon" type="image/svg+xml" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24'%3E%3Ccircle cx='12' cy='12' r='10' fill='%232698D8'/%3E%3C/svg%3E" />
+  <!-- Apply persisted theme/language before first paint to avoid a flash. -->
+  <script>
+    (function () {
+      try {
+        var t = localStorage.getItem("lh_theme");
+        if (t === "dark" || t === "light") document.documentElement.setAttribute("data-theme", t);
+        var l = localStorage.getItem("lh_lang");
+        document.documentElement.setAttribute("lang", l === "zh" ? "zh-CN" : "en");
+      } catch (e) {}
+    })();
+  </script>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Fraunces:ital,opsz,wght@0,9..144,600;0,9..144,700;1,9..144,600&family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@500;600&display=swap" rel="stylesheet" />
+  <link rel="stylesheet" href="/static/style.css" />
+</head>
+<body>
+  <div class="app">
+    <!-- Left rail: run list (like Codex conversation list) -->
+    <aside class="rail">
+      <div class="rail-brand">
+        <span class="name">LongHorizon<span class="bench">-Harness</span></span>
+      </div>
+      <div id="railCap" class="rail-cap" data-i18n="runsCap">Runs</div>
+      <div id="runList" class="run-list"></div>
+    </aside>
+
+    <!-- Main: serial timeline of the current run -->
+    <div class="main">
+      <div class="head">
+        <span id="title" class="title">LongHorizon-Harness</span>
+        <span id="statusPill" class="pill" data-i18n="statusLoading">Loading…</span>
+        <span id="roundPill" class="pill">Round 0</span>
+        <span class="spacer"></span>
+        <button id="langBtn" class="iconbtn" title="Language">EN</button>
+        <button id="themeBtn" class="iconbtn" title="Theme">🖥</button>
+        <span id="clock" class="clock"></span>
+      </div>
+
+      <div id="activityBar" class="activity-bar" style="display:none">
+        <span id="activityLead" class="lead" data-i18n="activityLead">Live</span>
+        <span id="activityNow" class="now"></span>
+      </div>
+
+      <div class="stream">
+        <div id="streamInner" class="stream-inner">
+          <p class="placeholder" data-i18n="placeholderTimeline">Select a run on the left to view its serial Manager → Executor → Auditor timeline.</p>
+        </div>
+      </div>
+
+      <div class="composer">
+        <div class="composer-inner">
+          <div class="wrap">
+            <textarea id="injectText" rows="1" data-i18n-ph="composerPlaceholder" placeholder="Inject an extra instruction for later models (non-blocking)…"></textarea>
+            <button id="injectBtn" class="send" title="Send">↑</button>
+          </div>
+          <div id="composerHint" class="hint" data-i18n="composerHint">Instructions are injected before the next management round, taking priority over the automatic flow.</div>
+        </div>
+      </div>
+    </div>
+
+    <!-- Right detail column: trajectory / artifacts (inline, squeezes the timeline) -->
+    <aside id="detail" class="detail">
+      <div class="detail-head">
+        <span id="detailTitle" class="dt" data-i18n="detailTitle">Details</span>
+        <button id="detailClose" class="detail-close">×</button>
+      </div>
+      <div id="detailTabs" class="detail-tabs"></div>
+      <div id="detailBody" class="detail-body"></div>
+    </aside>
+  </div>
+
+  <div id="lightbox" class="lightbox"><img id="lightboxImg" src="" alt="" /></div>
+
+  <script src="/static/app.js"></script>
+</body>
+</html>

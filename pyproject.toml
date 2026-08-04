@@ -1,0 +1,33 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "lh-harness"
+version = "0.1.0"
+description = "Role-orchestrated harness for long-horizon computer-use tasks"
+readme = "README.md"
+requires-python = ">=3.10"
+license = "MIT"
+license-files = ["LICENSE"]
+keywords = ["agent", "long-horizon", "computer-use", "llm"]
+dependencies = []
+
+[project.optional-dependencies]
+ssh = ["asyncssh>=2.0"]
+docker = []
+
+[project.scripts]
+lh-harness = "lh_harness.cli:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/lh_harness"]
+
+[tool.hatch.build.targets.sdist]
+include = [
+    "/src/lh_harness",
+    "/pyproject.toml",
+    "/README.md",
+    "/README.zh-CN.md",
+    "/LICENSE",
+]

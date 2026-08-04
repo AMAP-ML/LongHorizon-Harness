@@ -1,0 +1,13 @@
+{
+  "id": "computer-tool",
+  "name": "Computer (function-tool CUA)",
+  "description": "Registers ONE GUI agent tool (`__computer__`); patched pi-ai exposes it as a standard OpenAI Responses function tool. The plugin runs single or batched actions inside the openclaw VM via local pyautogui and ALWAYS returns a fresh screenshot, so a separate observation tool is unnecessary (pass `actions:[]` for pure observation).",
+  "configSchema": {
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {
+      "displayWidth": { "type": "integer", "default": 1920 },
+      "displayHeight": { "type": "integer", "default": 1080 }
+    }
+  }
+}
