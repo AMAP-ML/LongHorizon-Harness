@@ -7,7 +7,12 @@ from ..types import ExecResult
 
 @runtime_checkable
 class Environment(Protocol):
-    async def exec(self, command: str, timeout: int = 30, tee_path: str | None = None) -> ExecResult: ...
+    async def exec(
+        self,
+        command: str,
+        timeout: int = 30,
+        tee_path: str | None = None,
+    ) -> ExecResult: ...
 
     async def screenshot(self) -> bytes: ...
 

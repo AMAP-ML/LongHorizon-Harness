@@ -35,7 +35,7 @@ export WEBSITE_HOST_SUFFIX="${WEBSITE_HOST_SUFFIX:-web.hku.icu}"
 
 # host-side LLM-judge evaluators still route via LiteLLM 4200 (gpt judge)
 export OSWORLD_EVAL_MODEL_PROVIDER="${OSWORLD_EVAL_MODEL_PROVIDER:-openai_compatible}"
-export OSWORLD_EVAL_MODEL_API_KEY="${OSWORLD_EVAL_MODEL_API_KEY:-sk-litellm-azure-direct}"
+export OSWORLD_EVAL_MODEL_API_KEY="${OSWORLD_EVAL_MODEL_API_KEY:-}"
 export OSWORLD_EVAL_MODEL_BASE_URL="${OSWORLD_EVAL_MODEL_BASE_URL:-http://127.0.0.1:4200/v1}"
 
 export GITLAB_URL="${GITLAB_URL:-http://172.17.0.1}"

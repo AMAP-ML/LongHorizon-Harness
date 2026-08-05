@@ -1,96 +1,165 @@
 from __future__ import annotations
 
 import asyncio
-import os
-import signal
+import contextlib
 import shutil
-import tempfile
+import signal
 import time
 from pathlib import Path
 
-from ..types import ExecResult
+from ..process_group import (
+    kill_process_group,
+    signal_process_group,
+    track_process_group,
+    untrack_process_group,
+)
+from ..types import DEFAULT_TMP_DIR, ExecResult
 
 
 class LocalEnvironment:
     def __init__(self, tmp_dir: str | None = None) -> None:
-        # Per-run scratch dir for local artifacts (screenshots, etc.). Falls back
-        # to the system temp dir when not provided so behavior stays unchanged.
-        self._tmp_dir = Path(tmp_dir) if tmp_dir else Path(tempfile.gettempdir())
+        # Library usage falls back to user-scoped scratch storage.
+        self._tmp_dir = Path(tmp_dir).expanduser() if tmp_dir else Path(DEFAULT_TMP_DIR)
 
-    async def exec(self, command: str, timeout: int = 30, tee_path: str | None = None) -> ExecResult:
+    async def exec(
+        self,
+        command: str,
+        timeout: int = 30,
+        tee_path: str | None = None,
+    ) -> ExecResult:
         start = time.monotonic()
+        proc = None
+        io_task: asyncio.Task[None] | None = None
+        stdout_chunks: list[bytes] = []
+        stderr_chunks: list[bytes] = []
         try:
             proc = await asyncio.create_subprocess_shell(
                 command,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
-                preexec_fn=os.setsid,
+                # Own session, so one killpg reaps the agent CLI and everything
+                # it spawned. It also detaches the child from our terminal, so
+                # Ctrl+C never reaches it — every exit path below must kill it.
+                start_new_session=True,
                 # Claude Code emits one JSON object per line in stream-json mode.
                 # A single line (e.g. a tool_result carrying a base64 screenshot)
                 # can far exceed asyncio's default 64KB StreamReader limit and
                 # truncate the trajectory. Raise the limit so full lines survive.
                 limit=64 * 1024 * 1024,
             )
-            if tee_path:
-                # Stream stdout to a local file line-by-line so the dashboard can
-                # render the trajectory in real time while the agent is running.
-                stdout, stderr = await asyncio.wait_for(
-                    self._communicate_tee(proc, tee_path), timeout=timeout
+            track_process_group(proc.pid)
+            # Always drain incrementally. Besides powering the live dashboard,
+            # this leaves the bytes already received available if a timeout or
+            # cancellation happens before the child exits normally.
+            io_task = asyncio.create_task(
+                self._communicate_streaming(
+                    proc,
+                    tee_path,
+                    stdout_chunks,
+                    stderr_chunks,
                 )
-            else:
-                stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout)
+            )
+            await asyncio.wait_for(asyncio.shield(io_task), timeout=timeout)
             return ExecResult(
-                stdout=stdout.decode("utf-8", errors="replace"),
-                stderr=stderr.decode("utf-8", errors="replace"),
+                stdout=b"".join(stdout_chunks).decode("utf-8", errors="replace"),
+                stderr=b"".join(stderr_chunks).decode("utf-8", errors="replace"),
                 exit_code=proc.returncode if proc.returncode is not None else -1,
                 duration_ms=int((time.monotonic() - start) * 1000),
             )
         except asyncio.TimeoutError:
-            if "proc" in locals() and proc.returncode is None:
-                try:
-                    os.killpg(proc.pid, signal.SIGKILL)
-                except ProcessLookupError:
-                    pass
-                await proc.wait()
+            await self._terminate(proc)
+            await self._finish_io(io_task)
+            captured_stderr = b"".join(stderr_chunks).decode("utf-8", errors="replace")
+            timeout_message = f"Command timed out after {timeout}s"
             return ExecResult(
-                stdout="",
-                stderr=f"Command timed out after {timeout}s",
+                stdout=b"".join(stdout_chunks).decode("utf-8", errors="replace"),
+                stderr=(captured_stderr + "\n" + timeout_message).lstrip("\n"),
                 exit_code=-1,
                 duration_ms=int((time.monotonic() - start) * 1000),
+                termination_reason="timeout",
             )
+        except BaseException:
+            # Covers Ctrl+C and task cancellation: kill the agent before the
+            # exception unwinds, or it keeps running with no parent.
+            await self._terminate(proc)
+            await self._finish_io(io_task)
+            raise
+        finally:
+            if proc is not None:
+                untrack_process_group(proc.pid)
 
     @staticmethod
-    async def _communicate_tee(proc, tee_path: str) -> tuple[bytes, bytes]:
-        """Drain stdout/stderr concurrently, mirroring stdout to ``tee_path``.
+    async def _terminate(proc) -> None:
+        """SIGTERM the agent's whole group, escalating to SIGKILL if it lingers."""
+        if proc is None or proc.returncode is not None:
+            return
+        signal_process_group(proc.pid, signal.SIGTERM)
+        try:
+            # Shielded because this often runs while a CancelledError propagates,
+            # and an unshielded await would be cancelled before the child exits.
+            await asyncio.shield(asyncio.wait_for(proc.wait(), timeout=5))
+        except asyncio.TimeoutError:
+            signal_process_group(proc.pid, signal.SIGKILL)
+            with contextlib.suppress(asyncio.TimeoutError, asyncio.CancelledError):
+                await asyncio.shield(asyncio.wait_for(proc.wait(), timeout=5))
+        except asyncio.CancelledError:
+            # Cancelled again mid-wait: fall back to the blocking sweep so the
+            # agent cannot outlive us.
+            kill_process_group(proc.pid)
+
+    @staticmethod
+    async def _finish_io(io_task: asyncio.Task[None] | None) -> None:
+        if io_task is None or io_task.done():
+            return
+        with contextlib.suppress(asyncio.TimeoutError, asyncio.CancelledError):
+            await asyncio.wait_for(asyncio.shield(io_task), timeout=5)
+
+    @staticmethod
+    async def _communicate_streaming(
+        proc,
+        tee_path: str | None,
+        stdout_chunks: list[bytes],
+        stderr_chunks: list[bytes],
+    ) -> None:
+        """Drain both streams while optionally teeing stdout to a live file.
 
         stdout is written incrementally (one line at a time) so an external
         reader — the dashboard — sees the agent's stream-json trajectory grow
-        live. The full stdout/stderr bytes are still returned unchanged.
+        live. The caller owns the chunk lists, so partial output survives even
+        when the wait is interrupted by timeout or cancellation.
         """
-        path = Path(tee_path)
-        path.parent.mkdir(parents=True, exist_ok=True)
+        path = Path(tee_path) if tee_path else None
+        if path is not None:
+            path.parent.mkdir(parents=True, exist_ok=True)
 
-        async def _read_stdout() -> bytes:
-            chunks: list[bytes] = []
-            # Open in binary append-less write mode; flush after every line.
-            with open(path, "wb", buffering=0) as fh:
+        async def _read_stdout() -> None:
+            # Open in binary truncating mode once at episode start. Every later
+            # save is guarded against replacing this partial stream with empty
+            # output.
+            fh = open(path, "wb", buffering=0) if path is not None else None
+            try:
                 while True:
                     line = await proc.stdout.readline()
                     if not line:
                         break
-                    chunks.append(line)
-                    try:
-                        fh.write(line)
-                    except OSError:
-                        pass
-            return b"".join(chunks)
+                    stdout_chunks.append(line)
+                    if fh is not None:
+                        try:
+                            fh.write(line)
+                        except OSError:
+                            pass
+            finally:
+                if fh is not None:
+                    fh.close()
 
-        async def _read_stderr() -> bytes:
-            return await proc.stderr.read()
+        async def _read_stderr() -> None:
+            while True:
+                chunk = await proc.stderr.read(64 * 1024)
+                if not chunk:
+                    return
+                stderr_chunks.append(chunk)
 
-        stdout, stderr = await asyncio.gather(_read_stdout(), _read_stderr())
-        await proc.wait()
-        return stdout, stderr
+        await asyncio.gather(_read_stdout(), _read_stderr(), proc.wait())
 
     async def screenshot(self) -> bytes:
         self._tmp_dir.mkdir(parents=True, exist_ok=True)

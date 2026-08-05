@@ -441,8 +441,7 @@ def run_one(env, agent, task: dict, output_dir: Path,
             from agent_judge.agent_judge_gold import judge_in_vm_gold
             litellm_base = getattr(agent, "litellm_base_url",
                                    "http://172.17.0.1:4200/v1")
-            litellm_key = getattr(agent, "litellm_api_key",
-                                  "sk-litellm-azure-direct")
+            litellm_key = getattr(agent, "litellm_api_key", "")
             judge_base_url = os.environ.get(
                 "VM_JUDGE_BASE_URL",
                 litellm_base.replace("172.17.0.1", "127.0.0.1"))

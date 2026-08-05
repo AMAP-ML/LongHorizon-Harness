@@ -14,7 +14,7 @@ OSWORLD_DIR="$(cd "${EVAL_DIR}/../.." && pwd)"              # OSWorld-V2 repo ro
 LITELLM_HOST_IP="${LITELLM_HOST_IP:-127.0.0.1}"
 LITELLM_VM_IP="${LITELLM_VM_IP:-172.17.0.1}"
 LITELLM_PORT="${LITELLM_PORT:-4200}"
-LITELLM_API_KEY="${LITELLM_API_KEY:-sk-litellm-azure-direct}"
+LITELLM_API_KEY="${LITELLM_API_KEY:-}"
 MODEL="${MODEL:-gpt-5.5}"
 
 # === Run knobs ===
@@ -44,7 +44,7 @@ export WEBSITE_HOST_SUFFIX="${WEBSITE_HOST_SUFFIX:-web.hku.icu}"
 
 # LLM-judge evaluators (host-side env.evaluate) route through LiteLLM proxy.
 export OSWORLD_EVAL_MODEL_PROVIDER="${OSWORLD_EVAL_MODEL_PROVIDER:-openai_compatible}"
-export OSWORLD_EVAL_MODEL_API_KEY="${OSWORLD_EVAL_MODEL_API_KEY:-${LITELLM_API_KEY:-sk-litellm-azure-direct}}"
+export OSWORLD_EVAL_MODEL_API_KEY="${OSWORLD_EVAL_MODEL_API_KEY:-${LITELLM_API_KEY:-}}"
 export OSWORLD_EVAL_MODEL_BASE_URL="${OSWORLD_EVAL_MODEL_BASE_URL:-http://${LITELLM_HOST_IP:-127.0.0.1}:${LITELLM_PORT:-4200}/v1}"
 
 # GitLab-backed tasks (026/041).

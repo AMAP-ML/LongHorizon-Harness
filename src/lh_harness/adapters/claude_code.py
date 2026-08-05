@@ -3,6 +3,8 @@ from __future__ import annotations
 import os
 import shlex
 
+from ..agent_logs import visible_output as extract_claude_visible_output
+from ..types import DEFAULT_CLAUDE_MODEL, DEFAULT_TMP_DIR, DEFAULT_WORKSPACE_PATH
 from .cli_agent import CommandAgentAdapter
 
 
@@ -10,10 +12,11 @@ class ClaudeCodeAdapter(CommandAgentAdapter):
     def __init__(
         self,
         *,
-        model: str = "claude-sonnet-4-20250514",
+        model: str = DEFAULT_CLAUDE_MODEL,
         api_key: str | None = None,
         base_url: str | None = None,
-        workspace_path: str = "/tmp_workspace",
+        workspace_path: str = DEFAULT_WORKSPACE_PATH,
+        prompt_dir: str = f"{DEFAULT_TMP_DIR}/prompts",
         mcp_config: str | None = None,
         add_dirs: list[str] | None = None,
     ) -> None:
@@ -58,6 +61,7 @@ class ClaudeCodeAdapter(CommandAgentAdapter):
 
         super().__init__(
             command_template=f"{env_prefix}{' '.join(command_parts)} < {{prompt_path}}",
+            prompt_dir=prompt_dir,
             workspace_path=workspace_path,
-            enforces_turn_budget=False,
+            visible_output_parser=extract_claude_visible_output,
         )

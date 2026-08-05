@@ -4,18 +4,21 @@ build-backend = "hatchling.build"
 
 [project]
 name = "lh-harness"
-version = "0.1.0"
+version = "0.1.1"
 description = "Role-orchestrated harness for long-horizon computer-use tasks"
 readme = "README.md"
 requires-python = ">=3.10"
 license = "MIT"
 license-files = ["LICENSE"]
 keywords = ["agent", "long-horizon", "computer-use", "llm"]
-dependencies = []
+dependencies = [
+    "packaging",
+    "tomli; python_version < '3.11'",
+]
 
-[project.optional-dependencies]
-ssh = ["asyncssh>=2.0"]
-docker = []
+[project.urls]
+Homepage = "https://github.com/AMAP-ML/LongHorizon-Harness"
+Issues = "https://github.com/AMAP-ML/LongHorizon-Harness/issues"
 
 [project.scripts]
 lh-harness = "lh_harness.cli:main"

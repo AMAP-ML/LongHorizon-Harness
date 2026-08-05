@@ -1,12 +1,16 @@
 from __future__ import annotations
 
+import posixpath
 import re
 import shlex
 import time
+import uuid
+from collections.abc import Callable
+from pathlib import PurePath
 
 from ..environment.base import Environment
 from ..remote_io import write_remote_text
-from ..types import EpisodeBudget, EpisodeResult
+from ..types import DEFAULT_TMP_DIR, DEFAULT_WORKSPACE_PATH, EpisodeBudget, EpisodeResult
 
 _SECRET_NAME = r"(?:API[_-]?KEY|AUTH[_-]?TOKEN|ACCESS[_-]?TOKEN|SECRET|PASSWORD|TOKEN)"
 _SECRET_VALUE = r"(?:'[^']*'|\"[^\"]*\"|\S+)"
@@ -28,14 +32,14 @@ class CommandAgentAdapter:
         self,
         *,
         command_template: str,
-        prompt_path: str = "/tmp/_lh_harness_prompt.md",
-        workspace_path: str = "/tmp_workspace",
-        enforces_turn_budget: bool = False,
+        prompt_dir: str = f"{DEFAULT_TMP_DIR}/prompts",
+        workspace_path: str = DEFAULT_WORKSPACE_PATH,
+        visible_output_parser: Callable[[str], str] | None = None,
     ) -> None:
         self.command_template = command_template
-        self.prompt_path = prompt_path
+        self.prompt_dir = prompt_dir.rstrip("/") or "."
         self.workspace_path = workspace_path.rstrip("/")
-        self.enforces_turn_budget = enforces_turn_budget
+        self.visible_output_parser = visible_output_parser
 
     async def run_episode(
         self,
@@ -45,33 +49,79 @@ class CommandAgentAdapter:
         live_trajectory_path: str | None = None,
     ) -> EpisodeResult:
         start = time.monotonic()
-        await write_remote_text(env, self.prompt_path, prompt)
-        command_body = self.command_template.format(
-            prompt_path=shlex.quote(self.prompt_path),
-            max_turns=budget.max_turns,
-            timeout=budget.max_duration_seconds,
+        # Never reuse one global prompt.md. A run owns its prompt directory and
+        # every role episode gets a distinct filename, so concurrent harnesses
+        # (and future concurrent roles within one harness) cannot overwrite the
+        # input while an agent CLI is still reading it.
+        prompt_path = posixpath.join(
+            self.prompt_dir,
+            f"{_episode_prompt_label(live_trajectory_path)}_{uuid.uuid4().hex[:12]}.md",
         )
+        await write_remote_text(env, prompt_path, prompt)
+        # Substituted by explicit replace, not str.format: templates embed literal
+        # braces (e.g. Codex passes inline-TOML `-c` overrides) that format() would
+        # try to interpret as placeholders.
+        command_body = self.command_template
+        for placeholder, value in (
+            ("{prompt_path}", shlex.quote(prompt_path)),
+            ("{timeout}", str(budget.max_duration_seconds)),
+        ):
+            command_body = command_body.replace(placeholder, value)
         command = f"cd {shlex.quote(self.workspace_path)} && {command_body}"
         # When a live path is given (local runs), the environment mirrors stdout
         # to that file line-by-line so the dashboard shows the trajectory live.
         result = await env.exec(
-            command, timeout=budget.max_duration_seconds + 30, tee_path=live_trajectory_path
+            command,
+            timeout=budget.max_duration_seconds,
+            tee_path=live_trajectory_path,
         )
         duration_ms = int((time.monotonic() - start) * 1000)
-        status = "done" if result.exit_code == 0 else "error"
-        # Keep the FULL combined output so the saved raw trajectory captures every
-        # step of the Claude session. Downstream prompt builders and auditor
-        # parsers apply their own length clipping, so this does not inflate prompts.
-        full_log = result.stdout + ("\n" + result.stderr if result.stderr else "")
+        if result.termination_reason == "timeout":
+            status = "timeout"
+        else:
+            status = "done" if result.exit_code == 0 else "error"
+        stdout_log = result.stdout
+        actions_log = stdout_log
+        visible_output = (
+            self.visible_output_parser(stdout_log).strip()
+            if self.visible_output_parser is not None
+            else ""
+        )
+        if result.termination_reason == "timeout":
+            error = f"Episode timed out after {budget.max_duration_seconds}s."
+        else:
+            error = redact_secrets(result.stderr[-2000:]) if result.exit_code != 0 else None
         return EpisodeResult(
             status=status,
-            actions_log=full_log,
-            error=redact_secrets(result.stderr[-2000:]) if result.exit_code != 0 else None,
+            actions_log=actions_log,
+            error=error,
             duration_ms=duration_ms,
             metadata={
                 "command": redact_secrets(command),
+                "prompt_path": prompt_path,
                 "exit_code": result.exit_code,
-                "turn_budget_enforced": self.enforces_turn_budget,
-                "actions_log_chars": len(full_log),
+                "termination_reason": result.termination_reason,
+                "actions_log_chars": len(actions_log),
+                "trajectory_format": "jsonl",
+                "assistant_visible_output": visible_output,
+                "actions_log_diagnostics_only": bool(
+                    self.visible_output_parser is not None and not visible_output
+                ),
+                "stderr_chars": len(result.stderr),
+                "stderr_tail": redact_secrets(result.stderr[-2000:]),
             },
         )
+
+
+def _episode_prompt_label(live_trajectory_path: str | None) -> str:
+    """Derive a readable round/role label without relying on it for uniqueness."""
+    if not live_trajectory_path:
+        return "episode_agent"
+    path = PurePath(live_trajectory_path)
+    role = path.stem
+    suffix = "_raw_trajectory"
+    if role.endswith(suffix):
+        role = role[: -len(suffix)]
+    round_name = path.parent.name if re.fullmatch(r"round_\d+", path.parent.name) else "episode"
+    label = f"{round_name}_{role}"
+    return re.sub(r"[^A-Za-z0-9_.-]+", "_", label).strip("._") or "episode_agent"

@@ -37,12 +37,14 @@ def rule_repeated_failure(limit: int) -> Rule:
             auditor_status = auditor_status if isinstance(auditor_status, dict) else {}
             executor_status = item.get("executor_status")
             executor_status = executor_status if isinstance(executor_status, dict) else {}
+            repair_status = auditor_status.get("format_repair_status")
+            repair_status = repair_status if isinstance(repair_status, dict) else {}
             failed = bool(
                 auditor_status.get("invalid_plan")
                 or auditor_status.get("invalid_completion")
-                # ``executor_status`` is the compact dict produced by
-                # ``_episode_status()``; the episode outcome lives under "status".
-                or executor_status.get("status") == "error"
+                or executor_status.get("status") in {"error", "timeout"}
+                or auditor_status.get("status") in {"error", "timeout"}
+                or repair_status.get("status") in {"error", "timeout"}
             )
             if failed:
                 streak += 1
@@ -75,7 +77,6 @@ class ApprovalRules:
 
 
 def default_rules() -> list[Rule]:
-    # Trigger human review after this many consecutive failing rounds.
-    failure_limit = _env_int("LH_HARNESS_DASHBOARD_FAILURE_LIMIT", 3)
+    failure_limit = max(1, _env_int("LH_HARNESS_DASHBOARD_FAILURE_LIMIT", 3))
     return [rule_repeated_failure(failure_limit)]
 

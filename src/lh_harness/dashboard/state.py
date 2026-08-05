@@ -24,6 +24,9 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from ..types import DEFAULT_LOG_DIR
+
+from ..agent_logs import parse_trajectory as parse_agent_trajectory
 from ..role_prompts import parse_role_manager_next_step
 
 
@@ -99,6 +102,7 @@ class DashboardState:
         *,
         task: str = "",
         runs_root: str | Path | None = None,
+        control_enabled: bool = False,
     ) -> None:
         # When only a runs_root is given (manual dashboard browsing), the newest
         # run is auto-selected so the UI shows something immediately; the user
@@ -109,8 +113,9 @@ class DashboardState:
             runs = self._scan_runs()
             if runs:
                 resolved = Path(runs[0]["log_dir"])
-        self.log_dir = resolved or Path(".")
+        self.log_dir = resolved or Path(DEFAULT_LOG_DIR)
         self.task = task
+        self.control_enabled = control_enabled
         self._lock = threading.Lock()
         self._approvals: dict[str, Approval] = {}
         self._approval_order: list[str] = []
@@ -198,13 +203,14 @@ class DashboardState:
         # To reflect live progress we also scan the per-round directories, whose
         # artifact files (manager_plan.txt, executor_output.txt, ...) are written
         # incrementally while a round is still running.
+        report = self.read_report()
+        events = _read_jsonl(self._role_dir / "events.jsonl")
         recorded: dict[int, dict[str, Any]] = {}
         for item in _read_jsonl(self._role_dir / "rounds.jsonl"):
             index = item.get("round_index")
             if isinstance(index, int):
                 recorded[index] = item  # append-only ledger: keep the latest
         if not recorded:
-            report = self.read_report()
             report_rounds = report.get("rounds")
             if isinstance(report_rounds, list):
                 for item in report_rounds:
@@ -212,12 +218,22 @@ class DashboardState:
                     if isinstance(index, int):
                         recorded[index] = item
 
-        merged = dict(recorded)
+        run_finished = bool(report.get("status")) or any(
+            event.get("event") in {"role_harness_cancelled", "role_harness_done"}
+            for event in events
+        )
+        merged: dict[int, dict[str, Any]] = {}
         for index, live in self._scan_round_dirs().items():
-            # Recorded (finished) rounds are authoritative; only add rounds that
-            # exist on disk but have not been flushed to the ledger yet.
+            live["in_progress"] = not run_finished and index not in recorded
+            merged[index] = {**live, **recorded.get(index, {})}
+            merged[index]["in_progress"] = live["in_progress"]
+        for index, item in recorded.items():
             if index not in merged:
-                merged[index] = live
+                merged[index] = {**item, "in_progress": False}
+        for index, item in merged.items():
+            active_role, lifecycle_seen = _active_role_for_round(events, index)
+            if lifecycle_seen:
+                item["active_role"] = active_role
         return [merged[key] for key in sorted(merged)]
 
     def _scan_round_dirs(self) -> dict[int, dict[str, Any]]:
@@ -241,18 +257,38 @@ class DashboardState:
             except OSError:
                 return ""
 
+        def _status(role: str) -> dict[str, Any]:
+            data = _read_json(round_dir / f"{role}_metadata.json")
+            if not isinstance(data, dict):
+                return {}
+            return {
+                key: data.get(key)
+                for key in ("status", "error", "duration_ms")
+                if data.get(key) is not None
+            }
+
         plan_text = _text("manager_plan.txt")
+        auditor_status = _status("auditor")
+        repair_status = _status("auditor_format_repair")
+        if repair_status:
+            auditor_status = {
+                **auditor_status,
+                "format_repair_attempted": True,
+                "format_repair_status": repair_status,
+            }
         return {
             "round_index": index,
             "next_step": _infer_next_step(plan_text),
             "plan_text": plan_text,
             "task_state": _text("task_state.txt"),
+            "task_contract": _text("task_contract.txt"),
             "executor_output": _text("executor_output.txt"),
             "auditor_report": _text("auditor_report.txt"),
             "harness_feedback": _text("harness_feedback.txt"),
             "related_report_refs": [],
-            "executor_status": {},
-            "auditor_status": {},
+            "manager_status": _status("manager"),
+            "executor_status": _status("executor"),
+            "auditor_status": auditor_status,
             "in_progress": True,
         }
 
@@ -284,7 +320,7 @@ class DashboardState:
             return None
 
     # ------------------------------------------------------------------
-    # Full role trajectories (parsed Claude stream-json for visualization)
+    # Full role trajectories normalized across supported agent backends
     # ------------------------------------------------------------------
     def list_round_roles(self, round_index: int) -> list[str]:
         """Roles that have a saved raw trajectory for the given round."""
@@ -322,7 +358,7 @@ class DashboardState:
         return sizes
 
     def read_trajectory(self, round_index: int, role: str) -> dict[str, Any] | None:
-        """Parse a role's raw Claude stream-json trajectory into ordered steps."""
+        """Parse a role's raw agent trajectory into ordered, backend-agnostic steps."""
         if role not in {"manager", "executor", "auditor", "auditor_format_repair"}:
             return None
         round_dir = self._role_dir / "rounds" / f"round_{round_index:03d}"
@@ -333,7 +369,8 @@ class DashboardState:
             raw = traj_path.read_text(encoding="utf-8", errors="replace")
         except OSError:
             return None
-        steps = _parse_claude_trajectory(raw)
+        steps = parse_agent_trajectory(raw)
+        steps = _deduplicate_final_text(steps)
         return {
             "round_index": round_index,
             "role": role,
@@ -363,6 +400,7 @@ class DashboardState:
             "events": self.read_events(limit=200),
             "approvals": self.list_approvals(),
             "pending_injections": self.list_injections(),
+            "control_enabled": self.control_enabled,
             "server_time": time.time(),
         }
 
@@ -406,6 +444,8 @@ class DashboardState:
         reason: str = "",
         user_input: str = "",
     ) -> bool:
+        if not self.control_enabled:
+            return False
         with self._lock:
             approval = self._approvals.get(approval_id)
             if approval is None or approval.status == "resolved":
@@ -434,6 +474,18 @@ class DashboardState:
         with self._lock:
             return self._approvals.get(approval_id)
 
+    def update_approval_context(self, approval_id: str, **updates: Any) -> bool:
+        """Update live setup/progress metadata and append a durable snapshot."""
+
+        with self._lock:
+            approval = self._approvals.get(approval_id)
+            if approval is None:
+                return False
+            approval.context.update(updates)
+            snapshot = approval.to_dict()
+        self._persist_approval(snapshot)
+        return True
+
     def list_approvals(self) -> list[dict[str, Any]]:
         # Merge on-disk records (so past/other-process interactions still show)
         # with in-memory approvals (authoritative for the live run). The JSONL is
@@ -458,6 +510,8 @@ class DashboardState:
     # Free-form operator instruction injections
     # ------------------------------------------------------------------
     def add_injection(self, text: str) -> bool:
+        if not self.control_enabled:
+            return False
         text = (text or "").strip()
         if not text:
             return False
@@ -476,146 +530,6 @@ class DashboardState:
         return drained
 
 
-def _parse_claude_trajectory(raw: str) -> list[dict[str, Any]]:
-    """Turn a Claude Code stream-json log into ordered, UI-friendly steps.
-
-    Emits one step per meaningful event: session init, assistant thinking, text,
-    tool calls, tool results, and the final result. Non-JSON or noise lines
-    (e.g. thinking_tokens deltas) are ignored.
-    """
-    steps: list[dict[str, Any]] = []
-    for line in raw.splitlines():
-        stripped = line.strip()
-        if not stripped.startswith("{"):
-            continue
-        try:
-            record = json.loads(stripped)
-        except json.JSONDecodeError:
-            continue
-        if not isinstance(record, dict):
-            continue
-        rtype = record.get("type")
-        if rtype == "system":
-            subtype = record.get("subtype")
-            if subtype == "init":
-                servers = record.get("mcp_servers") or []
-                names = [s.get("name") for s in servers if isinstance(s, dict)]
-                steps.append(
-                    {
-                        "kind": "session",
-                        "model": record.get("model", ""),
-                        "cwd": record.get("cwd", ""),
-                        "mcp_servers": names,
-                        "tool_count": len(record.get("tools") or []),
-                    }
-                )
-            # skip thinking_tokens and other noisy system deltas
-            continue
-        if rtype == "assistant":
-            message = record.get("message") if isinstance(record.get("message"), dict) else {}
-            for block in message.get("content", []) or []:
-                if not isinstance(block, dict):
-                    continue
-                btype = block.get("type")
-                if btype == "thinking":
-                    text = block.get("thinking")
-                    if isinstance(text, str) and text.strip():
-                        steps.append({"kind": "thinking", "text": text})
-                elif btype == "text":
-                    text = block.get("text")
-                    if isinstance(text, str) and text.strip():
-                        steps.append({"kind": "text", "text": text})
-                elif btype == "tool_use":
-                    steps.append(
-                        {
-                            "kind": "tool_use",
-                            "id": block.get("id", ""),
-                            "name": block.get("name", ""),
-                            "input": block.get("input") or {},
-                        }
-                    )
-            continue
-        if rtype == "user":
-            message = record.get("message") if isinstance(record.get("message"), dict) else {}
-            content = message.get("content")
-            blocks = content if isinstance(content, list) else []
-            for block in blocks:
-                if not isinstance(block, dict) or block.get("type") != "tool_result":
-                    continue
-                text, images = _tool_result_to_text(block.get("content"))
-                steps.append(
-                    {
-                        "kind": "tool_result",
-                        "tool_use_id": block.get("tool_use_id", ""),
-                        "text": text,
-                        "images": images,  # list of data URLs (base64 embedded)
-                        "has_image": bool(images),
-                        "is_error": bool(block.get("is_error")),
-                    }
-                )
-            continue
-        if rtype == "result":
-            result_text = record.get("result", "") if isinstance(record.get("result"), str) else ""
-            # Claude's final `result` is a copy of the last assistant text block,
-            # so it would render twice. Drop the duplicated text step and keep
-            # only the richer `result` step (which also carries run metadata).
-            for i in range(len(steps) - 1, -1, -1):
-                if steps[i]["kind"] == "text":
-                    if steps[i].get("text", "").strip() == result_text.strip():
-                        steps.pop(i)
-                    break
-            steps.append(
-                {
-                    "kind": "result",
-                    "text": result_text,
-                    "is_error": bool(record.get("is_error")),
-                    "duration_ms": record.get("duration_ms"),
-                    "num_turns": record.get("num_turns"),
-                    "cost_usd": record.get("total_cost_usd"),
-                }
-            )
-    return steps
-
-
-def _tool_result_to_text(content: Any) -> tuple[str, list[str]]:
-    """Flatten a tool_result payload into text plus embedded image data URLs.
-
-    Claude tool results carry screenshots as base64 image blocks. We turn each
-    into a ``data:`` URL so the dashboard can render them inline without any
-    extra file writes.
-    """
-    if isinstance(content, str):
-        return content, []
-    if not isinstance(content, list):
-        return ("" if content is None else str(content)), []
-    parts: list[str] = []
-    images: list[str] = []
-    for block in content:
-        if isinstance(block, dict):
-            btype = block.get("type")
-            if btype == "text" and isinstance(block.get("text"), str):
-                parts.append(block["text"])
-            elif btype == "image":
-                data_url = _image_block_to_data_url(block)
-                if data_url:
-                    images.append(data_url)
-                    parts.append("[image]")
-        elif isinstance(block, str):
-            parts.append(block)
-    return "\n".join(parts), images
-
-
-def _image_block_to_data_url(block: dict[str, Any]) -> str:
-    source = block.get("source")
-    if not isinstance(source, dict):
-        return ""
-    data = source.get("data")
-    if not isinstance(data, str) or not data:
-        return ""
-    media_type = source.get("media_type") or "image/png"
-    return f"data:{media_type};base64,{data}"
-
-
 def _infer_next_step(plan_text: str) -> str:
     """Route of an in-progress round, read from its ``manager_plan.txt``.
 
@@ -625,6 +539,52 @@ def _infer_next_step(plan_text: str) -> str:
     """
     route = parse_role_manager_next_step(plan_text)
     return "" if route == "invalid" else route
+
+
+def _deduplicate_final_text(steps: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    if not steps or steps[-1].get("kind") != "result":
+        return steps
+    final_text = str(steps[-1].get("text") or "").strip()
+    if not final_text:
+        return steps
+    for index in range(len(steps) - 2, -1, -1):
+        if steps[index].get("kind") != "text":
+            continue
+        if str(steps[index].get("text") or "").strip() == final_text:
+            return steps[:index] + steps[index + 1 :]
+        break
+    return steps
+
+
+def _active_role_for_round(events: list[dict[str, Any]], round_index: int) -> tuple[str | None, bool]:
+    starts = {
+        "manager_round_start": "manager",
+        "executor_role_start": "executor",
+        "auditor_role_start": "auditor",
+        "auditor_format_repair_start": "auditor_format_repair",
+    }
+    stops = {
+        "manager_round_done",
+        "executor_role_done",
+        "auditor_role_done",
+        "auditor_format_repair_done",
+        "managed_round_recorded",
+    }
+    active: str | None = None
+    seen = False
+    for event in events:
+        name = event.get("event")
+        if name in {"role_harness_cancelled", "role_harness_done"}:
+            active = None
+            seen = True
+        elif event.get("round") == round_index:
+            if name in starts:
+                active = starts[name]
+                seen = True
+            elif name in stops:
+                active = None
+                seen = True
+    return active, seen
 
 
 def _read_json(path: Path) -> Any:

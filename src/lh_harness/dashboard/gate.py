@@ -82,10 +82,13 @@ def _classify(
         return "completed", ""
     if outcome == "ask":
         return "needs_input", ""  # extra_message filled from the manager question
-    if outcome == "blocked":
-        return "needs_human", ""
+    # The hard round limit takes precedence over a generic blocked/failure
+    # outcome on the same final round, so the operator is explicitly told that
+    # the configured budget was exhausted and can decide whether to extend it.
     if reached_max:
         return "max_rounds", ""
+    if outcome == "blocked":
+        return "needs_human", ""
     reason = rules.evaluate(round_index, rounds)  # repeated-failure streak, etc.
     if reason:
         return "repeated_failure", reason

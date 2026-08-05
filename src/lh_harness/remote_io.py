@@ -7,6 +7,7 @@ import tempfile
 from pathlib import Path
 
 from .environment.base import Environment
+from .types import DEFAULT_TMP_DIR
 
 
 async def write_remote_text(env: Environment, remote_path: str, content: str, mode: str = "0644") -> None:
@@ -16,7 +17,9 @@ async def write_remote_text(env: Environment, remote_path: str, content: str, mo
 
     tmp_path: str | None = None
     try:
-        fd, tmp_path = tempfile.mkstemp(prefix="lh_harness_remote_", text=True)
+        tmp_dir = Path(DEFAULT_TMP_DIR)
+        tmp_dir.mkdir(parents=True, exist_ok=True)
+        fd, tmp_path = tempfile.mkstemp(prefix="lh_harness_remote_", dir=tmp_dir, text=True)
         with os.fdopen(fd, "w", encoding="utf-8") as fh:
             fh.write(content)
         await env.upload(tmp_path, remote_path)

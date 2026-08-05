@@ -4,7 +4,8 @@ import json
 import re
 from typing import Any
 
-from .types import EpisodeResult, AuditReport
+from .agent_logs import visible_output as decode_agent_visible_output
+from .types import DEFAULT_WORKSPACE_PATH, EpisodeResult, AuditReport
 
 COMPACT_REPORT_CHARS = 2_500
 STATE_SUMMARY_CHARS = 1_000
@@ -16,6 +17,22 @@ _STATUS_CONTROL_LINE_RE = re.compile(
 _INTEGRITY_CONTROL_LINE_RE = re.compile(
     r"^\s*(?:\*\*)?\s*(?:完整性|integrity)\s*[:：]\s*(clean|suspect|violation)\s*(?:\*\*)?\s*$",
     re.I,
+)
+_CONTRACT_AUDIT_CONTROL_LINE_RE = re.compile(
+    r"^\s*(?:\*\*)?\s*(?:契约审计|contract(?:[_\s-]*audit)?)\s*[:：]\s*"
+    r"(aligned|unknown|needs[_\s-]*revision|invalid|对齐|未知|需修订|需要修订|无效)"
+    r"\s*(?:\*\*)?\s*$",
+    re.I,
+)
+_BLOCKING_ACCEPTANCE_SECTION_RE = re.compile(
+    r"^\s*(?:[-*]\s*)?(?:阻断约束|blocking\s+(?:acceptance\s+)?(?:constraints?|claims?))\s*[:：]\s*(?P<rest>.*)$",
+    re.I,
+)
+_NO_BLOCKING_ACCEPTANCE_RE = re.compile(
+    r"(?ix)^\s*(?:[-*+]\s*|\d+[.)]\s*)?(?:无|没有|暂无|none|nothing|n/?a|not\s+applicable)(?:\s*[。.,，;；:].*)?\s*$"
+)
+_ACCEPTANCE_SECTION_BOUNDARY_RE = re.compile(
+    r"(?im)^\s*(?:[-*]\s*)?(?:契约结论|可能评分风险|过窄或错误解释|建议契约修订|审计事实|证据|缺口|下一步|给任务管理器的状态更新|contract\s+conclusion|possible\s+scoring\s+risks|over-narrow|recommended\s+contract\s+revision|audit\s+facts|evidence|gaps?|next\s+step|state\s+update\s+for\s+manager|status|integrity|contract\s+audit)\s*[:：]"
 )
 _DELETE_DECLARATION_RE = re.compile(
     r"^\s*(?:[-*]\s*)?"
@@ -43,13 +60,16 @@ def audit_report_from_episode_result(result: EpisodeResult, round_index: int) ->
             action_guidance="Auditor runtime failed; rerun audit after fixing the runtime issue.",
         )
 
-    report_text = compact_auditor_report_text(extract_auditor_report_text(result.actions_log))
+    report_text = compact_auditor_report_text(
+        extract_auditor_report_text(_episode_visible_output(result))
+    )
     if not _has_valid_control_header(report_text):
         report_text = _invalid_control_header_report(report_text)
     status = infer_report_status(report_text)
     state_summary = extract_state_summary(report_text)
     action_guidance = extract_action_guidance(report_text)
     integrity_status, integrity_findings = infer_integrity_findings(report_text)
+    contract_audit_status = infer_contract_audit_status(report_text)
     artifact_actions = extract_deleted_artifact_actions(report_text) if integrity_status == "violation" else []
     if result.metadata.get("verifier_workspace_mutation_detected"):
         paths = _mutation_paths(result.metadata.get("verifier_workspace_mutations"))
@@ -81,7 +101,8 @@ def audit_report_from_episode_result(result: EpisodeResult, round_index: int) ->
             )
             prefix = (
                 "状态: blocked\n"
-                "完整性: violation\n\n"
+                "完整性: violation\n"
+                "契约审计: unknown\n\n"
                 "Auditor read-only violation: the auditor window changed task workspace files while checking. "
                 f"{restore_text} Any claim based on auditor-created or auditor-modified files is invalid.\n"
             )
@@ -96,6 +117,7 @@ def audit_report_from_episode_result(result: EpisodeResult, round_index: int) ->
             state_summary = extract_state_summary(report_text)
             action_guidance = extract_action_guidance(report_text)
             integrity_status = "violation"
+            contract_audit_status = "unknown"
             integrity_findings.append(
                 {
                     "type": "verifier_workspace_write",
@@ -107,7 +129,7 @@ def audit_report_from_episode_result(result: EpisodeResult, round_index: int) ->
             )
         else:
             suffix = (
-                "\n\n环境活动归档: auditor 运行前已观察到 `/tmp_workspace` 存在活动进程或不稳定文件状态；"
+                f"\n\n环境活动归档: auditor 运行前已观察到 `{DEFAULT_WORKSPACE_PATH}` 存在活动进程或不稳定文件状态；"
                 "审计窗口内 workspace 又发生变化。harness 没有回滚这些变化，避免把 executor agent 或后台服务的"
                 "真实进展误判为 auditor 写入。该归档不自动废弃本轮审计报告。"
             )
@@ -117,7 +139,10 @@ def audit_report_from_episode_result(result: EpisodeResult, round_index: int) ->
             state_summary = extract_state_summary(report_text)
             action_guidance = extract_action_guidance(report_text)
     artifact_actions = _mark_unconfirmed_deletion_declarations(artifact_actions)
-    if integrity_status == "violation" and status == "complete":
+    report_text, status, contract_audit_status = _apply_acceptance_constraint_guard(
+        report_text, status, contract_audit_status
+    )
+    if (integrity_status == "violation" or contract_audit_status != "aligned") and status == "complete":
         status = "incomplete"
     return AuditReport(
         round_id=f"round_{round_index}",
@@ -126,6 +151,7 @@ def audit_report_from_episode_result(result: EpisodeResult, round_index: int) ->
         state_summary=state_summary,
         action_guidance=action_guidance,
         integrity_status=integrity_status,
+        contract_audit_status=contract_audit_status,
         integrity_findings=integrity_findings,
         artifact_actions=artifact_actions,
     )
@@ -137,7 +163,11 @@ def parse_audit_report(raw: str, round_index: int) -> AuditReport:
         report_text = _invalid_control_header_report(report_text)
     status = infer_report_status(report_text)
     integrity_status, integrity_findings = infer_integrity_findings(report_text)
-    if integrity_status == "violation" and status == "complete":
+    contract_audit_status = infer_contract_audit_status(report_text)
+    report_text, status, contract_audit_status = _apply_acceptance_constraint_guard(
+        report_text, status, contract_audit_status
+    )
+    if (integrity_status == "violation" or contract_audit_status != "aligned") and status == "complete":
         status = "incomplete"
     return AuditReport(
         round_id=f"round_{round_index}",
@@ -146,13 +176,35 @@ def parse_audit_report(raw: str, round_index: int) -> AuditReport:
         state_summary=extract_state_summary(report_text),
         action_guidance=extract_action_guidance(report_text),
         integrity_status=integrity_status,
+        contract_audit_status=contract_audit_status,
         integrity_findings=integrity_findings,
         artifact_actions=extract_deleted_artifact_actions(report_text) if integrity_status == "violation" else [],
     )
 
 
 def auditor_report_text_from_episode_result(result: EpisodeResult) -> str:
-    return compact_auditor_report_text(extract_auditor_report_text(result.actions_log))
+    return compact_auditor_report_text(
+        extract_auditor_report_text(_episode_visible_output(result))
+    )
+
+
+def _episode_visible_output(result: EpisodeResult) -> str:
+    """Prefer adapter-provided assistant text over the diagnostic trajectory."""
+    metadata = result.metadata if isinstance(result.metadata, dict) else {}
+    for key in (
+        "executor_agent_visible_output",
+        "visible_executor_output",
+        "assistant_visible_output",
+        "output_text",
+    ):
+        value = metadata.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    if metadata.get("actions_log_diagnostics_only"):
+        return ""
+    raw = result.actions_log or ""
+    decoded = decode_agent_visible_output(raw)
+    return decoded if decoded else raw
 
 
 def has_valid_auditor_control_header(text: str) -> bool:
@@ -161,6 +213,50 @@ def has_valid_auditor_control_header(text: str) -> bool:
 
 def infer_report_status(text: str) -> str:
     return _parse_status_control_header(text) or "blocked"
+
+
+def infer_contract_audit_status(text: str) -> str:
+    return _parse_contract_audit_control_header(text) or "unknown"
+
+
+def _apply_acceptance_constraint_guard(
+    report_text: str,
+    status: str,
+    contract_audit_status: str,
+) -> tuple[str, str, str]:
+    if status != "complete" or not _has_blocking_acceptance_constraints(report_text):
+        return report_text, status, contract_audit_status
+    guarded = compact_auditor_report_text(
+        report_text
+        + "\n\nHarness completion guard: the auditor listed nonempty blocking constraints, "
+        "so `complete` and an aligned contract decision are not accepted."
+    )
+    return guarded, "incomplete", "unknown" if contract_audit_status == "aligned" else contract_audit_status
+
+
+def _has_blocking_acceptance_constraints(text: str) -> bool:
+    lines = str(text or "").splitlines()
+    for index, line in enumerate(lines):
+        match = _BLOCKING_ACCEPTANCE_SECTION_RE.match(line)
+        if not match:
+            continue
+        rest = match.group("rest").strip()
+        if rest:
+            return not _is_no_blocking_acceptance(rest)
+        section_lines: list[str] = []
+        for following in lines[index + 1 :]:
+            stripped = following.strip()
+            if not stripped:
+                continue
+            if _ACCEPTANCE_SECTION_BOUNDARY_RE.match(stripped):
+                break
+            section_lines.append(stripped)
+        return bool(section_lines) and not all(_is_no_blocking_acceptance(item) for item in section_lines)
+    return False
+
+
+def _is_no_blocking_acceptance(text: str) -> bool:
+    return bool(_NO_BLOCKING_ACCEPTANCE_RE.match(str(text or "").strip().strip("`")))
 
 
 def _parse_status_control_header(text: str) -> str | None:
@@ -188,8 +284,29 @@ def _parse_integrity_control_header(text: str) -> str | None:
     return match.group(1).lower()
 
 
+def _parse_contract_audit_control_header(text: str) -> str | None:
+    lines = _first_nonempty_lines(text, 3)
+    if len(lines) < 3:
+        return None
+    match = _CONTRACT_AUDIT_CONTROL_LINE_RE.match(lines[2])
+    if not match:
+        return None
+    value = match.group(1).lower().replace("-", "_").replace(" ", "_")
+    if value in {"aligned", "对齐"}:
+        return "aligned"
+    if value in {"needs_revision", "需修订", "需要修订"}:
+        return "needs_revision"
+    if value in {"invalid", "无效"}:
+        return "invalid"
+    return "unknown"
+
+
 def _has_valid_control_header(text: str) -> bool:
-    return _parse_status_control_header(text) is not None and _parse_integrity_control_header(text) is not None
+    return (
+        _parse_status_control_header(text) is not None
+        and _parse_integrity_control_header(text) is not None
+        and _parse_contract_audit_control_header(text) is not None
+    )
 
 
 def _invalid_control_header_report(raw: str) -> str:
@@ -197,8 +314,9 @@ def _invalid_control_header_report(raw: str) -> str:
     return (
         "状态: blocked\n"
         "完整性: suspect\n"
-        "审计事实: auditor 报告缺少有效的前两行控制头，harness 不会根据正文猜测完成状态或完整性。\n"
-        "缺口: auditor 必须以前两行明确写出 `状态: complete/incomplete/blocked` 和 `完整性: clean/suspect/violation`。\n\n"
+        "契约审计: unknown\n"
+        "审计事实: auditor 报告缺少有效的前三行控制头，harness 不会根据正文猜测完成状态、完整性或契约审计。\n"
+        "缺口: auditor 必须以前三行明确写出状态、完整性和契约审计。\n\n"
         "原始 auditor 输出摘录:\n"
         f"{clipped}"
     )
@@ -342,7 +460,7 @@ def extract_deleted_artifact_actions(text: str) -> list[dict[str, Any]]:
 
 def extract_candidate_artifact_paths(text: str) -> list[str]:
     patterns = [
-        r"(?P<path>/tmp_workspace/[^\s`'\"<>:;|，。；：]+)",
+        rf"(?P<path>{re.escape(DEFAULT_WORKSPACE_PATH)}/[^\s`'\"<>:;|，。；：]+)",
         r"(?<![A-Za-z0-9_./-])(?P<path>(?:[A-Za-z0-9_.-]+/)+[A-Za-z0-9_.-]+\.(?:png|jpg|jpeg|gif|webp|svg|pdf|txt|md|csv|json|html|htm|mp4|mov|wav|zip|tar|gz))",
     ]
     paths: list[str] = []
@@ -587,8 +705,8 @@ def _workspace_relpath(raw: object) -> str:
     if not path:
         return ""
     path = path.rstrip(".,)]}，。；：")
-    prefix = "/tmp_workspace/"
-    if path == "/tmp_workspace":
+    prefix = f"{DEFAULT_WORKSPACE_PATH}/"
+    if path == DEFAULT_WORKSPACE_PATH:
         return "."
     if path.startswith(prefix):
         return path[len(prefix) :]
@@ -626,6 +744,7 @@ def _runtime_failure_report(result, runtime_signals: list[str]) -> str:  # noqa:
     lines = [
         "状态: blocked",
         "完整性: suspect",
+        "契约审计: unknown",
         "",
         "Auditor runtime failed before producing a trustworthy report.",
     ]
