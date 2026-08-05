@@ -80,14 +80,20 @@ def start_dashboard(
     task: str = "",
     runs_root: str | None = None,
     state: DashboardState | None = None,
+    control_enabled: bool | None = None,
 ) -> DashboardHandle:
     """Start the dashboard HTTP server in a background daemon thread.
 
-    Pass ``runs_root`` (e.g. ``./runs``) to let the operator browse and switch
-    between all runs from the UI. Pass ``log_dir`` to pin one run's logs.
+    Pass ``runs_root`` (e.g. ``./.lh-harness/runs``) to let the operator browse
+    and switch between all runs from the UI. Pass ``log_dir`` to pin one run's logs.
     """
 
-    dashboard_state = state or DashboardState(log_dir, task=task, runs_root=runs_root)
+    dashboard_state = state or DashboardState(
+        log_dir,
+        task=task,
+        runs_root=runs_root,
+        control_enabled=bool(task) if control_enabled is None else control_enabled,
+    )
 
     handler = _make_handler(dashboard_state)
     server = ThreadingHTTPServer((host, port), handler)

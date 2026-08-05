@@ -24,7 +24,7 @@ mkdir -p logs results_osworld_cua_gpt55
 
 # LiteLLM proxy serves the same Azure deployment as the direct endpoint
 export OPENAI_BASE_URL="${OPENAI_BASE_URL:-http://10.160.199.232:4200/v1}"
-export OPENAI_API_KEY="${OPENAI_API_KEY:-sk-litellm-azure-direct}"
+export OPENAI_API_KEY="${OPENAI_API_KEY:-}"
 
 # Preflight: confirm LiteLLM serves gpt-5.5
 curl -sf --max-time 5 --noproxy '*' \

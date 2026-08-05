@@ -159,7 +159,7 @@ class CodexAgent:
     def __init__(self,
                  model: str = "gpt-5.5",
                  litellm_base_url: str = "http://172.17.0.1:4200/v1",
-                 litellm_api_key: str = "sk-litellm-azure-direct",
+                 litellm_api_key: str = "",
                  client_password: str = "password",
                  timeout: int = 900,
                  gui: bool = True,

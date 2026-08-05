@@ -18,6 +18,7 @@ dist/
 *.egg-info/
 
 # Local run outputs
+.lh-harness/
 runs/
 logs/
 results/

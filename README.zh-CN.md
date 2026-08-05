@@ -18,7 +18,7 @@
 </p>
 
 [![Python](https://img.shields.io/badge/python-≥3.10-blue?logo=python&logoColor=white)](https://www.python.org/)
-[![Agents](https://img.shields.io/badge/backends-Claude%20Code%20|%20Codex%20|%20OpenClaw-8A2BE2)](#任意模型任意-agent-后端)
+[![Agents](https://img.shields.io/badge/backends-Claude%20Code%20|%20Codex-8A2BE2)](#任意模型任意-agent-后端)
 [![Benchmarks](https://img.shields.io/badge/benchmarks-WeaveBench%20|%20OSWorld%202.0%20|%20Terminal--Bench%202.1-orange)](#数百个真实任务规模化验证)
 
 [Usage](#一条命令全程可见) · [What You Get](#桌面-app-与命令行一个连续任务) · [How It Works](#三个角色一份可信状态) · [Results](#数百个真实任务规模化验证) · [Project Website](https://lh-harness.pages.dev) · [English](README.md)
@@ -30,9 +30,13 @@
 
 > **模型决定 Agent 一轮能做什么。LongHorizon-Harness 决定这些工作能否被验证、保存并持续积累，直到任务真正完成。**
 
-**支持 Claude Code、Codex 和 OpenClaw。一条命令安装，开箱即用。**
+**支持 Claude Code 和 Codex。一条命令安装，开箱即用。**
 
 LongHorizon-Harness 是一套面向长程任务的执行、状态管理和结果验证系统。它不训练新模型，也不替换现有 Agent，而是运行在 Codex、Claude Code 等系统之上，帮助 Agent 在真实电脑环境中长时间自主运行，持续推进复杂任务。
+
+## ✨ News
+
+> 🚀 我们正在快速迭代，敬请期待！
 
 ## 视频演示
 
@@ -66,21 +70,6 @@ LongHorizon-Harness 同时支持 GUI 和 CLI 工作流。
 
 一个任务可以先在浏览器中收集信息，再通过命令行处理数据，接着在桌面软件中生成交付物，最后回到命令行验证或调试。整个过程中，目标、进度和证据始终由同一套状态管理系统维护。
 
-<details>
-<summary><strong>🖱️ 接入计算机操作 MCP 服务</strong></summary>
-
-GUI 操作由兼容的外部计算机操作 MCP 服务提供。LongHorizon-Harness 默认不内置或启用特定的计算机操作实现。
-
-```bash
-lh-harness run --task @task.md --agent claude_code \
-  --mcp-config /path/to/your/mcp.json \
-  --mcp-add-dir /path/to/your/mcp/files
-```
-
-也可以使用 `LH_HARNESS_CLAUDECODE_MCP_CONFIG` 和 `LH_HARNESS_CLAUDECODE_ADD_DIRS`。未提供配置时，Claude Code 适配器不会添加 MCP 参数。
-
-</details>
-
 ## 任意模型。任意 Agent 后端。
 
 LongHorizon-Harness 不绑定特定模型或 Agent 后端。现有模型和 Agent 可以通过配置接入，无需改变原来的工作方式。
@@ -88,9 +77,9 @@ LongHorizon-Harness 不绑定特定模型或 Agent 后端。现有模型和 Agen
 | | 层级 | 支持选项 |
 |---|---|---|
 | 🧠 | **模型** | Claude、GPT、Qwen，以及 Agent 后端提供的其他模型 |
-| 🤖 | **Agent 后端** | Claude Code、Codex CLI、OpenClaw，以及自定义 `AgentAdapter` 实现 |
+| 🤖 | **Agent 后端** | Claude Code、Codex CLI，以及自定义 `AgentAdapter` 实现 |
 | 🎛️ | **角色分配** | 项目经理、执行者和验收员可以分别使用不同模型或后端 |
-| 🖥️ | **执行环境** | 本地、`ssh://user@host:port` 和 `docker://container` |
+| 🖥️ | **执行环境** | 本地，并提供可扩展的 `Environment` 协议 |
 
 轻量级 `AgentAdapter` 会保留每个 Agent 原生的执行循环，同时让 LongHorizon-Harness 在外层协调角色边界、可信任务状态和跨轮进度。
 
@@ -146,8 +135,7 @@ LongHorizon-Harness 不只展示了几个精心挑选的成功案例。
 <img src="assets/harness_perf.png" alt="不同评测和模型上的性能提升" width="72%">
 </div>
 
-<details>
-<summary><strong>📊 完整评测结果与实验设置</strong></summary>
+### 📊 完整评测结果与实验设置
 
 | 评测 | 指标 | Claude Code | **LongHorizon-Harness** | 提升 |
 |---|---|:-:|:-:|:-:|
@@ -159,19 +147,193 @@ LongHorizon-Harness 不只展示了几个精心挑选的成功案例。
 
 <sub>所有结果均使用 Qwen 3.7-Plus 作为基础模型，并使用 Claude Code 作为执行后端。</sub>
 
-</details>
-
 完整实验设置、结果表格和案例轨迹可在 [LongHorizon-Harness 项目主页](https://lh-harness.pages.dev) 查看。
 
 ## 一条命令。全程可见。
 
-安装 LongHorizon-Harness：
+### 快速开始
+
+详细安装和配置说明请参阅[安装](#安装)。
+
+1. 安装 LongHorizon-Harness：
+
+  ```bash
+  uv tool install lh-harness
+  ```
+
+2. 检查运行环境，然后显式安装并启用 Codex GUI 插件：
+
+  ```bash
+  lh-harness doctor
+  lh-harness doctor --install-codex-gui
+  ```
+
+3. 进入项目并生成配置：
+
+  ```bash
+  cd /path/to/your/project
+  lh-harness init
+  ```
+
+4. 打开 `.lh-harness/config.toml`，按需修改默认配置。生成的配置默认使用 Codex、`gpt-5.6-sol`，并开启 Dashboard。
+
+5. 运行任务：
+
+  ```bash
+  lh-harness run --task "hi"
+  ```
+
+Dashboard 会自动打开，并展示完整的 Manager → Executor → Auditor 流程。
+
+### 安装
+
+#### 环境要求
+
+- Python 3.10 或更高版本
+- 使用推荐的隔离安装方式时，需要先[安装 uv](https://docs.astral.sh/uv/getting-started/installation/)
+- `PATH` 中至少有一个受支持的 Agent 运行时：
+  - [`claude`](https://docs.anthropic.com/en/docs/claude-code/getting-started) — Claude Code CLI
+  - [`codex`](https://github.com/openai/codex#installing-and-running-codex-cli) — Codex CLI
+
+#### 使用 uv 安装
 
 ```bash
 uv tool install lh-harness
 ```
 
-LongHorizon-Harness 需要 Python 3.10+，以及至少一个 Agent 运行时：`claude`、`codex` 或 `openclaw`。
+升级已有安装：
+
+```bash
+uv tool upgrade lh-harness
+```
+
+#### 使用 pip 安装
+
+```bash
+pip install lh-harness
+```
+
+#### 生成项目配置
+
+```bash
+lh-harness init
+```
+
+该命令会生成 `./.lh-harness/config.toml`，默认不会覆盖已有文件。只有需要重新生成配置时才使用 `lh-harness init --force`。
+
+`lh-harness run` 启动时会自动读取该文件，配置优先级为：
+
+1. 显式传入的 CLI 参数
+2. `./.lh-harness/config.toml` 中的值
+3. 内置默认值
+
+生成的文件包含运行目录、Agent/model 分配、角色超时、MCP、Prompt 语言和 Dashboard 默认配置。任务内容、run ID 和 API key 仍通过命令行或环境传入，不会写入生成的配置文件。
+
+检查 Harness 安装、Python 运行时、可用的 Agent CLI 和 Codex GUI 支持：
+
+```bash
+lh-harness doctor
+```
+
+`doctor` 还会检查 [PyPI](https://pypi.org/project/lh-harness) 是否有新版本，超时时间为 3 秒。自动检测失败时，输出会提示前往 PyPI 页面手动检查。
+
+也可以直接运行：
+
+```bash
+lh-harness check-update
+```
+
+Codex Computer Use 的安装与任务执行相互独立。需要安装并启用官方插件时，必须显式运行：
+
+```bash
+lh-harness doctor --install-codex-gui
+```
+
+卸载插件：
+
+```bash
+lh-harness doctor --uninstall-codex-gui
+```
+
+普通的 `lh-harness doctor` 只检查状态。`lh-harness run` 不会安装、卸载或修改 Codex 插件。
+
+#### 配置计算机操作 MCP 服务
+
+GUI 操作由兼容的外部计算机操作 MCP 服务提供。LongHorizon-Harness 默认不内置或启用特定的计算机操作实现。
+
+Claude Code 和 Codex 均可通过 `--mcp-config` 读取 Claude 风格的 MCP 配置。Codex 会将该配置转换为自身的命令行覆盖项。建议 MCP server 名称仅使用字母、数字、连字符或下划线。
+
+本地 stdio MCP server 配置示例：
+
+```json
+{
+  "mcpServers": {
+    "computer-use": {
+      "command": "/path/to/mcp-server",
+      "args": ["--option", "value"],
+      "env": {
+        "EXAMPLE_VARIABLE": "value"
+      }
+    }
+  }
+}
+```
+
+HTTP MCP server 配置示例：
+
+```json
+{
+  "mcpServers": {
+    "computer-use": {
+      "url": "http://127.0.0.1:3000/mcp"
+    }
+  }
+}
+```
+
+使用 MCP 配置运行 Harness，并通过 `--mcp-add-dir` 暴露 Agent 需要访问的目录：
+
+```bash
+lh-harness run --task @task.md --agent claude_code \
+  --mcp-config /path/to/mcp.json \
+  --mcp-add-dir /path/to/mcp/files
+```
+
+同一份配置也可以用于 Codex：
+
+```bash
+lh-harness run --task @task.md --agent codex \
+  --mcp-config /path/to/mcp.json \
+  --mcp-add-dir /path/to/mcp/files
+```
+
+`--mcp-add-dir` 可以重复指定。也可以通过环境变量提供 MCP 配置和附加目录：
+
+| 后端 | MCP 配置 | 附加目录 |
+|---|---|---|
+| Claude Code | `LH_HARNESS_CLAUDECODE_MCP_CONFIG` | `LH_HARNESS_CLAUDECODE_ADD_DIRS` |
+| Codex | `LH_HARNESS_CODEX_MCP_CONFIG` | `LH_HARNESS_CODEX_ADD_DIRS` |
+| 所有后端 | `LH_HARNESS_MCP_CONFIG` | `LH_HARNESS_MCP_ADD_DIRS` |
+
+多个目录之间使用操作系统的路径分隔符分隔（macOS/Linux 为 `:`，Windows 为 `;`）。如果 MCP server 可以从自身环境中读取密钥，应避免把 API key 直接写入 MCP JSON 文件。
+
+### Dashboard 命令
+
+```bash
+lh-harness run --task @task.md --dashboard      # 监控正在运行的任务
+lh-harness dashboard                            # 浏览已完成和正在运行的任务
+```
+
+### 常用 CLI 参数
+
+| 参数 | 说明 |
+|---|---|
+| `--task` | 任务文本或 `@task.md` |
+| `--agent` | `claude_code` 或 `codex` |
+| `--env` | `local` |
+| `--max-rounds` | 规划、执行与验收循环的最大轮数；CLI 默认为 30 |
+| `--dashboard` | 启动实时监控和人工介入功能 |
+| `--no-dashboard` | 关闭项目配置中默认启用的 Dashboard |
 
 运行一个任务：
 
@@ -202,32 +364,6 @@ Dashboard 会展示每一轮的任务规划、执行结果、审计证据和返�
 | 🧠 **角色轨迹** | 项目经理、执行者和验收员的输入与输出 |
 | 📁 **工作区** | 执行过程中产生的文件和交付物 |
 | ✅ **最终报告** | 经过验证的任务结果 |
-
-<details>
-<summary><strong>⚙️ 其他安装方式与常用 CLI 参数</strong></summary>
-
-使用 `pip` 安装：
-
-```bash
-pip install lh-harness
-```
-
-Dashboard 命令：
-
-```bash
-lh-harness run --task @task.md --dashboard      # 监控正在运行的任务
-lh-harness dashboard --runs-root ./runs         # 浏览已完成和正在运行的任务
-```
-
-| 参数 | 说明 |
-|---|---|
-| `--task` | 任务文本或 `@task.md` |
-| `--agent` | `claude_code`、`codex` 或 `openclaw` |
-| `--env` | `local`、`ssh://...` 或 `docker://...` |
-| `--max-rounds` | 规划、执行与验收循环的最大轮数；CLI 默认为 30 |
-| `--dashboard` | 启动实时监控和人工介入功能 |
-
-</details>
 
 ## 评测复现
 

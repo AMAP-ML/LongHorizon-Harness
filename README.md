@@ -18,7 +18,7 @@
 </p>
 
 [![Python](https://img.shields.io/badge/python-≥3.10-blue?logo=python&logoColor=white)](https://www.python.org/)
-[![Agents](https://img.shields.io/badge/backends-Claude%20Code%20|%20Codex%20|%20OpenClaw-8A2BE2)](#any-model-any-agent-backend)
+[![Agents](https://img.shields.io/badge/backends-Claude%20Code%20|%20Codex-8A2BE2)](#any-model-any-agent-backend)
 [![Benchmarks](https://img.shields.io/badge/benchmarks-WeaveBench%20|%20OSWorld%202.0%20|%20Terminal--Bench%202.1-orange)](#hundreds-of-real-tasks-measured-gains)
 
 [Usage](#one-command-full-visibility) · [What You Get](#desktop-apps-and-cli-one-continuous-task) · [How It Works](#three-roles-one-trusted-state) · [Results](#hundreds-of-real-tasks-measured-gains) · [Project Website](https://lh-harness.pages.dev) · [简体中文](README.zh-CN.md)
@@ -30,9 +30,13 @@
 
 > **The model determines what an agent can do in one round. LongHorizon-Harness determines whether that work can be verified, preserved, and continued until the task is actually complete.**
 
-**Works with Claude Code, Codex, and OpenClaw. One-command install, ready to run.**
+**Works with Claude Code and Codex. One-command install, ready to run.**
 
 LongHorizon-Harness is an execution, state-management, and result-verification system for long-horizon tasks. It does not train a new model or replace an existing agent. It runs on top of systems such as Codex and Claude Code, helping agents operate autonomously in real computer environments for extended periods and continuously move complex tasks forward.
+
+## ✨ News
+
+> 🚀 We’re iterating rapidly. Stay tuned!
 
 ## Video Demo
 
@@ -66,21 +70,6 @@ LongHorizon-Harness supports both GUI and CLI workflows.
 
 One task can begin in a browser, move to the command line for data processing, continue in desktop software to produce an artifact, and return to the terminal for validation or debugging. The goal, progress, and evidence remain under the same state-management system throughout.
 
-<details>
-<summary><strong>🖱️ Connect a computer-use MCP server</strong></summary>
-
-GUI interaction is supplied through a compatible external computer-use MCP server. LongHorizon-Harness does not bundle or enable a specific computer-use implementation by default.
-
-```bash
-lh-harness run --task @task.md --agent claude_code \
-  --mcp-config /path/to/your/mcp.json \
-  --mcp-add-dir /path/to/your/mcp/files
-```
-
-You can also use `LH_HARNESS_CLAUDECODE_MCP_CONFIG` and `LH_HARNESS_CLAUDECODE_ADD_DIRS`. When no configuration is supplied, the Claude Code adapter does not add MCP arguments.
-
-</details>
-
 ## Any model. Any agent backend.
 
 LongHorizon-Harness is not tied to a specific model or agent backend. Existing models and agents connect through configuration without changing their original workflows.
@@ -88,9 +77,9 @@ LongHorizon-Harness is not tied to a specific model or agent backend. Existing m
 | | Layer | Supported choices |
 |---|---|---|
 | 🧠 | **Models** | Claude, GPT, Qwen, and other models exposed by an agent backend |
-| 🤖 | **Agent backends** | Claude Code, Codex CLI, OpenClaw, and custom `AgentAdapter` implementations |
+| 🤖 | **Agent backends** | Claude Code, Codex CLI, and custom `AgentAdapter` implementations |
 | 🎛️ | **Role assignment** | The Manager, Executor, and Auditor can each use a different model or backend |
-| 🖥️ | **Execution environments** | Local, `ssh://user@host:port`, and `docker://container` |
+| 🖥️ | **Execution environments** | Local, with a pluggable `Environment` protocol |
 
 A lightweight `AgentAdapter` preserves each agent's native execution loop while LongHorizon-Harness coordinates role boundaries, verified task state, and cross-round progress around it.
 
@@ -146,8 +135,7 @@ We ran it on hundreds of complex tasks across GUI, CLI, and mixed computer envir
 <img src="assets/harness_perf.png" alt="Performance gains across benchmarks and backbones" width="72%">
 </div>
 
-<details>
-<summary><strong>📊 Full benchmark results and experimental settings</strong></summary>
+### 📊 Full benchmark results and experimental settings
 
 | Benchmark | Metric | Claude Code | **LongHorizon-Harness** | Gain |
 |---|---|:-:|:-:|:-:|
@@ -159,19 +147,193 @@ We ran it on hundreds of complex tasks across GUI, CLI, and mixed computer envir
 
 <sub>All rows use Qwen 3.7-Plus as the backbone and Claude Code as the execution backend.</sub>
 
-</details>
-
 Full result tables and case trajectories are available on the [LongHorizon-Harness project website](https://lh-harness.pages.dev).
 
 ## One command. Full visibility.
 
-Install LongHorizon-Harness:
+### Quick start
+
+For detailed setup and configuration options, see [Installation](#installation).
+
+1. Install LongHorizon-Harness:
+
+  ```bash
+  uv tool install lh-harness
+  ```
+
+2. Check the environment, then explicitly install and enable the Codex GUI plugin:
+
+  ```bash
+  lh-harness doctor
+  lh-harness doctor --install-codex-gui
+  ```
+
+3. Enter your project and generate its configuration:
+
+  ```bash
+  cd /path/to/your/project
+  lh-harness init
+  ```
+
+4. Open `.lh-harness/config.toml` and adjust the defaults if needed. The generated configuration uses Codex, `gpt-5.6-sol`, and an enabled Dashboard by default.
+
+5. Run a task:
+
+  ```bash
+  lh-harness run --task "hi"
+  ```
+
+The Dashboard opens automatically and shows the complete Manager → Executor → Auditor workflow.
+
+### Installation
+
+#### Requirements
+
+- Python 3.10 or later
+- [uv](https://docs.astral.sh/uv/getting-started/installation/) for the recommended isolated installation method
+- At least one supported agent runtime available on `PATH`:
+  - [`claude`](https://docs.anthropic.com/en/docs/claude-code/getting-started) — Claude Code CLI
+  - [`codex`](https://github.com/openai/codex#installing-and-running-codex-cli) — Codex CLI
+
+#### Install with uv
 
 ```bash
 uv tool install lh-harness
 ```
 
-LongHorizon-Harness requires Python 3.10+ and at least one agent runtime: `claude`, `codex`, or `openclaw`.
+To upgrade an existing installation:
+
+```bash
+uv tool upgrade lh-harness
+```
+
+#### Install with pip
+
+```bash
+pip install lh-harness
+```
+
+#### Generate a project configuration
+
+```bash
+lh-harness init
+```
+
+This creates `./.lh-harness/config.toml` without replacing an existing file. Use `lh-harness init --force` only when you want to regenerate it.
+
+When `lh-harness run` starts, it reads this file automatically. Configuration precedence is:
+
+1. Explicit CLI arguments
+2. Values in `./.lh-harness/config.toml`
+3. Built-in defaults
+
+The generated file includes run storage, Agent/model assignment, role timeouts, MCP, prompt language, and Dashboard defaults. Task text, run IDs, and API keys remain command-line or environment inputs and are not stored in the generated configuration.
+
+Check the installation, Python runtime, available agent CLIs, and Codex GUI support:
+
+```bash
+lh-harness doctor
+```
+
+`doctor` also checks [PyPI](https://pypi.org/project/lh-harness) for updates with a 3-second timeout. When automatic detection fails, the output points to the PyPI page for a manual check.
+
+To check for updates directly:
+
+```bash
+lh-harness check-update
+```
+
+Codex Computer Use setup is intentionally separate from task execution. To explicitly install and enable the official plugin:
+
+```bash
+lh-harness doctor --install-codex-gui
+```
+
+To remove the plugin:
+
+```bash
+lh-harness doctor --uninstall-codex-gui
+```
+
+Plain `lh-harness doctor` only checks status. Running `lh-harness run` never installs, removes, or changes Codex plugins.
+
+#### Configure a computer-use MCP server
+
+GUI interaction is supplied through a compatible external computer-use MCP server. LongHorizon-Harness does not bundle or enable a specific computer-use implementation by default.
+
+Both Claude Code and Codex accept a Claude-style MCP configuration through `--mcp-config`. Codex translates this configuration into its native command-line overrides. Use simple server names containing letters, numbers, hyphens, or underscores.
+
+Example configuration for a local stdio MCP server:
+
+```json
+{
+  "mcpServers": {
+    "computer-use": {
+      "command": "/path/to/mcp-server",
+      "args": ["--option", "value"],
+      "env": {
+        "EXAMPLE_VARIABLE": "value"
+      }
+    }
+  }
+}
+```
+
+Example configuration for an HTTP MCP server:
+
+```json
+{
+  "mcpServers": {
+    "computer-use": {
+      "url": "http://127.0.0.1:3000/mcp"
+    }
+  }
+}
+```
+
+Run the harness with the MCP configuration and any directories that the agent needs to access:
+
+```bash
+lh-harness run --task @task.md --agent claude_code \
+  --mcp-config /path/to/mcp.json \
+  --mcp-add-dir /path/to/mcp/files
+```
+
+The same configuration works with Codex:
+
+```bash
+lh-harness run --task @task.md --agent codex \
+  --mcp-config /path/to/mcp.json \
+  --mcp-add-dir /path/to/mcp/files
+```
+
+`--mcp-add-dir` may be repeated. MCP configuration and additional directories can also be supplied through environment variables:
+
+| Backend | MCP configuration | Additional directories |
+|---|---|---|
+| Claude Code | `LH_HARNESS_CLAUDECODE_MCP_CONFIG` | `LH_HARNESS_CLAUDECODE_ADD_DIRS` |
+| Codex | `LH_HARNESS_CODEX_MCP_CONFIG` | `LH_HARNESS_CODEX_ADD_DIRS` |
+| All backends | `LH_HARNESS_MCP_CONFIG` | `LH_HARNESS_MCP_ADD_DIRS` |
+
+Separate multiple directories using the operating system path separator (`:` on macOS/Linux and `;` on Windows). Avoid storing API keys directly in the MCP JSON file when the MCP server can read them from its environment.
+
+### Dashboard commands
+
+```bash
+lh-harness run --task @task.md --dashboard      # Monitor a live run
+lh-harness dashboard                            # Browse completed and active runs
+```
+
+### Common CLI options
+
+| Option | Description |
+|---|---|
+| `--task` | Task text or `@task.md` |
+| `--agent` | `claude_code` or `codex` |
+| `--env` | `local` |
+| `--max-rounds` | Maximum number of Manage-Execute-Audit rounds; the CLI default is 30 |
+| `--dashboard` | Start live monitoring and human intervention |
+| `--no-dashboard` | Disable a Dashboard enabled by the project configuration |
 
 Run a task:
 
@@ -202,32 +364,6 @@ Every run is stored in an isolated `runs/<run-id>/` directory. The complete task
 | 🧠 **Role trajectories** | Manager, Executor, and Auditor inputs and outputs |
 | 📁 **Workspace** | Files and artifacts produced during execution |
 | ✅ **Final report** | The verified outcome of the task |
-
-<details>
-<summary><strong>⚙️ Installation alternatives and common CLI options</strong></summary>
-
-Install with `pip`:
-
-```bash
-pip install lh-harness
-```
-
-Dashboard commands:
-
-```bash
-lh-harness run --task @task.md --dashboard      # Monitor a live run
-lh-harness dashboard --runs-root ./runs         # Browse completed and active runs
-```
-
-| Option | Description |
-|---|---|
-| `--task` | Task text or `@task.md` |
-| `--agent` | `claude_code`, `codex`, or `openclaw` |
-| `--env` | `local`, `ssh://...`, or `docker://...` |
-| `--max-rounds` | Maximum number of Manage-Execute-Audit rounds; the CLI default is 30 |
-| `--dashboard` | Start live monitoring and human intervention |
-
-</details>
 
 ## Evaluation Reproduction
 

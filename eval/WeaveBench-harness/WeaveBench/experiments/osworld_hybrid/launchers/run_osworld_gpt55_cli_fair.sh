@@ -28,7 +28,7 @@ OSWORLD_DIR="$(cd "${WCB_DIR}/.." && pwd)"
 LITELLM_HOST_IP="${LITELLM_HOST_IP:-127.0.0.1}"
 LITELLM_VM_IP="${LITELLM_VM_IP:-172.17.0.1}"
 LITELLM_PORT="${LITELLM_PORT:-4200}"
-LITELLM_API_KEY="${LITELLM_API_KEY:-sk-litellm-azure-direct}"
+LITELLM_API_KEY="${LITELLM_API_KEY:-}"
 
 # Judge LLM runs HOST-SIDE (Responses-API loop driving REST into the VM). User
 # chose the 4141 copilot-api /responses endpoint (the 500-retry fix covers its

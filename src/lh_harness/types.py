@@ -1,9 +1,21 @@
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass, field
+from pathlib import Path
 from typing import Any, Literal
 
+# Library defaults are user-scoped; CLI runs remain project-scoped.
+DEFAULT_STATE_ROOT = str(Path.home() / ".lh-harness")
+DEFAULT_WORKSPACE_PATH = f"{DEFAULT_STATE_ROOT}/workspace"
+DEFAULT_HARNESS_DIR = f"{DEFAULT_WORKSPACE_PATH}/.harness"
+DEFAULT_LOG_DIR = f"{DEFAULT_STATE_ROOT}/logs"
+DEFAULT_TMP_DIR = f"{DEFAULT_STATE_ROOT}/tmp"
+
+DEFAULT_CLAUDE_MODEL = "claude-opus-5"
+DEFAULT_CODEX_MODEL = "gpt-5.6-sol"
+
 RoleNextStep = Literal["gui", "cli", "done", "blocked", "invalid", "ask"]
+PromptLanguage = Literal["en", "zh"]
 
 
 @dataclass
@@ -12,17 +24,21 @@ class ExecResult:
     stderr: str
     exit_code: int
     duration_ms: int
+    termination_reason: str | None = None
 
 
 @dataclass
 class EpisodeBudget:
-    max_turns: int = 20
     max_duration_seconds: int = 1800
+
+    def __post_init__(self) -> None:
+        if self.max_duration_seconds < 1:
+            raise ValueError("max_duration_seconds must be at least 1")
 
 
 @dataclass
 class EpisodeResult:
-    status: Literal["done", "timeout", "error"]
+    status: Literal["done", "timeout", "error", "cancelled"]
     actions_log: str = ""
     error: str | None = None
     duration_ms: int = 0
@@ -41,6 +57,7 @@ class AuditReport:
     action_guidance: str = ""
     raw_commands: list[dict[str, str]] = field(default_factory=list)
     integrity_status: Literal["clean", "suspect", "violation"] = "clean"
+    contract_audit_status: Literal["aligned", "unknown", "needs_revision", "invalid"] = "unknown"
     integrity_findings: list[dict[str, Any]] = field(default_factory=list)
     artifact_actions: list[dict[str, Any]] = field(default_factory=list)
 
@@ -54,6 +71,7 @@ class ManagedRound:
     auditor_report: str = ""
     harness_feedback: str = ""
     task_state: str = ""
+    task_contract: str = ""
     related_report_refs: list[str] = field(default_factory=list)
     executor_status: dict[str, Any] = field(default_factory=dict)
     auditor_status: dict[str, Any] = field(default_factory=dict)
@@ -62,47 +80,39 @@ class ManagedRound:
 @dataclass
 class HarnessConfig:
     max_total_episodes: int = 4
-    episode_budget: EpisodeBudget = field(default_factory=EpisodeBudget)
-    auditor_budget: EpisodeBudget = field(
-        default_factory=lambda: EpisodeBudget(max_turns=20, max_duration_seconds=300)
+    manager_budget: EpisodeBudget = field(
+        default_factory=lambda: EpisodeBudget(max_duration_seconds=600)
     )
-    workspace_path: str = "/tmp_workspace"
-    harness_dir: str = "/tmp_workspace/.harness"
-    log_dir: str = "./harness_logs"
-    output_truncation_chars: int = 4096
-    auditor_context_chars: int = 20_000
+    gui_executor_budget: EpisodeBudget = field(default_factory=EpisodeBudget)
+    cli_executor_budget: EpisodeBudget = field(default_factory=EpisodeBudget)
+    auditor_budget: EpisodeBudget = field(
+        default_factory=lambda: EpisodeBudget(max_duration_seconds=600)
+    )
+    workspace_path: str = DEFAULT_WORKSPACE_PATH
+    harness_dir: str = DEFAULT_HARNESS_DIR
+    log_dir: str = DEFAULT_LOG_DIR
     auditor_output_chars: int = 24_000
-    auditor_prompt_chars: int = 60_000
-    auditor_model: str = "gpt-4o-mini"
-    agent_model: str = "gpt-4o"
-    api_key: str | None = None
-    base_url: str | None = None
-    manager_budget: EpisodeBudget | None = None
-    gui_executor_budget: EpisodeBudget | None = None
-    cli_executor_budget: EpisodeBudget | None = None
-    role_auditor_budget: EpisodeBudget | None = None
     role_verified_context_chars: int = 60_000
     role_history_chars: int = 100_000
-    # Kept for compatibility with WeaveBench wrappers that expose the newer
-    # role-memory knob. V2 does not use a separate rolling memory prompt.
-    role_memory_chars: int = 0
+    # English is the production default; Chinese remains available for
+    # OSWorldv2-compatible role prompts and operator-facing control headers.
+    prompt_language: PromptLanguage = "en"
 
     def effective_ignored_path_prefixes(self) -> list[str]:
         workspace = self.workspace_path.rstrip("/")
         harness = self.harness_dir.rstrip("/")
+        home = Path.home()
         return [
             harness,
             f"{workspace}/.harness",
             f"{workspace}/gt",
-            "/home/user/.claude",
-            "/tmp/weavebench_claudecode_install",
-            "/tmp/lh_harness_claudecode_auditor_bin",
-            "/tmp/lh_harness_claudecode_auditor_py",
+            str(home / ".claude"),
+            str(home / ".codex"),
         ]
 
     def ground_truth_path_prefixes(self) -> list[str]:
         workspace = self.workspace_path.rstrip("/")
-        return [f"{workspace}/gt", "/tmp_workspace/gt"]
+        return [f"{workspace}/gt"]
 
 
 def audit_report_to_dict(report: AuditReport) -> dict[str, Any]:
@@ -143,6 +153,11 @@ def audit_report_from_dict(data: dict[str, Any]) -> AuditReport:
             if isinstance(item, dict)
         ],
         integrity_status=integrity_status,
+        contract_audit_status=(
+            data.get("contract_audit_status")
+            if data.get("contract_audit_status") in {"aligned", "unknown", "needs_revision", "invalid"}
+            else "unknown"
+        ),
         integrity_findings=[
             {str(key): _coerce_record_value(value) for key, value in item.items()}
             for item in data.get("integrity_findings", [])

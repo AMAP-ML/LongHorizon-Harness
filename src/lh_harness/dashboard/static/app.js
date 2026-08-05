@@ -7,22 +7,32 @@
 //
 // The UI is bilingual (English default + Chinese) and supports light/dark
 // themes (following the system by default). Both preferences persist in
-// localStorage. Dynamic content produced by the harness itself (approval
-// titles/messages, quick-answers) stays in the harness language; only the
-// dashboard chrome is translated.
+// localStorage. Task prompts, model output, and artifact content stay verbatim.
 
 // ---------- i18n ----------
 const I18N = {
   en: {
     appTitle: "LongHorizon-Harness",
+    pageTitle: "LongHorizon-Harness Dashboard",
     runsCap: "Runs",
     statusLoading: "Loading…",
     connFail: "Connection failed",
-    statusPrefix: "Status ",
+    statusPrefix: "Status: ",
     running: "Running",
+    roundZero: "Round 0",
     roundPrefix: "Round ",
     runsEmpty: "Single run only (runs browsing disabled).",
     activityLead: "Live",
+    overviewTitle: "Run overview",
+    overviewStatus: "Status",
+    overviewProgress: "Progress",
+    overviewActive: "Now",
+    overviewAudit: "Latest audit",
+    overviewState: "Current verified state",
+    overviewEvidence: "Latest audit evidence",
+    overviewNoState: "No verified state has been recorded yet.",
+    overviewNoAudit: "Waiting for the first audit result.",
+    overviewIdle: "Waiting for the next role",
     placeholderTimeline: "Select a run on the left to view its serial Manager → Executor → Auditor timeline.",
     placeholderSelect: "Select a run on the left to view its serial timeline.",
     composerPlaceholder: "Inject an extra instruction for later models (non-blocking)…",
@@ -32,7 +42,6 @@ const I18N = {
     foldChildren: "Fold children",
     artifacts: "Artifacts",
     runningBadge: "Running",
-    inputPrompt: "Input Prompt",
     loadingTraj: "Loading trajectory…",
     noTraj: "No trajectory steps",
     roleManager: "Manager",
@@ -44,7 +53,31 @@ const I18N = {
     doingManager: "Planning this round's subtask and route",
     doingExec: "Executing the subtask and producing outputs",
     doingAudit: "Auditing output authenticity and integrity",
+    doingRepair: "Repairing the auditor report control headers",
     auditLabel: "Audit",
+    taskContract: "Task Contract",
+    auditReport: "Authoritative Audit Report",
+    harnessFeedback: "Harness Feedback",
+    languageTitle: "Switch language",
+    sendInstruction: "Send instruction",
+    closeDetails: "Close details",
+    managerQuestion: "Manager question:",
+    answerYes: "Yes",
+    answerNo: "No",
+    gateTitle_completed: "Task complete. Continue the run?",
+    gateMessage_completed: "The Manager confirmed task completion. Continue to add rounds and instructions, or end this run.",
+    gateTitle_max_rounds: "Round limit reached. Continue the run?",
+    gateMessage_max_rounds: "The configured round budget is exhausted before completion. Continue to add rounds, or end this run.",
+    gateTitle_needs_input: "Manager needs your decision",
+    gateMessage_needs_input: "The Manager needs input before it can continue. Answer below and continue, or stop this run.",
+    gateTitle_needs_human: "Task blocked; operator input required",
+    gateMessage_needs_human: "The Manager cannot proceed automatically. Add instructions and continue, or stop this run.",
+    gateTitle_repeated_failure: "Repeated failures require operator input",
+    gateMessage_repeated_failure: "Several consecutive rounds failed to make progress. Add instructions and continue, or stop this run.",
+    gateTitle_computer_use_plugin: "Codex Computer Use requires approval",
+    gateMessage_computer_use_plugin: "The Codex GUI executor needs the official computer-use@openai-bundled plugin. Approve the requested installation or enablement to continue; no model process will start before this check passes.",
+    gateInput_default: "Optional: add instructions for the next Manager round",
+    gateInput_needs_input: "Your answer, injected into the next Manager round",
     stSession: "Session",
     stThinking: "Thinking",
     stOutput: "Output",
@@ -69,6 +102,13 @@ const I18N = {
     continueParen: "(continue)",
     endRun: "End run",
     continueRun: "Continue run",
+    installContinue: "Install and continue",
+    enableContinue: "Enable and continue",
+    cancelTask: "Cancel task",
+    pluginInstalling: "Installing official plugin…",
+    pluginEnabling: "Enabling official plugin…",
+    pluginReady: "Plugin installed and enabled",
+    pluginFailed: "Plugin setup failed",
     recHuman: "Human confirmation",
     roundWord: "Round ",
     ev_role_harness_start: "Run started",
@@ -84,11 +124,48 @@ const I18N = {
     ev_human_abort: "Human abort",
     ev_managed_round_recorded: "Round recorded",
     ev_role_harness_done: "Run finished",
+    ev_role_harness_cancelled: "Run cancelled",
+    ev_human_continue_after_finish: "Run continued by operator",
+    status_complete: "Complete",
+    status_incomplete: "Incomplete",
+    status_blocked: "Blocked",
+    status_cancelled: "Cancelled",
+    status_done: "Done",
+    status_error: "Error",
+    status_timeout: "Timed out",
+    badge_gui: "GUI",
+    badge_cli: "CLI",
+    badge_done: "Done",
+    badge_blocked: "Blocked",
+    badge_invalid: "Invalid",
+    badge_ask: "Input needed",
+    badge_complete: "Complete",
+    badge_incomplete: "Incomplete",
+    badge_clean: "Clean",
+    badge_suspect: "Suspect",
+    badge_violation: "Violation",
+    badge_aligned: "Aligned",
+    badge_unknown: "Unknown",
+    badge_needs_revision: "Needs revision",
+    badge_cancelled: "Cancelled",
+    badge_error: "Error",
+    badge_timeout: "Timed out",
+    metaModel: "model",
+    metaTools: "tools",
+    metaThread: "thread",
+    metaMcp: "MCP",
+    metaTurns: "turns",
+    metaDuration: "duration",
+    metaCost: "cost",
+    metaInputTokens: "input tokens",
+    metaCachedInputTokens: "cached input tokens",
+    metaOutputTokens: "output tokens",
     tg_completed: "Run completion",
     tg_max_rounds: "Round limit",
     tg_needs_input: "Manager query",
     tg_needs_human: "Blocked intervention",
     tg_repeated_failure: "Repeated-failure intervention",
+    tg_computer_use_plugin: "GUI plugin authorization",
     langLabel: "EN",
     themeSystem: "System",
     themeLight: "Light",
@@ -96,14 +173,26 @@ const I18N = {
   },
   zh: {
     appTitle: "LongHorizon-Harness",
+    pageTitle: "LongHorizon-Harness Dashboard",
     runsCap: "运行记录",
     statusLoading: "加载中…",
     connFail: "连接失败",
-    statusPrefix: "状态 ",
+    statusPrefix: "状态：",
     running: "运行中",
+    roundZero: "第 0 轮",
     roundPrefix: "轮次 ",
     runsEmpty: "当前只有单个运行（未启用 runs 浏览）。",
     activityLead: "实时",
+    overviewTitle: "运行概览",
+    overviewStatus: "状态",
+    overviewProgress: "进度",
+    overviewActive: "当前阶段",
+    overviewAudit: "最近审计",
+    overviewState: "当前可信状态",
+    overviewEvidence: "最近审计证据",
+    overviewNoState: "尚未记录可信任务状态。",
+    overviewNoAudit: "正在等待首个审计结果。",
+    overviewIdle: "等待下一角色",
     placeholderTimeline: "选择左侧任一运行记录，查看串行的任务管理 → 执行 → 审计时间线。",
     placeholderSelect: "选择左侧任一运行记录，查看串行时间线。",
     composerPlaceholder: "向后续模型注入补充指令（不阻塞）…",
@@ -113,19 +202,42 @@ const I18N = {
     foldChildren: "折叠子级",
     artifacts: "产物文件",
     runningBadge: "运行中",
-    inputPrompt: "输入 Prompt",
     loadingTraj: "加载轨迹…",
     noTraj: "无轨迹步骤",
-    roleManager: "任务管理器",
-    roleAuditor: "审计",
+    roleManager: "Manager",
+    roleAuditor: "Auditor",
     roleFormatRepair: "格式修复",
-    roleExecGui: "GUI 执行",
-    roleExecCli: "CLI 执行",
-    roleExec: "任务执行",
-    doingManager: "正在制定本轮子任务与路由",
-    doingExec: "正在执行子任务并产出",
-    doingAudit: "正在校验产出的真实性与完整性",
-    auditLabel: "审计",
+    roleExecGui: "GUI Executor",
+    roleExecCli: "CLI Executor",
+    roleExec: "Executor",
+    doingManager: "正在规划本轮子任务与路由",
+    doingExec: "正在执行子任务并生成产出",
+    doingAudit: "正在审计产出的真实性与完整性",
+    doingRepair: "正在修复 Auditor 报告的控制头",
+    auditLabel: "Auditor",
+    taskContract: "任务契约",
+    auditReport: "权威审计报告",
+    harnessFeedback: "Harness 反馈",
+    languageTitle: "切换语言",
+    sendInstruction: "发送指令",
+    closeDetails: "关闭详情",
+    managerQuestion: "Manager 的问题：",
+    answerYes: "是",
+    answerNo: "否",
+    gateTitle_completed: "任务已完成，是否继续运行？",
+    gateMessage_completed: "Manager 已确认任务完成。可继续追加轮次和指令，或结束本次运行。",
+    gateTitle_max_rounds: "已到达轮次上限，是否继续运行？",
+    gateMessage_max_rounds: "任务尚未完成，但预设轮次预算已用完。可继续追加轮次，或结束本次运行。",
+    gateTitle_needs_input: "Manager 需要你的决定",
+    gateMessage_needs_input: "Manager 需要输入才能继续。请在下方回答并继续，或终止本次运行。",
+    gateTitle_needs_human: "任务已阻塞，需要人工介入",
+    gateMessage_needs_human: "Manager 当前无法自动推进。请补充指令后继续，或终止本次运行。",
+    gateTitle_repeated_failure: "连续失败，需要人工介入",
+    gateMessage_repeated_failure: "连续多轮未取得进展。请补充指令后继续，或终止本次运行。",
+    gateTitle_computer_use_plugin: "Codex Computer Use 插件需要授权",
+    gateMessage_computer_use_plugin: "Codex GUI 执行器需要官方 computer-use@openai-bundled 插件。允许安装或启用后才能继续；本项检查通过前不会启动任何模型进程。",
+    gateInput_default: "可选：补充指令，将注入下一轮 Manager",
+    gateInput_needs_input: "你的回答，将注入下一轮 Manager",
     stSession: "会话",
     stThinking: "思考",
     stOutput: "输出",
@@ -150,6 +262,13 @@ const I18N = {
     continueParen: "（继续）",
     endRun: "结束运行",
     continueRun: "继续运行",
+    installContinue: "安装并继续",
+    enableContinue: "启用并继续",
+    cancelTask: "取消任务",
+    pluginInstalling: "正在安装官方插件…",
+    pluginEnabling: "正在启用官方插件…",
+    pluginReady: "插件已安装并启用",
+    pluginFailed: "插件配置失败",
     recHuman: "人工确认",
     roundWord: "第 ",
     ev_role_harness_start: "任务启动",
@@ -165,11 +284,48 @@ const I18N = {
     ev_human_abort: "人工终止",
     ev_managed_round_recorded: "记录轮次",
     ev_role_harness_done: "任务结束",
+    ev_role_harness_cancelled: "任务已取消",
+    ev_human_continue_after_finish: "操作员继续运行",
+    status_complete: "已完成",
+    status_incomplete: "未完成",
+    status_blocked: "已阻塞",
+    status_cancelled: "已取消",
+    status_done: "已完成",
+    status_error: "错误",
+    status_timeout: "超时",
+    badge_gui: "GUI",
+    badge_cli: "CLI",
+    badge_done: "完成",
+    badge_blocked: "阻塞",
+    badge_invalid: "无效",
+    badge_ask: "需要输入",
+    badge_complete: "完成",
+    badge_incomplete: "未完成",
+    badge_clean: "正常",
+    badge_suspect: "可疑",
+    badge_violation: "违规",
+    badge_aligned: "已对齐",
+    badge_unknown: "未知",
+    badge_needs_revision: "需修订",
+    badge_cancelled: "已取消",
+    badge_error: "错误",
+    badge_timeout: "超时",
+    metaModel: "model",
+    metaTools: "工具",
+    metaThread: "thread",
+    metaMcp: "MCP",
+    metaTurns: "轮次",
+    metaDuration: "耗时",
+    metaCost: "费用",
+    metaInputTokens: "输入 token",
+    metaCachedInputTokens: "缓存输入 token",
+    metaOutputTokens: "输出 token",
     tg_completed: "运行完成确认",
     tg_max_rounds: "轮次上限确认",
     tg_needs_input: "任务管理器请示",
     tg_needs_human: "阻塞介入",
     tg_repeated_failure: "失败介入",
+    tg_computer_use_plugin: "GUI 插件授权",
     langLabel: "中",
     themeSystem: "跟随系统",
     themeLight: "亮色",
@@ -188,9 +344,56 @@ function t(key) {
   const table = I18N[LANG] || I18N.en;
   return table[key] != null ? table[key] : (I18N.en[key] != null ? I18N.en[key] : key);
 }
+function hasTranslation(key) {
+  return I18N.en[key] != null;
+}
+function statusLabel(status) {
+  const key = "status_" + String(status || "").toLowerCase();
+  return hasTranslation(key) ? t(key) : String(status || "");
+}
+function badgeLabel(value) {
+  const key = "badge_" + String(value || "").toLowerCase();
+  return hasTranslation(key) ? t(key) : String(value || "");
+}
+function eventRoleLabel(role) {
+  if (role === "manager") return t("roleManager");
+  if (role === "executor") return t("roleExec");
+  if (role === "auditor") return t("roleAuditor");
+  if (role === "auditor_format_repair") return t("roleFormatRepair");
+  if (role === "gui") return t("roleExecGui");
+  if (role === "cli") return t("roleExecCli");
+  return role || "";
+}
+function gateText(a, field) {
+  const trigger = (a.context && a.context.trigger) || "";
+  const key = "gate" + field + "_" + trigger;
+  return hasTranslation(key) ? t(key) : String(a[field.toLowerCase()] || "");
+}
+function approvalMessage(a) {
+  const trigger = (a.context && a.context.trigger) || "";
+  const base = gateText(a, "Message");
+  const question = String((a.context && a.context.question) || "").trim();
+  if (trigger === "needs_input" && question) return base + "\n\n" + t("managerQuestion") + "\n" + question;
+  return base;
+}
+function approvalInputLabel(a) {
+  const trigger = (a.context && a.context.trigger) || "";
+  if (trigger === "needs_input") return t("gateInput_needs_input");
+  if (hasTranslation("gateTitle_" + trigger)) return t("gateInput_default");
+  return a.input_label || t("inputOptional");
+}
+function quickAnswerLabel(answer) {
+  const normalized = String(answer || "").trim().toLowerCase();
+  if (["yes", "y", "是"].includes(normalized)) return t("answerYes");
+  if (["no", "n", "否"].includes(normalized)) return t("answerNo");
+  return answer;
+}
 // Round-aware label: "Round 3" (en) / "第 3 轮" (zh)
 function roundLabel(n) {
   return LANG === "zh" ? "第 " + n + " 轮" : "Round " + n;
+}
+function formatTime(value) {
+  return value.toLocaleTimeString(LANG === "zh" ? "zh-CN" : "en-US");
 }
 
 // ---------- theme ----------
@@ -223,7 +426,6 @@ let STREAM_SIG = null;          // signature of rendered timeline (avoid reflow)
 // element's own default applies. This persists across the 2s refresh.
 const FOLD = { on: new Set(), off: new Set() };
 const TRAJ = {};                // cache: `${round}:${role}` -> { steps } | { loading }
-const INPUTS = {};              // cache: `${round}:${role}` -> text | null | { loading }
 let DRAWER = null;              // { round } — the inline artifacts panel
 // Whether the timeline should stick to the bottom. Async content (images that
 // grow after load, streamed steps) would otherwise scroll out of view once it
@@ -260,7 +462,12 @@ function toggleDescendants(container) {
 const $ = (id) => document.getElementById(id);
 
 function esc(s) {
-  return String(s == null ? "" : s).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+  return String(s == null ? "" : s)
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#39;");
 }
 function el(tag, cls, html) {
   const n = document.createElement(tag);
@@ -272,8 +479,10 @@ function el(tag, cls, html) {
 // Apply translations to static [data-i18n] / [data-i18n-ph] elements.
 function applyStaticI18n() {
   document.documentElement.setAttribute("lang", LANG === "zh" ? "zh-CN" : "en");
+  document.title = t("pageTitle");
   document.querySelectorAll("[data-i18n]").forEach((n) => { n.textContent = t(n.dataset.i18n); });
   document.querySelectorAll("[data-i18n-ph]").forEach((n) => { n.setAttribute("placeholder", t(n.dataset.i18nPh)); });
+  document.querySelectorAll("[data-i18n-title]").forEach((n) => { n.setAttribute("title", t(n.dataset.i18nTitle)); });
   $("langBtn").textContent = t("langLabel");
   const mode = loadThemeMode();
   $("themeBtn").textContent = themeIcon(mode);
@@ -304,7 +513,13 @@ function render() {
   renderHead();
   renderActivity();
   renderStream();
+  renderControls();
   highlightDetailBtn();
+}
+
+function renderControls() {
+  const composer = document.querySelector(".composer");
+  if (composer) composer.style.display = STATE.control_enabled ? "" : "none";
 }
 
 function renderHead() {
@@ -312,9 +527,10 @@ function renderHead() {
   $("title").textContent = STATE.task ? shorten(STATE.task, 70) : t("appTitle");
   $("title").title = STATE.task || "";
   const pill = $("statusPill");
-  pill.textContent = t("statusPrefix") + (report.status || t("running"));
+  const status = report.status || "";
+  pill.textContent = t("statusPrefix") + (status ? statusLabel(status) : t("running"));
   pill.className = "pill " + statusClass(report.status);
-  $("roundPill").textContent = t("roundPrefix") + (STATE.round_count || 0);
+  $("roundPill").textContent = roundLabel(STATE.round_count || 0);
 }
 
 function shorten(s, n) {
@@ -338,7 +554,7 @@ function renderRuns() {
   runs.forEach((r) => {
     const item = el("div", "run-item" + (r.id === current ? " active" : ""));
     item.innerHTML = '<div class="rid">' + esc(r.id) + "</div>" +
-      (r.status ? '<div class="rst"><span class="badge ' + esc(r.status) + '">' + esc(r.status) + "</span></div>" : "");
+      (r.status ? '<div class="rst"><span class="badge ' + esc(r.status) + '">' + esc(statusLabel(r.status)) + "</span></div>" : "");
     item.addEventListener("click", () => selectRun(r.id));
     box.appendChild(item);
   });
@@ -354,7 +570,6 @@ async function selectRun(runId) {
   FOLD.on.clear();
   FOLD.off.clear();
   for (const k of Object.keys(TRAJ)) delete TRAJ[k];
-  for (const k of Object.keys(INPUTS)) delete INPUTS[k];
   closeDrawer();
   await fetchState();
 }
@@ -372,9 +587,9 @@ function renderActivity() {
   const ev = events[events.length - 1];
   bar.style.display = "";
   const label = eventLabel(ev.event);
-  const rnd = ev.round != null ? " · R" + ev.round : "";
-  const role = ev.role ? " · " + ev.role : "";
-  const time = ev.ts ? new Date(ev.ts * 1000).toLocaleTimeString() : "";
+  const rnd = ev.round != null ? " · " + roundLabel(ev.round) : "";
+  const role = ev.role ? " · " + eventRoleLabel(ev.role) : "";
+  const time = ev.ts ? formatTime(new Date(ev.ts * 1000)) : "";
   $("activityNow").innerHTML = '<span class="t">' + esc(time) + "</span>" + esc(label + rnd + role);
 }
 
@@ -382,29 +597,42 @@ function renderActivity() {
 const STEP_BADGE = { gui: "gui", cli: "cli", done: "done", blocked: "blocked", invalid: "invalid", ask: "ask" };
 
 function auditorHeads(report) {
-  // Parse leading "状态: X" / "完整性: Y" for compact badges.
+  // Parse the same bilingual three-line control header accepted by the harness.
   const out = {};
   (report || "").split("\n").slice(0, 4).forEach((ln) => {
-    let m = ln.match(/^\s*(?:状态|status)\s*[:：]\s*(complete|incomplete|blocked|完成|未完成|阻塞)/i);
-    if (m) out.status = m[1].toLowerCase().replace("完成", "complete").replace("未完成", "incomplete").replace("阻塞", "blocked");
-    m = ln.match(/^\s*(?:完整性|integrity)\s*[:：]\s*(clean|suspect|violation)/i);
+    let m = ln.match(/^\s*(?:\*\*)?\s*(?:状态|status)\s*[:：]\s*(complete|incomplete|blocked|完成|未完成|阻塞)\s*(?:\*\*)?\s*$/i);
+    if (m) out.status = ({ "完成": "complete", "未完成": "incomplete", "阻塞": "blocked" })[m[1]] || m[1].toLowerCase();
+    m = ln.match(/^\s*(?:\*\*)?\s*(?:完整性|integrity)\s*[:：]\s*(clean|suspect|violation)\s*(?:\*\*)?\s*$/i);
     if (m) out.integrity = m[1].toLowerCase();
+    m = ln.match(/^\s*(?:\*\*)?\s*(?:契约审计|contract(?:[_\s-]*audit)?)\s*[:：]\s*(aligned|unknown|needs[_\s-]*revision|invalid|对齐|未知|需修订|需要修订|无效)\s*(?:\*\*)?\s*$/i);
+    if (m) out.contract = ({ "对齐": "aligned", "未知": "unknown", "需修订": "needs_revision", "需要修订": "needs_revision", "无效": "invalid" })[m[1]] || m[1].toLowerCase().replace(/[\s-]+/g, "_");
   });
   return out;
 }
 
 function streamSignature() {
   const rounds = STATE.rounds || [];
+  const report = STATE.report || {};
+  const events = STATE.events || [];
   const parts = rounds.map((r) =>
     r.round_index + ":" + (r.in_progress ? "L" : "F") + ":" +
     (r.plan_text || "").length + "/" + (r.executor_output || "").length + "/" +
-    (r.auditor_report || "").length + "/" + (r.harness_feedback || "").length +
+    (r.auditor_report || "").length + "/" + (r.harness_feedback || "").length + "/" +
+    (r.task_contract || "").length + "/" + JSON.stringify(r.manager_status || {}) + "/" +
+    JSON.stringify(r.executor_status || {}) + "/" + JSON.stringify(r.auditor_status || {}) +
+    "/" + String(r.active_role) +
     "/" + (r.roles || []).join(",") +
     // include live trajectory byte sizes so streamed steps trigger a re-render
     "/" + JSON.stringify(r.role_sizes || {})
   );
-  const appr = (STATE.approvals || []).map((a) => a.approval_id + ":" + a.status).join(",");
-  return LANG + "|" + (STATE.current_run || "") + "|" + parts.join("|") + "|appr:" + appr;
+  const appr = (STATE.approvals || []).map((a) =>
+    a.approval_id + ":" + a.status + ":" + String((a.context && a.context.plugin_status) || "")
+  ).join(",");
+  const lastEvent = events.length ? JSON.stringify(events[events.length - 1]) : "";
+  return LANG + "|" + (STATE.current_run || "") + "|" + parts.join("|") +
+    "|status:" + String(report.status || "") +
+    "|state:" + String(report.current_task_state || "") +
+    "|event:" + lastEvent + "|appr:" + appr;
 }
 
 function renderStream() {
@@ -422,6 +650,9 @@ function renderStream() {
   // so a re-render triggered by streamed steps / late image loads stays put.
   const atBottom = STICK_BOTTOM || isNearBottom();
   host.innerHTML = "";
+
+  const overview = renderOverviewCard(rounds);
+  if (overview) host.appendChild(overview);
 
   // resolved human interactions are saved records — show each after its round.
   const approvals = STATE.approvals || [];
@@ -447,8 +678,8 @@ function renderStream() {
     }
   });
 
-  // pending approvals (interactive) at the end of the stream.
-  approvals.filter((a) => a.status === "pending").forEach((a) => host.appendChild(renderApproval(a)));
+  approvals.filter((a) => a.status === "pending").forEach((a) =>
+    host.appendChild(renderApproval(a, !!STATE.control_enabled)));
 
   if (atBottom) followBottom();
   // Content (images, fold-open animations, streamed steps) keeps growing after
@@ -456,13 +687,103 @@ function renderStream() {
   ensureStickObserver();
 }
 
+function effectiveRoundLimit() {
+  const report = (STATE && STATE.report) || {};
+  const events = (STATE && STATE.events) || [];
+  let limit = Number(report.max_rounds || 0);
+  events.forEach((event) => {
+    if (event.event === "role_harness_start") {
+      limit = Math.max(limit, Number(event.max_rounds || 0));
+    } else if (event.event === "human_continue_after_finish") {
+      limit = Math.max(limit, Number(event.round || 0) + Number(event.extra_rounds || 0));
+    }
+  });
+  return limit;
+}
+
+function latestAuditRound(rounds) {
+  for (let i = rounds.length - 1; i >= 0; i -= 1) {
+    if (rounds[i].auditor_report) return rounds[i];
+  }
+  return null;
+}
+
+function auditEvidenceSummary(report) {
+  const body = [];
+  let controlHeaders = 0;
+  String(report || "").split("\n").forEach((line) => {
+    const value = line.trim();
+    if (!value) return;
+    if (controlHeaders < 3 && /^(?:\*\*)?\s*(?:状态|status|完整性|integrity|契约审计|contract(?:[_\s-]*audit)?)\s*[:：]/i.test(value)) {
+      controlHeaders += 1;
+      return;
+    }
+    body.push(value);
+  });
+  return body.join(" ");
+}
+
+function overviewMetric(label, value, className) {
+  return '<div class="overview-metric' + (className ? " " + className : "") + '">' +
+    '<span class="overview-metric-label">' + esc(label) + '</span>' +
+    '<span class="overview-metric-value">' + esc(value) + "</span></div>";
+}
+
+function renderOverviewCard(rounds) {
+  if (!STATE) return null;
+  const report = STATE.report || {};
+  const last = rounds.length ? rounds[rounds.length - 1] : null;
+  const auditRound = latestAuditRound(rounds);
+  const audit = auditorHeads(auditRound && auditRound.auditor_report);
+  const status = report.status || "";
+  const limit = effectiveRoundLimit();
+  const currentRound = Number(STATE.round_count || (last && last.round_index) || 0);
+  const active = last && activeRole(last);
+  const events = STATE.events || [];
+  const latestEvent = events.length ? eventLabel(events[events.length - 1].event) : t("overviewIdle");
+  const progress = limit ? currentRound + " / " + limit : String(currentRound);
+  const activeText = active ? active.label + " · " + active.doing : latestEvent;
+  const auditText = auditRound
+    ? [audit.status && statusLabel(audit.status), audit.integrity && badgeLabel(audit.integrity), audit.contract && badgeLabel(audit.contract)].filter(Boolean).join(" · ")
+    : t("overviewNoAudit");
+  const stateText = report.current_task_state || (last && last.task_state) || t("overviewNoState");
+  const evidenceText = auditRound ? auditEvidenceSummary(auditRound.auditor_report) : t("overviewNoAudit");
+
+  const card = el("section", "overview-card");
+  card.innerHTML =
+    '<div class="overview-head"><span class="overview-title">' + esc(t("overviewTitle")) + '</span></div>' +
+    '<div class="overview-grid">' +
+      overviewMetric(t("overviewStatus"), status ? statusLabel(status) : t("running"), statusClass(status)) +
+      overviewMetric(t("overviewProgress"), progress, "") +
+      overviewMetric(t("overviewActive"), shorten(activeText, 72), active ? "live" : "") +
+      overviewMetric(t("overviewAudit"), shorten(auditText, 72), audit.status || "") +
+    '</div>' +
+    '<div class="overview-notes">' +
+      '<div class="overview-note"><span>' + esc(t("overviewState")) + '</span><p title="' + esc(shorten(stateText, 1200)) + '">' + esc(shorten(stateText, 260)) + '</p></div>' +
+      '<div class="overview-note"><span>' + esc(t("overviewEvidence")) + '</span><p title="' + esc(shorten(evidenceText, 1200)) + '">' + esc(shorten(evidenceText, 260)) + '</p></div>' +
+    '</div>';
+  return card;
+}
+
 // The role that is currently working in an in-progress round (its result text
 // has not been written to disk yet). Drives the live "thinking" indicator.
 function activeRole(r) {
   if (!r.in_progress) return null;
+  if (Object.prototype.hasOwnProperty.call(r, "active_role")) {
+    if (r.active_role === "manager") return { label: t("roleManager"), doing: t("doingManager") };
+    if (r.active_role === "executor") {
+      return { label: r.next_step === "gui" ? t("roleExecGui") : r.next_step === "cli" ? t("roleExecCli") : t("roleExec"), doing: t("doingExec") };
+    }
+    if (r.active_role === "auditor") return { label: t("auditLabel"), doing: t("doingAudit") };
+    if (r.active_role === "auditor_format_repair") return { label: t("roleFormatRepair"), doing: t("doingRepair") };
+    return null;
+  }
   if (!r.plan_text) return { label: t("roleManager"), doing: t("doingManager") };
   if ((r.next_step === "gui" || r.next_step === "cli") && !r.executor_output) {
     return { label: r.next_step === "gui" ? t("roleExecGui") : t("roleExecCli"), doing: t("doingExec") };
+  }
+  if ((r.roles || []).includes("auditor_format_repair") && !r.auditor_report) {
+    return { label: t("roleFormatRepair"), doing: t("doingRepair") };
   }
   if (r.executor_output && !r.auditor_report && r.next_step !== "done") {
     return { label: t("auditLabel"), doing: t("doingAudit") };
@@ -471,7 +792,7 @@ function activeRole(r) {
   return null;
 }
 
-const ROLE_ORDER = ["manager", "executor", "auditor_format_repair", "auditor"];
+const ROLE_ORDER = ["manager", "executor", "auditor", "auditor_format_repair"];
 
 function roleDisplayName(r, role) {
   if (role === "manager") return t("roleManager");
@@ -492,26 +813,31 @@ function roleAccentClass(r, role) {
 }
 
 function roleBadges(r, role) {
+  const status = role === "manager"
+    ? r.manager_status
+    : role === "executor"
+      ? r.executor_status
+      : role === "auditor_format_repair"
+        ? ((r.auditor_status || {}).format_repair_status || {})
+        : r.auditor_status;
+  const episode = status && status.status
+    ? '<span class="badge ' + esc(status.status) + '">' + esc(statusLabel(status.status)) + "</span>"
+    : "";
   if (role === "executor") {
-    return r.next_step ? '<span class="badge ' + (STEP_BADGE[r.next_step] || "") + '">' + esc(r.next_step) + "</span>" : "";
+    const route = r.next_step ? '<span class="badge ' + (STEP_BADGE[r.next_step] || "") + '">' + esc(badgeLabel(r.next_step)) + "</span>" : "";
+    return route + episode;
   }
   if (role === "auditor") {
     const vh = auditorHeads(r.auditor_report);
     return [
-      vh.status ? '<span class="badge ' + vh.status + '">' + vh.status + "</span>" : "",
-      vh.integrity ? '<span class="badge ' + vh.integrity + '">' + vh.integrity + "</span>" : "",
+      vh.status ? '<span class="badge ' + vh.status + '">' + esc(badgeLabel(vh.status)) + "</span>" : "",
+      vh.integrity ? '<span class="badge ' + vh.integrity + '">' + esc(badgeLabel(vh.integrity)) + "</span>" : "",
+      vh.contract ? '<span class="badge ' + vh.contract + '">' + esc(badgeLabel(vh.contract)) + "</span>" : "",
+      episode,
     ].join(" ");
   }
-  return "";
+  return episode;
 }
-
-// input prompt file per role (shown as a default-folded step)
-const ROLE_INPUT_FILE = {
-  manager: "manager_input.txt",
-  executor: "executor_prompt.txt",
-  auditor: "auditor_input.txt",
-  auditor_format_repair: "auditor_format_repair_input.txt",
-};
 
 // The whole round folds via its header, for quick jumping between rounds.
 function renderRound(r, isLastRound) {
@@ -520,11 +846,11 @@ function renderRound(r, isLastRound) {
   group.dataset.foldkey = roundKey;
   const open = isOpen(roundKey, true);
   if (open) group.classList.add("open");
-  const stepBadge = r.next_step ? '<span class="badge ' + (STEP_BADGE[r.next_step] || "") + '">' + esc(r.next_step) + "</span>" : "";
+  const stepBadge = r.next_step ? '<span class="badge ' + (STEP_BADGE[r.next_step] || "") + '">' + esc(badgeLabel(r.next_step)) + "</span>" : "";
   const liveBadge = r.in_progress ? '<span class="badge live"><span class="live-dot"></span>' + esc(t("runningBadge")) + "</span>" : "";
 
   const rule = el("div", "round-rule",
-    '<span class="chev">▶</span><span class="lbl">Round ' + r.round_index + "</span>" + stepBadge + liveBadge);
+    '<span class="chev">▶</span><span class="lbl">' + esc(roundLabel(r.round_index)) + "</span>" + stepBadge + liveBadge);
   const actions = el("div", "round-actions");
   const foldAll = el("button", "rbtn ghost", esc(t("foldChildren")));
   foldAll.addEventListener("click", (e) => { e.stopPropagation(); toggleDescendants(group); });
@@ -546,6 +872,22 @@ function renderRound(r, isLastRound) {
   const presentRoles = ROLE_ORDER.filter((role) => (r.roles || []).includes(role));
   presentRoles.forEach((role, i) =>
     body.appendChild(renderRoleSection(r, role, isLastRound && i === presentRoles.length - 1)));
+
+  if (r.task_contract) {
+    body.appendChild(foldBlock(
+      r.round_index + ":contract", "contract", t("taskContract"), brief(r.task_contract),
+      '<div class="tp">' + esc(r.task_contract) + "</div>", false));
+  }
+  if (r.auditor_report) {
+    body.appendChild(foldBlock(
+      r.round_index + ":audit-report", "report", t("auditReport"), brief(r.auditor_report),
+      '<div class="tp">' + esc(r.auditor_report) + "</div>", false));
+  }
+  if (r.harness_feedback) {
+    body.appendChild(foldBlock(
+      r.round_index + ":feedback", "err", t("harnessFeedback"), brief(r.harness_feedback),
+      '<div class="tp">' + esc(r.harness_feedback) + "</div>", false));
+  }
 
   // live status while a role is running (no trajectory saved yet)
   const active = activeRole(r);
@@ -586,6 +928,12 @@ function renderRoleSection(r, role, isLastRole) {
   const box = el("div", "tsteps");
   bodyWrap.appendChild(box);
   sec.appendChild(head);
+  const summaryText = roleResultSummary(r, role);
+  if (summaryText) {
+    const summary = el("div", "role-summary", esc(shorten(summaryText, 220)));
+    summary.title = shorten(summaryText, 1200);
+    sec.appendChild(summary);
+  }
   sec.appendChild(bodyWrap);
   head.addEventListener("click", (e) => {
     if (e.target.closest(".role-actions")) return;
@@ -593,10 +941,6 @@ function renderRoleSection(r, role, isLastRole) {
     sec.classList.toggle("open", now);
     setOpen(secKey, now);
   });
-
-  // input prompt as the first step, folded by default.
-  const promptStep = renderPromptStep(r, role);
-  if (promptStep) box.appendChild(promptStep);
 
   const key = r.round_index + ":" + role;
   const size = (r.role_sizes || {})[role] || 0;
@@ -617,15 +961,16 @@ function renderRoleSection(r, role, isLastRole) {
   } else {
     box.appendChild(el("div", "tloading", '<span class="dots"><i></i><i></i><i></i></span>' + esc(t("loadingTraj"))));
   }
+
   return sec;
 }
 
-function renderPromptStep(r, role) {
-  const key = r.round_index + ":" + role;
-  const cached = INPUTS[key];
-  if (cached === undefined) { ensureInput(r.round_index, role); return null; }
-  if (cached == null || (cached.loading)) return null; // no input file, or still loading
-  return foldBlock(r.round_index + ":" + role + ":prompt", "prompt", t("inputPrompt"), brief(cached), '<div class="tp">' + esc(cached) + "</div>", false);
+function roleResultSummary(r, role) {
+  if (role === "manager") return r.plan_text || "";
+  if (role === "executor") return r.executor_output || "";
+  if (role === "auditor") return auditEvidenceSummary(r.auditor_report);
+  if (role === "auditor_format_repair") return r.auditor_report || "";
+  return "";
 }
 
 function brief(t2, n) {
@@ -635,8 +980,9 @@ function brief(t2, n) {
 // Turn one parsed trajectory step into { label, sum, body }.
 function stepBits(s) {
   if (s.kind === "session") {
-    return { label: t("stSession"), sum: "model=" + (s.model || "") + " · tools=" + (s.tool_count || 0),
-      body: '<div class="meta">model=' + esc(s.model || "") + " · mcp=" + esc((s.mcp_servers || []).join(",")) + " · tools=" + (s.tool_count || 0) + "</div>" };
+    const thread = s.thread_id ? " · " + t("metaThread") + "=" + s.thread_id : "";
+    return { label: t("stSession"), sum: t("metaModel") + "=" + (s.model || "") + " · " + t("metaTools") + "=" + (s.tool_count || 0) + thread,
+      body: '<div class="meta">' + esc(t("metaModel")) + "=" + esc(s.model || "") + " · " + esc(t("metaMcp")) + "=" + esc((s.mcp_servers || []).join(",")) + " · " + esc(t("metaTools")) + "=" + (s.tool_count || 0) + esc(thread) + "</div>" };
   }
   if (s.kind === "thinking") return { label: t("stThinking"), sum: brief(s.text), body: '<div class="tp">' + esc(s.text) + "</div>" };
   if (s.kind === "text") return { label: t("stOutput"), sum: brief(s.text), body: '<div class="tp">' + esc(s.text) + "</div>" };
@@ -652,11 +998,18 @@ function stepBits(s) {
     return { label: s.is_error ? t("stToolResultErr") : t("stToolResult"), sum, body: body || '<div class="tempty">' + esc(t("stNoContent")) + "</div>" };
   }
   if (s.kind === "result") {
+    // Run metadata differs per agent backend (Claude reports turns/cost, Codex
+    // does not), so only render the fields this step actually carries.
+    const meta = [];
+    if (s.num_turns != null) meta.push(t("metaTurns") + "=" + s.num_turns);
+    if (s.duration_ms != null) meta.push(t("metaDuration") + "=" + s.duration_ms + "ms");
+    if (s.cost_usd != null) meta.push(t("metaCost") + "=$" + s.cost_usd);
+    if (s.input_tokens != null) meta.push(t("metaInputTokens") + "=" + s.input_tokens);
+    if (s.cached_input_tokens != null) meta.push(t("metaCachedInputTokens") + "=" + s.cached_input_tokens);
+    if (s.output_tokens != null) meta.push(t("metaOutputTokens") + "=" + s.output_tokens);
     return { label: t("stFinalResult"), sum: brief(s.text),
       body: '<div class="tp">' + esc(s.text) + "</div>" +
-        '<div class="meta">turns=' + (s.num_turns != null ? s.num_turns : "-") +
-        (s.duration_ms != null ? " · " + s.duration_ms + "ms" : "") +
-        (s.cost_usd != null ? " · $" + s.cost_usd : "") + "</div>" };
+        (meta.length ? '<div class="meta">' + esc(meta.join(" · ")) + "</div>" : "") };
   }
   return { label: s.kind, sum: brief(s.text || ""), body: '<div class="tp">' + esc(s.text || "") + "</div>" };
 }
@@ -686,10 +1039,11 @@ function foldBlock(key, kindCls, label, sum, bodyHtml, defOpen) {
 
 // The session step is default info — always shown, never collapsible.
 function sessionRow(s) {
+  const thread = s.thread_id ? " · " + t("metaThread") + "=" + s.thread_id : "";
   return el("div", "tstep session static",
     '<div class="tstep-head static"><span class="tk">' + esc(t("stSession")) + '</span>' +
-    '<span class="tsum">model=' + esc(s.model || "") + " · mcp=" + esc((s.mcp_servers || []).join(",")) +
-    " · tools=" + (s.tool_count || 0) + "</span></div>");
+    '<span class="tsum">' + esc(t("metaModel")) + "=" + esc(s.model || "") + " · " + esc(t("metaMcp")) + "=" + esc((s.mcp_servers || []).join(",")) +
+    " · " + esc(t("metaTools")) + "=" + (s.tool_count || 0) + esc(thread) + "</span></div>");
 }
 
 // A single trajectory step. Every step defaults to folded except the very last
@@ -719,49 +1073,38 @@ async function ensureTraj(round, role, sig) {
   render();
 }
 
-// Fetch a role's input prompt file once (immutable). Missing file -> null.
-async function ensureInput(round, role) {
-  const key = round + ":" + role;
-  if (INPUTS[key] !== undefined) return;
-  const file = ROLE_INPUT_FILE[role];
-  if (!file) { INPUTS[key] = null; return; }
-  INPUTS[key] = { loading: true };
-  try {
-    const res = await fetch("/api/round/" + round + "/" + encodeURIComponent(file));
-    INPUTS[key] = res.ok ? await res.text() : null;
-  } catch (e) {
-    INPUTS[key] = null;
-  }
-  STREAM_SIG = null;
-  render();
-}
-
 // Render an approval as a question + option buttons. Option buttons are driven
 // by `a.options` ([{value,label,style}]); known machine values (continue/stop)
 // are localized so the buttons follow the dashboard language. `a.answers`
 // (["是","否",...]) are harness-produced quick answers and shown verbatim.
-function optionLabel(opt) {
+function optionLabel(opt, isDecision) {
   if (opt.value === "continue") return t("continueRun");
-  if (opt.value === "stop") return opt.style === "danger" ? t("stopRun") : t("endRun");
+  if (opt.value === "stop") return isDecision ? t("endRun") : t("stopRun");
+  if (opt.value === "install") return t("installContinue");
+  if (opt.value === "enable") return t("enableContinue");
+  if (opt.value === "cancel") return t("cancelTask");
   return opt.label || opt.value;
 }
-function renderApproval(a) {
+function renderApproval(a, interactive = true) {
   const trigger = (a.context && a.context.trigger) || "";
   const isDecision = trigger === "completed" || trigger === "max_rounds";
-  const icon = isDecision ? "⏸" : trigger === "needs_input" ? "❓" : "⚠";
+  const isPluginSetup = trigger === "computer_use_plugin";
+  const icon = isPluginSetup ? "🖥" : isDecision ? "⏸" : trigger === "needs_input" ? "❓" : "⚠";
   const prefix = a.round_index ? roundLabel(a.round_index) + " · " : "";
-  const card = el("div", "approval-card" + (isDecision ? " end" : ""));
+  const card = el("div", "approval-card" + (isDecision || isPluginSetup ? " end" : ""));
 
-  const head = el("div", "h", icon + " " + prefix + esc(a.title || t("needHuman")));
+  const head = el("div", "h", icon + " " + prefix + esc(gateText(a, "Title") || t("needHuman")));
   card.appendChild(head);
-  if (a.message) card.appendChild(el("div", "reason", esc(a.message)));
+  const message = approvalMessage(a);
+  if (message) card.appendChild(el("div", "reason", esc(message)));
 
-  // quick-answer buttons (e.g. 是 / 否) — one click continues with that answer.
+  if (!interactive) return card;
+
   const answers = a.answers || [];
   if (answers.length) {
     const arow = el("div", "answer-row");
     answers.forEach((ans) => {
-      const b = el("button", "answer-btn", esc(ans));
+      const b = el("button", "answer-btn", esc(quickAnswerLabel(ans)));
       b.addEventListener("click", () => resolveApproval(a.approval_id, "continue", ans));
       arow.appendChild(b);
     });
@@ -771,7 +1114,7 @@ function renderApproval(a) {
   if (a.allow_input !== false) {
     const ta = el("textarea");
     ta.dataset.appr = a.approval_id;
-    ta.placeholder = a.input_label || t("inputOptional");
+    ta.placeholder = approvalInputLabel(a);
     card.appendChild(ta);
   }
 
@@ -781,7 +1124,7 @@ function renderApproval(a) {
     : [{ value: "continue", label: t("optContinue"), style: "primary" }];
   options.forEach((opt) => {
     const cls = "btn " + (opt.style === "danger" ? "danger" : opt.style === "primary" ? "approve" : "ghost");
-    const b = el("button", cls, esc(optionLabel(opt)));
+    const b = el("button", cls, esc(optionLabel(opt, isDecision)));
     b.addEventListener("click", () => resolveApproval(a.approval_id, opt.value));
     row.appendChild(b);
   });
@@ -811,26 +1154,45 @@ function triggerLabel(trigger) {
 // what was asked and what you chose / answered.
 function renderApprovalRecord(a) {
   const trigger = (a.context && a.context.trigger) || "";
+  const context = a.context || {};
   const card = el("div", "approval-record");
   const tag = triggerLabel(trigger);
   const answer = (a.user_input || "").trim();
   const stopped = a.action === "stop";
+  const isDecision = trigger === "completed" || trigger === "max_rounds";
+  const isPluginSetup = trigger === "computer_use_plugin";
   const question = (a.context && a.context.question) || "";
 
   let html = '<div class="rec-head">' +
     '<span class="rec-tag">✓ ' + esc(tag) + "</span>" +
     (a.round_index ? '<span class="rec-round">' + esc(roundLabel(a.round_index)) + "</span>" : "") +
     "</div>";
-  const prompt = question || a.message || "";
+  const prompt = question || approvalMessage(a);
   if (prompt) html += '<div class="rec-q">' + esc(prompt) + "</div>";
 
-  if (trigger === "needs_input") {
+  if (isPluginSetup) {
+    const cancelled = a.action === "cancel";
+    const actionLabel = a.action === "enable" ? t("enableContinue") :
+      a.action === "install" ? t("installContinue") : t("cancelTask");
+    html += '<div class="rec-ans"><span class="rec-lbl">' + esc(t("yourChoice")) + "</span>" + esc(actionLabel) + "</div>";
+    if (!cancelled) {
+      const pluginStatus = context.plugin_status || "";
+      const statusLabel = pluginStatus === "installing" ? t("pluginInstalling") :
+        pluginStatus === "enabling" ? t("pluginEnabling") :
+        pluginStatus === "ready" ? t("pluginReady") :
+        pluginStatus === "failed" ? t("pluginFailed") : "";
+      if (statusLabel) html += '<div class="rec-ans"><span class="rec-lbl">' + esc(t("overviewStatus")) + "</span>" + esc(statusLabel) + "</div>";
+      if (pluginStatus === "failed" && context.plugin_status_message) {
+        html += '<div class="rec-q">' + esc(context.plugin_status_message) + "</div>";
+      }
+    }
+  } else if (trigger === "needs_input") {
     // an "ask" gate: the answer is the point.
     html += '<div class="rec-ans"><span class="rec-lbl">' + esc(t("yourAnswer")) + "</span>" +
       esc(answer || (stopped ? t("stopRun") : t("continueParen"))) + "</div>";
   } else {
     html += '<div class="rec-ans"><span class="rec-lbl">' + esc(t("yourChoice")) + "</span>" +
-      (stopped ? t("endRun") : t("continueRun")) + "</div>";
+      (stopped ? (isDecision ? t("endRun") : t("stopRun")) : t("continueRun")) + "</div>";
     if (answer) html += '<div class="rec-ans"><span class="rec-lbl">' + esc(t("extraInstr")) + "</span>" + esc(answer) + "</div>";
   }
   card.innerHTML = html;
@@ -900,7 +1262,7 @@ function openDrawer(round) {
   if (DRAWER && DRAWER.round === round) { closeDrawer(); return; }
   DRAWER = { round };
   document.querySelector(".app").classList.add("detail-open");
-  $("detailTitle").textContent = "Round " + round + t("artifactsSuffix");
+  $("detailTitle").textContent = roundLabel(round) + t("artifactsSuffix");
   $("detailTabs").innerHTML = "";
   highlightDetailBtn();
   loadDrawerArtifacts();
@@ -1030,6 +1392,6 @@ $("injectText").addEventListener("keydown", (e) => {
   });
 })();
 
-setInterval(() => { $("clock").textContent = new Date().toLocaleTimeString(); }, 1000);
+setInterval(() => { $("clock").textContent = formatTime(new Date()); }, 1000);
 setInterval(fetchState, 2000);
 fetchState();

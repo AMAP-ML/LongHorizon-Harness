@@ -326,6 +326,32 @@ body {
 .stream-inner { max-width: 1080px; margin: 0 auto; padding: 0 34px; }
 .placeholder { color: var(--muted); text-align: center; margin-top: 64px; }
 
+/* At-a-glance run state. This stays above the detailed role trajectory so an
+   operator can understand progress without reading prompts or raw JSONL. */
+.overview-card {
+  margin-bottom: 28px;
+  padding: 18px;
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-top: 3px solid var(--accent);
+  border-radius: var(--radius);
+  box-shadow: var(--shadow-md);
+}
+.overview-head { display: flex; align-items: center; margin-bottom: 13px; }
+.overview-title { font-family: var(--serif); font-size: 16px; font-weight: 700; color: var(--ink-strong); }
+.overview-grid { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 9px; }
+.overview-metric { min-width: 0; padding: 10px 11px; border: 1px solid var(--line); border-radius: var(--radius-sm); background: var(--surface-2); }
+.overview-metric-label { display: block; margin-bottom: 3px; font-family: var(--mono); font-size: 9.5px; letter-spacing: 0.06em; text-transform: uppercase; color: var(--muted); }
+.overview-metric-value { display: block; overflow: hidden; font-size: 12px; font-weight: 700; color: var(--ink-strong); text-overflow: ellipsis; white-space: nowrap; }
+.overview-metric.ok .overview-metric-value, .overview-metric.complete .overview-metric-value { color: var(--done); }
+.overview-metric.bad .overview-metric-value, .overview-metric.blocked .overview-metric-value, .overview-metric.incomplete .overview-metric-value { color: var(--bad); }
+.overview-metric.warn .overview-metric-value { color: var(--warn); }
+.overview-metric.live .overview-metric-value { color: var(--gui); }
+.overview-notes { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 9px; margin-top: 9px; }
+.overview-note { min-width: 0; padding: 11px 12px; border: 1px solid var(--line); border-radius: var(--radius-sm); }
+.overview-note > span { display: block; margin-bottom: 4px; font-size: 11px; font-weight: 700; color: var(--ink-strong); }
+.overview-note p { margin: 0; color: var(--ink-soft); font-size: 12px; line-height: 1.55; }
+
 /* round group — the whole round folds via its header */
 .round-group { margin-bottom: 32px; }
 .round-rule { display: flex; align-items: center; gap: 10px; margin: 0 0 16px; cursor: pointer; user-select: none; }
@@ -415,6 +441,15 @@ body {
 .role-head .chev { color: var(--muted); font-size: 10px; width: 10px; flex: none; transition: transform 0.2s ease; display: inline-block; }
 .role-sec.open > .role-head .chev { transform: rotate(90deg); }
 .role-head .rname { font-size: 12.5px; font-weight: 700; color: var(--ink-strong); }
+.role-summary {
+  margin: -2px 14px 10px 32px;
+  color: var(--ink-soft);
+  font-size: 12px;
+  line-height: 1.55;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
 
 .role-body-wrap { display: grid; grid-template-rows: 0fr; transition: grid-template-rows 0.24s cubic-bezier(0.4, 0, 0.2, 1); }
 .role-sec.open > .role-body-wrap { grid-template-rows: 1fr; }
@@ -476,7 +511,6 @@ body {
 .tstep.tool_result.err .tk { color: var(--bad); }
 .tstep.result .tk { color: var(--done); }
 .tstep.session .tk { color: var(--muted); }
-.tstep.prompt .tk { color: var(--accent-ink); }
 
 /* an event block in the stream (manage / execute / audit) */
 .event { margin-bottom: 14px; }
@@ -517,7 +551,9 @@ body {
 .badge.blocked, .badge.invalid, .badge.incomplete { background: var(--bad-soft); color: var(--bad); border-color: transparent; }
 .badge.ask { background: var(--accent-soft); color: var(--accent-ink); border-color: transparent; }
 .badge.complete, .badge.clean { background: var(--done-soft); color: var(--done); border-color: transparent; }
-.badge.suspect, .badge.violation { background: var(--warn-soft); color: var(--warn); border-color: transparent; }
+.badge.aligned { background: var(--done-soft); color: var(--done); border-color: transparent; }
+.badge.suspect, .badge.violation, .badge.unknown, .badge.cancelled { background: var(--warn-soft); color: var(--warn); border-color: transparent; }
+.badge.error, .badge.timeout, .badge.needs_revision { background: var(--bad-soft); color: var(--bad); border-color: transparent; }
 .badge.live { background: var(--gui-soft); color: var(--gui); border-color: transparent; display: inline-flex; align-items: center; gap: 5px; }
 .live-dot { width: 7px; height: 7px; border-radius: 50%; background: var(--gui); animation: pulse 1.2s infinite; }
 @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.25; } }
@@ -696,4 +732,6 @@ pre.block { background: var(--code-bg); border: 1px solid var(--line); border-ra
   .app { grid-template-columns: 0px minmax(0, 1fr) 0px; }
   .app.detail-open { grid-template-columns: 0px 0px minmax(0, 1fr); }
   .rail { display: none; }
+  .stream-inner { padding: 0 16px; }
+  .overview-grid, .overview-notes { grid-template-columns: 1fr; }
 }
