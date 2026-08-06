@@ -1,6 +1,6 @@
 "use strict";
 
-// LongHorizon-Harness Dashboard — Codex-style serial timeline front-end.
+// LongHorizon-Harness Dashboard: Codex-style serial timeline front-end.
 // The harness is strictly serial, so the run renders as one top-to-bottom
 // stream: task prompt -> per-round (manage / execute / audit) events.
 // A right drawer shows full trajectories and raw artifacts on demand.
@@ -374,7 +374,9 @@ function approvalMessage(a) {
   const base = gateText(a, "Message");
   const question = String((a.context && a.context.question) || "").trim();
   if (trigger === "needs_input" && question) return base + "\n\n" + t("managerQuestion") + "\n" + question;
-  return base;
+  // The localized text is generic; `detail` carries why this gate fired.
+  const detail = String((a.context && a.context.detail) || "").trim();
+  return detail ? base + "\n\n" + detail : base;
 }
 function approvalInputLabel(a) {
   const trigger = (a.context && a.context.trigger) || "";
@@ -426,7 +428,7 @@ let STREAM_SIG = null;          // signature of rendered timeline (avoid reflow)
 // element's own default applies. This persists across the 2s refresh.
 const FOLD = { on: new Set(), off: new Set() };
 const TRAJ = {};                // cache: `${round}:${role}` -> { steps } | { loading }
-let DRAWER = null;              // { round } — the inline artifacts panel
+let DRAWER = null;              // { round }: the inline artifacts panel
 // Whether the timeline should stick to the bottom. Async content (images that
 // grow after load, streamed steps) would otherwise scroll out of view once it
 // finishes loading. The scroll listener flips this off when the user scrolls up
@@ -444,7 +446,7 @@ function setOpen(key, open) {
 }
 
 // "Fold children": fold (or, if all already folded, unfold) only the DIRECT
-// collapsible children of `container` — not grandchildren — and without
+// collapsible children of `container` (not grandchildren) and without
 // touching the container's own fold state. A node counts as a direct child when
 // its nearest [data-foldkey] ancestor is `container` itself.
 function toggleDescendants(container) {
@@ -596,17 +598,27 @@ function renderActivity() {
 // ---------- serial timeline ----------
 const STEP_BADGE = { gui: "gui", cli: "cli", done: "done", blocked: "blocked", invalid: "invalid", ask: "ask" };
 
+// Mirror of the harness control-header parser: the status, integrity and
+// contract lines must be the FIRST THREE NONEMPTY lines, each in its own slot.
+// Scanning physical lines instead would let a body line like "Integrity:
+// violation" show a badge the harness never accepted.
+const HEAD_SLOTS = [
+  ["status", /^\s*(?:\*\*)?\s*(?:状态|status)\s*[:：]\s*(complete|incomplete|blocked|完成|未完成|阻塞)\s*(?:\*\*)?\s*$/i,
+    { "完成": "complete", "未完成": "incomplete", "阻塞": "blocked" }],
+  ["integrity", /^\s*(?:\*\*)?\s*(?:完整性|integrity)\s*[:：]\s*(clean|suspect|violation)\s*(?:\*\*)?\s*$/i, {}],
+  ["contract", /^\s*(?:\*\*)?\s*(?:契约审计|contract(?:[_\s-]*audit)?)\s*[:：]\s*(aligned|unknown|needs[_\s-]*revision|invalid|对齐|未知|需修订|需要修订|无效)\s*(?:\*\*)?\s*$/i,
+    { "对齐": "aligned", "未知": "unknown", "需修订": "needs_revision", "需要修订": "needs_revision", "无效": "invalid" }],
+];
+
 function auditorHeads(report) {
-  // Parse the same bilingual three-line control header accepted by the harness.
   const out = {};
-  (report || "").split("\n").slice(0, 4).forEach((ln) => {
-    let m = ln.match(/^\s*(?:\*\*)?\s*(?:状态|status)\s*[:：]\s*(complete|incomplete|blocked|完成|未完成|阻塞)\s*(?:\*\*)?\s*$/i);
-    if (m) out.status = ({ "完成": "complete", "未完成": "incomplete", "阻塞": "blocked" })[m[1]] || m[1].toLowerCase();
-    m = ln.match(/^\s*(?:\*\*)?\s*(?:完整性|integrity)\s*[:：]\s*(clean|suspect|violation)\s*(?:\*\*)?\s*$/i);
-    if (m) out.integrity = m[1].toLowerCase();
-    m = ln.match(/^\s*(?:\*\*)?\s*(?:契约审计|contract(?:[_\s-]*audit)?)\s*[:：]\s*(aligned|unknown|needs[_\s-]*revision|invalid|对齐|未知|需修订|需要修订|无效)\s*(?:\*\*)?\s*$/i);
-    if (m) out.contract = ({ "对齐": "aligned", "未知": "unknown", "需修订": "needs_revision", "需要修订": "needs_revision", "无效": "invalid" })[m[1]] || m[1].toLowerCase().replace(/[\s-]+/g, "_");
-  });
+  const lines = String(report || "").split("\n").map((ln) => ln.trim()).filter((ln) => ln);
+  for (let i = 0; i < HEAD_SLOTS.length && i < lines.length; i += 1) {
+    const [key, re, zhMap] = HEAD_SLOTS[i];
+    const m = lines[i].match(re);
+    if (!m) break; // a malformed slot invalidates the rest, as in the harness
+    out[key] = zhMap[m[1]] || m[1].toLowerCase().replace(/[\s-]+/g, "_");
+  }
   return out;
 }
 
@@ -654,7 +666,7 @@ function renderStream() {
   const overview = renderOverviewCard(rounds);
   if (overview) host.appendChild(overview);
 
-  // resolved human interactions are saved records — show each after its round.
+  // resolved human interactions are saved records, so show each after its round.
   const approvals = STATE.approvals || [];
   const resolvedByRound = {};
   approvals.filter((a) => a.status === "resolved").forEach((a) => {
@@ -909,7 +921,7 @@ function renderRound(r, isLastRound) {
 }
 
 // Each role section (Manager / Executor / Auditor) folds via its header.
-// `isLastRole` marks the round's final role — only there does the last step
+// `isLastRole` marks the round's final role; only there does the last step
 // default to expanded.
 function renderRoleSection(r, role, isLastRole) {
   const secKey = "sec:" + r.round_index + ":" + role;
@@ -1037,7 +1049,7 @@ function foldBlock(key, kindCls, label, sum, bodyHtml, defOpen) {
   return wrap;
 }
 
-// The session step is default info — always shown, never collapsible.
+// The session step is default info: always shown, never collapsible.
 function sessionRow(s) {
   const thread = s.thread_id ? " · " + t("metaThread") + "=" + s.thread_id : "";
   return el("div", "tstep session static",
@@ -1362,7 +1374,7 @@ $("injectText").addEventListener("keydown", (e) => {
 // The subtle bug this guards against: a large screenshot finishing loading
 // grows scrollHeight, which makes the distance-from-bottom jump. If we decided
 // "not following" from that distance alone (isNearBottom()), a real image would
-// silently disable auto-follow forever — exactly the "real images break it"
+// silently disable auto-follow forever, exactly the "real images break it"
 // symptom. So we only RELEASE follow when scrollTop actually DECREASES (a
 // genuine upward move by the user); content growth and image loads never
 // decrease scrollTop. Returning to the bottom re-enables following.

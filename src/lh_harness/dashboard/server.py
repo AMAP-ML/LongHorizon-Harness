@@ -1,7 +1,7 @@
 """Standalone HTTP server for the LongHorizon-Harness dashboard.
 
 Uses only the Python standard library (no extra dependencies). All front-end
-assets live as static files under ``static/`` (index.html, style.css, app.js) —
+assets live as static files under ``static/`` (index.html, style.css, app.js);
 no HTML/CSS/JS is embedded in Python. Serves:
 
 * ``GET  /`` and ``/static/*``            -> static front-end assets

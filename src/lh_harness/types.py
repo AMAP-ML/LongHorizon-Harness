@@ -98,22 +98,6 @@ class HarnessConfig:
     # OSWorldv2-compatible role prompts and operator-facing control headers.
     prompt_language: PromptLanguage = "en"
 
-    def effective_ignored_path_prefixes(self) -> list[str]:
-        workspace = self.workspace_path.rstrip("/")
-        harness = self.harness_dir.rstrip("/")
-        home = Path.home()
-        return [
-            harness,
-            f"{workspace}/.harness",
-            f"{workspace}/gt",
-            str(home / ".claude"),
-            str(home / ".codex"),
-        ]
-
-    def ground_truth_path_prefixes(self) -> list[str]:
-        workspace = self.workspace_path.rstrip("/")
-        return [f"{workspace}/gt"]
-
 
 def audit_report_to_dict(report: AuditReport) -> dict[str, Any]:
     return asdict(report)

@@ -1,7 +1,7 @@
 """Rule engine for the "repeated failure" human-review trigger.
 
 Completion and max-rounds are decided by the manager directly; these rules
-only cover the *special* condition — too many failing rounds in a row. Each rule
+only cover the *special* condition, too many failing rounds in a row. Each rule
 inspects the current round index plus recorded rounds and returns a
 human-readable reason when human review should be requested, or ``None``.
 """
@@ -52,8 +52,8 @@ def rule_repeated_failure(limit: int) -> Rule:
                 break
         if streak >= limit:
             return (
-                f"连续 {streak} 轮失败（任务管理无效 / 完成被拒 / 任务报错，阈值 {limit}），"
-                "可能陷入循环，请人工介入。"
+                f"{streak} consecutive rounds failed (invalid route / rejected completion / "
+                f"episode error; threshold {limit}). The run may be looping; operator input is requested."
             )
         return None
 

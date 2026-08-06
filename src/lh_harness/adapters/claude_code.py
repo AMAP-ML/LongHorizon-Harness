@@ -2,9 +2,24 @@ from __future__ import annotations
 
 import os
 import shlex
+from pathlib import Path
 
 from ..agent_logs import visible_output as extract_claude_visible_output
-from ..types import DEFAULT_CLAUDE_MODEL, DEFAULT_TMP_DIR, DEFAULT_WORKSPACE_PATH
+from .claude_permissions import (
+    ClaudeRole,
+    is_auditor_role,
+    policy_for_role,
+    snapshot_workspace,
+    workspace_snapshot_diff,
+)
+from ..environment.base import Environment
+from ..types import (
+    DEFAULT_CLAUDE_MODEL,
+    DEFAULT_TMP_DIR,
+    DEFAULT_WORKSPACE_PATH,
+    EpisodeBudget,
+    EpisodeResult,
+)
 from .cli_agent import CommandAgentAdapter
 
 
@@ -19,7 +34,9 @@ class ClaudeCodeAdapter(CommandAgentAdapter):
         prompt_dir: str = f"{DEFAULT_TMP_DIR}/prompts",
         mcp_config: str | None = None,
         add_dirs: list[str] | None = None,
+        role: ClaudeRole = "cli_executor",
     ) -> None:
+        policy = policy_for_role(role)
         env_parts: list[str] = []
         if api_key:
             quoted_key = shlex.quote(api_key)
@@ -30,21 +47,43 @@ class ClaudeCodeAdapter(CommandAgentAdapter):
             if raw_url.endswith("/v1"):
                 raw_url = raw_url[:-3]
             env_parts.append(f"ANTHROPIC_BASE_URL={shlex.quote(raw_url)}")
-
-        # MCP support is opt-in. The core adapter must not depend on a specific
-        # computer-use server or a repository-local reference configuration.
-        mcp_config = (
-            mcp_config
-            or os.getenv("LH_HARNESS_CLAUDECODE_MCP_CONFIG")
-            or os.getenv("LH_HARNESS_MCP_CONFIG")
+        env_parts.extend(
+            [
+                "CLAUDE_CODE_DISABLE_AUTO_MEMORY=1",
+                "CLAUDE_CODE_SKIP_PROMPT_HISTORY=1",
+                f"LH_HARNESS_CLAUDE_ROLE={shlex.quote(role)}",
+            ]
         )
+
+        # MCP support remains opt-in. --strict-mcp-config keeps unrelated
+        # user/project MCP servers out of every role.
+        mcp_config = mcp_config or os.getenv("LH_HARNESS_CLAUDECODE_MCP_CONFIG")
+        if mcp_config:
+            candidate = Path(mcp_config).expanduser()
+            if candidate.is_file():
+                mcp_config = str(candidate.resolve())
         resolved_add_dirs = list(add_dirs or [])
-        env_add_dirs = os.getenv("LH_HARNESS_CLAUDECODE_ADD_DIRS") or os.getenv("LH_HARNESS_MCP_ADD_DIRS")
+        env_add_dirs = os.getenv("LH_HARNESS_CLAUDECODE_ADD_DIRS") or os.getenv(
+            "LH_HARNESS_MCP_ADD_DIRS"
+        )
         if env_add_dirs:
             resolved_add_dirs.extend(part for part in env_add_dirs.split(os.pathsep) if part)
+        if resolved_add_dirs:
+            raise ValueError(
+                "Claude Code role isolation does not allow additional directories; "
+                "put task files inside the run workspace instead."
+            )
+
+        if is_auditor_role(role):
+            env_parts.extend(
+                [
+                    "GIT_OPTIONAL_LOCKS=0",
+                    "GIT_PAGER=cat",
+                    "PAGER=cat",
+                ]
+            )
 
         env_prefix = (" ".join(env_parts) + " ") if env_parts else ""
-
         command_parts = [
             "claude",
             "--print",
@@ -53,15 +92,64 @@ class ClaudeCodeAdapter(CommandAgentAdapter):
             "--verbose",
             "--dangerously-skip-permissions",
         ]
-        if mcp_config:
+        if policy.disallowed_tools:
+            command_parts.append("--disallowedTools")
+            command_parts.extend(shlex.quote(tool) for tool in policy.disallowed_tools)
+        self.computer_mcp_configured = bool(policy.load_computer_mcp and mcp_config)
+        if self.computer_mcp_configured:
             command_parts.extend(["--mcp-config", shlex.quote(mcp_config)])
-        for add_dir in resolved_add_dirs:
-            command_parts.extend(["--add-dir", shlex.quote(add_dir)])
         command_parts.extend(["--model", shlex.quote(model)])
 
+        self.role = role
+        self.policy = policy
         super().__init__(
             command_template=f"{env_prefix}{' '.join(command_parts)} < {{prompt_path}}",
             prompt_dir=prompt_dir,
             workspace_path=workspace_path,
             visible_output_parser=extract_claude_visible_output,
         )
+
+    async def run_episode(
+        self,
+        prompt: str,
+        env: Environment,
+        budget: EpisodeBudget,
+        live_trajectory_path: str | None = None,
+    ) -> EpisodeResult:
+        before = (
+            snapshot_workspace(self.workspace_path)
+            if is_auditor_role(self.role)
+            else None
+        )
+        result = await super().run_episode(
+            prompt,
+            env,
+            budget,
+            live_trajectory_path=live_trajectory_path,
+        )
+        result.metadata.update(
+            {
+                "claude_role": self.role,
+                "claude_permission_mode": self.policy.permission_mode,
+                "claude_dangerously_skip_permissions": True,
+                "claude_hooks_enabled": False,
+                "claude_native_sandbox_enabled": False,
+                "claude_tool_policy": "default-minus-disallowed",
+                "claude_disallowed_tools": list(self.policy.disallowed_tools),
+                "claude_computer_mcp_loaded": self.computer_mcp_configured,
+                "claude_workspace_read_only": self.policy.workspace_read_only,
+            }
+        )
+        if before is not None:
+            after = snapshot_workspace(self.workspace_path)
+            diff = workspace_snapshot_diff(before, after)
+            result.metadata.update(diff)
+            snapshot_errors = diff.get("verifier_workspace_snapshot_errors")
+            if snapshot_errors:
+                result.status = "error"
+                guard_error = (
+                    "Auditor workspace read-only guard could not inspect every path; "
+                    "the audit was rejected fail-closed."
+                )
+                result.error = f"{result.error}\n{guard_error}".strip() if result.error else guard_error
+        return result

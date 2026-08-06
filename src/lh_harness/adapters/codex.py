@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import importlib
 import json
 import os
 import shlex
@@ -7,6 +8,11 @@ import shlex
 from ..types import DEFAULT_CODEX_MODEL, DEFAULT_TMP_DIR, DEFAULT_WORKSPACE_PATH
 from ..agent_logs import visible_output as extract_codex_visible_output
 from .cli_agent import CommandAgentAdapter
+
+try:
+    tomllib = importlib.import_module("tomllib")
+except ModuleNotFoundError:
+    tomllib = importlib.import_module("tomli")
 
 # Codex resolves this provider id against `model_providers.<id>` so a run can
 # target any OpenAI-compatible endpoint without editing ~/.codex/config.toml.
@@ -51,16 +57,12 @@ class CodexAdapter(CommandAgentAdapter):
         for override in _config_overrides(base_url=base_url, api_key=api_key):
             command_parts.extend(["-c", shlex.quote(override)])
 
-        # MCP support is opt-in. Codex reads MCP servers from config, so a
-        # Claude-style `.mcp.json` is translated into `-c mcp_servers.*`
-        # overrides instead of being passed as a file.
-        mcp_config = (
-            mcp_config
-            or os.getenv("LH_HARNESS_CODEX_MCP_CONFIG")
-            or os.getenv("LH_HARNESS_MCP_CONFIG")
-        )
+        # MCP support is opt-in and uses Codex's own format: a TOML file holding
+        # `[mcp_servers.*]` tables, replayed as `-c mcp_servers.<name>=...`
+        # overrides because `--profile` only reads files inside $CODEX_HOME.
+        mcp_config = mcp_config or os.getenv("LH_HARNESS_CODEX_MCP_CONFIG")
         if mcp_config:
-            for override in _mcp_config_overrides(mcp_config):
+            for override in mcp_server_overrides(mcp_config):
                 command_parts.extend(["-c", shlex.quote(override)])
 
         resolved_add_dirs = list(add_dirs or [])
@@ -111,43 +113,21 @@ def _normalize_base_url(base_url: str | None) -> str:
     return trimmed if trimmed.endswith("/v1") else f"{trimmed}/v1"
 
 
-def _mcp_config_overrides(path: str) -> list[str]:
-    """Translate a Claude-style `.mcp.json` into Codex `mcp_servers` overrides."""
+def mcp_server_overrides(path: str) -> list[str]:
+    """Read `[mcp_servers.*]` tables from a Codex TOML file as `-c` overrides."""
     try:
-        with open(path, encoding="utf-8") as fh:
-            data = json.load(fh)
-    except (OSError, json.JSONDecodeError):
+        with open(path, "rb") as fh:
+            data = tomllib.load(fh)
+    except (OSError, tomllib.TOMLDecodeError):
         return []
-    servers = data.get("mcpServers") if isinstance(data, dict) else None
+    servers = data.get("mcp_servers") if isinstance(data, dict) else None
     if not isinstance(servers, dict):
         return []
-    overrides: list[str] = []
-    for name, spec in servers.items():
-        if not isinstance(spec, dict) or not str(name).strip():
-            continue
-        entry = _mcp_server_entry(spec)
-        if entry:
-            overrides.append(f"mcp_servers.{name}={_toml_inline(entry)}")
-    return overrides
-
-
-def _mcp_server_entry(spec: dict) -> dict | None:
-    url = spec.get("url")
-    if isinstance(url, str) and url.strip():
-        return {"url": url}
-    command = spec.get("command")
-    if not isinstance(command, str) or not command.strip():
-        return None
-    entry: dict = {"command": command}
-    args = spec.get("args")
-    if isinstance(args, list):
-        string_args = [str(arg) for arg in args]
-        if string_args:
-            entry["args"] = string_args
-    env = spec.get("env")
-    if isinstance(env, dict) and env:
-        entry["env"] = {str(key): str(value) for key, value in env.items()}
-    return entry
+    return [
+        f"mcp_servers.{name}={_toml_inline(spec)}"
+        for name, spec in servers.items()
+        if isinstance(spec, dict) and spec and str(name).strip()
+    ]
 
 
 def _toml_inline(value) -> str:

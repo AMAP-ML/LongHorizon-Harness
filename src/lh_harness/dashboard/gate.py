@@ -4,10 +4,10 @@ The manager calls one hook per round with the round's ``outcome`` and
 ``reached_max``. The hook classifies whether a human gate is needed and, if so,
 raises a blocking approval dialog. Trigger conditions (see ``_TRIGGERS``):
 
-1. ``completed`` / ``max_rounds`` — the run finished or hit the round budget.
-2. ``needs_human`` — the round's output explicitly requires human intervention
+1. ``completed`` / ``max_rounds``: the run finished or hit the round budget.
+2. ``needs_human``: the round's output explicitly requires human intervention
    (manager reported blocked).
-3. ``repeated_failure`` — a special condition: too many failing rounds in a row.
+3. ``repeated_failure``, a special condition: too many failing rounds in a row.
 
 Adding a new trigger = add one ``_Trigger`` to ``_TRIGGERS`` and one clause in
 ``_classify``; nothing else changes.
@@ -24,10 +24,12 @@ from .state import ApprovalOption, DashboardState
 
 HumanHook = Callable[[dict[str, Any]], Awaitable[dict[str, Any]]]
 
-# Shared option sets (buttons). ``continue`` keeps the run going, ``stop`` ends it.
-_CONTINUE = ApprovalOption("continue", "继续运行", "primary")
-_STOP_FINISH = ApprovalOption("stop", "结束", "danger")
-_STOP_ABORT = ApprovalOption("stop", "终止", "danger")
+# Dialog text is authored in English and persisted that way in approvals.jsonl.
+# The dashboard localizes each dialog from its `trigger` key, so these strings
+# are the fallback for clients that do not (older records, API consumers).
+_CONTINUE = ApprovalOption("continue", "Continue run", "primary")
+_STOP_FINISH = ApprovalOption("stop", "End run", "danger")
+_STOP_ABORT = ApprovalOption("stop", "Stop run", "danger")
 
 
 @dataclass(frozen=True)
@@ -37,34 +39,34 @@ class _Trigger:
     title: str
     message: str
     options: list[ApprovalOption]
-    input_label: str = "可选：补充指令，将注入下一轮任务管理"
+    input_label: str = "Optional: add instructions for the next manager round"
 
 
 _TRIGGERS: dict[str, _Trigger] = {
     "completed": _Trigger(
-        "任务已完成，是否继续运行？",
-        "任务管理器已确认任务完成。选择“继续运行”可追加轮次并注入指令，选择“结束”将停止本次运行。",
+        "Task complete. Continue the run?",
+        "The manager confirmed task completion. Continue to add rounds and inject instructions, or end this run.",
         [_CONTINUE, _STOP_FINISH],
     ),
     "max_rounds": _Trigger(
-        "已到达最大轮次，是否继续运行？",
-        "已用完预设的轮次预算但任务未完成。选择“继续运行”可追加轮次，选择“结束”将停止本次运行。",
+        "Round limit reached. Continue the run?",
+        "The configured round budget is exhausted before completion. Continue to add rounds, or end this run.",
         [_CONTINUE, _STOP_FINISH],
     ),
     "needs_input": _Trigger(
-        "任务管理器请示：需要你的决定",
-        "任务管理器需要你的决定或输入才能继续。请在下方输入你的回答，然后“继续运行”；或“终止”本次运行。",
+        "Manager needs your decision",
+        "The manager needs your decision or input before it can continue. Answer below and continue, or stop this run.",
         [_CONTINUE, _STOP_ABORT],
-        input_label="你的回答（将作为指令注入下一轮任务管理）",
+        input_label="Your answer, injected into the next manager round",
     ),
     "needs_human": _Trigger(
-        "任务被阻塞，需要人工介入",
-        "任务管理器判定当前无法自动推进（阻塞）。请补充指令后“继续运行”，或“终止”本次运行。",
+        "Task blocked; operator input required",
+        "The manager reported that it cannot proceed automatically. Add instructions and continue, or stop this run.",
         [_CONTINUE, _STOP_ABORT],
     ),
     "repeated_failure": _Trigger(
-        "连续多轮未取得进展，请人工介入",
-        "任务管理器连续多轮输出无效或完成请求被拒，可能陷入循环。请补充指令后“继续运行”，或“终止”。",
+        "Repeated failures require operator input",
+        "The manager produced invalid routes or rejected completions over several rounds and may be looping. Add instructions and continue, or stop this run.",
         [_CONTINUE, _STOP_ABORT],
     ),
 }
@@ -134,7 +136,7 @@ def make_human_hook(
         answers = context.get("answers") if kind == "needs_input" else None
         answers = [str(a) for a in answers] if isinstance(answers, list) else []
         if kind == "needs_input" and question:
-            message = spec.message + "\n\n任务管理器的问题：\n" + question
+            message = spec.message + "\n\nManager question:\n" + question
         else:
             message = extra_message or spec.message
         approval = state.create_approval(
@@ -149,6 +151,9 @@ def make_human_hook(
                 "outcome": outcome,
                 "round_index": round_index,
                 "question": question,
+                # Kept separate from `message`: clients localize the dialog from
+                # `trigger`, which would otherwise discard this rule detail.
+                "detail": extra_message,
                 "task": context.get("task", ""),
                 "task_state": context.get("task_state", ""),
                 "round_count": len(rounds),

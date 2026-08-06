@@ -1,4 +1,4 @@
-/* LongHorizon-Harness Dashboard — trajectory-gallery aesthetic.
+/* LongHorizon-Harness Dashboard: trajectory-gallery aesthetic.
    Design language mirrors the project's Trajectory Gallery (test-html):
    Fraunces display serif, Inter body, JetBrains Mono for code; a
    blue→violet→pink gradient accent; role colors (Manager amber, GUI sky,
@@ -352,7 +352,7 @@ body {
 .overview-note > span { display: block; margin-bottom: 4px; font-size: 11px; font-weight: 700; color: var(--ink-strong); }
 .overview-note p { margin: 0; color: var(--ink-soft); font-size: 12px; line-height: 1.55; }
 
-/* round group — the whole round folds via its header */
+/* round group: the whole round folds via its header */
 .round-group { margin-bottom: 32px; }
 .round-rule { display: flex; align-items: center; gap: 10px; margin: 0 0 16px; cursor: pointer; user-select: none; }
 .round-rule::before { content: ""; height: 3px; width: 30px; border-radius: 2px; background: linear-gradient(90deg, var(--pink), var(--blue)); flex: none; }

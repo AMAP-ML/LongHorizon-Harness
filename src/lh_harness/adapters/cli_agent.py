@@ -9,7 +9,8 @@ from collections.abc import Callable
 from pathlib import PurePath
 
 from ..environment.base import Environment
-from ..remote_io import write_remote_text
+from ..environment.remote_files import write_remote_text
+from ..runtime_signals import detect_runtime_signals
 from ..types import DEFAULT_TMP_DIR, DEFAULT_WORKSPACE_PATH, EpisodeBudget, EpisodeResult
 
 _SECRET_NAME = r"(?:API[_-]?KEY|AUTH[_-]?TOKEN|ACCESS[_-]?TOKEN|SECRET|PASSWORD|TOKEN)"
@@ -87,6 +88,7 @@ class CommandAgentAdapter:
             if self.visible_output_parser is not None
             else ""
         )
+        runtime_signals = detect_runtime_signals(stdout_log)
         if result.termination_reason == "timeout":
             error = f"Episode timed out after {budget.max_duration_seconds}s."
         else:
@@ -104,6 +106,7 @@ class CommandAgentAdapter:
                 "actions_log_chars": len(actions_log),
                 "trajectory_format": "jsonl",
                 "assistant_visible_output": visible_output,
+                "runtime_signals": runtime_signals,
                 "actions_log_diagnostics_only": bool(
                     self.visible_output_parser is not None and not visible_output
                 ),

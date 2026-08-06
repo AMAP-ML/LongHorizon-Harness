@@ -12,6 +12,12 @@ _CRASH_PATTERNS = (
     re.compile(r"response\.failed"),
 )
 
+# A Traceback can legitimately appear in tool output (an agent running a script
+# that raises), so only signals that mean the agent runtime itself died count as
+# hard failures.
+_HARD_SIGNAL_PREFIXES = ("AGENT_EXIT=", TURN_FAILED_SIGNAL)
+_HARD_SIGNAL_VALUES = frozenset({"Connection error.", "response.failed"})
+
 
 def detect_runtime_signals(log: str) -> list[dict[str, str]]:
     runtime_log = tool_output_view(log)
@@ -21,6 +27,26 @@ def detect_runtime_signals(log: str) -> list[dict[str, str]]:
         if match:
             signals.append({"signal": match.group(0), "evidence": _near(runtime_log, match.start())})
     return signals
+
+
+def _signal_labels(raw: object) -> list[str]:
+    if not isinstance(raw, list):
+        return []
+    labels: list[str] = []
+    for item in raw:
+        signal = item.get("signal") if isinstance(item, dict) else item
+        if isinstance(signal, str) and signal.strip():
+            labels.append(signal.strip())
+    return labels
+
+
+def hard_signal_labels(raw: object) -> list[str]:
+    """Labels for signals that mean the agent runtime failed, not the task."""
+    return [
+        label
+        for label in _signal_labels(raw)
+        if label.startswith(_HARD_SIGNAL_PREFIXES) or label in _HARD_SIGNAL_VALUES
+    ]
 
 
 def _near(text: str, index: int, radius: int = 240) -> str:

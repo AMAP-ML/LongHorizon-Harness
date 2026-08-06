@@ -2,9 +2,9 @@
 
 Each backend speaks a different format: Claude Code emits
 ``--output-format stream-json`` while ``codex exec --json`` emits thread events.
-The harness only ever needs three views of either — the assistant-visible text,
+The harness only ever needs three views of either: the assistant-visible text,
 an ordered step list for the dashboard, and a tool/command output view for crash
-detection — so format handling lives here instead of being re-derived at every
+detection, so format handling lives here instead of being re-derived at every
 call site.
 """
 
@@ -15,6 +15,10 @@ from typing import Any, Iterator
 
 CLAUDE_STREAM_JSON = "claude_stream_json"
 CODEX_EXEC_JSON = "codex_exec_json"
+# Untyped chat transcripts (one `{"role": ..., "content": ...}` object per line,
+# optionally wrapped in `message`). Neither CLI emits this directly, but saved
+# chat.jsonl transcripts and older runs use it.
+CHAT_JSONL = "chat_jsonl"
 UNKNOWN = ""
 
 # Harness-normalized label for a Codex turn that died before answering, so it
@@ -44,13 +48,16 @@ _CODEX_TOOL_ITEMS = {
 
 
 def detect_format(raw: str) -> str:
+    saw_chat_role = False
     for record in _json_records(raw):
         record_type = record.get("type")
         if record_type in _CODEX_EVENTS:
             return CODEX_EXEC_JSON
         if record_type in _CLAUDE_EVENTS:
             return CLAUDE_STREAM_JSON
-    return UNKNOWN
+        if _chat_message(record) is not None:
+            saw_chat_role = True
+    return CHAT_JSONL if saw_chat_role else UNKNOWN
 
 
 def visible_output(raw: str) -> str:
@@ -64,6 +71,9 @@ def visible_output(raw: str) -> str:
         if result_text.strip():
             return result_text.strip()
         return "\n\n".join(assistant_texts).strip()
+    if log_format == CHAT_JSONL:
+        texts = _chat_assistant_texts(raw)
+        return texts[-1].strip() if texts else ""
     return ""
 
 
@@ -77,6 +87,8 @@ def assistant_texts(raw: str) -> list[str]:
         if result_text.strip() and (not texts or texts[-1].strip() != result_text.strip()):
             texts.append(result_text)
         return texts
+    if log_format == CHAT_JSONL:
+        return _chat_assistant_texts(raw)
     return []
 
 
@@ -426,6 +438,33 @@ def _claude_trajectory(raw: str) -> list[dict[str, Any]]:
                 }
             )
     return steps
+
+
+# ----------------------------------------------------------------------------
+# Untyped chat transcripts
+# ----------------------------------------------------------------------------
+
+
+def _chat_message(record: dict[str, Any]) -> dict[str, Any] | None:
+    """Return the assistant message in an untyped chat record, else None."""
+    if record.get("type") in _CODEX_EVENTS or record.get("type") in _CLAUDE_EVENTS:
+        return None
+    message = record.get("message") if isinstance(record.get("message"), dict) else record
+    if not isinstance(message, dict) or message.get("role") != "assistant":
+        return None
+    return message
+
+
+def _chat_assistant_texts(raw: str) -> list[str]:
+    texts: list[str] = []
+    for record in _json_records(raw):
+        message = _chat_message(record)
+        if message is None:
+            continue
+        text, _ = _content_blocks_to_text(message.get("content"))
+        if text.strip():
+            texts.append(text)
+    return texts
 
 
 # ----------------------------------------------------------------------------

@@ -3,9 +3,9 @@
 Everything the dashboard needs lives in this package. The rest of the harness
 only touches the small public surface below:
 
-* :func:`start_dashboard` — launch the web server in a background thread.
-* :func:`make_human_hook` — build the human-in-the-loop hook (round + end gates).
-* :class:`DashboardState` / :class:`ApprovalRules` — shared state and rules.
+* :func:`start_dashboard`: launch the web server in a background thread.
+* :func:`make_human_hook`: build the human-in-the-loop hook (round + end gates).
+* :class:`DashboardState` / :class:`ApprovalRules`: shared state and rules.
 """
 
 from __future__ import annotations
