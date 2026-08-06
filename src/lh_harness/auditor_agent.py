@@ -1,15 +1,25 @@
 from __future__ import annotations
 
-import json
 import re
 from typing import Any
 
+from .agent_logs import assistant_texts as decode_agent_assistant_texts
 from .agent_logs import visible_output as decode_agent_visible_output
-from .types import DEFAULT_WORKSPACE_PATH, EpisodeResult, AuditReport
+from .runtime_signals import hard_signal_labels
+from .types import DEFAULT_WORKSPACE_PATH, EpisodeResult, AuditReport, PromptLanguage
 
 COMPACT_REPORT_CHARS = 2_500
 STATE_SUMMARY_CHARS = 1_000
 ACTION_GUIDANCE_CHARS = 1_200
+# Metadata keys holding assistant-visible text, most specific first. Anything
+# rewriting a report must go through these, not `actions_log`, which is ignored
+# whenever one of them is present.
+VISIBLE_OUTPUT_KEYS = (
+    "executor_agent_visible_output",
+    "visible_executor_output",
+    "assistant_visible_output",
+    "output_text",
+)
 _STATUS_CONTROL_LINE_RE = re.compile(
     r"^\s*(?:\*\*)?\s*(?:状态|status)\s*[:：]\s*(complete|incomplete|blocked|完成|未完成|阻塞)\s*(?:\*\*)?\s*$",
     re.I,
@@ -31,8 +41,16 @@ _BLOCKING_ACCEPTANCE_SECTION_RE = re.compile(
 _NO_BLOCKING_ACCEPTANCE_RE = re.compile(
     r"(?ix)^\s*(?:[-*+]\s*|\d+[.)]\s*)?(?:无|没有|暂无|none|nothing|n/?a|not\s+applicable)(?:\s*[。.,，;；:].*)?\s*$"
 )
+# Every heading the auditor contract prompt mandates must terminate the blocking
+# section; otherwise a reordered report leaks the next section into it and the
+# acceptance guard downgrades an otherwise clean audit.
 _ACCEPTANCE_SECTION_BOUNDARY_RE = re.compile(
-    r"(?im)^\s*(?:[-*]\s*)?(?:契约结论|可能评分风险|过窄或错误解释|建议契约修订|审计事实|证据|缺口|下一步|给任务管理器的状态更新|contract\s+conclusion|possible\s+scoring\s+risks|over-narrow|recommended\s+contract\s+revision|audit\s+facts|evidence|gaps?|next\s+step|state\s+update\s+for\s+manager|status|integrity|contract\s+audit)\s*[:：]"
+    r"(?im)^\s*(?:[-*]\s*)?(?:契约结论|可能评分风险|过窄或错误解释|建议契约修订|审计事实|证据|缺口|下一步|给任务管理器的状态更新"
+    r"|验收约束反查|原题约束清单|契约覆盖检查|逐项反查"
+    r"|contract\s+conclusion|possible\s+scoring\s+risks|over-narrow|recommended\s+contract\s+revision"
+    r"|audit\s+facts|evidence|gaps?|next\s+step|state\s+update\s+for\s+manager|status|integrity|contract\s+audit"
+    r"|acceptance[-\s]*constraint\s+backcheck|original\s+constraint\s+inventory|contract\s+coverage\s+check"
+    r"|per[-\s]*constraint\s+backcheck)\s*[:：]"
 )
 _DELETE_DECLARATION_RE = re.compile(
     r"^\s*(?:[-*]\s*)?"
@@ -43,28 +61,152 @@ _DELETE_DECLARATION_RE = re.compile(
     re.I,
 )
 
+# Harness-synthesized report fragments. The auditor's own report stays verbatim;
+# only these harness-authored lines follow the run's prompt language, and the
+# control-header keywords match what the parser above accepts for each language.
+_CONTROL_HEADER: dict[PromptLanguage, tuple[str, str, str]] = {
+    "en": ("Status", "Integrity", "Contract audit"),
+    "zh": ("状态", "完整性", "契约审计"),
+}
+_SYNTHETIC_TEXT: dict[str, dict[PromptLanguage, str]] = {
+    "invalid_header_facts": {
+        "en": "Audit facts: the auditor report lacks a valid three-line control header; the harness will not guess completion, integrity, or contract audit from the body.",
+        "zh": "审计事实: auditor 报告缺少有效的前三行控制头，harness 不会根据正文猜测完成状态、完整性或契约审计。",
+    },
+    "invalid_header_gap": {
+        "en": "Gap: the auditor must state status, integrity, and contract audit on the first three lines.",
+        "zh": "缺口: auditor 必须以前三行明确写出状态、完整性和契约审计。",
+    },
+    "invalid_header_excerpt": {
+        "en": "Original auditor output excerpt:",
+        "zh": "原始 auditor 输出摘录:",
+    },
+    "deleted_ledger": {
+        "en": "Deletion ledger: the auditor deleted executor artifacts it confirmed to be fabricated or untrusted; those paths can no longer count as valid deliverables.",
+        "zh": "删除记录: auditor 在审计中删除了确认伪造或不可信的 executor 产物；这些路径不能再作为有效 deliverable。",
+    },
+    "deleted_paths": {
+        "en": "Deleted paths: ",
+        "zh": "已删除路径: ",
+    },
+    "read_only_violation": {
+        "en": "Auditor read-only violation: the auditor window changed task workspace files while checking.",
+        "zh": "auditor 只读违规: auditor 在审计过程中修改了任务 workspace 文件。",
+    },
+    "restored": {
+        "en": "The harness restored the workspace snapshot taken before audit.",
+        "zh": "harness 已恢复审计前的 workspace 快照。",
+    },
+    "not_restored": {
+        "en": "The harness detected a workspace mutation but did not confirm restoration; treat the audit as invalid.",
+        "zh": "harness 检测到 workspace 变化但未确认恢复；本次审计视为无效。",
+    },
+    "violation_claims_invalid": {
+        "en": "Any claim based on auditor-created or auditor-modified files is invalid.",
+        "zh": "任何基于 auditor 创建或修改的文件得出的结论都无效。",
+    },
+    "changed_paths": {
+        "en": "Changed paths observed: ",
+        "zh": "观察到的变更路径: ",
+    },
+    "executor_must_repair": {
+        "en": "The next executor must check and finish the missing deliverables itself; the auditor may only report state, never repair it.",
+        "zh": "下一轮 executor 必须自行检查并完成缺失 deliverable；auditor 只能报告状态，不能修复。",
+    },
+    "diagnostics_only": {
+        "en": "Original auditor report, for diagnostics only:",
+        "zh": "原始 auditor 报告，仅供诊断:",
+    },
+    "activity_archive": {
+        "en": (
+            f"Environment activity note: active processes or unstable file state were already observed under `{DEFAULT_WORKSPACE_PATH}` before the auditor ran, "
+            "and the workspace changed again during the audit window. The harness did not roll these changes back, to avoid misreading real executor or "
+            "background-service progress as auditor writes. This note does not by itself invalidate the round's audit report."
+        ),
+        "zh": (
+            f"环境活动归档: auditor 运行前已观察到 `{DEFAULT_WORKSPACE_PATH}` 存在活动进程或不稳定文件状态；"
+            "审计窗口内 workspace 又发生变化。harness 没有回滚这些变化，避免把 executor 或后台服务的真实进展"
+            "误判为 auditor 写入。该归档不自动废弃本轮审计报告。"
+        ),
+    },
+    "completion_guard": {
+        "en": "Harness completion guard: the auditor listed nonempty blocking constraints, so `complete` and an aligned contract decision are not accepted.",
+        "zh": "harness 完成守卫: auditor 列出了非空阻断约束，因此不接受 `complete` 和 aligned 契约结论。",
+    },
+    "runtime_failed": {
+        "en": "Auditor runtime failed before producing a trustworthy report.",
+        "zh": "auditor 运行时在产出可信报告前失败。",
+    },
+    "runtime_mutation_restored": {
+        "en": "Auditor also changed task workspace files; the harness restored the pre-audit snapshot.",
+        "zh": "auditor 还修改了任务 workspace 文件；harness 已恢复审计前快照。",
+    },
+    "runtime_mutation_not_restored": {
+        "en": "Auditor also changed task workspace files, and restoration was not confirmed.",
+        "zh": "auditor 还修改了任务 workspace 文件，且未确认恢复。",
+    },
+    "no_claim_from_logs": {
+        "en": "No completion claim was accepted from raw runtime logs or echoed prompt text.",
+        "zh": "harness 不接受来自原始运行日志或回显 prompt 文本的完成声明。",
+    },
+    "runtime_failed_guidance": {
+        "en": "Auditor runtime failed; rerun the audit after fixing the runtime issue.",
+        "zh": "auditor 运行时失败；修复运行时问题后重新审计。",
+    },
+}
 
-def audit_report_from_episode_result(result: EpisodeResult, round_index: int) -> AuditReport:
+
+def _language(language: str) -> PromptLanguage:
+    return "zh" if str(language or "").strip().lower() == "zh" else "en"
+
+
+def _text(key: str, language: str) -> str:
+    return _SYNTHETIC_TEXT[key][_language(language)]
+
+
+def _control_header(
+    status: str,
+    integrity: str,
+    contract_audit: str,
+    *,
+    language: str,
+) -> str:
+    status_label, integrity_label, contract_label = _CONTROL_HEADER[_language(language)]
+    return (
+        f"{status_label}: {status}\n"
+        f"{integrity_label}: {integrity}\n"
+        f"{contract_label}: {contract_audit}"
+    )
+
+
+def audit_report_from_episode_result(
+    result: EpisodeResult,
+    round_index: int,
+    *,
+    language: str = "en",
+) -> AuditReport:
     """Convert a auditor role episode into the structured report used by the runner.
 
     The role manager stores auditor output as natural language, but the
     final report and stop checks need a compact status, integrity flag, and
     artifact-deletion ledger.
     """
-    hard_runtime_signals = _hard_runtime_signal_labels(result.metadata.get("runtime_signals"))
+    hard_runtime_signals = hard_signal_labels(result.metadata.get("runtime_signals"))
     if result.status != "done" or hard_runtime_signals:
         return AuditReport(
             round_id=f"round_{round_index}",
             status="blocked",
-            report_text=_runtime_failure_report(result, hard_runtime_signals),
-            action_guidance="Auditor runtime failed; rerun audit after fixing the runtime issue.",
+            report_text=_runtime_failure_report(
+                result, hard_runtime_signals, language=language
+            ),
+            action_guidance=_text("runtime_failed_guidance", language),
         )
 
     report_text = compact_auditor_report_text(
         extract_auditor_report_text(_episode_visible_output(result))
     )
     if not _has_valid_control_header(report_text):
-        report_text = _invalid_control_header_report(report_text)
+        report_text = _invalid_control_header_report(report_text, language=language)
     status = infer_report_status(report_text)
     state_summary = extract_state_summary(report_text)
     action_guidance = extract_action_guidance(report_text)
@@ -85,32 +227,28 @@ def audit_report_from_episode_result(result: EpisodeResult, round_index: int) ->
                 declared_actions=artifact_actions,
                 confirmed_deleted_paths=allowed_delete_paths,
             )
-            suffix = (
-                "\n\n删除记录: auditor 在审计中删除了确认伪造或不可信的 executor agent 产物；"
-                "这些路径不能再作为有效 deliverable。"
-            )
-            suffix += "\nDeleted paths: " + ", ".join(allowed_delete_paths[:20])
+            suffix = "\n\n" + _text("deleted_ledger", language)
+            suffix += "\n" + _text("deleted_paths", language) + ", ".join(allowed_delete_paths[:20])
             report_text = compact_auditor_report_text(report_text + suffix)
             state_summary = extract_state_summary(report_text)
             action_guidance = extract_action_guidance(report_text)
         elif restore_on_mutation:
-            restore_text = (
-                "The harness restored the workspace snapshot taken before audit."
-                if restored
-                else "The harness detected a workspace mutation but did not confirm restoration; treat the audit as invalid."
-            )
+            restore_text = _text("restored" if restored else "not_restored", language)
             prefix = (
-                "状态: blocked\n"
-                "完整性: violation\n"
-                "契约审计: unknown\n\n"
-                "Auditor read-only violation: the auditor window changed task workspace files while checking. "
-                f"{restore_text} Any claim based on auditor-created or auditor-modified files is invalid.\n"
+                _control_header("blocked", "violation", "unknown", language=language)
+                + "\n\n"
+                + _text("read_only_violation", language)
+                + f" {restore_text} "
+                + _text("violation_claims_invalid", language)
+                + "\n"
             )
             if paths:
-                prefix += "Changed paths observed: " + ", ".join(paths[:20]) + "\n"
+                prefix += _text("changed_paths", language) + ", ".join(paths[:20]) + "\n"
             prefix += (
-                "下一轮 executor agent 必须自行检查并完成缺失 deliverables；auditor 只能报告状态，不能修复。\n\n"
-                "Original auditor report, for diagnostics only:\n"
+                _text("executor_must_repair", language)
+                + "\n\n"
+                + _text("diagnostics_only", language)
+                + "\n"
             )
             report_text = compact_auditor_report_text(prefix + report_text)
             status = "blocked"
@@ -128,19 +266,15 @@ def audit_report_from_episode_result(result: EpisodeResult, round_index: int) ->
                 }
             )
         else:
-            suffix = (
-                f"\n\n环境活动归档: auditor 运行前已观察到 `{DEFAULT_WORKSPACE_PATH}` 存在活动进程或不稳定文件状态；"
-                "审计窗口内 workspace 又发生变化。harness 没有回滚这些变化，避免把 executor agent 或后台服务的"
-                "真实进展误判为 auditor 写入。该归档不自动废弃本轮审计报告。"
-            )
+            suffix = "\n\n" + _text("activity_archive", language)
             if paths:
-                suffix += "\nChanged paths observed: " + ", ".join(paths[:20])
+                suffix += "\n" + _text("changed_paths", language) + ", ".join(paths[:20])
             report_text = compact_auditor_report_text(report_text + suffix)
             state_summary = extract_state_summary(report_text)
             action_guidance = extract_action_guidance(report_text)
     artifact_actions = _mark_unconfirmed_deletion_declarations(artifact_actions)
     report_text, status, contract_audit_status = _apply_acceptance_constraint_guard(
-        report_text, status, contract_audit_status
+        report_text, status, contract_audit_status, language=language
     )
     if (integrity_status == "violation" or contract_audit_status != "aligned") and status == "complete":
         status = "incomplete"
@@ -157,15 +291,15 @@ def audit_report_from_episode_result(result: EpisodeResult, round_index: int) ->
     )
 
 
-def parse_audit_report(raw: str, round_index: int) -> AuditReport:
+def parse_audit_report(raw: str, round_index: int, *, language: str = "en") -> AuditReport:
     report_text = compact_auditor_report_text(extract_auditor_report_text(raw))
     if not _has_valid_control_header(report_text):
-        report_text = _invalid_control_header_report(report_text)
+        report_text = _invalid_control_header_report(report_text, language=language)
     status = infer_report_status(report_text)
     integrity_status, integrity_findings = infer_integrity_findings(report_text)
     contract_audit_status = infer_contract_audit_status(report_text)
     report_text, status, contract_audit_status = _apply_acceptance_constraint_guard(
-        report_text, status, contract_audit_status
+        report_text, status, contract_audit_status, language=language
     )
     if (integrity_status == "violation" or contract_audit_status != "aligned") and status == "complete":
         status = "incomplete"
@@ -191,12 +325,7 @@ def auditor_report_text_from_episode_result(result: EpisodeResult) -> str:
 def _episode_visible_output(result: EpisodeResult) -> str:
     """Prefer adapter-provided assistant text over the diagnostic trajectory."""
     metadata = result.metadata if isinstance(result.metadata, dict) else {}
-    for key in (
-        "executor_agent_visible_output",
-        "visible_executor_output",
-        "assistant_visible_output",
-        "output_text",
-    ):
+    for key in VISIBLE_OUTPUT_KEYS:
         value = metadata.get(key)
         if isinstance(value, str) and value.strip():
             return value.strip()
@@ -223,13 +352,13 @@ def _apply_acceptance_constraint_guard(
     report_text: str,
     status: str,
     contract_audit_status: str,
+    *,
+    language: str = "en",
 ) -> tuple[str, str, str]:
     if status != "complete" or not _has_blocking_acceptance_constraints(report_text):
         return report_text, status, contract_audit_status
     guarded = compact_auditor_report_text(
-        report_text
-        + "\n\nHarness completion guard: the auditor listed nonempty blocking constraints, "
-        "so `complete` and an aligned contract decision are not accepted."
+        report_text + "\n\n" + _text("completion_guard", language)
     )
     return guarded, "incomplete", "unknown" if contract_audit_status == "aligned" else contract_audit_status
 
@@ -309,21 +438,22 @@ def _has_valid_control_header(text: str) -> bool:
     )
 
 
-def _invalid_control_header_report(raw: str) -> str:
+def _invalid_control_header_report(raw: str, *, language: str = "en") -> str:
     clipped = compact_auditor_report_text(raw, max_chars=1_800)
     return (
-        "状态: blocked\n"
-        "完整性: suspect\n"
-        "契约审计: unknown\n"
-        "审计事实: auditor 报告缺少有效的前三行控制头，harness 不会根据正文猜测完成状态、完整性或契约审计。\n"
-        "缺口: auditor 必须以前三行明确写出状态、完整性和契约审计。\n\n"
-        "原始 auditor 输出摘录:\n"
-        f"{clipped}"
+        _control_header("blocked", "suspect", "unknown", language=language)
+        + "\n"
+        + _text("invalid_header_facts", language)
+        + "\n"
+        + _text("invalid_header_gap", language)
+        + "\n\n"
+        + _text("invalid_header_excerpt", language)
+        + f"\n{clipped}"
     )
 
 
 def extract_auditor_report_text(raw: str, *, max_chars: int = 8_000) -> str:
-    assistant_texts = _assistant_texts_from_openclaw_jsonl(raw)
+    assistant_texts = decode_agent_assistant_texts(raw)
     if not assistant_texts:
         assistant_texts = _assistant_texts_from_compacted_openclaw_log(raw)
     for text in reversed(assistant_texts):
@@ -494,25 +624,6 @@ def _trim_to_report_start(text: str) -> str:
     return text.strip()
 
 
-def _assistant_texts_from_openclaw_jsonl(raw: str) -> list[str]:
-    texts: list[str] = []
-    for line in raw.splitlines():
-        stripped = line.strip()
-        if not stripped.startswith("{"):
-            continue
-        try:
-            record = json.loads(stripped)
-        except json.JSONDecodeError:
-            continue
-        message = record.get("message") if isinstance(record.get("message"), dict) else record
-        if not isinstance(message, dict) or message.get("role") != "assistant":
-            continue
-        text = _message_text(message)
-        if text:
-            texts.append(text)
-    return texts
-
-
 def _assistant_texts_from_compacted_openclaw_log(raw: str) -> list[str]:
     texts: list[str] = []
     role: str | None = None
@@ -540,23 +651,6 @@ def _assistant_texts_from_compacted_openclaw_log(raw: str) -> list[str]:
             current.append(line)
     flush()
     return texts
-
-
-def _message_text(message: dict) -> str:
-    content = message.get("content")
-    if isinstance(content, str):
-        return content
-    if isinstance(content, list):
-        chunks: list[str] = []
-        for item in content:
-            if isinstance(item, dict):
-                text = item.get("text")
-                if isinstance(text, str):
-                    chunks.append(text)
-            elif isinstance(item, str):
-                chunks.append(item)
-        return "\n".join(chunks)
-    return ""
 
 
 def _tail(text: str, max_chars: int) -> str:
@@ -724,29 +818,11 @@ def _mutation_paths(raw: object) -> list[str]:
     return paths
 
 
-def _hard_runtime_signal_labels(raw: object) -> list[str]:
-    if not isinstance(raw, list):
-        return []
-    labels: list[str] = []
-    for item in raw:
-        if not isinstance(item, dict):
-            continue
-        signal = item.get("signal")
-        if not isinstance(signal, str):
-            continue
-        signal = signal.strip()
-        if signal.startswith("AGENT_EXIT=") or signal in {"Connection error.", "response.failed"}:
-            labels.append(signal)
-    return labels
-
-
-def _runtime_failure_report(result, runtime_signals: list[str]) -> str:  # noqa: ANN001
+def _runtime_failure_report(result, runtime_signals: list[str], *, language: str = "en") -> str:  # noqa: ANN001
     lines = [
-        "状态: blocked",
-        "完整性: suspect",
-        "契约审计: unknown",
+        _control_header("blocked", "suspect", "unknown", language=language),
         "",
-        "Auditor runtime failed before producing a trustworthy report.",
+        _text("runtime_failed", language),
     ]
     if result.status != "done":
         lines.append(f"Episode status: {result.status}.")
@@ -768,13 +844,16 @@ def _runtime_failure_report(result, runtime_signals: list[str]) -> str:  # noqa:
 
     if metadata.get("verifier_workspace_mutation_detected"):
         paths = _mutation_paths(metadata.get("verifier_workspace_mutations"))
-        if metadata.get("verifier_workspace_restored"):
-            lines.append("Auditor also changed task workspace files; the harness restored the pre-audit snapshot.")
-        else:
-            lines.append("Auditor also changed task workspace files, and restoration was not confirmed.")
+        restored = bool(metadata.get("verifier_workspace_restored"))
+        lines.append(
+            _text(
+                "runtime_mutation_restored" if restored else "runtime_mutation_not_restored",
+                language,
+            )
+        )
         if paths:
-            lines.append("Changed paths observed: " + ", ".join(paths[:20]))
+            lines.append(_text("changed_paths", language) + ", ".join(paths[:20]))
 
     lines.append("")
-    lines.append("No completion claim was accepted from raw runtime logs or echoed prompt text.")
+    lines.append(_text("no_claim_from_logs", language))
     return "\n".join(lines).strip()

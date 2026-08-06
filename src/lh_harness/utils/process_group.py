@@ -9,8 +9,8 @@ harness. Without the bookkeeping here, killing the harness would leave a
 Two layers cover the realistic exit paths:
 
 * ``LocalEnvironment.exec`` kills its own child on timeout and on cancellation.
-* The handlers installed here catch what ``exec`` cannot see — SIGTERM, SIGHUP,
-  and interpreter shutdown — and sweep any still-tracked group.
+* The handlers installed here catch what ``exec`` cannot see (SIGTERM, SIGHUP,
+  and interpreter shutdown) and sweep any still-tracked group.
 """
 
 from __future__ import annotations

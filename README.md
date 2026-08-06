@@ -36,7 +36,17 @@ LongHorizon-Harness is an execution, state-management, and result-verification s
 
 ## ✨ News
 
+- **[2026-08-06]** LongHorizon-Harness reaches **#1** on the [Hugging Face Daily Papers weekly ranking](https://huggingface.co/papers/week/2026-W32).
+- **[v0.1.2 · 2026-08-06]** Adds unified computer-use plugin management, stronger auditor read-only checks and role isolation, reliable process cleanup, and expanded `doctor` diagnostics. See [Manage computer-use plugins](#manage-computer-use-plugins).
+- **[2026-08-06]** The WeChat group is open. Scan the QR code below to join.
+
 > 🚀 We’re iterating rapidly. Stay tuned!
+
+<div align="center">
+<img src="assets/wechat_group.JPG" alt="WeChat group QR code" width="240">
+<br>
+<sub>The QR code is refreshed periodically. If it has expired, open an issue and we will post a new one.</sub>
+</div>
 
 ## Video Demo
 
@@ -151,119 +161,196 @@ Full result tables and case trajectories are available on the [LongHorizon-Harne
 
 ## One command. Full visibility.
 
-### Quick start
-
-For detailed setup and configuration options, see [Installation](#installation).
-
-1. Install LongHorizon-Harness:
-
-  ```bash
-  uv tool install lh-harness
-  ```
-
-2. Check the environment, then explicitly install and enable the Codex GUI plugin:
-
-  ```bash
-  lh-harness doctor
-  lh-harness doctor --install-codex-gui
-  ```
-
-3. Enter your project and generate its configuration:
-
-  ```bash
-  cd /path/to/your/project
-  lh-harness init
-  ```
-
-4. Open `.lh-harness/config.toml` and adjust the defaults if needed. The generated configuration uses Codex, `gpt-5.6-sol`, and an enabled Dashboard by default.
-
-5. Run a task:
-
-  ```bash
-  lh-harness run --task "hi"
-  ```
-
-The Dashboard opens automatically and shows the complete Manager → Executor → Auditor workflow.
-
 ### Installation
+
+Steps 1–2 are once per machine; steps 3–4 are once per project.
 
 #### Requirements
 
-- Python 3.10 or later
-- [uv](https://docs.astral.sh/uv/getting-started/installation/) for the recommended isolated installation method
-- At least one supported agent runtime available on `PATH`:
-  - [`claude`](https://docs.anthropic.com/en/docs/claude-code/getting-started) — Claude Code CLI
-  - [`codex`](https://github.com/openai/codex#installing-and-running-codex-cli) — Codex CLI
+| | Needed for |
+|---|---|
+| [uv](https://docs.astral.sh/uv/getting-started/installation/) | The recommended isolated install. Skip it if you prefer pip. |
+| Python 3.10 or later | Running the harness. `uv tool install` brings its own; a pip install uses yours. |
+| One agent runtime on `PATH`: [`codex`](https://github.com/openai/codex#installing-and-running-codex-cli) or [`claude`](https://docs.anthropic.com/en/docs/claude-code/getting-started) | Actually executing the work. Install both if you want to mix them across roles. |
+| [Node.js](https://nodejs.org) 20 or later | Only the npm-distributed computer-use plugins. Not needed for `codex-computer-use` or CLI-only tasks. |
 
-#### Install with uv
+> **Platform status:** Currently tested on macOS. Windows support is included but has not yet been thoroughly tested.
+
+Run `lh-harness doctor` at any point to check all of the above; see [Verify the environment](#verify-the-environment).
+
+#### 1. Install LongHorizon-Harness
 
 ```bash
-uv tool install lh-harness
+uv tool install lh-harness            # or: pip install lh-harness
 ```
 
-To upgrade an existing installation:
+Upgrade later with `uv tool upgrade lh-harness` or `pip install --upgrade lh-harness`.
+
+#### 2. Install a computer-use plugin
+
+Skip this if your tasks never touch the GUI. Otherwise install the one that matches your agent. No plugin is enabled by default, and one install covers every project on the machine.
+
+Using Codex:
 
 ```bash
-uv tool upgrade lh-harness
+lh-harness plugin install codex-computer-use
 ```
 
-#### Install with pip
+Using Claude Code, or both agents:
 
 ```bash
-pip install lh-harness
+lh-harness plugin install open-computer-use
 ```
 
-#### Generate a project configuration
+`codex-computer-use` is the official plugin bundled with the Codex CLI and only works with Codex. `open-computer-use` is distributed on npm, needs Node.js 20+, and drives both agents. Both need OS permissions that **must be granted by hand on macOS**. See [Manage computer-use plugins](#manage-computer-use-plugins) for that, for `clawdcursor` as a third option, and for how each one is wired.
+
+#### 3. Generate a project configuration
 
 ```bash
+cd /path/to/your/project
 lh-harness init
 ```
 
-This creates `./.lh-harness/config.toml` without replacing an existing file. Use `lh-harness init --force` only when you want to regenerate it.
+This creates `./.lh-harness/config.toml` without replacing an existing file; use `lh-harness init --force` to regenerate. Open it and adjust the defaults. Every field is documented in [Configuration reference](#configuration-reference).
 
-When `lh-harness run` starts, it reads this file automatically. Configuration precedence is:
+#### 4. Run a task
 
-1. Explicit CLI arguments
-2. Values in `./.lh-harness/config.toml`
-3. Built-in defaults
+```bash
+TASK="Inspect the current directory and summarize its files."
+lh-harness run --task "${TASK}"
+```
 
-The generated file includes run storage, Agent/model assignment, role timeouts, MCP, prompt language, and Dashboard defaults. Task text, run IDs, and API keys remain command-line or environment inputs and are not stored in the generated configuration.
+The Dashboard opens automatically and shows the complete Manager → Executor → Auditor workflow. Every run is stored under `./.lh-harness/runs/<run-id>/`.
 
-Check the installation, Python runtime, available agent CLIs, and Codex GUI support:
+#### Verify the environment
 
 ```bash
 lh-harness doctor
 ```
 
-`doctor` also checks [PyPI](https://pypi.org/project/lh-harness) for updates with a 3-second timeout. When automatic detection fails, the output points to the PyPI page for a manual check.
+`doctor` is read-only. It reports the Python runtime, the agent CLIs, Node.js, and plugin state, and exits non-zero when a required check fails.
 
-To check for updates directly:
+Agent CLIs are verified by running `<binary> --version`, not just by finding them on `PATH`, so one that is present but broken is reported as a failure instead of OK. This catches the Windows case where a Microsoft Store desktop install leaves a zero-byte `codex.exe` alias on `PATH` that is not the CLI; `doctor` prints how to fix it.
+
+It also checks [PyPI](https://pypi.org/project/lh-harness) for a newer version. To check on its own:
 
 ```bash
 lh-harness check-update
 ```
 
-Codex Computer Use setup is intentionally separate from task execution. To explicitly install and enable the official plugin:
+#### Configuration reference
 
-```bash
-lh-harness doctor --install-codex-gui
+`lh-harness run` reads `./.lh-harness/config.toml` automatically. Precedence is:
+
+1. Explicit CLI arguments
+2. Values in `./.lh-harness/config.toml`
+3. Built-in defaults
+
+Task text, run IDs, and API keys are deliberately **not** configurable here; they stay command-line or environment inputs so they never land in a file you might commit.
+
+##### `[run]`
+
+| Field | Default | Description |
+|---|---|---|
+| `agent` | `"codex"` | Backend for every role unless a role overrides it: `codex` or `claude_code`. |
+| `model` | `"gpt-5.6-sol"` | Model for every role unless a role overrides it. Must be a model the chosen backend exposes. |
+| `env` | `"local"` | Execution environment. Only `local` today. |
+| `runs_root` | `"./.lh-harness/runs"` | Where run directories are created. Each run gets `<runs_root>/<run-id>/`. |
+| `workspace` | commented out | Working directory the agents operate in. Defaults to the run's own `workspace/`, which keeps runs isolated; set it to point at an existing project instead. |
+| `harness_dir` | commented out | Where harness state is written inside the workspace. Defaults to `<workspace>/.harness`. |
+| `log_dir` | commented out | Where logs are written. Defaults to the run's own `logs/`. |
+| `base_url` | commented out | OpenAI-compatible endpoint override, for a proxy or a self-hosted model. |
+| `prompt_language` | `"en"` | Language of the harness-generated prompts and reports: `en` or `zh`. Does not restrict the task language. |
+| `claude_mcp_config` | commented out | Path to a `.mcp.json` for Claude Code. Overrides the installed plugin. |
+| `codex_mcp_config` | commented out | Path to a `[mcp_servers.*]` TOML for Codex. Overrides the installed plugin. |
+| `mcp_add_dirs` | `[]` | Extra directories the MCP server may read. Claude Code rejects these, because its role isolation requires task files to live inside the workspace. |
+| `max_rounds` | `30` | Upper bound on Manage-Execute-Audit rounds before the run stops. |
+| `dashboard` | `true` | Start the web dashboard with each run. |
+| `dashboard_port` | `0` | Dashboard port; `0` lets the OS pick a free one. |
+
+##### `[run.timeouts]`
+
+Per-episode limits in seconds. One episode is a single role invocation, not the whole run.
+
+| Field | Default | Description |
+|---|---|---|
+| `manager` | `600` | Planning the next step. |
+| `gui_executor` | `1800` | Executing a GUI/visual subtask. |
+| `cli_executor` | `1800` | Executing a CLI/non-GUI subtask. |
+| `auditor` | `600` | Verifying a subtask. Applies to both auditors. |
+
+##### `[run.roles.*]`
+
+Each role can take its own `agent` and `model`, so you can pay for a strong model only where it matters: a capable Manager and Auditor with a cheaper Executor, for example. Every field is commented out by default, meaning "inherit".
+
+Resolution walks the chain until it finds a value:
+
+```
+gui_executor → executor → [run].agent / [run].model
+cli_auditor  → auditor  → [run].agent / [run].model
 ```
 
-To remove the plugin:
+| Section | Falls back to | Covers |
+|---|---|---|
+| `[run.roles.manager]` | `[run]` | The scheduler role |
+| `[run.roles.executor]` | `[run]` | Both executor roles |
+| `[run.roles.gui_executor]` | `executor` | GUI/visual subtasks |
+| `[run.roles.cli_executor]` | `executor` | CLI/non-GUI subtasks |
+| `[run.roles.auditor]` | `[run]` | Both auditor roles |
+| `[run.roles.gui_auditor]` | `auditor` | GUI audit |
+| `[run.roles.cli_auditor]` | `auditor` | CLI audit |
+
+Every field above also has a CLI flag (`--agent`, `--max-rounds`, `--gui-executor-model`, `--auditor-timeout`, and so on) that overrides it for a single run. Run `lh-harness run --help` for the full list.
+
+#### Manage computer-use plugins
+
+Computer-use setup is intentionally separate from task execution: `doctor` only reports status, and `lh-harness run` never installs, removes, or changes plugins. All changes go through `lh-harness plugin`.
+
+List the available plugins with their install state, supported agents, and homepages:
 
 ```bash
-lh-harness doctor --uninstall-codex-gui
+lh-harness plugin list
 ```
 
-Plain `lh-harness doctor` only checks status. Running `lh-harness run` never installs, removes, or changes Codex plugins.
+| Plugin | Source | Agents | Platforms |
+| --- | --- | --- | --- |
+| `codex-computer-use` | Official plugin bundled with the Codex CLI | `codex` | whatever your Codex build offers |
+| `open-computer-use` | npm ([open-codex-computer-use](https://github.com/iFurySt/open-codex-computer-use)) | `codex`, `claude_code` | macOS, Windows, Linux |
+| `clawdcursor` | npm ([clawdcursor](https://github.com/AmrDab/clawdcursor)) | `codex`, `claude_code` | macOS, Windows, Linux |
 
-#### Configure a computer-use MCP server
+Installing needs no agent flag. Every agent the plugin supports is configured, since the per-agent difference is only one more config file:
 
-GUI interaction is supplied through a compatible external computer-use MCP server. LongHorizon-Harness does not bundle or enable a specific computer-use implementation by default.
+```bash
+lh-harness plugin install clawdcursor
+```
 
-Both Claude Code and Codex accept a Claude-style MCP configuration through `--mcp-config`. Codex translates this configuration into its native command-line overrides. Use simple server names containing letters, numbers, hyphens, or underscores.
+One install covers every project on the machine. It installs the package, runs whatever consent or permission step the plugin needs on the current OS, and writes one MCP config per agent under `~/.lh-harness/plugins/`. Agents missing from `PATH` are skipped; `--agent` narrows the selection, and `--no-activate` skips the permission step on a headless machine.
 
-Example configuration for a local stdio MCP server:
+`lh-harness run` then loads the right server automatically. When several are installed, the first available one wins:
+
+```
+codex-computer-use > open-computer-use > clawdcursor
+```
+
+`--claude-mcp-config` and `--codex-mcp-config` override that choice. `plugin list` and `doctor` both print which plugin each agent will load and whether its permissions are granted.
+
+To remove one:
+
+```bash
+lh-harness plugin uninstall clawdcursor
+```
+
+**GUI access stays scoped to the harness.** The npm plugins live entirely inside `~/.lh-harness/` and are passed per run, so `~/.codex/config.toml`, `~/.claude.json`, and the user-scope MCP registries are never touched. `codex-computer-use` is the unavoidable exception: Codex loads it from its own registry, so `codex plugin add` records it there.
+
+**`codex-computer-use` needs manual grants on macOS.** It raises no permission dialog, so an unauthorized GUI call just fails. The install opens the two panes for you; tick *Codex Computer Use* under Privacy & Security → **Accessibility** and → **Screen & System Audio Recording**, then re-run the install to verify. On Windows there is nothing to grant, but the harness has to run in a signed-in desktop session and stay unelevated.
+
+Any missing prerequisite is printed during install.
+
+#### Configure MCP servers
+
+Any MCP server can be passed to the agents, not just computer-use ones. Each backend reads its own native format; nothing is translated between them.
+
+Claude Code takes a `.mcp.json` file through `--claude-mcp-config`:
 
 ```json
 {
@@ -279,43 +366,28 @@ Example configuration for a local stdio MCP server:
 }
 ```
 
-Example configuration for an HTTP MCP server:
+Codex takes a TOML file of `[mcp_servers.<name>]` tables through `--codex-mcp-config`, matching `~/.codex/config.toml`:
 
-```json
-{
-  "mcpServers": {
-    "computer-use": {
-      "url": "http://127.0.0.1:3000/mcp"
-    }
-  }
-}
+```toml
+[mcp_servers.my-server]
+command = "/path/to/mcp-server"
+args = ["--option", "value"]
+
+[mcp_servers.my-server.env]
+EXAMPLE_VARIABLE = "value"
 ```
 
-Run the harness with the MCP configuration and any directories that the agent needs to access:
-
-```bash
-lh-harness run --task @task.md --agent claude_code \
-  --mcp-config /path/to/mcp.json \
-  --mcp-add-dir /path/to/mcp/files
-```
-
-The same configuration works with Codex:
+Pass the config for the backend in use, plus any directory the server needs to read:
 
 ```bash
 lh-harness run --task @task.md --agent codex \
-  --mcp-config /path/to/mcp.json \
+  --codex-mcp-config /path/to/mcp.toml \
   --mcp-add-dir /path/to/mcp/files
 ```
 
-`--mcp-add-dir` may be repeated. MCP configuration and additional directories can also be supplied through environment variables:
+Both flags can be given together when roles use different backends, and `--mcp-add-dir` may be repeated. The equivalent environment variables are `LH_HARNESS_CLAUDECODE_MCP_CONFIG`, `LH_HARNESS_CODEX_MCP_CONFIG`, and `LH_HARNESS_MCP_ADD_DIRS`, the last separated by `:` on macOS/Linux and `;` on Windows.
 
-| Backend | MCP configuration | Additional directories |
-|---|---|---|
-| Claude Code | `LH_HARNESS_CLAUDECODE_MCP_CONFIG` | `LH_HARNESS_CLAUDECODE_ADD_DIRS` |
-| Codex | `LH_HARNESS_CODEX_MCP_CONFIG` | `LH_HARNESS_CODEX_ADD_DIRS` |
-| All backends | `LH_HARNESS_MCP_CONFIG` | `LH_HARNESS_MCP_ADD_DIRS` |
-
-Separate multiple directories using the operating system path separator (`:` on macOS/Linux and `;` on Windows). Avoid storing API keys directly in the MCP JSON file when the MCP server can read them from its environment.
+Prefer letting the server read API keys from its environment over writing them into the config file.
 
 ### Dashboard commands
 
@@ -334,13 +406,6 @@ lh-harness dashboard                            # Browse completed and active ru
 | `--max-rounds` | Maximum number of Manage-Execute-Audit rounds; the CLI default is 30 |
 | `--dashboard` | Start live monitoring and human intervention |
 | `--no-dashboard` | Disable a Dashboard enabled by the project configuration |
-
-Run a task:
-
-```bash
-lh-harness run \
-  --task "Inspect the current directory and summarize its files."
-```
 
 Run a longer task from a file and open the Dashboard:
 

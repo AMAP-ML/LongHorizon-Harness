@@ -32,7 +32,8 @@ _RUN_KEYS = {
     "log_dir",
     "base_url",
     "prompt_language",
-    "mcp_config",
+    "claude_mcp_config",
+    "codex_mcp_config",
     "mcp_add_dirs",
     "max_rounds",
     "dashboard",
@@ -47,7 +48,8 @@ _STRING_KEYS = {
     "harness_dir",
     "log_dir",
     "base_url",
-    "mcp_config",
+    "claude_mcp_config",
+    "codex_mcp_config",
 }
 
 CONFIG_TEMPLATE = """# LongHorizon-Harness project defaults.
@@ -66,7 +68,9 @@ runs_root = "./.lh-harness/runs"
 # base_url = "https://api.example.com/v1"
 
 prompt_language = "en"
-# mcp_config = "/path/to/mcp.json"
+# Each agent reads its own format; installed plugins are loaded automatically.
+# claude_mcp_config = "/path/to/mcp.json"
+# codex_mcp_config = "/path/to/mcp.toml"
 mcp_add_dirs = []
 
 max_rounds = 30

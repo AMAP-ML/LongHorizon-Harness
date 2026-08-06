@@ -6,8 +6,8 @@ import shlex
 import tempfile
 from pathlib import Path
 
-from .environment.base import Environment
-from .types import DEFAULT_TMP_DIR
+from .base import Environment
+from ..types import DEFAULT_TMP_DIR
 
 
 async def write_remote_text(env: Environment, remote_path: str, content: str, mode: str = "0644") -> None:
@@ -17,7 +17,10 @@ async def write_remote_text(env: Environment, remote_path: str, content: str, mo
 
     tmp_path: str | None = None
     try:
-        tmp_dir = Path(DEFAULT_TMP_DIR)
+        # Prompts can carry task secrets, so stage them in the run's own tmp dir
+        # rather than a directory shared by every run on the machine.
+        staging = getattr(env, "staging_dir", None)
+        tmp_dir = Path(staging) if staging else Path(DEFAULT_TMP_DIR)
         tmp_dir.mkdir(parents=True, exist_ok=True)
         fd, tmp_path = tempfile.mkstemp(prefix="lh_harness_remote_", dir=tmp_dir, text=True)
         with os.fdopen(fd, "w", encoding="utf-8") as fh:

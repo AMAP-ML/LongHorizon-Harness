@@ -7,19 +7,24 @@ import signal
 import time
 from pathlib import Path
 
-from ..process_group import (
+from ..types import DEFAULT_TMP_DIR, ExecResult
+from ..utils.process_group import (
     kill_process_group,
     signal_process_group,
     track_process_group,
     untrack_process_group,
 )
-from ..types import DEFAULT_TMP_DIR, ExecResult
 
 
 class LocalEnvironment:
     def __init__(self, tmp_dir: str | None = None) -> None:
         # Library usage falls back to user-scoped scratch storage.
         self._tmp_dir = Path(tmp_dir).expanduser() if tmp_dir else Path(DEFAULT_TMP_DIR)
+
+    @property
+    def staging_dir(self) -> Path:
+        """Where callers may stage files before uploading them into this env."""
+        return self._tmp_dir
 
     async def exec(
         self,
@@ -39,7 +44,7 @@ class LocalEnvironment:
                 stderr=asyncio.subprocess.PIPE,
                 # Own session, so one killpg reaps the agent CLI and everything
                 # it spawned. It also detaches the child from our terminal, so
-                # Ctrl+C never reaches it — every exit path below must kill it.
+                # Ctrl+C never reaches it, so every exit path below must kill it.
                 start_new_session=True,
                 # Claude Code emits one JSON object per line in stream-json mode.
                 # A single line (e.g. a tool_result carrying a base64 screenshot)
@@ -124,7 +129,7 @@ class LocalEnvironment:
         """Drain both streams while optionally teeing stdout to a live file.
 
         stdout is written incrementally (one line at a time) so an external
-        reader — the dashboard — sees the agent's stream-json trajectory grow
+        reader (the dashboard) sees the agent's stream-json trajectory grow
         live. The caller owns the chunk lists, so partial output survives even
         when the wait is interrupted by timeout or cancellation.
         """

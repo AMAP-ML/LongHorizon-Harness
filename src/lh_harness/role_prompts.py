@@ -328,7 +328,9 @@ def extract_role_manager_question(plan_text: str) -> str:
         if not collecting:
             if head.startswith(("问题:", "问题：")) or re.match(r"(?i)^question\s*:", line.strip().strip("*")):
                 collecting = True
-                rest = line.split("：", 1)[-1] if "：" in line else line.split(":", 1)[-1]
+                # Split on the heading's own colon, whichever form it is; a colon
+                # later in the question text must not truncate it.
+                rest = re.split(r"[:：]", line, maxsplit=1)[-1]
                 if rest.strip():
                     collected.append(rest.strip())
             continue

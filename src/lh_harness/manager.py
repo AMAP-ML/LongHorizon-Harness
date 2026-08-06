@@ -11,7 +11,8 @@ from typing import Any, Awaitable, Callable
 from .adapters.base import AgentAdapter
 from .agent_logs import visible_output as decode_agent_visible_output
 from .environment.base import Environment
-from .remote_io import ensure_remote_dir, write_remote_text
+from .environment.remote_files import ensure_remote_dir, write_remote_text
+from .runtime_signals import hard_signal_labels
 from .role_prompts import (
     MANAGER_NEXT_BLOCKED,
     MANAGER_NEXT_DONE,
@@ -40,6 +41,7 @@ from .types import (
     RoleNextStep,
 )
 from .auditor_agent import (
+    VISIBLE_OUTPUT_KEYS,
     has_valid_auditor_control_header,
     parse_audit_report,
     auditor_report_text_from_episode_result,
@@ -102,6 +104,7 @@ async def run(
     cli_executor_agent: AgentAdapter | None = None,
     gui_auditor_agent: AgentAdapter | None = None,
     cli_auditor_agent: AgentAdapter | None = None,
+    auditor_format_repair_agent: AgentAdapter | None = None,
     human_hook: Callable[[dict[str, Any]], Awaitable[dict[str, Any]]] | None = None,
 ) -> dict[str, Any]:
     """Run the generic LongHorizon-Harness four-role management loop.
@@ -292,7 +295,7 @@ async def run(
         )
 
         if next_step == MANAGER_NEXT_DONE:
-            if _latest_auditor_is_clean_complete(rounds):
+            if _latest_auditor_is_clean_complete(rounds, language=config.prompt_language):
                 gate.completion_satisfied = True
                 rounds.append(
                     ManagedRound(
@@ -522,7 +525,10 @@ async def run(
             config=config,
             round_dir=round_dir,
             events_path=events_path,
-            auditor_agent=auditor_for_step,
+            # By default, repair uses the same concrete GUI/CLI auditor that
+            # produced the report. Callers may still provide an explicit
+            # override for compatibility or backend specialization.
+            format_repair_agent=auditor_format_repair_agent or auditor_for_step,
             auditor_budget=auditor_budget,
             primary_result=auditor_result,
             round_index=round_index,
@@ -613,7 +619,7 @@ class _GateContext:
     Bundles the run-scoped dependencies (hook, task, rounds, paths, config) with
     the loop state the gate updates (round budget, completion, abort reason,
     carryover instructions). The gate is thus a single module-level function the
-    run loop calls directly, reading results straight back from this object — no
+    run loop calls directly, reading results straight back from this object, with no
     thin wrapper and no return-then-reassign dance.
     """
 
@@ -746,7 +752,7 @@ async def _auditor_report_with_format_repair(
     config: HarnessConfig,
     round_dir: Path,
     events_path: Path,
-    auditor_agent: AgentAdapter,
+    format_repair_agent: AgentAdapter,
     auditor_budget: EpisodeBudget,
     primary_result: EpisodeResult,
     round_index: int,
@@ -775,7 +781,7 @@ async def _auditor_report_with_format_repair(
         },
     )
     repair_result = await _run_role_episode(
-        auditor_agent,
+        format_repair_agent,
         repair_prompt,
         env,
         repair_budget,
@@ -819,7 +825,7 @@ async def _auditor_report_with_format_repair(
 def _should_repair_auditor_format(result: EpisodeResult, report_text: str) -> bool:
     if result.status != "done":
         return False
-    if _runtime_signal_labels(result):
+    if _hard_runtime_signal_labels(result):
         return False
     return not has_valid_auditor_control_header(report_text)
 
@@ -827,7 +833,7 @@ def _should_repair_auditor_format(result: EpisodeResult, report_text: str) -> bo
 def _should_accept_auditor_format_repair(result: EpisodeResult, report_text: str) -> bool:
     if result.status != "done":
         return False
-    if _runtime_signal_labels(result):
+    if _hard_runtime_signal_labels(result):
         return False
     if _workspace_mutation_detected(result):
         return False
@@ -846,7 +852,7 @@ def _auditor_report_text(
     *,
     language: str = "en",
 ) -> str:
-    report = audit_report_from_episode_result(result, round_index)
+    report = audit_report_from_episode_result(result, round_index, language=language)
     if report.report_text.strip():
         return report.report_text.strip()
     visible = _visible_output(result).strip()
@@ -869,13 +875,13 @@ def _auditor_report_text(
     )
 
 
-def _latest_auditor_is_clean_complete(rounds: list[ManagedRound]) -> bool:
+def _latest_auditor_is_clean_complete(rounds: list[ManagedRound], *, language: str = "en") -> bool:
     for item in reversed(rounds):
         if item.auditor_status.get("invalid_completion") or item.auditor_status.get("invalid_plan"):
             continue
         if not item.auditor_report.strip():
             continue
-        report = parse_audit_report(item.auditor_report, item.round_index)
+        report = parse_audit_report(item.auditor_report, item.round_index, language=language)
         return (
             report.status == "complete"
             and report.integrity_status == "clean"
@@ -943,7 +949,7 @@ def _visible_output(result: EpisodeResult) -> str:
     # Adapters can expose a clean assistant-visible output in metadata. Falling
     # back to actions_log keeps simple command adapters usable.
     metadata = result.metadata if isinstance(result.metadata, dict) else {}
-    for key in ("executor_agent_visible_output", "visible_executor_output", "assistant_visible_output", "output_text"):
+    for key in VISIBLE_OUTPUT_KEYS:
         value = metadata.get(key)
         if isinstance(value, str) and value.strip():
             return value
@@ -969,20 +975,9 @@ def _episode_status(result: EpisodeResult) -> dict[str, Any]:
     }
 
 
-def _runtime_signal_labels(result: EpisodeResult) -> list[str]:
+def _hard_runtime_signal_labels(result: EpisodeResult) -> list[str]:
     metadata = result.metadata if isinstance(result.metadata, dict) else {}
-    raw = metadata.get("runtime_signals")
-    if not isinstance(raw, list):
-        return []
-    labels: list[str] = []
-    for item in raw:
-        if isinstance(item, dict):
-            signal = item.get("signal")
-            if isinstance(signal, str) and signal.strip():
-                labels.append(signal.strip())
-        elif isinstance(item, str) and item.strip():
-            labels.append(item.strip())
-    return labels
+    return hard_signal_labels(metadata.get("runtime_signals"))
 
 
 def _workspace_mutation_detected(result: EpisodeResult) -> bool:

@@ -5,8 +5,6 @@ import asyncio
 import json
 import platform
 import re
-import shutil
-import subprocess
 import sys
 import time
 import uuid
@@ -21,6 +19,7 @@ from .config import (
     load_run_defaults,
 )
 from .types import DEFAULT_CLAUDE_MODEL, DEFAULT_CODEX_MODEL, EpisodeBudget, HarnessConfig
+from .utils.agent_cli import probe_agent_cli
 
 if TYPE_CHECKING:
     from .utils import UpdateCheckResult
@@ -37,6 +36,13 @@ _AGENTS = (
     ("codex", "codex", DEFAULT_CODEX_MODEL),
 )
 _AGENT_CHOICES = tuple(name for name, _, _ in _AGENTS)
+# Each agent reads MCP config in its own format, so each gets its own flag.
+_MCP_CONFIG_DESTS = {"claude_code": "claude_mcp_config", "codex": "codex_mcp_config"}
+
+# Computer-use plugins, listed here so `--help` needs no plugins import.
+# Kept in sync by a check in `_plugin_command`.
+_CODEX_GUI_PLUGIN = "codex-computer-use"
+_PLUGIN_CHOICES = (_CODEX_GUI_PLUGIN, "open-computer-use", "clawdcursor")
 
 # Role options as (dest prefix, broader option it falls back to, help scope).
 # Each entry gets a matching `--<role>-agent` and `--<role>-model` flag;
@@ -80,6 +86,13 @@ def _positive_int(value: str) -> int:
     parsed = int(value)
     if parsed < 1:
         raise argparse.ArgumentTypeError("must be at least 1")
+    return parsed
+
+
+def _port(value: str) -> int:
+    parsed = int(value)
+    if not 0 <= parsed <= 65535:
+        raise argparse.ArgumentTypeError("must be between 0 and 65535")
     return parsed
 
 
@@ -197,10 +210,18 @@ def main(argv: list[str] | None = None) -> int:
         default=run_default("prompt_language", "en"),
         help="Language for manager/executor/auditor prompts.",
     )
+    # One entry per agent, each in that agent's own format: no translation.
     run_parser.add_argument(
-        "--mcp-config",
-        default=run_default("mcp_config"),
-        help="Optional MCP config path (Claude `.mcp.json` shape; translated for Codex). No MCP server is enabled by default.",
+        "--claude-mcp-config",
+        default=run_default("claude_mcp_config"),
+        help="MCP config for Claude Code, in its own `.mcp.json` format. Overrides the installed "
+        "computer-use plugin, which is loaded automatically otherwise.",
+    )
+    run_parser.add_argument(
+        "--codex-mcp-config",
+        default=run_default("codex_mcp_config"),
+        help="MCP config for Codex, a TOML file holding `[mcp_servers.<name>]` tables. Overrides "
+        "the installed computer-use plugin, which is loaded automatically otherwise.",
     )
     run_parser.add_argument(
         "--mcp-add-dir",
@@ -230,7 +251,7 @@ def main(argv: list[str] | None = None) -> int:
     )
     run_parser.add_argument(
         "--dashboard-port",
-        type=int,
+        type=_port,
         default=run_default("dashboard_port", 0),
         help="Dashboard port; 0 lets the OS pick a free one.",
     )
@@ -246,20 +267,43 @@ def main(argv: list[str] | None = None) -> int:
         default=None,
         help="Pin one run's log directory instead of browsing --runs-root.",
     )
-    dash_parser.add_argument("--port", type=int, default=0, help="Dashboard port; 0 lets the OS pick a free one.")
+    dash_parser.add_argument("--port", type=_port, default=0, help="Dashboard port; 0 lets the OS pick a free one.")
 
-    doctor_parser = add_command("doctor", "Check the local environment and optional Codex GUI support")
-    codex_gui_actions = doctor_parser.add_mutually_exclusive_group()
-    codex_gui_actions.add_argument(
-        "--install-codex-gui",
-        action="store_true",
-        help="Install and enable the official Codex Computer Use plugin after explicit opt-in.",
-    )
-    codex_gui_actions.add_argument(
-        "--uninstall-codex-gui",
-        action="store_true",
-        help="Remove the official Codex Computer Use plugin after explicit opt-in.",
-    )
+    add_command("doctor", "Check the local environment and report computer-use plugin state")
+
+    plugin_parser = add_command("plugin", "Install or remove computer-use plugins")
+    plugin_actions = plugin_parser.add_subparsers(dest="plugin_command")
+    for action, help_text in (
+        ("list", "Show the available computer-use plugins and their install state"),
+        ("install", "Install a computer-use plugin and register it with an agent"),
+        ("uninstall", "Remove a computer-use plugin"),
+    ):
+        sub_parser = plugin_actions.add_parser(
+            action,
+            help=help_text,
+            epilog=_EPILOG,
+            formatter_class=_HelpFormatter,
+        )
+        if action == "list":
+            continue
+        sub_parser.add_argument(
+            "name",
+            choices=_PLUGIN_CHOICES,
+            help="Plugin to set up. Run `lh-harness plugin list` for what each one provides.",
+        )
+        if action == "install":
+            sub_parser.add_argument(
+                "--agent",
+                action="append",
+                choices=_AGENT_CHOICES,
+                default=None,
+                help="Agent to register the plugin with. May be repeated; defaults to every supported agent.",
+            )
+            sub_parser.add_argument(
+                "--no-activate",
+                action="store_true",
+                help="Skip the plugin's consent and OS-permission commands (they need a desktop session).",
+            )
 
     init_parser = add_command("init", "Generate ./.lh-harness/config.toml for this project")
     init_parser.add_argument(
@@ -282,7 +326,12 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "dashboard":
         return _dashboard_command(args)
     if args.command == "doctor":
-        return _doctor_command(args)
+        return _doctor_command()
+    if args.command == "plugin":
+        if not args.plugin_command:
+            plugin_parser.print_help()
+            return 2
+        return _plugin_command(args)
     if args.command == "init":
         return _init_command(args)
     if args.command == "check-update":
@@ -292,7 +341,7 @@ def main(argv: list[str] | None = None) -> int:
     return 2
 
 
-def _doctor_command(args: argparse.Namespace) -> int:
+def _doctor_command() -> int:
     from .utils import start_update_check
 
     update_check = start_update_check(__version__)
@@ -329,73 +378,27 @@ def _doctor_command(args: argparse.Namespace) -> int:
 
     found_agents: dict[str, str] = {}
     for name, binary, _ in _AGENTS:
-        path = shutil.which(binary)
-        if not path:
-            _doctor_line("WARN", name, f"`{binary}` was not found on PATH")
+        cli = probe_agent_cli(binary)
+        if not cli.found:
+            _doctor_line("WARN", name, cli.problem)
             warnings += 1
             continue
-        found_agents[name] = path
-        version = _agent_version(path)
-        _doctor_line("OK", name, f"{version + ' ' if version else ''}({path})")
+        if not cli.usable:
+            # On PATH but not runnable is worse than absent: it silently breaks
+            # every run, so it is a failure rather than a warning.
+            _doctor_line("FAIL", name, cli.problem)
+            failures += 1
+            continue
+        found_agents[name] = cli.path
+        _doctor_line("OK", name, f"{cli.version} ({cli.path})")
 
     if not found_agents:
         _doctor_line("FAIL", "Agent runtime", "install Claude Code or Codex CLI and add it to PATH")
         failures += 1
 
-    codex_path = found_agents.get("codex")
-    if codex_path:
-        from .codex_plugins import (
-            COMPUTER_USE_PLUGIN_ID,
-            CodexPluginError,
-            get_codex_plugin_state,
-            install_computer_use_plugin,
-            uninstall_computer_use_plugin,
-        )
+    warnings += _doctor_node_toolchain()
 
-        try:
-            if args.install_codex_gui:
-                state = install_computer_use_plugin(
-                    codex_binary=codex_path,
-                    on_status=lambda status, message: _doctor_line(status.upper(), "Codex GUI", message),
-                )
-            elif args.uninstall_codex_gui:
-                state = uninstall_computer_use_plugin(
-                    codex_binary=codex_path,
-                    on_status=lambda status, message: _doctor_line(status.upper(), "Codex GUI", message),
-                )
-            else:
-                state = get_codex_plugin_state(COMPUTER_USE_PLUGIN_ID, codex_binary=codex_path)
-        except CodexPluginError as exc:
-            changing_plugin = args.install_codex_gui or args.uninstall_codex_gui
-            level = "FAIL" if changing_plugin else "WARN"
-            _doctor_line(level, "Codex GUI", str(exc))
-            if changing_plugin:
-                failures += 1
-            else:
-                warnings += 1
-        else:
-            if args.uninstall_codex_gui:
-                _doctor_line("OK", "Codex GUI", f"{state.plugin_id} is not installed")
-            elif state.ready:
-                version = f" {state.version}" if state.version else ""
-                _doctor_line("OK", "Codex GUI", f"{state.plugin_id}{version} is installed and enabled")
-            elif state.available:
-                detail = "installed but disabled" if state.installed else "available but not installed"
-                _doctor_line(
-                    "WARN",
-                    "Codex GUI",
-                    f"{state.plugin_id} is {detail}; run `lh-harness doctor --install-codex-gui`",
-                )
-                warnings += 1
-            else:
-                _doctor_line("WARN", "Codex GUI", f"{state.plugin_id} is unavailable; update Codex CLI")
-                warnings += 1
-    elif args.install_codex_gui or args.uninstall_codex_gui:
-        action = "install" if args.install_codex_gui else "uninstall"
-        _doctor_line("FAIL", "Codex GUI", f"Codex CLI is required to {action} Computer Use")
-        failures += 1
-    else:
-        _doctor_line("SKIP", "Codex GUI", "Codex CLI is not installed")
+    warnings += _doctor_plugin_state(codex_path=found_agents.get("codex"))
 
     update_result = update_check.result(timeout=3.0)
     update_warning = _report_update_result(update_result)
@@ -413,6 +416,352 @@ def _doctor_command(args: argparse.Namespace) -> int:
 
 def _doctor_line(status: str, label: str, detail: str) -> None:
     print(f"[{status:<4}] {label}: {detail}")
+
+
+_MIN_NODE_MAJOR = 20
+
+
+def _doctor_node_toolchain() -> int:
+    """Report the Node/npm toolchain the npm-distributed plugins need."""
+    from .plugins import node_version, npm_binary, npm_version
+
+    warnings = 0
+    npm = npm_binary()
+    if not npm:
+        _doctor_line(
+            "WARN",
+            "npm",
+            "not found on PATH; `lh-harness plugin install` needs Node.js 20+ (https://nodejs.org)",
+        )
+        warnings += 1
+    else:
+        _doctor_line("OK", "npm", f"{npm_version() or 'unknown version'} ({npm})")
+
+    node = node_version()
+    if not node:
+        _doctor_line("WARN", "Node.js", "`node --version` was unreadable; install Node.js 20 or later")
+        return warnings + 1
+    major_match = re.match(r"(\d+)", node)
+    major = int(major_match.group(1)) if major_match else 0
+    if major >= _MIN_NODE_MAJOR:
+        _doctor_line("OK", "Node.js", node)
+    else:
+        _doctor_line("WARN", "Node.js", f"{node} is older than {_MIN_NODE_MAJOR}; plugins may fail")
+        warnings += 1
+    return warnings
+
+
+def _doctor_plugin_state(*, codex_path: str | None) -> int:
+    """Report each computer-use plugin's state, in `plugin list` order."""
+    from .plugins import (
+        COMMUNITY_PLUGINS,
+        COMPUTER_USE_PLUGIN_ID,
+        PluginError,
+        codex_gui_grants,
+        community_plugin_activation,
+        community_plugin_state,
+        get_codex_plugin_state,
+        global_registrations,
+        npm_binary,
+    )
+
+    hint = "run `lh-harness plugin install {name}`"
+    warnings = 0
+
+    if not codex_path:
+        _doctor_line("SKIP", _CODEX_GUI_PLUGIN, "skipped while the Codex CLI is unusable")
+    else:
+        try:
+            state = get_codex_plugin_state(COMPUTER_USE_PLUGIN_ID, codex_binary=codex_path)
+        except PluginError as exc:
+            _doctor_line("WARN", _CODEX_GUI_PLUGIN, str(exc))
+            warnings += 1
+        else:
+            version = f" {state.version}" if state.version else ""
+            if state.ready:
+                _doctor_line("OK", _CODEX_GUI_PLUGIN, f"{state.plugin_id}{version} is enabled")
+                _doctor_line("NOTE", f"{_CODEX_GUI_PLUGIN} grants", codex_gui_grants())
+            elif state.available:
+                detail = "installed but disabled" if state.installed else "not installed"
+                _doctor_line(
+                    "SKIP",
+                    _CODEX_GUI_PLUGIN,
+                    f"{state.plugin_id} is {detail}; " + hint.format(name=_CODEX_GUI_PLUGIN),
+                )
+            else:
+                _doctor_line(
+                    "WARN", _CODEX_GUI_PLUGIN, f"{state.plugin_id} is unavailable; update Codex CLI"
+                )
+                warnings += 1
+
+    if not npm_binary():
+        for plugin in COMMUNITY_PLUGINS:
+            _doctor_line("SKIP", plugin.plugin_id, "state unknown while npm is missing")
+        return warnings
+
+    for plugin in COMMUNITY_PLUGINS:
+        if not plugin.supports_platform(sys.platform):
+            _doctor_line("SKIP", plugin.plugin_id, f"does not support {sys.platform}")
+            continue
+        try:
+            state = community_plugin_state(plugin)
+        except PluginError as exc:
+            _doctor_line("WARN", plugin.plugin_id, str(exc))
+            warnings += 1
+            continue
+        if not state.installed:
+            _doctor_line(
+                "SKIP", plugin.plugin_id, "not installed; " + hint.format(name=plugin.plugin_id)
+            )
+            continue
+        _doctor_line("OK", plugin.plugin_id, f"{plugin.package} {state.version}".strip())
+        ready, detail = community_plugin_activation(plugin)
+        if ready is False:
+            _doctor_line("WARN", f"{plugin.plugin_id} grants", detail)
+            warnings += 1
+        elif ready:
+            _doctor_line("OK", f"{plugin.plugin_id} grants", detail)
+        leftovers = global_registrations(plugin)
+        if leftovers:
+            _doctor_line(
+                "WARN",
+                f"{plugin.plugin_id} scope",
+                f"also registered globally in {', '.join(sorted(set(leftovers)))}; "
+                "the harness loads it per run, so remove the global entry to keep GUI "
+                "control out of unrelated sessions",
+            )
+            warnings += 1
+    return warnings + _doctor_active_plugins()
+
+
+def _doctor_active_plugins() -> int:
+    """Report which plugin each agent will load, following the priority order."""
+    from .plugins import PluginError, active_plugin_for_agent
+
+    warnings = 0
+    for agent in _AGENT_CHOICES:
+        try:
+            active = active_plugin_for_agent(agent)
+        except PluginError as exc:
+            _doctor_line("WARN", f"Computer use ({agent})", str(exc))
+            warnings += 1
+            continue
+        if active is None:
+            _doctor_line(
+                "SKIP",
+                f"Computer use ({agent})",
+                "no plugin installed; GUI subtasks will have no computer-use server",
+            )
+            continue
+        plugin_id, config = active
+        _doctor_line(
+            "OK",
+            f"Computer use ({agent})",
+            f"{plugin_id} ({config or 'loaded natively by the agent'})",
+        )
+    return warnings
+
+
+def _plugin_command(args: argparse.Namespace) -> int:
+    from .plugins import PluginError, community_plugin_ids
+
+    assert set(_PLUGIN_CHOICES) == {_CODEX_GUI_PLUGIN, *community_plugin_ids()}, (
+        "CLI plugin choices are stale"
+    )
+
+    if args.plugin_command == "list":
+        return _plugin_list_command()
+    try:
+        if args.name == _CODEX_GUI_PLUGIN:
+            return _codex_gui_plugin_command(args)
+        return _community_plugin_command(args)
+    except PluginError as exc:
+        _doctor_line("FAIL", args.name, str(exc))
+        return 1
+
+
+def _plugin_list_command() -> int:
+    from .plugins import (
+        COMMUNITY_PLUGINS,
+        COMPUTER_USE_PLUGIN_ID,
+        PLUGIN_PRIORITY,
+        PluginError,
+        active_plugin_for_agent,
+        codex_gui_grants,
+        community_plugin_activation,
+        community_plugin_state,
+        get_codex_plugin_state,
+        npm_binary,
+        plugins_root,
+    )
+
+    def entry(name: str, summary: str, fields: dict[str, str]) -> None:
+        print(f"\n{name}")
+        print(f"  {summary}")
+        width = max(len(key) for key in fields)
+        for key, value in fields.items():
+            print(f"  {key.ljust(width)} : {value}")
+
+    print(f"Priority when several are installed: {' > '.join(PLUGIN_PRIORITY)}")
+    print(f"Generated MCP configs live under {plugins_root()}")
+    for agent in _AGENT_CHOICES:
+        try:
+            active = active_plugin_for_agent(agent)
+        except PluginError as exc:
+            print(f"Active for {agent}: unknown ({exc})")
+            continue
+        print(f"Active for {agent}: {active[0] if active else 'none installed'}")
+
+    codex_cli = probe_agent_cli("codex")
+    if not codex_cli.found:
+        codex_state = "unknown (Codex CLI is not installed)"
+    elif not codex_cli.usable:
+        codex_state = f"unknown ({codex_cli.problem})"
+    else:
+        try:
+            official = get_codex_plugin_state(COMPUTER_USE_PLUGIN_ID, codex_binary=codex_cli.path)
+        except PluginError as exc:
+            codex_state = f"unknown ({exc})"
+        else:
+            if official.ready:
+                codex_state = f"installed and enabled {official.version}".strip()
+            elif official.installed:
+                codex_state = "installed but disabled"
+            elif official.available:
+                codex_state = "not installed"
+            else:
+                codex_state = f"not offered by this Codex build on {sys.platform}"
+    entry(
+        _CODEX_GUI_PLUGIN,
+        "Official Codex Computer Use plugin, bundled with the Codex CLI.",
+        {
+            "source": f"codex plugin ({COMPUTER_USE_PLUGIN_ID})",
+            "agents": "codex",
+            "platforms": "whatever your Codex build offers",
+            "grants": codex_gui_grants(),
+            "homepage": "https://github.com/openai/codex",
+            "state": codex_state,
+        },
+    )
+
+    npm_missing = not npm_binary()
+    for plugin in COMMUNITY_PLUGINS:
+        grants = "not checked"
+        if npm_missing:
+            state = "unknown (npm is not on PATH; needs Node.js 20 or later)"
+        else:
+            try:
+                package_state = community_plugin_state(plugin)
+            except PluginError as exc:
+                state = f"unknown ({exc})"
+            else:
+                state = (
+                    f"installed {package_state.version}".strip()
+                    if package_state.installed
+                    else "not installed"
+                )
+                if package_state.installed:
+                    ready, detail = community_plugin_activation(plugin)
+                    prefix = {True: "granted", False: "MISSING", None: "unknown"}[ready]
+                    grants = f"{prefix}: {detail}"
+        platforms = ", ".join(sorted(plugin.platforms))
+        if not plugin.supports_platform(sys.platform):
+            platforms += f" (not {sys.platform})"
+        entry(
+            plugin.plugin_id,
+            plugin.summary,
+            {
+                "source": f"npm ({plugin.package})",
+                "agents": ", ".join(sorted(plugin.agents)),
+                "platforms": platforms,
+                "grants": grants,
+                "homepage": plugin.homepage,
+                "state": state,
+            },
+        )
+    return 0
+
+
+def _codex_gui_plugin_command(args: argparse.Namespace) -> int:
+    from .plugins import install_computer_use_plugin, uninstall_computer_use_plugin
+
+    codex = probe_agent_cli("codex")
+    if not codex.found:
+        _doctor_line("FAIL", _CODEX_GUI_PLUGIN, "Codex CLI is required; install it and retry")
+        return 1
+    if not codex.usable:
+        _doctor_line("FAIL", _CODEX_GUI_PLUGIN, codex.problem)
+        return 1
+    codex_path = codex.path
+    if args.plugin_command == "install" and args.agent and set(args.agent) - {"codex"}:
+        _doctor_line("FAIL", _CODEX_GUI_PLUGIN, "this plugin only supports --agent codex")
+        return 1
+
+    def report(status: str, message: str) -> None:
+        _doctor_line(status.upper(), _CODEX_GUI_PLUGIN, message)
+
+    if args.plugin_command == "install":
+        state = install_computer_use_plugin(
+            codex_binary=codex_path, on_status=report, activate=not args.no_activate
+        )
+        version = f" {state.version}" if state.version else ""
+        report("ok", f"{state.plugin_id}{version} is installed and enabled")
+    else:
+        state = uninstall_computer_use_plugin(codex_binary=codex_path, on_status=report)
+        report("ok", f"{state.plugin_id} is not installed")
+    return 0
+
+
+def _community_plugin_command(args: argparse.Namespace) -> int:
+    from .plugins import (
+        get_community_plugin,
+        install_community_plugin,
+        node_version,
+        uninstall_community_plugin,
+    )
+
+    plugin = get_community_plugin(args.name)
+
+    def report(status: str, message: str) -> None:
+        _doctor_line(status.upper(), plugin.plugin_id, message)
+
+    if args.plugin_command != "install":
+        uninstall_community_plugin(plugin, on_status=report)
+        return 0
+
+    requested = args.agent or sorted(plugin.agents)
+    explicit = bool(args.agent)
+    agents: list[str] = []
+    missing: list[tuple[str, str]] = []
+    for agent in requested:
+        binary = next(b for n, b, _ in _AGENTS if n == agent)
+        cli = probe_agent_cli(binary)
+        if cli.usable:
+            agents.append(agent)
+        else:
+            missing.append((agent, cli.problem))
+    for agent, problem in missing:
+        # Writing config for an agent that cannot run would produce a plugin
+        # nothing reads. Only an explicit --agent makes this an error.
+        level = "FAIL" if explicit else "SKIP"
+        suffix = "" if explicit else "; skipped"
+        _doctor_line(level, f"Agent ({agent})", f"{problem}{suffix}")
+    if explicit and missing:
+        return 1
+    if not agents:
+        _doctor_line("FAIL", "Agent", "install Claude Code or Codex CLI, then retry")
+        return 1
+
+    print(f"Installing {plugin.plugin_id} for: {', '.join(agents)}")
+    if not node_version():
+        _doctor_line("WARN", "Node.js", "could not read `node --version`; the plugin may not run")
+    install_community_plugin(
+        plugin,
+        agents=agents,
+        on_status=report,
+        activate=not args.no_activate,
+    )
+    return 0
 
 
 def _init_command(args: argparse.Namespace) -> int:
@@ -455,29 +804,6 @@ def _report_update_result(result: UpdateCheckResult | None) -> bool:
     return False
 
 
-def _agent_version(path: str) -> str:
-    """Best-effort `<agent> --version`; an unresponsive CLI must not fail the command."""
-    try:
-        result = subprocess.run(
-            [path, "--version"],
-            capture_output=True,
-            text=True,
-            timeout=10,
-            check=False,
-        )
-    except (OSError, subprocess.SubprocessError):
-        return ""
-    if result.returncode != 0:
-        return ""
-    lines = (result.stdout or result.stderr).strip().splitlines()
-    if not lines:
-        return ""
-    # Each CLI decorates the number differently ("2.1.220 (Claude Code)",
-    # "codex-cli 0.146.0"), so keep just the version itself.
-    match = re.search(r"\d+(?:\.\d+)+\S*", lines[0])
-    return match.group(0) if match else lines[0].strip()
-
-
 def _dashboard_command(args: argparse.Namespace) -> int:
     from .dashboard import start_dashboard
 
@@ -501,7 +827,7 @@ def _run_command(args: argparse.Namespace) -> int:
     max_rounds = args.max_rounds
     if max_rounds is None:
         max_rounds = _DEFAULT_MAX_ROUNDS
-        print(f"未指定 --max-rounds，使用默认值：{max_rounds} 轮。")
+        print(f"--max-rounds was not set; using the default of {max_rounds} rounds.")
 
     # Each run is fully isolated under <runs-root>/<run-id>/ so a new run never
     # mixes with a previous run's tmp/log/workspace data (and the dashboard shows
@@ -513,7 +839,9 @@ def _run_command(args: argparse.Namespace) -> int:
     workspace = str(Path(args.workspace).expanduser() if args.workspace else run_dir / "workspace")
     log_dir = str(Path(args.log_dir).expanduser() if args.log_dir else run_dir / "logs")
     prompt_dir = str((run_dir / "tmp" / "prompts").resolve())
-    harness_dir = args.harness_dir or f"{workspace}/.harness"
+    harness_dir = (
+        str(Path(args.harness_dir).expanduser()) if args.harness_dir else f"{workspace}/.harness"
+    )
     Path(workspace).mkdir(parents=True, exist_ok=True)
     Path(log_dir).mkdir(parents=True, exist_ok=True)
 
@@ -545,23 +873,51 @@ def _run_command(args: argparse.Namespace) -> int:
         human_hook = make_human_hook(dashboard_handle.state)
         print(f"Dashboard live at {dashboard_handle.url} (log dir: {log_dir})")
 
-    agent_cache: dict[tuple[str, str | None], object] = {}
+    agent_cache: dict[tuple[str, str, str | None], object] = {}
+    plugin_mcp_cache: dict[str, str | None] = {}
 
-    def build_role_agent(role: str = ""):
+    def resolve_mcp_config(agent_name: str) -> str | None:
+        # The agent's own --*-mcp-config wins; otherwise the installed
+        # computer-use plugin with the highest priority is loaded for this agent.
+        override = getattr(args, _MCP_CONFIG_DESTS[agent_name], None)
+        if override:
+            return override
+        if agent_name not in plugin_mcp_cache:
+            from .plugins import PluginError, active_plugin_for_agent
+
+            try:
+                active = active_plugin_for_agent(agent_name)
+            except PluginError as exc:
+                print(f"Warning: could not read the plugin state: {exc}", file=sys.stderr)
+                active = None
+            if active is None:
+                plugin_mcp_cache[agent_name] = None
+            else:
+                plugin_id, config = active
+                origin = config or "loaded natively by the agent"
+                print(f"Computer use for {agent_name}: {plugin_id} ({origin})")
+                plugin_mcp_cache[agent_name] = config or None
+        return plugin_mcp_cache[agent_name]
+
+    def build_role_agent(role: str, *, permission_role: str | None = None):
         # Agent and model resolve independently down the same fallback chain, so
-        # mixing backends never sends one backend the other's model id.
+        # mixing backends never sends one backend the other's model id. The
+        # permission role is part of the cache key: two Claude roles using the
+        # same model must never share a differently privileged adapter.
         name = _resolve_role_option(args, role, "agent")
         model = _resolve_role_option(args, role, "model")
-        key = (name, model)
+        effective_permission_role = permission_role or role
+        key = (effective_permission_role, name, model)
         if key not in agent_cache:
             agent_cache[key] = _build_agent(
                 name,
+                role=effective_permission_role,
                 model=model,
                 api_key=args.api_key,
                 base_url=args.base_url,
                 workspace_path=workspace,
                 prompt_dir=prompt_dir,
-                mcp_config=args.mcp_config,
+                mcp_config=resolve_mcp_config(name),
                 mcp_add_dirs=args.mcp_add_dir,
             )
         return agent_cache[key]
@@ -588,7 +944,7 @@ def _run_command(args: argparse.Namespace) -> int:
         )
     finally:
         if dashboard_handle is not None:
-            print(f"Run finished. Dashboard still live at {dashboard_handle.url} — press Ctrl+C to exit.")
+            print(f"Run finished. Dashboard still live at {dashboard_handle.url}; press Ctrl+C to exit.")
             try:
                 dashboard_handle.serve_forever_blocking()
             except KeyboardInterrupt:
@@ -625,6 +981,7 @@ def _build_env(spec: str, *, tmp_dir: str | None = None):
 def _build_agent(
     name: str,
     *,
+    role: str,
     model: str | None,
     api_key: str | None,
     base_url: str | None,
@@ -657,6 +1014,7 @@ def _build_agent(
             prompt_dir=prompt_dir,
             mcp_config=mcp_config,
             add_dirs=mcp_add_dirs,
+            role=role,
         )
         if model is not None:
             kwargs["model"] = model
