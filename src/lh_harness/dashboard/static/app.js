@@ -33,6 +33,8 @@ const I18N = {
     overviewNoState: "No verified state has been recorded yet.",
     overviewNoAudit: "Waiting for the first audit result.",
     overviewIdle: "Waiting for the next role",
+    responseTitle: "Reply",
+    responseWriting: "Writing…",
     placeholderTimeline: "Select a run on the left to view its serial Manager → Executor → Auditor timeline.",
     placeholderSelect: "Select a run on the left to view its serial timeline.",
     composerPlaceholder: "Inject an extra instruction for later models (non-blocking)…",
@@ -47,6 +49,7 @@ const I18N = {
     roleManager: "Manager",
     roleAuditor: "Auditor",
     roleFormatRepair: "Format Repair",
+    roleFinalResponse: "Reply",
     roleExecGui: "GUI Executor",
     roleExecCli: "CLI Executor",
     roleExec: "Executor",
@@ -54,6 +57,7 @@ const I18N = {
     doingExec: "Executing the subtask and producing outputs",
     doingAudit: "Auditing output authenticity and integrity",
     doingRepair: "Repairing the auditor report control headers",
+    doingReply: "Writing the reply to your request",
     auditLabel: "Audit",
     taskContract: "Task Contract",
     auditReport: "Authoritative Audit Report",
@@ -120,6 +124,9 @@ const I18N = {
     ev_auditor_role_done: "Audit done",
     ev_auditor_format_repair_start: "Format repair",
     ev_auditor_format_repair_done: "Format repair done",
+    ev_final_response_start: "Writing reply",
+    ev_final_response_done: "Reply ready",
+    ev_final_response_discarded: "Reply discarded (run continued)",
     ev_human_instructions_injected: "Human instruction injected",
     ev_human_abort: "Human abort",
     ev_managed_round_recorded: "Round recorded",
@@ -193,6 +200,8 @@ const I18N = {
     overviewNoState: "尚未记录可信任务状态。",
     overviewNoAudit: "正在等待首个审计结果。",
     overviewIdle: "等待下一角色",
+    responseTitle: "最终回复",
+    responseWriting: "正在撰写…",
     placeholderTimeline: "选择左侧任一运行记录，查看串行的任务管理 → 执行 → 审计时间线。",
     placeholderSelect: "选择左侧任一运行记录，查看串行时间线。",
     composerPlaceholder: "向后续模型注入补充指令（不阻塞）…",
@@ -207,6 +216,7 @@ const I18N = {
     roleManager: "Manager",
     roleAuditor: "Auditor",
     roleFormatRepair: "格式修复",
+    roleFinalResponse: "最终回复",
     roleExecGui: "GUI Executor",
     roleExecCli: "CLI Executor",
     roleExec: "Executor",
@@ -214,6 +224,7 @@ const I18N = {
     doingExec: "正在执行子任务并生成产出",
     doingAudit: "正在审计产出的真实性与完整性",
     doingRepair: "正在修复 Auditor 报告的控制头",
+    doingReply: "正在撰写给你的回复",
     auditLabel: "Auditor",
     taskContract: "任务契约",
     auditReport: "权威审计报告",
@@ -280,6 +291,9 @@ const I18N = {
     ev_auditor_role_done: "审计完成",
     ev_auditor_format_repair_start: "格式修复",
     ev_auditor_format_repair_done: "格式修复完成",
+    ev_final_response_start: "正在撰写回复",
+    ev_final_response_done: "回复已生成",
+    ev_final_response_discarded: "回复已作废（运行继续）",
     ev_human_instructions_injected: "注入人工指令",
     ev_human_abort: "人工终止",
     ev_managed_round_recorded: "记录轮次",
@@ -360,6 +374,7 @@ function eventRoleLabel(role) {
   if (role === "executor") return t("roleExec");
   if (role === "auditor") return t("roleAuditor");
   if (role === "auditor_format_repair") return t("roleFormatRepair");
+  if (role === "final_response") return t("roleFinalResponse");
   if (role === "gui") return t("roleExecGui");
   if (role === "cli") return t("roleExecCli");
   return role || "";
@@ -644,6 +659,7 @@ function streamSignature() {
   return LANG + "|" + (STATE.current_run || "") + "|" + parts.join("|") +
     "|status:" + String(report.status || "") +
     "|state:" + String(report.current_task_state || "") +
+    "|reply:" + String(report.final_response || pendingApprovalResponse() || "").length +
     "|event:" + lastEvent + "|appr:" + appr;
 }
 
@@ -689,6 +705,11 @@ function renderStream() {
       resolvedByRound[ri].forEach((a) => host.appendChild(renderApprovalRecord(a)));
     }
   });
+
+  // The reply closes the timeline above any pending approval, so the operator
+  // reads the answer before being asked whether to accept it.
+  const response = renderResponseCard();
+  if (response) host.appendChild(response);
 
   approvals.filter((a) => a.status === "pending").forEach((a) =>
     host.appendChild(renderApproval(a, !!STATE.control_enabled)));
@@ -777,6 +798,51 @@ function renderOverviewCard(rounds) {
   return card;
 }
 
+// The one role that writes for the user rather than for the next role. It runs
+// as soon as the run reaches an ending, so the reply is visible while a pending
+// approval still asks whether to accept that ending or push further.
+function renderResponseCard() {
+  if (!STATE) return null;
+  const report = STATE.report || {};
+  const response = String(report.final_response || pendingApprovalResponse() || "").trim();
+  const events = STATE.events || [];
+  let writing = false;
+  for (let i = events.length - 1; i >= 0; i -= 1) {
+    const name = events[i].event;
+    if (name === "final_response_done" || name === "final_response_discarded") break;
+    if (name === "final_response_start") { writing = true; break; }
+  }
+  if (!response && !writing) return null;
+
+  const status = report.status || "";
+  const card = el("section", "response-card" + (status ? " " + statusClass(status) : ""));
+  if (writing) {
+    card.innerHTML =
+      '<div class="response-head"><span class="response-title">' + esc(t("responseTitle")) + '</span>' +
+      '<span class="pill live">' + esc(t("responseWriting")) + "</span></div>";
+    return card;
+  }
+  card.innerHTML =
+    '<div class="response-head"><span class="response-title">' + esc(t("responseTitle")) + '</span>' +
+    (status ? '<span class="pill ' + statusClass(status) + '">' + esc(statusLabel(status)) + "</span>" : "") +
+    "</div>" +
+    '<div class="response-body">' + esc(response) + "</div>";
+  return card;
+}
+
+// Before report.json exists the reply is only on disk, so the pending approval
+// carries it. Resolved approvals keep their copy forever, and continuing the run
+// discards that reply, so only a pending one may be read.
+function pendingApprovalResponse() {
+  const approvals = STATE.approvals || [];
+  for (let i = approvals.length - 1; i >= 0; i -= 1) {
+    if (approvals[i].status !== "pending") continue;
+    const ctx = approvals[i].context || {};
+    if (ctx.final_response) return ctx.final_response;
+  }
+  return "";
+}
+
 // The role that is currently working in an in-progress round (its result text
 // has not been written to disk yet). Drives the live "thinking" indicator.
 function activeRole(r) {
@@ -788,6 +854,7 @@ function activeRole(r) {
     }
     if (r.active_role === "auditor") return { label: t("auditLabel"), doing: t("doingAudit") };
     if (r.active_role === "auditor_format_repair") return { label: t("roleFormatRepair"), doing: t("doingRepair") };
+    if (r.active_role === "final_response") return { label: t("roleFinalResponse"), doing: t("doingReply") };
     return null;
   }
   if (!r.plan_text) return { label: t("roleManager"), doing: t("doingManager") };
@@ -804,12 +871,13 @@ function activeRole(r) {
   return null;
 }
 
-const ROLE_ORDER = ["manager", "executor", "auditor", "auditor_format_repair"];
+const ROLE_ORDER = ["manager", "executor", "auditor", "auditor_format_repair", "final_response"];
 
 function roleDisplayName(r, role) {
   if (role === "manager") return t("roleManager");
   if (role === "auditor") return t("roleAuditor");
   if (role === "auditor_format_repair") return t("roleFormatRepair");
+  if (role === "final_response") return t("roleFinalResponse");
   if (role === "executor") return r.next_step === "gui" ? t("roleExecGui") : r.next_step === "cli" ? t("roleExecCli") : t("roleExec");
   return role;
 }
@@ -820,6 +888,7 @@ function roleAccentClass(r, role) {
   if (role === "manager") return "acc-manager";
   if (role === "auditor") return "acc-auditor";
   if (role === "auditor_format_repair") return "acc-repair";
+  if (role === "final_response") return "acc-reply";
   if (role === "executor") return r.next_step === "gui" ? "acc-gui" : "acc-cli";
   return "";
 }
@@ -831,7 +900,9 @@ function roleBadges(r, role) {
       ? r.executor_status
       : role === "auditor_format_repair"
         ? ((r.auditor_status || {}).format_repair_status || {})
-        : r.auditor_status;
+        : role === "final_response"
+          ? r.final_response_status
+          : r.auditor_status;
   const episode = status && status.status
     ? '<span class="badge ' + esc(status.status) + '">' + esc(statusLabel(status.status)) + "</span>"
     : "";

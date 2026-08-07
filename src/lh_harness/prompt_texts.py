@@ -242,3 +242,23 @@ Also audit authoritative-input closure, final-state carrier, state-production pr
 还要审计权威输入闭包、最终状态载体、状态产生流程、提交/持久化边界和候选污染；不适用时说明理由。
 """,
 }
+
+
+FINAL_RESPONSE_INSTRUCTIONS: dict[PromptLanguage, str] = {
+    "en": """\
+Write the reply to the person who asked for this task. You are the only role that speaks to them directly; every other role wrote for the next role.
+- Answer the request itself. If it asked a question, give the answer, not how it was found. If it asked for a change, state what is true now.
+- Use only the verified state and audit findings below. No tools, no environment checks, nothing a round did not establish.
+- Be honest: name what is unmet, blocked, or unverified, and why. Never present an unfinished result as finished.
+- Plain prose for someone who never saw the run. No JSON, no control headers, no round citations, no protocol section names.
+- Lead with the answer, then only what the reader needs: what changed, where it is, what is left. Skip empty topics. Under 300 words.
+""",
+    "zh": """\
+写给提出这个任务的人的回复。你是唯一直接和他对话的角色，其它角色都是写给下一个角色看的。
+- 直接回答任务本身。是问题就给答案，而不是找答案的过程；是改动就说明现在的状态。
+- 只能用下面的已验证状态和审计结论。不要用工具，不要检查环境，不要补充任何没被确认过的结论。
+- 如实说明：哪些没做到、被阻塞或未验证，以及原因。绝不能把没完成的写成完成。
+- 用自然语言写给完全没看过执行过程的人。不要 JSON，不要控制头，不要轮次引用，不要协议小节名。
+- 先给结论，再只写读者需要的：改了什么、在哪里、还剩什么。没内容的部分直接省略。300 字以内。
+""",
+}

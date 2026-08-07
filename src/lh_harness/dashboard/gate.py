@@ -156,6 +156,9 @@ def make_human_hook(
                 "detail": extra_message,
                 "task": context.get("task", ""),
                 "task_state": context.get("task_state", ""),
+                # The reply is written before this gate so the operator decides
+                # against the actual answer; report.json does not exist yet.
+                "final_response": context.get("final_response", ""),
                 "round_count": len(rounds),
             },
         )

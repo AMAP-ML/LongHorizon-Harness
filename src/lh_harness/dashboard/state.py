@@ -29,6 +29,15 @@ from ..types import DEFAULT_LOG_DIR
 from ..agent_logs import parse_trajectory as parse_agent_trajectory
 from ..role_prompts import parse_role_manager_next_step
 
+# Roles whose raw trajectory a round directory can hold.
+_TRAJECTORY_ROLES = (
+    "manager",
+    "executor",
+    "auditor",
+    "auditor_format_repair",
+    "final_response",
+)
+
 
 @dataclass
 class ApprovalOption:
@@ -289,6 +298,7 @@ class DashboardState:
             "manager_status": _status("manager"),
             "executor_status": _status("executor"),
             "auditor_status": auditor_status,
+            "final_response_status": _status("final_response"),
             "in_progress": True,
         }
 
@@ -328,7 +338,7 @@ class DashboardState:
         if not round_dir.is_dir():
             return []
         roles: list[str] = []
-        for role in ("manager", "executor", "auditor", "auditor_format_repair"):
+        for role in _TRAJECTORY_ROLES:
             if self._trajectory_path(round_dir, role) is not None:
                 roles.append(role)
         return roles
@@ -348,7 +358,7 @@ class DashboardState:
         sizes: dict[str, int] = {}
         if not round_dir.is_dir():
             return sizes
-        for role in ("manager", "executor", "auditor", "auditor_format_repair"):
+        for role in _TRAJECTORY_ROLES:
             path = self._trajectory_path(round_dir, role)
             if path is not None:
                 try:
@@ -359,7 +369,7 @@ class DashboardState:
 
     def read_trajectory(self, round_index: int, role: str) -> dict[str, Any] | None:
         """Parse a role's raw agent trajectory into ordered, backend-agnostic steps."""
-        if role not in {"manager", "executor", "auditor", "auditor_format_repair"}:
+        if role not in _TRAJECTORY_ROLES:
             return None
         round_dir = self._role_dir / "rounds" / f"round_{round_index:03d}"
         traj_path = self._trajectory_path(round_dir, role)
@@ -562,12 +572,14 @@ def _active_role_for_round(events: list[dict[str, Any]], round_index: int) -> tu
         "executor_role_start": "executor",
         "auditor_role_start": "auditor",
         "auditor_format_repair_start": "auditor_format_repair",
+        "final_response_start": "final_response",
     }
     stops = {
         "manager_round_done",
         "executor_role_done",
         "auditor_role_done",
         "auditor_format_repair_done",
+        "final_response_done",
         "managed_round_recorded",
     }
     active: str | None = None

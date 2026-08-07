@@ -8,6 +8,7 @@ from ..agent_logs import visible_output as extract_claude_visible_output
 from .claude_permissions import (
     ClaudeRole,
     is_auditor_role,
+    path_deny_rules,
     policy_for_role,
     snapshot_workspace,
     workspace_snapshot_diff,
@@ -35,6 +36,7 @@ class ClaudeCodeAdapter(CommandAgentAdapter):
         mcp_config: str | None = None,
         add_dirs: list[str] | None = None,
         role: ClaudeRole = "cli_executor",
+        hidden_paths: tuple[str, ...] = (),
     ) -> None:
         policy = policy_for_role(role)
         env_parts: list[str] = []
@@ -92,9 +94,10 @@ class ClaudeCodeAdapter(CommandAgentAdapter):
             "--verbose",
             "--dangerously-skip-permissions",
         ]
-        if policy.disallowed_tools:
+        deny_tools = [*policy.disallowed_tools, *path_deny_rules(hidden_paths)]
+        if deny_tools:
             command_parts.append("--disallowedTools")
-            command_parts.extend(shlex.quote(tool) for tool in policy.disallowed_tools)
+            command_parts.extend(shlex.quote(tool) for tool in deny_tools)
         self.computer_mcp_configured = bool(policy.load_computer_mcp and mcp_config)
         if self.computer_mcp_configured:
             command_parts.extend(["--mcp-config", shlex.quote(mcp_config)])
@@ -107,6 +110,7 @@ class ClaudeCodeAdapter(CommandAgentAdapter):
             prompt_dir=prompt_dir,
             workspace_path=workspace_path,
             visible_output_parser=extract_claude_visible_output,
+            hidden_paths=hidden_paths,
         )
 
     async def run_episode(
@@ -117,7 +121,7 @@ class ClaudeCodeAdapter(CommandAgentAdapter):
         live_trajectory_path: str | None = None,
     ) -> EpisodeResult:
         before = (
-            snapshot_workspace(self.workspace_path)
+            snapshot_workspace(self.workspace_path, self.hidden_paths)
             if is_auditor_role(self.role)
             else None
         )
@@ -141,7 +145,7 @@ class ClaudeCodeAdapter(CommandAgentAdapter):
             }
         )
         if before is not None:
-            after = snapshot_workspace(self.workspace_path)
+            after = snapshot_workspace(self.workspace_path, self.hidden_paths)
             diff = workspace_snapshot_diff(before, after)
             result.metadata.update(diff)
             snapshot_errors = diff.get("verifier_workspace_snapshot_errors")

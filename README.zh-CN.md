@@ -36,6 +36,8 @@ LongHorizon-Harness 是一套面向长程任务的执行、状态管理和结果
 
 ## ✨ News
 
+- **[2026-08-07]** 我们正在开发新版 Dashboard，交互会更友好，敬请期待。
+- **[v0.1.3 · 2026-08-07]** 每次运行结束都会输出一份自然语言回复，只依据已验证状态回答你的任务；任务默认作用于你启动命令的目录，控制台也会实时打印每一轮进展。
 - **[2026-08-06]** LongHorizon-Harness 登上 [Hugging Face Daily Papers 周榜](https://huggingface.co/papers/week/2026-W32)**第 1 名**。
 - **[v0.1.2 · 2026-08-06]** 新增统一的 computer-use 插件管理，强化 Auditor 只读校验、角色隔离和进程清理，并扩展 `doctor` 环境检查。见[管理 computer-use 插件](#管理-computer-use-插件)。
 - **[2026-08-06]** 微信交流群已开放，扫码加入。
@@ -222,7 +224,11 @@ lh-harness run --task "${TASK}" --agent codex
 
 命令行上显式传入的参数（如 `--agent`）会覆盖 `./.lh-harness/config.toml` 中的对应配置，仅对本次运行生效；不传则沿用配置文件里的默认值。
 
-Dashboard 会自动打开，并展示完整的 Manager → Executor → Auditor 流程。每次运行都会存放在 `./.lh-harness/runs/<run-id>/` 下。
+Agent 直接在你启动命令的那个目录里工作，任务作用于你的真实项目。需要换到别处时设置 `workspace` 或 `--workspace`。`./.lh-harness/` 本身会被排除在外，本次运行自己的日志和状态不会被当成任务内容。
+
+Dashboard 会自动在浏览器中打开，控制台会逐行打印每个角色的进展。结束时会输出一份自然语言回复，只依据已验证状态回答你的原始任务，没跑完也会如实说明。
+
+每次运行都会存放在 `./.lh-harness/runs/<run-id>/` 下，包含该回复的完整报告在 `logs/report.json`。
 
 #### 检查运行环境
 
@@ -258,8 +264,8 @@ lh-harness check-update
 | `model` | `"gpt-5.6-sol"` | 所有角色使用的模型（角色可单独覆盖）。必须是所选后端支持的模型。 |
 | `env` | `"local"` | 执行环境，目前只有 `local`。 |
 | `runs_root` | `"./.lh-harness/runs"` | 运行目录的根路径，每次运行生成 `<runs_root>/<run-id>/`。 |
-| `workspace` | 默认注释 | Agent 实际操作的工作目录。默认使用该次运行自己的 `workspace/`，保证运行之间互相隔离；指向已有项目时才需要设置。 |
-| `harness_dir` | 默认注释 | Harness 状态在工作目录中的写入位置，默认为 `<workspace>/.harness`。 |
+| `workspace` | 默认注释 | Agent 实际操作的工作目录。默认就是启动 `lh-harness` 的那个目录，任务直接作用于你的真实项目；需要隔离到别处时才设置。 |
+| `harness_dir` | 默认注释 | Harness 任务状态的写入位置，默认为该次运行自己的 `harness/`，不会写进工作目录。 |
 | `log_dir` | 默认注释 | 日志目录，默认为该次运行自己的 `logs/`。 |
 | `base_url` | 默认注释 | OpenAI 兼容端点覆盖，用于代理或自建模型服务。 |
 | `prompt_language` | `"en"` | Harness 自身生成的 Prompt 与报告的语言：`en` 或 `zh`。不限制任务本身的语言。 |
@@ -301,6 +307,7 @@ cli_auditor  → auditor  → [run].agent / [run].model
 | `[run.roles.auditor]` | `[run]` | 两个 auditor 角色 |
 | `[run.roles.gui_auditor]` | `auditor` | GUI 验收 |
 | `[run.roles.cli_auditor]` | `auditor` | CLI 验收 |
+| `[run.roles.final_response]` | `manager` | 写给你的最终回复 |
 
 上述每个字段都有对应的 CLI 参数（`--agent`、`--max-rounds`、`--gui-executor-model`、`--auditor-timeout` 等）可以对单次运行覆盖。完整列表见 `lh-harness run --help`。
 

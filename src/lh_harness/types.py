@@ -1,13 +1,30 @@
 from __future__ import annotations
 
+import os
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, Literal
 
-# Library defaults are user-scoped; CLI runs remain project-scoped.
+
+def _launch_directory() -> str:
+    """Directory lh-harness was started from, captured once at import.
+
+    Symlinks stay resolved so this agrees with the run paths derived from it,
+    which the agent sandbox rules are matched against.
+    """
+    try:
+        return str(Path.cwd())
+    except OSError:
+        # The directory was deleted. Importing must still succeed so the CLI can
+        # report that clearly instead of failing with an opaque ImportError.
+        return os.environ.get("PWD") or "."
+
+
+# Harness bookkeeping is user-scoped; the agents work in the directory
+# lh-harness was started from, so a task acts on the caller's real project.
 DEFAULT_STATE_ROOT = str(Path.home() / ".lh-harness")
-DEFAULT_WORKSPACE_PATH = f"{DEFAULT_STATE_ROOT}/workspace"
-DEFAULT_HARNESS_DIR = f"{DEFAULT_WORKSPACE_PATH}/.harness"
+DEFAULT_WORKSPACE_PATH = _launch_directory()
+DEFAULT_HARNESS_DIR = f"{DEFAULT_STATE_ROOT}/harness"
 DEFAULT_LOG_DIR = f"{DEFAULT_STATE_ROOT}/logs"
 DEFAULT_TMP_DIR = f"{DEFAULT_STATE_ROOT}/tmp"
 

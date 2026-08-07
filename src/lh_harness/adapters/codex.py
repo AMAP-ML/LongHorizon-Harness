@@ -32,6 +32,7 @@ class CodexAdapter(CommandAgentAdapter):
         mcp_config: str | None = None,
         add_dirs: list[str] | None = None,
         sandbox_mode: str | None = None,
+        hidden_paths: tuple[str, ...] = (),
     ) -> None:
         env_parts: list[str] = []
         if api_key:
@@ -84,6 +85,7 @@ class CodexAdapter(CommandAgentAdapter):
             prompt_dir=prompt_dir,
             workspace_path=workspace_path,
             visible_output_parser=extract_codex_visible_output,
+            hidden_paths=hidden_paths,
         )
 
 

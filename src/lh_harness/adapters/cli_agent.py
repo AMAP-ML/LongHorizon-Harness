@@ -36,11 +36,13 @@ class CommandAgentAdapter:
         prompt_dir: str = f"{DEFAULT_TMP_DIR}/prompts",
         workspace_path: str = DEFAULT_WORKSPACE_PATH,
         visible_output_parser: Callable[[str], str] | None = None,
+        hidden_paths: tuple[str, ...] = (),
     ) -> None:
         self.command_template = command_template
         self.prompt_dir = prompt_dir.rstrip("/") or "."
         self.workspace_path = workspace_path.rstrip("/")
         self.visible_output_parser = visible_output_parser
+        self.hidden_paths = tuple(hidden_paths)
 
     async def run_episode(
         self,
@@ -58,7 +60,7 @@ class CommandAgentAdapter:
             self.prompt_dir,
             f"{_episode_prompt_label(live_trajectory_path)}_{uuid.uuid4().hex[:12]}.md",
         )
-        await write_remote_text(env, prompt_path, prompt)
+        await write_remote_text(env, prompt_path, prompt + _hidden_paths_notice(self.hidden_paths))
         # Substituted by explicit replace, not str.format: templates embed literal
         # braces (e.g. Codex passes inline-TOML `-c` overrides) that format() would
         # try to interpret as placeholders.
@@ -114,6 +116,23 @@ class CommandAgentAdapter:
                 "stderr_tail": redact_secrets(result.stderr[-2000:]),
             },
         )
+
+
+def _hidden_paths_notice(hidden_paths: tuple[str, ...]) -> str:
+    """Tell the agent to stay out of the harness's own run directories.
+
+    The run's logs, prompts and harness state may sit inside the workspace. They
+    are not task content, and reading them would leak other roles' context.
+    """
+    if not hidden_paths:
+        return ""
+    listed = "\n".join(f"- {path}" for path in hidden_paths)
+    return (
+        "\n\nHarness-owned paths (off limits):\n"
+        f"{listed}\n"
+        "These hold this run's own logs, prompts, and harness state. Never read, list, "
+        "search, or modify them, and never treat their contents as task input or evidence."
+    )
 
 
 def _episode_prompt_label(live_trajectory_path: str | None) -> str:
