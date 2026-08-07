@@ -217,8 +217,10 @@ lh-harness init
 
 ```bash
 TASK="检查当前目录并总结其中的文件。"
-lh-harness run --task "${TASK}"
+lh-harness run --task "${TASK}" --agent codex
 ```
+
+命令行上显式传入的参数（如 `--agent`）会覆盖 `./.lh-harness/config.toml` 中的对应配置，仅对本次运行生效；不传则沿用配置文件里的默认值。
 
 Dashboard 会自动打开，并展示完整的 Manager → Executor → Auditor 流程。每次运行都会存放在 `./.lh-harness/runs/<run-id>/` 下。
 
