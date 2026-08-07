@@ -217,8 +217,10 @@ This creates `./.lh-harness/config.toml` without replacing an existing file; use
 
 ```bash
 TASK="Inspect the current directory and summarize its files."
-lh-harness run --task "${TASK}"
+lh-harness run --task "${TASK}" --agent codex
 ```
+
+Explicit CLI arguments such as `--agent` override the matching values in `./.lh-harness/config.toml` for that run; drop them to use the configured defaults.
 
 The Dashboard opens automatically and shows the complete Manager → Executor → Auditor workflow. Every run is stored under `./.lh-harness/runs/<run-id>/`.
 
