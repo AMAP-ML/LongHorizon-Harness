@@ -36,6 +36,8 @@ LongHorizon-Harness is an execution, state-management, and result-verification s
 
 ## ✨ News
 
+- **[2026-08-07]** A new, more user-friendly Dashboard is in the works. Stay tuned.
+- **[v0.1.3 · 2026-08-07]** Every run now ends with a plain-language reply that answers your task from the verified state alone. Tasks act on the directory you launched from by default, and the console reports each round as it happens.
 - **[2026-08-06]** LongHorizon-Harness reaches **#1** on the [Hugging Face Daily Papers weekly ranking](https://huggingface.co/papers/week/2026-W32).
 - **[v0.1.2 · 2026-08-06]** Adds unified computer-use plugin management, stronger auditor read-only checks and role isolation, reliable process cleanup, and expanded `doctor` diagnostics. See [Manage computer-use plugins](#manage-computer-use-plugins).
 - **[2026-08-06]** The WeChat group is open. Scan the QR code below to join.
@@ -222,7 +224,11 @@ lh-harness run --task "${TASK}" --agent codex
 
 Explicit CLI arguments such as `--agent` override the matching values in `./.lh-harness/config.toml` for that run; drop them to use the configured defaults.
 
-The Dashboard opens automatically and shows the complete Manager → Executor → Auditor workflow. Every run is stored under `./.lh-harness/runs/<run-id>/`.
+The agents work in the directory you launched from, so the task acts on your real project. Set `workspace` or `--workspace` to point somewhere else. `./.lh-harness/` itself stays off limits, so the run's own logs and state are never mistaken for task content.
+
+The Dashboard opens in your browser automatically, and the console prints one line per role as the run progresses. At the end you get a plain-language reply that answers your request from the verified state alone, and says so plainly if the task did not finish.
+
+Every run is stored under `./.lh-harness/runs/<run-id>/`; the full report, including that reply, stays in the run's `logs/report.json`.
 
 #### Verify the environment
 
@@ -258,8 +264,8 @@ Task text, run IDs, and API keys are deliberately **not** configurable here; the
 | `model` | `"gpt-5.6-sol"` | Model for every role unless a role overrides it. Must be a model the chosen backend exposes. |
 | `env` | `"local"` | Execution environment. Only `local` today. |
 | `runs_root` | `"./.lh-harness/runs"` | Where run directories are created. Each run gets `<runs_root>/<run-id>/`. |
-| `workspace` | commented out | Working directory the agents operate in. Defaults to the run's own `workspace/`, which keeps runs isolated; set it to point at an existing project instead. |
-| `harness_dir` | commented out | Where harness state is written inside the workspace. Defaults to `<workspace>/.harness`. |
+| `workspace` | commented out | Working directory the agents operate in. Defaults to the directory `lh-harness` was started from, so a task acts on your real project; set it to isolate the run somewhere else. |
+| `harness_dir` | commented out | Where harness task state is written. Defaults to the run's own `harness/`, keeping it out of the workspace. |
 | `log_dir` | commented out | Where logs are written. Defaults to the run's own `logs/`. |
 | `base_url` | commented out | OpenAI-compatible endpoint override, for a proxy or a self-hosted model. |
 | `prompt_language` | `"en"` | Language of the harness-generated prompts and reports: `en` or `zh`. Does not restrict the task language. |
@@ -301,6 +307,7 @@ cli_auditor  → auditor  → [run].agent / [run].model
 | `[run.roles.auditor]` | `[run]` | Both auditor roles |
 | `[run.roles.gui_auditor]` | `auditor` | GUI audit |
 | `[run.roles.cli_auditor]` | `auditor` | CLI audit |
+| `[run.roles.final_response]` | `manager` | The closing reply written for you |
 
 Every field above also has a CLI flag (`--agent`, `--max-rounds`, `--gui-executor-model`, `--auditor-timeout`, and so on) that overrides it for a single run. Run `lh-harness run --help` for the full list.
 

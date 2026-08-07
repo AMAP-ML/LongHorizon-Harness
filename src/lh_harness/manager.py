@@ -1,10 +1,11 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import logging
 import time
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, Awaitable, Callable
 
@@ -23,6 +24,7 @@ from .role_prompts import (
     build_role_executor_prompt,
     build_role_auditor_format_repair_prompt,
     build_role_auditor_prompt,
+    build_role_final_response_prompt,
     extract_role_manager_plan_text,
     extract_related_report_refs,
     extract_role_manager_answer_choices,
@@ -105,7 +107,9 @@ async def run(
     gui_auditor_agent: AgentAdapter | None = None,
     cli_auditor_agent: AgentAdapter | None = None,
     auditor_format_repair_agent: AgentAdapter | None = None,
+    final_response_agent: AgentAdapter | None = None,
     human_hook: Callable[[dict[str, Any]], Awaitable[dict[str, Any]]] | None = None,
+    progress: Callable[[str, dict[str, Any]], None] | None = None,
 ) -> dict[str, Any]:
     """Run the generic LongHorizon-Harness four-role management loop.
 
@@ -128,7 +132,18 @@ async def run(
     ``"continue"`` keeps the run going (reopening / extending the budget when it
     was about to finish, and injecting any instructions); ``"stop"`` ends the
     run. Queued non-blocking operator instructions are drained here too.
+
+    ``progress`` is an optional synchronous ``(event, payload)`` sink for
+    operator-facing status lines (the CLI prints them to the console).
     """
+
+    def emit(event: str, **payload: Any) -> None:
+        if progress is None:
+            return
+        try:
+            progress(event, payload)
+        except Exception:  # progress reporting must never break a run
+            logger.debug("progress callback failed for %s", event, exc_info=True)
 
     # Role binding is resolved once at startup so the main loop can stay focused
     # on state transitions instead of adapter fallback logic.
@@ -199,12 +214,17 @@ async def run(
         config=config,
         events_path=events_path,
         round_budget=max(1, config.max_total_episodes),
+        env=env,
+        role_dir=role_dir,
+        response_agent=final_response_agent or manager_agent,
+        emit=emit,
     )
 
     while round_index < gate.round_budget:
         round_index += 1
         round_dir = rounds_dir / f"round_{round_index:03d}"
         round_dir.mkdir(parents=True, exist_ok=True)
+        emit("round_start", round=round_index, round_budget=gate.round_budget)
 
         # The manager sees the original task, its maintained task state,
         # and auditor reports. It never receives raw trajectories or previous
@@ -244,6 +264,7 @@ async def run(
             "manager_round_start",
             {"round": round_index, "prompt_chars": len(manager_prompt)},
         )
+        emit("role_start", round=round_index, role="manager")
 
         manager_result = await _run_role_episode(
             manager_agent,
@@ -292,6 +313,14 @@ async def run(
                 "related_report_refs": related_report_refs,
                 "status": _episode_status(manager_result),
             },
+        )
+        emit(
+            "role_done",
+            round=round_index,
+            role="manager",
+            status=manager_result.status,
+            duration_ms=manager_result.duration_ms,
+            next_step=next_step,
         )
 
         if next_step == MANAGER_NEXT_DONE:
@@ -427,6 +456,7 @@ async def run(
             "executor_role_start",
             {"round": round_index, "role": next_step, "prompt_chars": len(executor_prompt), "budget": _budget_to_dict(executor_budget)},
         )
+        emit("role_start", round=round_index, role=f"{next_step}_executor")
 
         executor_result = await _run_role_episode(
             executor_agent,
@@ -469,6 +499,13 @@ async def run(
                 "status": _episode_status(executor_result),
             },
         )
+        emit(
+            "role_done",
+            round=round_index,
+            role=f"{next_step}_executor",
+            status=executor_result.status,
+            duration_ms=executor_result.duration_ms,
+        )
 
         # The auditor audits only the just-finished subtask. Its natural
         # language report becomes the trusted intermediate state for later rounds.
@@ -490,6 +527,7 @@ async def run(
             "auditor_role_start",
             {"round": round_index, "role": next_step, "prompt_chars": len(auditor_prompt), "budget": _budget_to_dict(auditor_budget)},
         )
+        emit("role_start", round=round_index, role=f"{next_step}_auditor")
 
         auditor_result = await _run_role_episode(
             auditor_for_step,
@@ -582,6 +620,17 @@ async def run(
                 "status": _episode_status(auditor_result),
             },
         )
+        audit = parse_audit_report(auditor_report, round_index, language=config.prompt_language)
+        emit(
+            "role_done",
+            round=round_index,
+            role=f"{next_step}_auditor",
+            status=auditor_result.status,
+            duration_ms=auditor_result.duration_ms,
+            audit_status=audit.status,
+            integrity_status=audit.integrity_status,
+            contract_audit_status=audit.contract_audit_status,
+        )
         if await _human_gate(gate, "progress", round_index, current_task_state):
             break
 
@@ -596,6 +645,7 @@ async def run(
         task_contract=current_task_contract,
         max_rounds=max(1, config.max_total_episodes),
         elapsed_seconds=elapsed,
+        final_response=gate.final_response,
     )
     _write_local(role_dir / "report.json", json.dumps(final, ensure_ascii=False, indent=2) + "\n")
     _write_local(log_dir / "report.json", json.dumps(final, ensure_ascii=False, indent=2) + "\n")
@@ -609,7 +659,30 @@ async def run(
     )
     await _write_remote_text(env, f"{config.harness_dir.rstrip('/')}/management/management_transcript.txt", transcript)
     _append_event(events_path, "role_harness_done", final)
+    emit(
+        "run_done",
+        status=final["status"],
+        completion_satisfied=final["completion_satisfied"],
+        abort_reason=final["abort_reason"],
+        rounds_run=final["rounds_run"],
+        elapsed_seconds=final["elapsed_seconds"],
+        report_path=str(log_dir / "report.json"),
+    )
     return final
+
+
+def _discard_progress(*_args: Any, **_kwargs: Any) -> None:
+    """Default ``emit`` for gate contexts built without a progress sink."""
+
+
+def _mark_cancelled(ctx: _GateContext) -> None:
+    """Record an operator cancellation raised while the reply was being written.
+
+    Completion is cleared too: `_final_report` ranks it above the abort reason, so
+    a cancelled run would otherwise still be reported as complete.
+    """
+    ctx.abort_reason = "user_cancelled"
+    ctx.completion_satisfied = False
 
 
 @dataclass
@@ -630,9 +703,19 @@ class _GateContext:
     config: HarnessConfig
     events_path: Path
     round_budget: int
+    # The gate writes the user-facing reply before asking the operator to decide,
+    # so it needs the pieces an episode requires.
+    env: Environment | None = None
+    role_dir: Path | None = None
+    response_agent: AgentAdapter | None = None
+    emit: Callable[..., None] = field(default=_discard_progress)
     completion_satisfied: bool = False
     abort_reason: str = ""
     carryover_instructions: str = ""
+    # Round that already attempted a reply, so one gate cannot write a round's
+    # reply artifacts twice (which would corrupt the saved trajectory metadata).
+    response_round: int = 0
+    final_response: str = ""
 
 
 async def _human_gate(ctx: _GateContext, outcome: str, round_index: int, task_state: str, question: str = "", answers: list[str] | None = None) -> bool:
@@ -647,6 +730,25 @@ async def _human_gate(ctx: _GateContext, outcome: str, round_index: int, task_st
     the human's answer to an ``ask``) on ``ctx``.
     """
     reached_max = (not ctx.completion_satisfied) and round_index >= ctx.round_budget
+    # `ctx.abort_reason` is only assigned below, so the reason is derived here to
+    # keep "ran out of rounds" distinguishable from "blocked" in the reply. `ask`
+    # is excluded: the manager is asking a mid-task question, so the run is not
+    # ending and a reply written here would be discarded on the answer.
+    ending = (
+        ""
+        if ctx.completion_satisfied
+        else "manager_blocked"
+        if outcome == "blocked"
+        else "max_rounds_exhausted"
+        if reached_max
+        else None
+    )
+
+    # Written before the operator is asked anything, so the decision to accept the
+    # result or push the run further is made against the actual answer.
+    if ending is not None and await _write_final_response(ctx, round_index, task_state, ending):
+        _mark_cancelled(ctx)
+        return True
 
     if ctx.human_hook is None:
         if ctx.completion_satisfied:
@@ -655,7 +757,10 @@ async def _human_gate(ctx: _GateContext, outcome: str, round_index: int, task_st
             ctx.abort_reason = "manager_blocked"
             return True
         if outcome == "ask":
+            # Nothing can answer the question, so this ending is only known here.
             ctx.abort_reason = "needs_human_input"
+            if await _write_final_response(ctx, round_index, task_state, ctx.abort_reason):
+                _mark_cancelled(ctx)
             return True
         if reached_max:
             ctx.abort_reason = "max_rounds_exhausted"
@@ -672,6 +777,7 @@ async def _human_gate(ctx: _GateContext, outcome: str, round_index: int, task_st
             "task_state": task_state,
             "question": question,
             "answers": list(answers or []),
+            "final_response": ctx.final_response,
             "rounds": [asdict(item) for item in ctx.rounds],
             "log_dir": str(ctx.log_dir),
         }
@@ -691,9 +797,18 @@ async def _human_gate(ctx: _GateContext, outcome: str, round_index: int, task_st
             ctx.abort_reason = "human_abort"
         elif not ctx.completion_satisfied:
             ctx.abort_reason = "human_abort"
+        # The operator can stop on a round the harness did not treat as an ending
+        # (an `ask` or repeated-failure gate), which leaves no reply written yet.
+        if await _write_final_response(ctx, round_index, task_state, ctx.abort_reason):
+            _mark_cancelled(ctx)
         return True
 
-    # continue: reopen / extend the budget when we were about to finish.
+    # continue: reopen / extend the budget when we were about to finish. The reply
+    # just shown describes a run that is no longer over, so it is discarded and
+    # rewritten at whatever ending comes next.
+    if ctx.final_response:
+        ctx.final_response = ""
+        await _discard_final_response(ctx)
     if outcome == "completed":
         ctx.completion_satisfied = False
     if reached_max or outcome in ("completed", "blocked"):
@@ -846,6 +961,126 @@ def _format_repair_budget(budget: EpisodeBudget) -> EpisodeBudget:
     )
 
 
+async def _write_final_response(
+    ctx: _GateContext, round_index: int, task_state: str, ending: str
+) -> bool:
+    """Answer the original request in the user's terms, storing it on ``ctx``.
+
+    Every other role writes for the next role, so without this the operator only
+    sees audit protocol text. Failure must never cost the run its report, so any
+    problem degrades to an empty reply. Returns True when the operator cancelled
+    during generation, which the caller turns into a run-level abort.
+    """
+    if ctx.final_response or not ctx.rounds:
+        return False
+    if ctx.env is None or ctx.role_dir is None or ctx.response_agent is None:
+        return False
+    if ending == "user_cancelled" or ctx.response_round == round_index:
+        return False
+    ctx.response_round = round_index
+
+    status = (
+        "complete"
+        if ctx.completion_satisfied
+        else "blocked"
+        if ending == "manager_blocked"
+        else "incomplete"
+    )
+    prompt = build_role_final_response_prompt(
+        task=ctx.task,
+        rounds=ctx.rounds,
+        status=status,
+        abort_reason=ending,
+        task_state=task_state,
+        language=ctx.config.prompt_language,
+    )
+    budget = _final_response_budget(ctx.config.manager_budget)
+    # Stored per round, like the other roles, so a discarded reply keeps its own
+    # artifacts and the dashboard's round trajectory viewer can reach them.
+    round_dir = ctx.role_dir / "rounds" / f"round_{round_index:03d}"
+    round_dir.mkdir(parents=True, exist_ok=True)
+    _write_local(round_dir / "final_response_input.txt", prompt)
+    _append_event(
+        ctx.events_path,
+        "final_response_start",
+        {"round": round_index, "prompt_chars": len(prompt), "budget": _budget_to_dict(budget)},
+    )
+    ctx.emit("role_start", round=round_index, role="final_response")
+
+    try:
+        result = await _run_role_episode(
+            ctx.response_agent,
+            prompt,
+            ctx.env,
+            budget,
+            live_trajectory_path=str(round_dir / "final_response_raw_trajectory.jsonl"),
+        )
+    except Exception:
+        logger.warning("final response episode failed", exc_info=True)
+        _append_event(
+            ctx.events_path,
+            "final_response_done",
+            {"round": round_index, "accepted": False, "error": "episode_failed"},
+        )
+        ctx.emit("role_done", round=round_index, role="final_response", status="error")
+        return False
+
+    _save_role_result(round_dir, "final_response", result)
+    response = _visible_output(result).strip() if result.status == "done" else ""
+    if response:
+        ctx.final_response = response
+        _write_local(round_dir / "final_response.txt", response)
+        _write_local(ctx.role_dir / "final_response.txt", response)
+        await _write_remote_text(
+            ctx.env,
+            f"{ctx.config.harness_dir.rstrip('/')}/management/final_response.txt",
+            response,
+        )
+    _append_event(
+        ctx.events_path,
+        "final_response_done",
+        {
+            "round": round_index,
+            "accepted": bool(response),
+            "response_chars": len(response),
+            "status": _episode_status(result),
+        },
+    )
+    ctx.emit(
+        "role_done",
+        round=round_index,
+        role="final_response",
+        status=result.status,
+        duration_ms=result.duration_ms,
+    )
+    # Cancellation is normalized into a result by `_run_role_episode`, so without
+    # this the operator's Ctrl+C would be silently absorbed here.
+    return result.status == "cancelled"
+
+
+async def _discard_final_response(ctx: _GateContext) -> None:
+    """Drop the published reply once the operator reopens the run.
+
+    The round's own artifacts stay for auditing; only the published copies go, so
+    a later ending that yields no reply cannot leave stale text next to a report
+    whose ``final_response`` is empty.
+    """
+    if ctx.role_dir is not None:
+        with contextlib.suppress(OSError):
+            (ctx.role_dir / "final_response.txt").unlink(missing_ok=True)
+    if ctx.env is not None:
+        await _write_remote_text(
+            ctx.env, f"{ctx.config.harness_dir.rstrip('/')}/management/final_response.txt", ""
+        )
+    _append_event(ctx.events_path, "final_response_discarded", {"round": ctx.response_round})
+
+
+def _final_response_budget(budget: EpisodeBudget) -> EpisodeBudget:
+    return EpisodeBudget(
+        max_duration_seconds=max(60, min(budget.max_duration_seconds, 180)),
+    )
+
+
 def _auditor_report_text(
     result: EpisodeResult,
     round_index: int,
@@ -901,6 +1136,7 @@ def _final_report(
     task_contract: str,
     max_rounds: int,
     elapsed_seconds: float,
+    final_response: str = "",
 ) -> dict[str, Any]:
     # Final status is a harness-level decision, not the last executor agent's self
     # claim. The auditor artifact remains the natural-language audit report.
@@ -929,6 +1165,7 @@ def _final_report(
         "current_task_state": task_state,
         "current_task_contract": task_contract,
         "latest_auditor_report": latest_report_text,
+        "final_response": final_response,
         "rounds": [asdict(item) for item in rounds],
         "elapsed_seconds": round(elapsed_seconds, 3),
     }

@@ -7,6 +7,7 @@ from .prompt_texts import (
     CLI_AUDITOR_INSTRUCTIONS,
     CLI_EXECUTOR_INSTRUCTIONS,
     FINAL_STATE_SEMANTIC_GUARD,
+    FINAL_RESPONSE_INSTRUCTIONS,
     GUI_AUDITOR_INSTRUCTIONS,
     GUI_EXECUTOR_INSTRUCTIONS,
     MANAGER_INSTRUCTIONS,
@@ -300,6 +301,114 @@ Output only the repaired auditor report. Do not explain the repair and do not ou
 
 只输出修正后的 auditor 报告，不解释格式修正，不输出 JSON。
 """
+
+
+def build_role_final_response_prompt(
+    *,
+    task: str,
+    rounds: list[ManagedRound],
+    status: str,
+    abort_reason: str,
+    task_state: str,
+    language: str = "en",
+    max_evidence_chars: int = 6_000,
+) -> str:
+    lang = normalize_prompt_language(language)
+    findings = format_audit_findings(rounds, max_chars=max_evidence_chars, language=lang)
+    if lang == "en":
+        outcome = f"Run outcome: {status}"
+        if abort_reason:
+            outcome += f" (ended because: {abort_reason})"
+        return f"""\
+{FINAL_RESPONSE_INSTRUCTIONS[lang].strip()}
+
+Original request:
+{task.rstrip()}
+
+{outcome}
+
+Verified state:
+{task_state.strip() or "(Nothing was verified.)"}
+
+Audit findings:
+{findings or "(No audit was produced.)"}
+
+Write the reply now. Output only the reply.
+"""
+    outcome = f"运行结果: {status}"
+    if abort_reason:
+        outcome += f"（结束原因: {abort_reason}）"
+    return f"""\
+{FINAL_RESPONSE_INSTRUCTIONS[lang].strip()}
+
+原始任务:
+{task.rstrip()}
+
+{outcome}
+
+已验证状态:
+{task_state.strip() or "(没有任何已验证内容。)"}
+
+审计结论:
+{findings or "(没有产生审计结论。)"}
+
+现在写这份回复。只输出回复本身。
+"""
+
+
+# Control headers and the backcheck protocol are addressed to the manager, so the
+# user-facing reply only needs the prose findings underneath them.
+_AUDIT_HEADER_RE = re.compile(
+    r"^(?:\*\*)?\s*(?:状态|status|完整性|integrity|契约审计|contract(?:[_\s-]*audit)?)\s*[:：]",
+    re.IGNORECASE,
+)
+_AUDIT_PROTOCOL_RE = re.compile(
+    r"^(?:\*\*)?\s*(?:验收约束反查|契约结论|原题约束清单|契约覆盖检查|逐项反查|阻断约束|可能评分风险"
+    r"|过窄或错误解释|建议契约修订|给任务管理器的状态更新"
+    r"|acceptance[-\s]constraint\s+backcheck|contract\s+conclusion|original\s+constraint\s+inventory"
+    r"|contract\s+coverage\s+check|per[-\s]constraint\s+backcheck|blocking\s+constraints"
+    r"|possible\s+scoring\s+risks|over[-\s]narrow[^:：]*|recommended\s+contract\s+revision"
+    r"|state\s+update\s+for\s+manager)\s*[:：]",
+    re.IGNORECASE,
+)
+
+
+def format_audit_findings(
+    rounds: list[ManagedRound],
+    *,
+    max_chars: int = 6_000,
+    language: str = "en",
+) -> str:
+    """Condense each round's audit into the findings a user-facing reply needs."""
+    lang = normalize_prompt_language(language)
+    sections: list[str] = []
+    for item in rounds:
+        report = (item.auditor_report or "").strip()
+        if not report:
+            continue
+        body: list[str] = []
+        verdicts: list[str] = []
+        skipping_protocol = False
+        for line in report.splitlines():
+            value = line.strip()
+            if not value:
+                continue
+            if _AUDIT_HEADER_RE.match(value):
+                verdict = value.split(":", 1)[-1].split("：", 1)[-1].strip().strip("*")
+                if verdict:
+                    verdicts.append(verdict)
+                continue
+            if _AUDIT_PROTOCOL_RE.match(value):
+                skipping_protocol = True
+                continue
+            if skipping_protocol:
+                continue
+            body.append(value)
+        heading = (
+            f"Round {item.round_index}" if lang == "en" else f"第 {item.round_index} 轮"
+        ) + (f" ({'/'.join(verdicts)})" if verdicts else "")
+        sections.append("\n".join([heading, _clip_preserve("\n".join(body), 1200)]))
+    return _clip_preserve("\n\n".join(sections), max_chars)
 
 
 def parse_role_manager_next_step(text: str) -> RoleNextStep:

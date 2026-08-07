@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import argparse
 import asyncio
-import json
 import platform
 import re
 import sys
@@ -18,7 +17,13 @@ from .config import (
     create_project_config,
     load_run_defaults,
 )
-from .types import DEFAULT_CLAUDE_MODEL, DEFAULT_CODEX_MODEL, EpisodeBudget, HarnessConfig
+from .types import (
+    DEFAULT_CLAUDE_MODEL,
+    DEFAULT_CODEX_MODEL,
+    DEFAULT_WORKSPACE_PATH,
+    EpisodeBudget,
+    HarnessConfig,
+)
 from .utils.agent_cli import probe_agent_cli
 
 if TYPE_CHECKING:
@@ -55,6 +60,7 @@ _ROLE_OPTIONS = (
     ("auditor", None, "both auditor roles"),
     ("gui_auditor", "auditor", "GUI audit"),
     ("cli_auditor", "auditor", "CLI audit"),
+    ("final_response", "manager", "the closing reply written for you"),
 )
 _ROLE_PARENTS = {role: parent for role, parent, _ in _ROLE_OPTIONS}
 _ROLE_SCOPES = {role: scope for role, _, scope in _ROLE_OPTIONS}
@@ -180,12 +186,12 @@ def main(argv: list[str] | None = None) -> int:
     run_parser.add_argument(
         "--workspace",
         default=run_default("workspace"),
-        help="Override the workspace path. Defaults to <runs-root>/<run-id>/workspace.",
+        help="Override the working directory the agents operate in. Defaults to the directory lh-harness was started from.",
     )
     run_parser.add_argument(
         "--harness-dir",
         default=run_default("harness_dir"),
-        help="Override the harness state directory. Defaults to <workspace>/.harness.",
+        help="Override the harness state directory. Defaults to <runs-root>/<run-id>/harness.",
     )
     run_parser.add_argument(
         "--log-dir",
@@ -823,31 +829,58 @@ def _dashboard_command(args: argparse.Namespace) -> int:
 
 
 def _run_command(args: argparse.Namespace) -> int:
+    # The agents work in the directory lh-harness was started from, so a task acts
+    # on the user's real project by default. Resolve it before touching the disk:
+    # every other path below is relative to it.
+    if args.workspace:
+        workspace = str(Path(args.workspace).expanduser().resolve())
+        Path(workspace).mkdir(parents=True, exist_ok=True)
+    else:
+        workspace = DEFAULT_WORKSPACE_PATH
+        if not Path(workspace).is_dir():
+            print(
+                f"The launch directory no longer exists: {workspace}\n"
+                "cd into an existing directory, or pass --workspace.",
+                file=sys.stderr,
+            )
+            return 1
+
     task = _read_task(args.task)
     max_rounds = args.max_rounds
     if max_rounds is None:
         max_rounds = _DEFAULT_MAX_ROUNDS
         print(f"--max-rounds was not set; using the default of {max_rounds} rounds.")
 
-    # Each run is fully isolated under <runs-root>/<run-id>/ so a new run never
-    # mixes with a previous run's tmp/log/workspace data (and the dashboard shows
-    # only the current run).
+    # Run bookkeeping (logs, prompts, harness state) is isolated under
+    # <runs-root>/<run-id>/ so it stays out of the user's project.
     run_id = args.run_id or f"{time.strftime('%Y%m%dT%H%M%SZ', time.gmtime())}_{uuid.uuid4().hex[:8]}"
     run_dir = Path(args.runs_root).expanduser() / run_id
     run_dir.mkdir(parents=True, exist_ok=True)
 
-    workspace = str(Path(args.workspace).expanduser() if args.workspace else run_dir / "workspace")
     log_dir = str(Path(args.log_dir).expanduser() if args.log_dir else run_dir / "logs")
     prompt_dir = str((run_dir / "tmp" / "prompts").resolve())
     harness_dir = (
-        str(Path(args.harness_dir).expanduser()) if args.harness_dir else f"{workspace}/.harness"
+        str(Path(args.harness_dir).expanduser())
+        if args.harness_dir
+        else str((run_dir / "harness").resolve())
     )
-    Path(workspace).mkdir(parents=True, exist_ok=True)
     Path(log_dir).mkdir(parents=True, exist_ok=True)
+
+    # The workspace is the user's own directory, so the run's bookkeeping may sit
+    # inside it. Hide those paths from the agents and from the auditor read-only
+    # guard, which would otherwise flag the harness's own writes.
+    hidden_paths = _outermost_paths(
+        PROJECT_CONFIG_PATH.parent,
+        args.runs_root,
+        run_dir,
+        log_dir,
+        harness_dir,
+        prompt_dir,
+    )
 
     print(f"Run id:    {run_id}")
     print(f"Run dir:   {run_dir.resolve()}")
-    print(f"Workspace: {Path(workspace).resolve()}")
+    print(f"Workspace: {workspace}")
     print(f"Log dir:   {Path(log_dir).resolve()}")
 
     config = HarnessConfig(
@@ -872,6 +905,7 @@ def _run_command(args: argparse.Namespace) -> int:
         dashboard_handle = start_dashboard(log_dir, port=args.dashboard_port, task=task)
         human_hook = make_human_hook(dashboard_handle.state)
         print(f"Dashboard live at {dashboard_handle.url} (log dir: {log_dir})")
+        _open_dashboard(dashboard_handle.url)
 
     agent_cache: dict[tuple[str, str, str | None], object] = {}
     plugin_mcp_cache: dict[str, str | None] = {}
@@ -919,6 +953,7 @@ def _run_command(args: argparse.Namespace) -> int:
                 prompt_dir=prompt_dir,
                 mcp_config=resolve_mcp_config(name),
                 mcp_add_dirs=args.mcp_add_dir,
+                hidden_paths=hidden_paths,
             )
         return agent_cache[key]
 
@@ -928,10 +963,12 @@ def _run_command(args: argparse.Namespace) -> int:
         "cli_executor_agent": build_role_agent("cli_executor"),
         "gui_auditor_agent": build_role_agent("gui_auditor"),
         "cli_auditor_agent": build_role_agent("cli_auditor"),
+        "final_response_agent": build_role_agent("final_response"),
     }
 
     from .manager import run
 
+    report: dict | None = None
     try:
         report = asyncio.run(
             run(
@@ -939,19 +976,100 @@ def _run_command(args: argparse.Namespace) -> int:
                 env=env,
                 config=config,
                 human_hook=human_hook,
+                progress=_print_progress,
                 **role_agents,
             )
         )
     finally:
+        # The summary is printed before the dashboard blocks, so the outcome is
+        # visible in the console even when the operator leaves the UI running.
+        if report is not None:
+            _print_run_summary(report, log_dir=log_dir, workspace=workspace)
         if dashboard_handle is not None:
-            print(f"Run finished. Dashboard still live at {dashboard_handle.url}; press Ctrl+C to exit.")
+            print(f"\nDashboard still live at {dashboard_handle.url}; press Ctrl+C to exit.")
             try:
                 dashboard_handle.serve_forever_blocking()
             except KeyboardInterrupt:
                 dashboard_handle.shutdown()
 
-    print(json.dumps(report, ensure_ascii=False, indent=2))
     return 0 if report.get("completion_satisfied") else 1
+
+
+def _outermost_paths(*paths: str | Path) -> tuple[str, ...]:
+    """Resolve paths and drop any that sit inside another, keeping the parents."""
+    resolved = sorted({Path(item).expanduser().resolve() for item in paths}, key=lambda p: len(p.parts))
+    kept: list[Path] = []
+    for path in resolved:
+        if not any(path.is_relative_to(parent) for parent in kept):
+            kept.append(path)
+    return tuple(str(path) for path in kept)
+
+
+def _open_dashboard(url: str) -> None:
+    import webbrowser
+
+    try:
+        opened = webbrowser.open_new_tab(url)
+    except Exception:
+        opened = False
+    if not opened:
+        print(f"Could not open a browser automatically; open {url} manually.")
+
+
+def _print_progress(event: str, payload: dict) -> None:
+    """Print one console line per role transition so a long run stays legible."""
+    round_index = payload.get("round")
+    if event == "round_start":
+        print(f"\n── Round {round_index}/{payload.get('round_budget')} ──", flush=True)
+    elif event == "role_start":
+        # The reply is written when the run reaches an ending, so it gets its own
+        # heading instead of appearing to be part of that round's work.
+        if payload.get("role") == "final_response":
+            print("\n── Writing reply ──", flush=True)
+        print(f"  [{payload.get('role')}] running...", flush=True)
+    elif event == "role_done":
+        parts = [str(payload.get("status"))]
+        duration_ms = payload.get("duration_ms")
+        if isinstance(duration_ms, int):
+            parts.append(f"{duration_ms / 1000:.1f}s")
+        if payload.get("next_step"):
+            parts.append(f"next={payload['next_step']}")
+        if payload.get("audit_status"):
+            parts.append(
+                f"audit={payload['audit_status']}/"
+                f"{payload.get('integrity_status')}/{payload.get('contract_audit_status')}"
+            )
+        print(f"  [{payload.get('role')}] {' · '.join(parts)}", flush=True)
+
+
+def _print_run_summary(report: dict, *, log_dir: str, workspace: str) -> None:
+    print("\n" + "=" * 72)
+    print(f"Result:    {report.get('status')}")
+    print(f"Rounds:    {report.get('rounds_run')}/{report.get('max_rounds')}")
+    elapsed = report.get("elapsed_seconds")
+    if isinstance(elapsed, (int, float)):
+        print(f"Elapsed:   {elapsed / 60:.1f} min")
+    if report.get("abort_reason"):
+        print(f"Stopped:   {report['abort_reason']}")
+    print(f"Workspace: {workspace}")
+    print(f"Report:    {Path(log_dir).resolve() / 'report.json'}")
+
+    # The reply answers the task in prose, so it leads. The protocol artifacts
+    # below it stay for anyone auditing how that answer was reached.
+    response = str(report.get("final_response") or "").strip()
+    if response:
+        print("\n" + "-" * 72)
+        print(_indent(response))
+        print("-" * 72)
+    for label, key in (("Task state", "current_task_state"), ("Final audit", "latest_auditor_report")):
+        text = str(report.get(key) or "").strip()
+        if text:
+            print(f"\n{label}:\n{_indent(text)}")
+    print("=" * 72)
+
+
+def _indent(text: str, prefix: str = "  ") -> str:
+    return "\n".join(prefix + line for line in text.splitlines())
 
 
 def _resolve_role_option(args: argparse.Namespace, role: str, suffix: str):
@@ -989,6 +1107,7 @@ def _build_agent(
     prompt_dir: str,
     mcp_config: str | None = None,
     mcp_add_dirs: list[str] | None = None,
+    hidden_paths: tuple[str, ...] = (),
 ):
     if name == "codex":
         from .adapters.codex import CodexAdapter
@@ -1000,6 +1119,7 @@ def _build_agent(
             prompt_dir=prompt_dir,
             mcp_config=mcp_config,
             add_dirs=mcp_add_dirs,
+            hidden_paths=hidden_paths,
         )
         if model is not None:
             kwargs["model"] = model
@@ -1015,6 +1135,7 @@ def _build_agent(
             mcp_config=mcp_config,
             add_dirs=mcp_add_dirs,
             role=role,
+            hidden_paths=hidden_paths,
         )
         if model is not None:
             kwargs["model"] = model

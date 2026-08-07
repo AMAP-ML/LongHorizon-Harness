@@ -352,6 +352,30 @@ body {
 .overview-note > span { display: block; margin-bottom: 4px; font-size: 11px; font-weight: 700; color: var(--ink-strong); }
 .overview-note p { margin: 0; color: var(--ink-soft); font-size: 12px; line-height: 1.55; }
 
+/* The reply to the user. Unlike every other card this is prose written for a
+   person, so it reads as text rather than as metrics. */
+.response-card {
+  margin: 8px 0 28px;
+  padding: 20px 22px;
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-left: 3px solid var(--accent);
+  border-radius: var(--radius);
+  box-shadow: var(--shadow-md);
+}
+.response-card.ok, .response-card.complete { border-left-color: var(--done); }
+.response-card.bad, .response-card.blocked, .response-card.incomplete { border-left-color: var(--bad); }
+.response-head { display: flex; align-items: center; gap: 10px; margin-bottom: 12px; }
+.response-title { font-family: var(--serif); font-size: 16px; font-weight: 700; color: var(--ink-strong); }
+.response-body {
+  margin: 0;
+  color: var(--ink);
+  font-size: 13.5px;
+  line-height: 1.75;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
 /* round group: the whole round folds via its header */
 .round-group { margin-bottom: 32px; }
 .round-rule { display: flex; align-items: center; gap: 10px; margin: 0 0 16px; cursor: pointer; user-select: none; }
@@ -424,17 +448,19 @@ body {
   box-shadow: var(--shadow-sm);
   overflow: hidden;
 }
-/* role-colored accent + name (classes added by app.js: acc-manager/gui/cli/auditor/repair) */
+/* role-colored accent + name (classes added by app.js: acc-manager/gui/cli/auditor/repair/reply) */
 .role-sec.acc-manager { border-left-color: var(--role-manager); }
 .role-sec.acc-gui { border-left-color: var(--role-gui); }
 .role-sec.acc-cli { border-left-color: var(--role-cli); }
 .role-sec.acc-auditor { border-left-color: var(--role-auditor); }
 .role-sec.acc-repair { border-left-color: var(--role-repair); }
+.role-sec.acc-reply { border-left-color: var(--accent); }
 .role-sec.acc-manager > .role-head .rname { color: var(--role-manager); }
 .role-sec.acc-gui > .role-head .rname { color: var(--role-gui); }
 .role-sec.acc-cli > .role-head .rname { color: var(--role-cli); }
 .role-sec.acc-auditor > .role-head .rname { color: var(--role-auditor); }
 .role-sec.acc-repair > .role-head .rname { color: var(--role-repair); }
+.role-sec.acc-reply > .role-head .rname { color: var(--accent); }
 
 .role-head { display: flex; align-items: center; gap: 8px; margin: 0; padding: 11px 14px; cursor: pointer; user-select: none; transition: background 0.12s ease; }
 .role-head:hover { background: var(--surface-2); }

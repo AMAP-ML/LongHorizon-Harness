@@ -14,6 +14,7 @@ ClaudeRole = Literal[
     "gui_auditor",
     "cli_auditor",
     "auditor_format_repair",
+    "final_response",
 ]
 
 _WRITE_TOOLS = ("Write", "Edit", "NotebookEdit")
@@ -36,9 +37,11 @@ def policy_for_role(role: str) -> ClaudeRolePolicy:
     bypassed.  The remaining deny-list expresses harness role separation, not
     a filesystem or process sandbox.
     """
-    if role == "manager":
+    if role in {"manager", "final_response"}:
+        # The reply role only rewrites evidence it is given, so it needs no tools
+        # at all; it shares the manager's no-side-effect deny list.
         return ClaudeRolePolicy(
-            role="manager",
+            role=role,
             permission_mode="bypassPermissions",
             disallowed_tools=(
                 "Bash",
@@ -73,15 +76,43 @@ def is_auditor_role(role: str) -> bool:
     return role in _AUDITOR_ROLES
 
 
+def path_deny_rules(paths: tuple[str, ...] | list[str]) -> tuple[str, ...]:
+    """Build `Read`/`Edit` deny rules that hide harness-owned paths from Claude.
+
+    Deny rules still apply under `--dangerously-skip-permissions`, and a `Read`
+    deny also blocks the Edit tool. `//` anchors the pattern at the filesystem
+    root; anything else would resolve against the settings source.
+    """
+    rules: list[str] = []
+    for raw in paths:
+        resolved = Path(raw).expanduser().resolve().as_posix().lstrip("/")
+        if not resolved:
+            continue
+        for tool in ("Read", "Edit"):
+            for pattern in (f"//{resolved}", f"//{resolved}/**"):
+                rule = f"{tool}({pattern})"
+                if rule not in rules:
+                    rules.append(rule)
+    return tuple(rules)
+
+
 @dataclass(frozen=True)
 class WorkspaceSnapshot:
     records: dict[str, tuple[object, ...]]
     errors: tuple[str, ...] = ()
 
 
-def snapshot_workspace(workspace_path: str) -> WorkspaceSnapshot:
-    """Take a bounded-content workspace manifest for auditor mutation checks."""
+def snapshot_workspace(
+    workspace_path: str,
+    hidden_paths: tuple[str, ...] | list[str] = (),
+) -> WorkspaceSnapshot:
+    """Take a bounded-content workspace manifest for auditor mutation checks.
+
+    ``hidden_paths`` skips harness-owned trees (logs, prompts, harness state)
+    that keep changing while the auditor runs.
+    """
     root = Path(workspace_path).expanduser().resolve()
+    excluded = {Path(item).expanduser().resolve() for item in hidden_paths}
     records: dict[str, tuple[object, ...]] = {}
     errors: list[str] = []
     if not root.exists():
@@ -96,6 +127,8 @@ def snapshot_workspace(workspace_path: str) -> WorkspaceSnapshot:
             continue
         for entry in entries:
             path = Path(entry.path)
+            if path in excluded:
+                continue
             try:
                 relative = path.relative_to(root).as_posix()
                 stat = entry.stat(follow_symlinks=False)

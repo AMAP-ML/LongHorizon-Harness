@@ -20,6 +20,7 @@ _ROLE_NAMES = {
     "auditor",
     "gui_auditor",
     "cli_auditor",
+    "final_response",
 }
 _TIMEOUT_NAMES = {"manager", "gui_executor", "cli_executor", "auditor"}
 _RUN_KEYS = {
@@ -61,8 +62,9 @@ model = "gpt-5.6-sol"
 
 env = "local"
 runs_root = "./.lh-harness/runs"
+# Agents work in the directory lh-harness was started from unless set here.
 # workspace = "./workspace"
-# harness_dir = "./workspace/.harness"
+# harness_dir = "./.lh-harness/runs/<run-id>/harness"
 # log_dir = "./logs"
 
 # base_url = "https://api.example.com/v1"
@@ -108,6 +110,11 @@ auditor = 600
 # model = "gpt-5.6-sol"
 
 [run.roles.cli_auditor]
+# agent = "codex"
+# model = "gpt-5.6-sol"
+
+# Writes the closing reply to you; falls back to the manager's agent/model.
+[run.roles.final_response]
 # agent = "codex"
 # model = "gpt-5.6-sol"
 """
