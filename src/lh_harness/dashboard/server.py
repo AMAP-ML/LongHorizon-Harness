@@ -213,6 +213,21 @@ def _make_handler(state: DashboardState) -> type[BaseHTTPRequestHandler]:
             path = self.path.split("?", 1)[0]
             match = _RESOLVE_RE.match(path)
             if match:
+                # Control-plane routes mutate a running agent (resolve
+                # approvals, inject instructions). Require an exact
+                # application/json content type: browsers may send
+                # cross-origin "simple" POSTs (e.g. text/plain) without a
+                # preflight, so any page the operator visits could drive the
+                # agent while the dashboard is up. application/json forces a
+                # preflight, which this server never answers. The bundled UI
+                # already sends it on every POST. Checked after routing so
+                # unknown paths keep their 404.
+                if self.headers.get("Content-Type") != "application/json":
+                    self._send_json(
+                        {"error": "Content-Type must be application/json"},
+                        status=415,
+                    )
+                    return
                 approval_id = match.group(1)
                 body = self._read_json_body()
                 action = str(body.get("action", "continue"))
@@ -225,6 +240,12 @@ def _make_handler(state: DashboardState) -> type[BaseHTTPRequestHandler]:
                 self._send_json({"ok": ok}, status=200 if ok else 404)
                 return
             if path == "/api/inject":
+                if self.headers.get("Content-Type") != "application/json":
+                    self._send_json(
+                        {"error": "Content-Type must be application/json"},
+                        status=415,
+                    )
+                    return
                 body = self._read_json_body()
                 ok = state.add_injection(str(body.get("instructions", "")))
                 self._send_json({"ok": ok}, status=200 if ok else 400)
