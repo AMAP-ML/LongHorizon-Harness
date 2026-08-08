@@ -10,10 +10,10 @@ directories. See README.md for the shipped product.
 
 On top of this codebase, the repo is also building the **Recursive
 Decomposition Harness** described in `PLAN.md` (repo root). `PLAN.md` §13
-defines a build ladder: v0 (resumability), v1 (the round loop), and v2
-(intake/survey/planning/pilot) are done and live in `src/lh_harness/v0/`,
-`src/lh_harness/v1/`, and `src/lh_harness/v2/`; see PLAN.md's Progress
-section for what's next.
+defines a build ladder: v0 (resumability), v1 (the round loop), v2
+(intake/survey/planning/pilot), and v3 (assembly and repair) are done and
+live in `src/lh_harness/v0/`, `src/lh_harness/v1/`, `src/lh_harness/v2/`,
+and `src/lh_harness/v3/`; see PLAN.md's Progress section for what's next.
 
 ## v0 — resumability (`src/lh_harness/v0/`)
 
@@ -247,6 +247,127 @@ pattern v0/v1 followed). Nothing in v0/v1 was modified beyond the one
   nodes (§10) is v3 scope (§13: "re-validation pass for contract
   amendments" is listed under v3, not v2).
 
+## v3 — assembly and repair (`src/lh_harness/v3/`)
+
+Deterministic concatenation, cross-cutting checks, a compile gate, and
+scoped repair — the last piece being what makes the first three matter,
+since none of the checks are worth anything if there's no way to fix what
+they find. Built on v0/v1/v2 without modifying them, beyond one additive
+touch to v1 (see below).
+
+- `v3/run_dir.py` — re-exports v0/v1/v2's path helpers and adds
+  `assembly_dir`/`assembly_index_path`/`assembly_checks_path`/
+  `assembly_output_path`/`compile_log_path` (all under `assembly/`),
+  `versions_dir`/`version_snapshot_path` (`out/.versions/<node>/`), and
+  `revalidation_dir`/`revalidation_audit_path` (`audit/revalidation/`,
+  kept separate from v1's `audit/<node>.json` so a re-validation pass never
+  overwrites the record of the review that originally passed a node).
+- `v3/assemble.py` (§4.6.1) — `assemble(run_dir, tree)` writes
+  `assembly/index.md` and a concatenated output file, zero model tokens.
+  Ordering comes straight from `tree.json`'s own array order
+  (`ordered_node_ids`) rather than a separate order field: `TaskTree.nodes`
+  is a dict, but `TaskTree.load` builds it via a comprehension over the
+  JSON array in file order, and `v2/planner.py` writes candidates into that
+  array left-to-right as it walks the spine — so dict iteration order
+  already *is* document order. `require_complete` raises
+  `AssemblyNotReadyError` listing every not-yet-`"passed"` node if called
+  before the tree is done. Output is generic markdown
+  (`assembly/main.md`), not LaTeX-specific — a caller needing `main.tex` (or
+  any other compiled format) passes its own `render` callable; nothing here
+  assumes a toolchain exists.
+- `v3/checks.py` (§4.6.2) — script only, no model call. PLAN.md's example
+  checklist (`refs_out` resolution, glossary terms, duplicate definitions)
+  needs the node-type template system for the underlying data, and that
+  system is still unbuilt (same gap `v1/gates.py`/`v2/planner.py` already
+  flag), so this ships what's actually derivable today:
+  `check_all_nodes_passed`, `check_artifacts_exist_and_nonempty`,
+  `check_no_gate_drift` (an artifact that passed its gates at dispatch time
+  but no longer would — the file changed under us since), and
+  `check_manifest_recorded` (a passed node with no matching
+  `manifest.jsonl` line). `run_cross_cutting_checks` + `write_checks_json`
+  emit `assembly/checks.json`. (A `check_no_duplicate_artifact_paths` was
+  cut during review: `node_artifact_path` derives the path purely from the
+  node id and `TaskTree.nodes` is a dict keyed by id, so that collision is
+  structurally unreachable, not just unlikely — dead code, not a check.)
+- `v3/compile.py` (§4.6.3) — "Run latexmk; exit code and log are the gate,"
+  generalized: `compile_command` is a plain injected shell string run
+  through the existing `Environment.exec` abstraction (the same one every
+  episode dispatch already uses), not an assumed LaTeX toolchain. No
+  command configured → trivial pass (`skipped=True`) — most corpora this
+  harness runs over don't compile anything, per §1's corpus-agnostic goal.
+  `run_compile` shells into `assembly_dir` by default (`cd {dir} &&
+  {command}`) and writes the combined stdout+stderr to
+  `assembly/compile.log`.
+- `v3/repair.py` (§4.5, §4.6) — the mechanism everything else in v3 leans
+  on. **Why it can't just call v0's `run_node` again under the node's own
+  id**: `run_node` is keyed by node id in `events.jsonl`, and every node
+  reaching this module already has an `episode_completed` event from its
+  original successful dispatch — calling `run_node` again on that id is
+  defined to be a no-op replay (v0's whole resumability contract), not a
+  fresh attempt. So `run_repair` dispatches under a derived id
+  (`repair_node_id`: `"<node id>~repair<attempt>"`, `attempt = node.attempts
+  + 1`, reusing the same counter v1's round loop already increments on
+  failed submits/reviews — which also makes the derived id deterministic
+  across a crash mid-repair, so v0's own resume machinery still covers the
+  repair dispatch itself), then copies the resulting text over the real
+  artifact path only after it re-clears **both** gates and review — same
+  invariant 1 v1's round loop enforces, applied to a second pass. Snapshots
+  the pre-repair artifact to `out/.versions/<node>/<repair_id>.md`
+  unconditionally, before dispatch (§4.6: "if the amendment was itself the
+  mistake, you'll only realize it three chapters in"). `RepairMode` is
+  `"patch"` (minimal scoped edit — §4.5: freeform suggestions get
+  over-applied) or `"regenerate"` (full rewrite; used by contract-amendment
+  regenerate triage), which only changes the prompt template
+  (`build_repair_prompt`), not the dispatch/gate/review mechanics. On
+  success the node returns to `"passed"`; on failure it becomes `"stale"`
+  (retryable) or `"blocked"` once `node.attempts >= max_attempts` (same
+  threshold v1 uses to escalate rather than loop forever). This is also the
+  guardrail behind §4.6's "the assembler's file tools are read-only over
+  `out/`": nothing in `assemble.py`/`checks.py`/`compile.py` ever writes
+  into `out/` — only a repair *writer*, dispatched here and gated the same
+  as any other writer node, is allowed to change a passed artifact.
+- `v3/assembly_loop.py` — the v3 entrypoint, mirroring how `v1/round_loop.py`
+  ties Orchestrator/Writer/Reviewer together. `run_assembly_loop(run_dir,
+  tree_path, manifest_path, writer_adapter_factory, env, provider,
+  compile_command=..., ...)` runs checks → assemble → compile, in that
+  order (cheapest, most structural gate first — a missing artifact should
+  surface as a checks failure, not a confusing compile error). On a compile
+  failure it calls `find_offending_nodes(tree, log_text)` — a plain
+  substring match of each passed node's artifact **filename** against the
+  log text, not a format-specific log parser — and dispatches a scoped
+  `repair.run_repair` (mode `"patch"`) for every match, then re-assembles
+  and recompiles, bounded by `max_repairs`. If the log can't be attributed
+  to any node, it stops and escalates immediately rather than guessing (an
+  `run_escalated` event, same posture as v1's `max_attempts` exhaustion).
+- `v3/revalidate.py` (§10, §15.5) — the contract-amendment re-validation
+  pass, built on `repair.py` rather than a parallel mechanism. Two-phase,
+  matching §10's "present counts, get approval, then execute": (1)
+  `run_revalidation_pass(run_dir, tree, tree_path, contract_text,
+  provider)` is **read-only** — no writer is dispatched — re-running the
+  existing Reviewer (a dedicated system prompt, same `VERDICT_SCHEMA` v1's
+  reviewer already defines) against the amended contract for every
+  currently-`"passed"` node, classifying each via `classify_verdict` into
+  clean/patchable/regenerate using the verdict schema's own per-item
+  `class` field (already shipped in `v1/reviewer.py`'s schema — a failing
+  item with a missing or mixed class defaults to the stricter
+  `"regenerate"`, never guesses patchable). Anything not clean is marked
+  `"stale"` in the tree. `estimate_revalidation_cost` is a pure token count
+  (contract + rubric + artifact per passed node, zero model calls) for
+  showing the estimate *before* running, and `summarize_triage` gives the
+  clean/patchable/regenerate counts for the approval step in between. (2)
+  `apply_revalidation_triage(...)` — call only after that approval —
+  dispatches `repair.run_repair` for every non-clean node, `mode="patch"`
+  for patchable and `mode="regenerate"` for regenerate, with the defect
+  text derived straight from the triage verdict's own `id`/`defect`
+  fields; clean nodes are left untouched.
+
+One additive touch to v1: `TaskNode.status` (`v1/tree.py`) gained
+`"stale"` (§10: "Amend contract... completed nodes now stale"). A passed
+node whose re-validation triage comes back non-clean is neither untouched
+work (`"pending"`) nor still confirmed-good (`"passed"`), so neither
+existing status fit. Nothing that never amends a contract ever produces
+this value — every v1/v2 code path is unaffected.
+
 ## Adapter changes (additive, backward compatible)
 
 - `adapters/cli_agent.py` — `CommandAgentAdapter.run_episode` gained a
@@ -279,7 +400,7 @@ no API key. Run everything:
 python3 -m unittest discover -s tests -p "test_*.py" -v
 ```
 
-~7s, 61 tests, all passing as of the v2 build.
+~7s, 89 tests, all passing as of the v3 build.
 
 ### v0 (`tests/test_v0_resume.py`, 4 tests)
 
@@ -380,6 +501,47 @@ Writer episode in the pilot tests. No new fixtures were needed.
   cover the round trip, the token-ceiling rejection leaving no partial
   write, and amendment appending without erasing prior rules.
 
+### v3 (`tests/test_v3_*.py`, 28 tests)
+
+Same fakes, no new fixtures — `FakeStreamAgentAdapter`/`fake_stream_agent.py`
+for repair-writer dispatch, `FakeProvider` for Reviewer calls, and the real
+`LocalEnvironment` for `compile.py` (plain shell one-liners, no LaTeX
+toolchain needed since the compile gate is a generic injected command).
+
+- `test_v3_assemble.py` (3) — tree.json array order round-trips through
+  `ordered_node_ids`; `assemble` concatenates in that order and writes a
+  correct index; a not-yet-passed node raises `AssemblyNotReadyError`
+  naming it.
+- `test_v3_checks.py` (5) — each check's true-positive case (missing/empty
+  artifact, gate drift, missing manifest line) plus an end-to-end
+  `run_cross_cutting_checks` → `write_checks_json` round trip.
+- `test_v3_compile.py` (4) — no command configured is a trivial pass;
+  successful/failing commands set `passed`/`exit_code`/`log` correctly and
+  the log lands on disk; runs inside `assembly_dir` by default.
+- `test_v3_repair.py` (4) — a repair dispatches a genuinely new episode
+  under the derived id (not a no-op replay of the node's original
+  `episode_completed`), the repaired text lands on the real artifact path,
+  and the pre-repair content is snapshotted first; a repair that still
+  fails its gates leaves the live artifact untouched and transitions to
+  `"stale"`; repeated failure exhausts `max_attempts` to `"blocked"`; a
+  node with judgment items routes through the Reviewer (asserted via
+  `FakeProvider` call count) before being allowed back to `"passed"`.
+- `test_v3_assembly_loop.py` (5) — `find_offending_nodes` matches by
+  artifact filename in document order; checks failing escalates before any
+  compile attempt; a full compile-fail → attribute → repair → reassemble →
+  recompile-clean cycle (grep-based fake "compiler," `--session-id` as the
+  literal marker string proving the repaired content actually flowed
+  through); an unattributable compile failure escalates without dispatching
+  any repair.
+- `test_v3_revalidate.py` (7) — `classify_verdict`'s four buckets (pass →
+  clean; all-patchable failures → patchable; missing class → regenerate;
+  mixed patchable+regenerate → regenerate); `estimate_revalidation_cost`
+  counts only passed nodes and scales with contract/artifact size;
+  `run_revalidation_pass` is read-only (asserted via `FakeProvider` call
+  count matching exactly the passed-node count) and marks non-clean nodes
+  `"stale"`; `apply_revalidation_triage` leaves clean nodes untouched and
+  routes patchable through `repair.run_repair`.
+
 Fixtures (`tests/fixtures/`):
 - `fake_stream_agent.py` — standalone script mimicking Claude Code's
   `stream-json` output: writes its own pid to `--pidfile` immediately (so a
@@ -395,19 +557,18 @@ Fixtures (`tests/fixtures/`):
 - `run_node_subprocess.py` — CLI wrapper so `run_node` can be launched as an
   independently-killable OS process.
 
-## Explicitly out of scope for v2 (do not build here)
+## Explicitly out of scope for v3 (do not build here)
 
 Node-type template system (so leaves still carry only v1's generic gates —
 no `headers:std`/`terms_defined`/`problems>=N` — and no judgment/rubric
-items; `v2/planner.py`'s and `v1/gates.py`'s docstrings both flag this same
-gap), assembly (concatenation, cross-cutting checks, compile gate),
-re-validation triage of already-passed nodes after a contract amendment
-(clean/patchable/regenerate, §10 — `contract.amend_contract` only appends
-to `contract.md`, it never touches `tree.json`), research tools (web
-search, current-docs retrieval), Codex per-node tool restriction,
-concurrent/parallel dispatch (round loop is sequential — `depends_on` is
-tracked so this is a config change later, not a redesign, per §4.5), and
-the CLI/dashboard wiring that would actually chain
-intake→survey→plan→pilot→execute into one pipeline run (`cli.py`,
-`dashboard/`) — v2 ships four composable library modules, not a driver.
-All of these are `PLAN.md` §13 v3+.
+items; `v1/gates.py`, `v2/planner.py`, and `v3/checks.py`'s docstrings all
+flag this same gap — it's also why `checks.py` can't check `refs_out`
+resolution or glossary terms, and why `glossary.json` from `PLAN.md` §5 is
+still unbuilt), research tools (web search, current-docs retrieval), Codex
+per-node tool restriction, concurrent/parallel dispatch (round loop and
+assembly loop are both sequential — `depends_on` is tracked so this is a
+config change later, not a redesign, per §4.5), and the CLI/dashboard
+wiring that would actually chain
+intake→survey→plan→pilot→execute→assemble into one pipeline run (`cli.py`,
+`dashboard/`) — v0-v3 ship composable library modules, not a driver. All of
+these are `PLAN.md` §13 v4+ or later.

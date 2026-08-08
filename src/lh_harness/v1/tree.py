@@ -13,6 +13,15 @@ One field here is a v1-only extension not in the PLAN.md §6 example:
 the imperative text is derived from the frozen contract (§4.4, v2+). v1 has
 no contract yet, so ``rubric`` carries that text directly on the node until
 contract derivation exists to generate it.
+
+``"stale"`` was added to ``NodeStatus`` for v3 (PLAN.md §10: "Amend
+contract... completed nodes now stale"). A passed node whose contract
+amendment re-validation (``v3/revalidate.py``) comes back patchable or
+regenerate is marked stale rather than reset to "pending" or left
+"passed" — neither of those states means what actually happened: it isn't
+untouched work, and it isn't yet re-confirmed against the amendment.
+Purely additive: no v1/v2 code path that never amends a contract ever
+produces this status.
 """
 
 from __future__ import annotations
@@ -23,10 +32,12 @@ from pathlib import Path
 from typing import Any, Literal
 
 NodeStatus = Literal[
-    "pending", "dispatched", "awaiting_review", "passed", "failed", "blocked"
+    "pending", "dispatched", "awaiting_review", "passed", "failed", "blocked", "stale"
 ]
 
-_VALID_STATUSES = {"pending", "dispatched", "awaiting_review", "passed", "failed", "blocked"}
+_VALID_STATUSES = {
+    "pending", "dispatched", "awaiting_review", "passed", "failed", "blocked", "stale"
+}
 _TERMINAL_STATUSES = {"passed", "blocked", "failed"}
 _IN_FLIGHT_STATUSES = {"dispatched", "awaiting_review"}
 

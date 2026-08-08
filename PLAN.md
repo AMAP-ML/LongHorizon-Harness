@@ -1,8 +1,8 @@
 # PLAN.md — Recursive Decomposition Harness
 
-**Status:** v0 (resumability), v1 (round loop), and v2 (intake, survey,
-recursive planning, pilot + contract derivation) implemented and tested.
-See Progress below.
+**Status:** v0 (resumability), v1 (round loop), v2 (intake, survey,
+recursive planning, pilot + contract derivation), and v3 (assembly and
+repair) implemented and tested. See Progress below.
 **Scope:** general-purpose long-horizon task executor. Not a coding harness.
 
 ## Progress
@@ -54,12 +54,44 @@ See Progress below.
   `tests/test_v2_planner.py`, `tests/test_v2_pilot.py`), all against fakes.
   See `CLAUDE.md` for the file-by-file breakdown and what's explicitly
   still out of scope.
-- **v3–v4:** not started. Next up per §13: assembly/repair (deterministic
-  concatenation, cross-cutting checks, compile gate, scoped repair nodes,
-  re-validation triage for contract amendments), then research tools (web
-  search subagent, current-docs retrieval). The node-type template system
-  v2's planner and v1's gates both flag as missing is also still open —
-  see `v2/planner.py`'s and `v1/gates.py`'s docstrings.
+- **v3 — assembly and repair (§13): done.** `src/lh_harness/v3/` —
+  deterministic concatenation + index ordered straight from `tree.json`'s
+  own array order (`assemble.py`, zero model tokens); cross-cutting
+  checks over what's actually derivable pre-node-type-templates: missing/
+  empty artifacts, gate drift, manifest desync (`checks.py`, emits
+  `assembly/checks.json`); a compile gate that's a plain injected shell
+  command run through the existing `Environment.exec` abstraction, not a
+  LaTeX-specific assumption — exit code + log are the gate, and it's a
+  trivial pass when no command is configured (`compile.py`). The harder
+  piece is `repair.py`: a scoped repair dispatches under a derived node id
+  (`"<id>~repair<attempt>"`) because v0's `run_node` would otherwise no-op-
+  replay an already-completed node id, then copies the result over the
+  real artifact only after it re-clears gates and review — snapshotting to
+  `out/.versions/` first. `assembly_loop.py` is the v3 entrypoint: on a
+  compile failure it attributes the log to a node by artifact filename and
+  dispatches a scoped repair, looping (bounded by `max_repairs`) until
+  clean or escalating rather than guessing when nothing can be attributed.
+  `revalidate.py` builds the §10 contract-amendment triage on top of the
+  same repair primitive: a read-only re-run of the existing Reviewer
+  against the amended contract (no writers dispatched), classified
+  clean/patchable/regenerate via the verdict schema's own `class` field
+  (already shipped in v1's `reviewer.py`), with a token-count cost
+  estimate and a triage-counts summary meant to sit either side of a user
+  approval gate before `apply_revalidation_triage` executes anything. One
+  additive touch to v1: `TaskNode.status` gained `"stale"` (§10:
+  "completed nodes now stale") — nothing that doesn't amend a contract
+  ever produces it. 89/89 tests passing (adds
+  `tests/test_v3_assemble.py`, `test_v3_checks.py`, `test_v3_compile.py`,
+  `test_v3_repair.py`, `test_v3_assembly_loop.py`,
+  `test_v3_revalidate.py`), all against fakes — no network, no real
+  provider/agent-CLI credentials. Glossary tracking (`glossary.json`) and
+  refs/terms-based checks remain unbuilt: they need the node-type template
+  system, still open (see below).
+- **v4:** not started. Next up per §13: research tools (web search
+  subagent, current-docs retrieval) — lowest priority, retrieval fixes
+  rather than correctness fixes. The node-type template system v2's
+  planner and v1's gates both flag as missing is also still open — see
+  `v2/planner.py`'s and `v1/gates.py`'s docstrings.
 
 ---
 
