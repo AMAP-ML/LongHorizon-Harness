@@ -468,6 +468,49 @@ modifications to v0/v1/v2/v3.
   defaults; `v0/runner.py` falls back to fresh redispatch for resume, and
   v1's round loop simply can't offer it per-node tool restriction (a
   `writer_adapter_factory` targeting Codex would just ignore `node.tools`).
+- `adapters/gptme_adapter.py` + `adapters/_gptme_worker.py` (new) —
+  `GptmeAdapter`, a third `AgentAdapter` with no agent CLI anywhere in the
+  chain. `ClaudeCodeAdapter`/`CodexAdapter` shell out to an existing
+  coding-agent product; `GptmeAdapter` instead drives gptme
+  (github.com/gptme/gptme, MIT, `pip install "lh-harness[gptme]"` — an
+  optional extra, so the core package and every other adapter stay
+  gptme-free) — a small shell/read/save/patch tool-use loop that talks to
+  any OpenAI-compatible endpoint, by default this harness's own dev
+  target: DeepSeek V4 Flash Free via OpenCode Zen, the exact host
+  `v1/provider.py` already talks to for Orchestrator/Reviewer
+  (`LH_HARNESS_PROVIDER_BASE_URL`/`_API_KEY` env vars, falling back to
+  `OPENCODE_API_KEY`, same lookup order). Still subclasses
+  `CommandAgentAdapter` and still shells a subprocess — but of
+  `_gptme_worker.py`, a few lines of code in *this* repo that call one
+  gptme library function (`gptme.chat(...)`), not of a product this repo
+  doesn't control. That subprocess boundary is deliberate, not a
+  compromise: gptme's own `chat()` calls `os.chdir(workspace)` itself (a
+  process-global mutation two concurrent in-process episodes would race)
+  and, being a synchronous call, can't be forcibly cancelled once wrapped
+  in `asyncio.to_thread` (a timed-out `EpisodeBudget` would only stop
+  *awaiting* it — the worker thread keeps running invisibly in the
+  background). A subprocess gets both for free from machinery every other
+  adapter already relies on (`environment/local.py`'s real
+  timeout+killpg) — confirmed by an actual end-to-end run against a
+  scratch `pip install gptme` venv pointed at an unreachable host: the
+  harness's own budget timeout correctly killed the stuck subprocess
+  rather than leaking it. `supports_session_resume = False` — gptme's own
+  continuity model (re-point `chat()` at the same `logdir`) has no
+  fresh-vs-corrupted-log distinction the way `--resume <session_id>`
+  does, since gptme's conversation log is a full-file rewrite per append,
+  not append-only/fsync'd like this harness's own `EventLog`; every
+  `run_episode` call gets a fresh, never-reused `logdir`, so a redispatch
+  can never collide with a crashed attempt's partial log. Every exact API
+  detail here (the `chat()` signature, the `"local/<name>"` +
+  `OPENAI_BASE_URL`/`OPENAI_API_KEY` custom-endpoint mechanism, the
+  `--output-format json` line shape `gptme_visible_output` parses) was
+  confirmed against a real installed `gptme` package via `inspect`, not
+  guessed from documentation. `tests/test_gptme_adapter.py` (15 tests)
+  covers command construction and output parsing the same
+  no-real-network way every other adapter's tests do; there is no
+  automated test that actually runs gptme, since that needs a real API
+  key the same way no test here ever calls a real `claude`/`codex`
+  binary either.
 
 ## Tests
 
@@ -478,7 +521,9 @@ no API key. Run everything:
 python3 -m unittest discover -s tests -p "test_*.py" -v
 ```
 
-~7s, 103 tests, all passing as of the v4 build.
+~7s, 118 tests, all passing (103 as of the v4 build, plus 15 for
+`GptmeAdapter`, the adapters/-layer addition described above under
+"Adapter changes").
 
 ### v0 (`tests/test_v0_resume.py`, 4 tests)
 

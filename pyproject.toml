@@ -16,6 +16,13 @@ dependencies = [
     "tomli; python_version < '3.11'",
 ]
 
+# Only GptmeAdapter's subprocess worker (adapters/_gptme_worker.py) imports
+# gptme -- the core package, every other adapter, and the test suite stay
+# gptme-free. Install with `pip install "lh-harness[gptme]"` to actually run
+# GptmeAdapter as a Writer backend.
+[project.optional-dependencies]
+gptme = ["gptme"]
+
 [project.urls]
 Homepage = "https://github.com/AMAP-ML/LongHorizon-Harness"
 Issues = "https://github.com/AMAP-ML/LongHorizon-Harness/issues"
