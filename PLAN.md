@@ -1,6 +1,7 @@
 # PLAN.md — Recursive Decomposition Harness
 
-**Status:** v0 (resumability) implemented and tested. See Progress below.
+**Status:** v0 (resumability) and v1 (round loop) implemented and tested.
+See Progress below.
 **Scope:** general-purpose long-horizon task executor. Not a coding harness.
 
 ## Progress
@@ -17,11 +18,26 @@
   inside `src/lh_harness/`, eventually replacing Manager→Orchestrator,
   Executor→Writer, Auditor→Reviewer in place (not a separate package).
   See `CLAUDE.md` for the file-by-file breakdown.
-- **v1 — the round loop: not started.** Needs the OpenAI-compatible provider
-  module (§12) for Orchestrator/Planner/Reviewer direct-API calls — model
-  credentials are on hand (OpenCode Zen, `opencode/deepseek-v4-flash-free`)
-  but the provider module itself isn't written yet.
-- **v2–v4:** not started.
+- **v1 — the round loop (§13): done.** `src/lh_harness/v1/` —
+  OpenAI-compatible provider module (§12, stdlib-only), stateless-per-round
+  Orchestrator, Reviewer, and a Writer wrapper over v0's `run_node`, all
+  tied together by `round_loop.run_round_loop`. Task state lives in
+  `tree.json` (§6 Node schema); a node cannot be constructed without
+  machine-checkable gates (§2 invariant 1/2). Schema-constrained JSON
+  returns for Orchestrator/Reviewer, with a validate-and-reprompt fallback
+  since `response_format: json_schema` support varies by endpoint (§12).
+  Per-node tool restriction via `ClaudeCodeAdapter(allowed_tools=...)`
+  (additive, §5). Writer handoff capped at ~400 tokens (§13 v1 scope).
+  Round-loop-level resumability composes with v0 rather than reimplementing
+  it — see `CLAUDE.md` for how in-flight nodes are resumed before the
+  orchestrator is asked anything new. 25/25 tests passing
+  (`tests/test_v0_resume.py`, `tests/test_v1_units.py`,
+  `tests/test_v1_round_loop.py`), all against fakes — no network, no real
+  provider/agent-CLI credentials needed to run the suite.
+- **v2–v4:** not started. v1's `rubric` field on `TaskNode` (per-node
+  judgment text) and its generic content-agnostic gates are the v1-only
+  stand-ins v2's planner/contract-derivation is meant to replace — see
+  `tree.py` and `gates.py` docstrings.
 
 ---
 

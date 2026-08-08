@@ -30,6 +30,10 @@ class ClaudeCodeAdapter(CommandAgentAdapter):
     # is v0's actual resumability mechanism for a Writer node (PLAN.md §3:
     # the Writer's whole agent-CLI invocation is one opaque unit).
     supports_session_resume = True
+    # PLAN.md §5: "tools is per-node... the single biggest token lever."
+    # allowed_tools below is v1's mechanism for that — additive to the
+    # existing role-based deny list, not a replacement for it.
+    supports_tool_restriction = True
 
     def __init__(
         self,
@@ -43,6 +47,7 @@ class ClaudeCodeAdapter(CommandAgentAdapter):
         add_dirs: list[str] | None = None,
         role: ClaudeRole = "cli_executor",
         hidden_paths: tuple[str, ...] = (),
+        allowed_tools: tuple[str, ...] | None = None,
     ) -> None:
         policy = policy_for_role(role)
         env_parts: list[str] = []
@@ -104,6 +109,12 @@ class ClaudeCodeAdapter(CommandAgentAdapter):
         if deny_tools:
             command_parts.append("--disallowedTools")
             command_parts.extend(shlex.quote(tool) for tool in deny_tools)
+        if allowed_tools:
+            # Intersects with (does not replace) the role deny list above —
+            # a node can only narrow what its role already permits, never
+            # widen it.
+            command_parts.append("--allowedTools")
+            command_parts.extend(shlex.quote(tool) for tool in allowed_tools)
         self.computer_mcp_configured = bool(policy.load_computer_mcp and mcp_config)
         if self.computer_mcp_configured:
             command_parts.extend(["--mcp-config", shlex.quote(mcp_config)])

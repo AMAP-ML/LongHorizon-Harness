@@ -11,7 +11,6 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import json
-import time
 from pathlib import Path
 from typing import Any
 
@@ -19,7 +18,7 @@ from ..adapters.base import AgentAdapter
 from ..environment.base import Environment
 from ..types import EpisodeBudget, EpisodeResult
 from .events import EventLog
-from .run_dir import events_path, manifest_path, node_artifact_path, node_trace_path
+from .run_dir import events_path, node_artifact_path, node_trace_path
 
 _SESSION_POLL_INTERVAL_SECONDS = 0.05
 
@@ -127,11 +126,11 @@ async def run_node(
     artifact_text = result.metadata.get("assistant_visible_output") or result.actions_log or ""
     artifact_path.write_text(artifact_text, encoding="utf-8")
 
-    _append_jsonl(
-        manifest_path(run_dir),
-        {"node": node_id, "artifact": str(artifact_path), "status": result.status},
-    )
-
+    # v0 does not write manifest.jsonl: a single Writer node has no gates to
+    # evaluate and no way to derive the PLAN.md §6 manifest schema. That
+    # line is written by the caller once gates have actually run — v1's
+    # round loop (src/lh_harness/v1/manifest.py) is the first caller that
+    # can do so correctly.
     log.append(
         {
             "node_id": node_id,
@@ -230,10 +229,3 @@ def _result_from_completed_event(event: dict[str, Any]) -> EpisodeResult:
             "replayed_from_event_log": True,
         },
     )
-
-
-def _append_jsonl(path: Path, obj: dict[str, Any]) -> None:
-    obj = dict(obj)
-    obj.setdefault("ts", time.time())
-    with open(path, "a", encoding="utf-8") as fh:
-        fh.write(json.dumps(obj, sort_keys=True) + "\n")

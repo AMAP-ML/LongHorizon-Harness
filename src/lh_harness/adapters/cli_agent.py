@@ -33,6 +33,11 @@ class CommandAgentAdapter:
     # starting over (see ClaudeCodeAdapter). v0's runner falls back to a fresh
     # redispatch whenever this is False instead of erroring.
     supports_session_resume = False
+    # Overridden True by adapters that can restrict which of their own tools
+    # a single episode may use (see ClaudeCodeAdapter.allowed_tools). v1's
+    # round loop builds one adapter per node via a caller-supplied factory,
+    # so this flag is informational rather than load-bearing for that path.
+    supports_tool_restriction = False
 
     def __init__(
         self,
