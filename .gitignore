@@ -35,3 +35,10 @@ env.local.sh
 .DS_Store
 .idea/
 .vscode/
+
+# Claude Code local worktrees — machine-local scratch, never repo content.
+# A worktree directory is itself a git checkout; adding it from the outer
+# repo (e.g. a stray `git add -A` run from the superproject root) records it
+# as a broken gitlink instead of real content. Keep it ignored so that can't
+# happen again.
+.claude/worktrees/

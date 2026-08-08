@@ -1,7 +1,27 @@
 # PLAN.md — Recursive Decomposition Harness
 
-**Status:** design v0.1, pre-implementation
+**Status:** v0 (resumability) implemented and tested. See Progress below.
 **Scope:** general-purpose long-horizon task executor. Not a coding harness.
+
+## Progress
+
+- **v0 — prove resumability (§13): done.** `src/lh_harness/v0/` — fsync'd
+  append-only `EventLog`, idempotent `run_node()` that converges to exactly
+  one artifact/terminal event no matter when a `kill -9` lands, and session
+  continuation for `ClaudeCodeAdapter` via `claude --resume <id>` (Codex has
+  no equivalent, falls back to fresh redispatch). Proven by
+  `tests/test_v0_resume.py`, which SIGKILLs real OS subprocesses (not
+  in-process mocks) — 4/4 passing. Existing role files
+  (`manager.py`/`auditor_agent.py`/`cli.py`/`role_prompts.py`) untouched;
+  this is additive scaffolding. Decision on file placement: build directly
+  inside `src/lh_harness/`, eventually replacing Manager→Orchestrator,
+  Executor→Writer, Auditor→Reviewer in place (not a separate package).
+  See `CLAUDE.md` for the file-by-file breakdown.
+- **v1 — the round loop: not started.** Needs the OpenAI-compatible provider
+  module (§12) for Orchestrator/Planner/Reviewer direct-API calls — model
+  credentials are on hand (OpenCode Zen, `opencode/deepseek-v4-flash-free`)
+  but the provider module itself isn't written yet.
+- **v2–v4:** not started.
 
 ---
 
