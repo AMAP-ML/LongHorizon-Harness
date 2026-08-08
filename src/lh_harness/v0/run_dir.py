@@ -26,6 +26,10 @@ def create_run_dir(root: str | Path, run_id: str) -> Path:
     return run_dir
 
 
+def spec_path(run_dir: str | Path) -> Path:
+    return Path(run_dir) / "spec.md"
+
+
 def events_path(run_dir: str | Path) -> Path:
     return Path(run_dir) / "events.jsonl"
 

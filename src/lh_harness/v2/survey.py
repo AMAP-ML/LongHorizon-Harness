@@ -1,0 +1,254 @@
+"""Survey — structure discovery (PLAN.md §4.2). Three stages, uniform
+output regardless of input structure:
+
+1. **Mechanical chunking** (``chunk_text``, no model) — split on whatever
+   boundaries exist: headings, page breaks, blank-line runs. A textbook's
+   TOC and a folder of unstructured lecture notes both go through the same
+   function; the difference shows up only in how much work stage 2 has to
+   do.
+2. **Windowed survey** (``survey_chunks``, model, tiny outputs) — walk
+   chunks in overlapping windows. Each call sees only that window (never
+   the whole corpus, §8) and emits only candidate boundaries — never a
+   summary, never content.
+3. **Spine assembly** (``assemble_spine``, harness, no model) — merge
+   boundary votes across overlapping windows, apply a minimum-size floor,
+   produce ``spine.json``.
+"""
+
+from __future__ import annotations
+
+import json
+import re
+from dataclasses import asdict, dataclass
+from pathlib import Path
+from typing import Any
+
+from ..v1.gates import estimate_tokens
+from ..v1.provider import OpenAICompatibleProvider
+from .run_dir import spine_path
+
+DEFAULT_MIN_CHUNK_TOKENS = 50
+DEFAULT_WINDOW_SIZE = 12
+DEFAULT_WINDOW_STRIDE = 8
+DEFAULT_MIN_UNIT_TOKENS = 800
+DEFAULT_CONFIDENCE_FLOOR = 0.5
+
+_HEADING_RE = re.compile(
+    r"(?m)^(?:#{1,6}[ \t]+\S.*"
+    r"|(?:chapter|section|part)\s+\d+\b.*"
+    r"|\d+(?:\.\d+)*[.)][ \t]+\S.*)$",
+    re.IGNORECASE,
+)
+_BLANK_RUN_RE = re.compile(r"\n{3,}")
+_PAGE_BREAK_RE = re.compile(r"\f")
+
+
+@dataclass
+class Chunk:
+    index: int
+    text: str
+    tokens: int
+
+
+def chunk_text(text: str, *, min_chunk_tokens: int = DEFAULT_MIN_CHUNK_TOKENS) -> list[Chunk]:
+    """Deterministic, model-free split on headings / page breaks / blank-line
+    runs, then folds any resulting fragment under ``min_chunk_tokens`` into
+    its neighbor so stage 2 never sees a near-empty window entry."""
+    if not text.strip():
+        return []
+    positions = {0, len(text)}
+    for pattern in (_HEADING_RE, _PAGE_BREAK_RE, _BLANK_RUN_RE):
+        for match in pattern.finditer(text):
+            positions.add(match.start() if pattern is _HEADING_RE else match.end())
+    ordered = sorted(positions)
+    segments = [
+        text[start:end] for start, end in zip(ordered, ordered[1:]) if text[start:end].strip()
+    ]
+    if not segments:
+        segments = [text]
+    merged = _merge_small_segments(segments, min_chunk_tokens)
+    return [Chunk(index=i, text=segment, tokens=estimate_tokens(segment)) for i, segment in enumerate(merged)]
+
+
+def _merge_small_segments(segments: list[str], min_tokens: int) -> list[str]:
+    merged: list[str] = []
+    for segment in segments:
+        if merged and estimate_tokens(merged[-1]) < min_tokens:
+            merged[-1] += segment
+        else:
+            merged.append(segment)
+    if len(merged) > 1 and estimate_tokens(merged[-1]) < min_tokens:
+        merged[-2] += merged[-1]
+        merged.pop()
+    return merged
+
+
+@dataclass
+class BoundaryVote:
+    boundary_after: int
+    label: str
+    confidence: float
+
+
+SURVEY_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "required": ["boundaries"],
+    "additionalProperties": False,
+    "properties": {
+        "boundaries": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "required": ["boundary_after", "label", "confidence"],
+                "additionalProperties": False,
+                "properties": {
+                    "boundary_after": {"type": "integer"},
+                    "label": {"type": "string", "maxLength": 120},
+                    "confidence": {"type": "number", "minimum": 0, "maximum": 1},
+                },
+            },
+        }
+    },
+}
+
+_SURVEY_SYSTEM_PROMPT = (
+    "You are surveying a corpus for structural boundaries. You never "
+    "summarize and never quote content back — you see a window of "
+    "consecutive chunks, each shown only as its first few words, and each "
+    "labeled by its index within this window. Emit only candidate "
+    "boundaries: the local chunk index after which a new structural unit "
+    "begins, a short label for what follows, and a confidence from 0 to 1. "
+    "A window with no real boundary should return an empty list. Respond "
+    "with a single JSON object only."
+)
+
+
+def _render_window(window: list[Chunk]) -> str:
+    lines = []
+    for local_index, chunk in enumerate(window):
+        preview = " ".join(chunk.text.split()[:15])
+        lines.append(f"{local_index}: {preview}")
+    return "\n".join(lines)
+
+
+def survey_chunks(
+    chunks: list[Chunk],
+    provider: OpenAICompatibleProvider,
+    *,
+    window_size: int = DEFAULT_WINDOW_SIZE,
+    stride: int = DEFAULT_WINDOW_STRIDE,
+) -> list[BoundaryVote]:
+    """Walk ``chunks`` in overlapping windows of ``window_size`` (advancing
+    by ``stride``), collecting one boundary-vote call per window. Each call's
+    ``boundary_after`` is local to its window; this converts it back to a
+    global chunk index before returning."""
+    votes: list[BoundaryVote] = []
+    if len(chunks) < 2:
+        return votes
+    start = 0
+    while start < len(chunks):
+        window = chunks[start : start + window_size]
+        if len(window) < 2:
+            break
+        messages = [
+            {"role": "system", "content": _SURVEY_SYSTEM_PROMPT},
+            {"role": "user", "content": _render_window(window)},
+        ]
+        payload = provider.complete_json(messages, SURVEY_SCHEMA)
+        for boundary in payload.get("boundaries", []):
+            global_index = start + int(boundary["boundary_after"])
+            if 0 <= global_index < len(chunks) - 1:
+                votes.append(
+                    BoundaryVote(
+                        boundary_after=global_index,
+                        label=str(boundary["label"])[:120],
+                        confidence=float(boundary["confidence"]),
+                    )
+                )
+        if start + window_size >= len(chunks):
+            break
+        start += stride
+    return votes
+
+
+@dataclass
+class SpineUnit:
+    id: str
+    label: str
+    start_chunk: int
+    end_chunk: int
+    tokens: int
+
+
+def assemble_spine(
+    chunks: list[Chunk],
+    votes: list[BoundaryVote],
+    *,
+    min_unit_tokens: int = DEFAULT_MIN_UNIT_TOKENS,
+    confidence_floor: float = DEFAULT_CONFIDENCE_FLOOR,
+) -> list[SpineUnit]:
+    """Harness-side merge (§4.2 stage 3, no model call): overlapping windows
+    can vote on the same boundary more than once, so this keeps the
+    highest-confidence vote per boundary index, drops anything below
+    ``confidence_floor``, then folds any resulting unit under
+    ``min_unit_tokens`` into a neighbor."""
+    if not chunks:
+        return []
+    accepted: dict[int, BoundaryVote] = {}
+    for vote in votes:
+        if vote.confidence < confidence_floor:
+            continue
+        if not (0 <= vote.boundary_after < len(chunks) - 1):
+            continue
+        current = accepted.get(vote.boundary_after)
+        if current is None or vote.confidence > current.confidence:
+            accepted[vote.boundary_after] = vote
+
+    boundary_indices = sorted(accepted)
+    bounds = [-1, *boundary_indices, len(chunks) - 1]
+    raw_units: list[list[Any]] = []
+    for i in range(len(bounds) - 1):
+        start_chunk = bounds[i] + 1
+        end_chunk = bounds[i + 1]
+        label = accepted[bounds[i]].label if bounds[i] in accepted else "Opening section"
+        tokens = sum(chunk.tokens for chunk in chunks[start_chunk : end_chunk + 1])
+        raw_units.append([start_chunk, end_chunk, label, tokens])
+
+    merged = _apply_min_size_floor(raw_units, min_unit_tokens)
+    return [
+        SpineUnit(id=f"unit-{i + 1:02d}", label=label, start_chunk=start, end_chunk=end, tokens=tokens)
+        for i, (start, end, label, tokens) in enumerate(merged)
+    ]
+
+
+def _apply_min_size_floor(raw_units: list[list[Any]], min_unit_tokens: int) -> list[list[Any]]:
+    merged = [list(unit) for unit in raw_units]
+    i = 0
+    while i < len(merged) - 1:
+        if merged[i][3] < min_unit_tokens:
+            # Fold into the following unit; keep that unit's label (it's the
+            # larger, more representative piece) and extend its start.
+            merged[i + 1][0] = merged[i][0]
+            merged[i + 1][3] += merged[i][3]
+            merged.pop(i)
+            continue
+        i += 1
+    if len(merged) > 1 and merged[-1][3] < min_unit_tokens:
+        merged[-2][1] = merged[-1][1]
+        merged[-2][3] += merged[-1][3]
+        merged.pop()
+    return merged
+
+
+def save_spine(run_dir: str | Path, units: list[SpineUnit]) -> None:
+    payload = [asdict(unit) for unit in units]
+    spine_path(run_dir).write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+
+
+def load_spine(run_dir: str | Path) -> list[SpineUnit]:
+    path = spine_path(run_dir)
+    if not path.exists():
+        return []
+    raw_text = path.read_text(encoding="utf-8").strip()
+    raw = json.loads(raw_text) if raw_text else []
+    return [SpineUnit(**item) for item in raw]

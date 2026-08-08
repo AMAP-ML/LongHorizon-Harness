@@ -10,9 +10,10 @@ directories. See README.md for the shipped product.
 
 On top of this codebase, the repo is also building the **Recursive
 Decomposition Harness** described in `PLAN.md` (repo root). `PLAN.md` §13
-defines a build ladder: v0 (resumability) and v1 (the round loop) are done
-and live in `src/lh_harness/v0/` and `src/lh_harness/v1/`; see PLAN.md's
-Progress section for what's next.
+defines a build ladder: v0 (resumability), v1 (the round loop), and v2
+(intake/survey/planning/pilot) are done and live in `src/lh_harness/v0/`,
+`src/lh_harness/v1/`, and `src/lh_harness/v2/`; see PLAN.md's Progress
+section for what's next.
 
 ## v0 — resumability (`src/lh_harness/v0/`)
 
@@ -26,10 +27,13 @@ one artifact and one terminal event per node — no double work, no lost work.
   means that's always the last line at kill time); `last_event()` /
   `has_terminal()` for querying node state.
 - `v0/run_dir.py` — `create_run_dir(root, run_id)` (idempotent) plus path
-  helpers for `events.jsonl`, `manifest.jsonl`, `scratch/<node>/trace.jsonl`,
-  `out/<node>.md`. A minimal slice of the full `PLAN.md` §5 layout — no
-  `spine.json`/`tree.json`/`contract.md` here, those are v1's
-  (`src/lh_harness/v1/run_dir.py` layers on top of this module).
+  helpers for `spec.md`, `events.jsonl`, `manifest.jsonl`,
+  `scratch/<node>/trace.jsonl`, `out/<node>.md`. A minimal slice of the full
+  `PLAN.md` §5 layout — no `tree.json` here (v1's), no `spine.json`/
+  `contract.md` here (v2's); both later layers re-export this module's
+  helpers rather than duplicating them. `spec_path()` was added alongside
+  the others once v2's intake needed to write to the file this module
+  already touches into existence (additive, no v0 behavior changed).
 - `v0/runner.py` — `run_node(run_dir, node_id, prompt, adapter, env, budget)`.
   One idempotent entrypoint for both first-run and resume: it inspects
   `events.jsonl` for the node's furthest-reached state (`episode_completed` →
@@ -151,6 +155,98 @@ this required.
   `escalate` on the next round instead of looping forever (§4.5: "Three
   failed submits → escalate to the user, don't loop").
 
+## v2 — intake, survey, recursive planning, pilot + contract (`src/lh_harness/v2/`)
+
+Four library modules, composed by a future pipeline driver rather than
+wired into `cli.py` here (same "additive scaffolding, wiring is later"
+pattern v0/v1 followed). Nothing in v0/v1 was modified beyond the one
+`spec_path()` addition noted above.
+
+- `v2/run_dir.py` — re-exports v0's and v1's path helpers and adds
+  `spine_path`/`contract_path`. Unlike v0's single-node files, `spine.json`
+  and `contract.md` aren't pre-touched by any `create_run_dir` — they don't
+  exist until `survey.save_spine`/`contract.freeze_contract` actually write
+  them, so a partially-run intake/survey doesn't leave a misleading empty
+  file behind.
+- `v2/intake.py` (§4.1) — `elicit_global_rubric(goal, provider, answer_fn)`
+  runs exactly one small `complete_json` call per entry in
+  `RUBRIC_DIMENSIONS` (7: audience/level, purpose, importance criteria,
+  exclusions, required components, target length, fidelity), each asking
+  for a single clarifying question; `answer_fn` is the seam to a real user
+  (CLI prompt in production, a scripted function in tests). One final
+  `complete_json` call turns the accumulated Q&A transcript into the rubric
+  plus an `assumptions` list — **the model, not the harness, decides what a
+  reasonable default is** for any dimension the user left blank, and must
+  add a matching assumption line explaining it (§4.1: "no unstated
+  assumptions... without an unbounded interview"). `run_intake(...)` calls
+  this and freezes the result into `spec.md` via `render_spec_md`. No
+  per-node rubric derivation from node type yet — that needs the
+  node-type template system, still unbuilt (see "out of scope" below).
+- `v2/survey.py` (§4.2) — three stages in one file, matching how PLAN.md
+  groups them:
+  1. `chunk_text(text)` — model-free. Splits on markdown/numbered headings,
+     page breaks (`\f`), or 2+ blank-line runs found by regex; folds any
+     resulting fragment under `min_chunk_tokens` into its neighbor so stage
+     2 never sees a near-empty window entry.
+  2. `survey_chunks(chunks, provider)` — walks chunks in overlapping
+     windows (`DEFAULT_WINDOW_SIZE=12`, `DEFAULT_WINDOW_STRIDE=8`); each
+     call sees only that window, rendered as index + first-15-words
+     preview (never full chunk text — §8: never cat the whole source), and
+     returns only candidate boundaries (`boundary_after`, `label`,
+     `confidence`), converted from window-local back to global chunk
+     indices before being returned.
+  3. `assemble_spine(chunks, votes)` — harness-only merge, no model call.
+     Overlapping windows can vote on the same boundary more than once; this
+     keeps the highest-confidence vote per boundary, drops anything under
+     `confidence_floor` (default 0.5), then folds any resulting unit under
+     `min_unit_tokens` (default 800) into a neighbor. `save_spine`/
+     `load_spine` round-trip `SpineUnit` lists through `spine.json`.
+- `v2/planner.py` (§4.3) — `build_tree(units, provider)` recurses
+  level-at-a-time: `plan_level` shows the model only the current slice
+  (unit index/label/token-count, indices local to that call — never source
+  content, never the whole spine past the top-level call) and asks for a
+  flat `children` list (8-12 at the top level, fewer for smaller slices).
+  `leaf_gate(candidate)` is pure harness code checking §4.3's per-node
+  conditions that are actually data-dependent (nonempty done-condition,
+  inputs within `token_budget`, `estimated_calls` within `tool_call_cap`;
+  "exactly one artifact" holds by construction, every candidate gets
+  exactly one `out/<id>.md`). A child that fails the gate gets its own
+  recursive `plan_level` call over just its slice. `depth_cap` (default 4)
+  and `node_cap` (default 400) are enforced entirely in code — a slice
+  hitting either cap becomes a forced leaf without ever asking the model,
+  and a single-unit slice is always a forced leaf too (§2 invariant 2).
+  Leaves get `depends_on=[]`: per §4.5, freezing the contract after the
+  pilot makes leaves genuinely independent, so the planner never wires up
+  leaf-to-leaf ordering. Leaves carry v1's generic gates only
+  (`nonempty`, `max_tokens:N`) and no judgment items — the node-type
+  template system that would generate richer gates/rubrics doesn't exist
+  yet (same gap `v1/gates.py`'s docstring already flags).
+- `v2/pilot.py` + `v2/contract.py` (§4.4) — the consistency mechanism.
+  `select_pilot_nodes(tree)` picks one node per distinct `shape` present in
+  the tree: the id-sorted **median**, not the first ("the first chapter of
+  anything is atypical"). `run_pilot(...)` runs the Writer via v1's
+  `run_writer_node` unmodified, then appends a `pilot_awaiting_approval`
+  event to `events.jsonl` and returns — a durable state, not a blocking
+  prompt, so the user can come back whenever. `approve_pilot(run_dir, node,
+  edited_text, provider, log)` is the resume point: diffs the edit against
+  the original artifact with `difflib.unified_diff`, writes the edit back
+  as the canonical artifact, and — only if the diff is non-empty — makes
+  one `complete_json` call asking the model to infer *generalizable* rules
+  from the diff (e.g. "exclude historical/biographical material", not "the
+  user deleted paragraph 3"); an unedited pilot derives zero rules and
+  spends zero model calls. `contract.freeze_contract(run_dir, rules)`
+  renders every pilot's `ContractRule`s into `contract.md`, grouped by
+  shape, and raises `ContractCeilingExceeded` **before writing anything**
+  if the rendered text is over `token_ceiling` (default 1500) — call once,
+  after every shape's pilot is approved, not incrementally.
+  `amend_contract(run_dir, rule_text, reason=...)` is the *only* other
+  writer to `contract.md` (§4.4: "reviewer suggestions must never reach
+  it"); it appends and re-freezes, same ceiling check, same
+  write-only-on-success guarantee. It does not touch `tree.json` — the
+  clean/patchable/regenerate re-validation triage over already-passed
+  nodes (§10) is v3 scope (§13: "re-validation pass for contract
+  amendments" is listed under v3, not v2).
+
 ## Adapter changes (additive, backward compatible)
 
 - `adapters/cli_agent.py` — `CommandAgentAdapter.run_episode` gained a
@@ -183,7 +279,7 @@ no API key. Run everything:
 python3 -m unittest discover -s tests -p "test_*.py" -v
 ```
 
-~7s, 25 tests, all passing as of the v1 build.
+~7s, 61 tests, all passing as of the v2 build.
 
 ### v0 (`tests/test_v0_resume.py`, 4 tests)
 
@@ -250,6 +346,40 @@ fails loudly instead of `round_loop.py` silently misbehaving.
    puts `--allowedTools` and the given tool names on the built command
    line; omitting it omits the flag.
 
+### v2 (`tests/test_v2_*.py`, 36 tests)
+
+All against fakes — `FakeProvider` for every `complete_json` call,
+`FakeStreamAgentAdapter`/`fake_stream_agent.py` for the one real-subprocess
+Writer episode in the pilot tests. No new fixtures were needed.
+
+- `test_v2_intake.py` (4) — the 7-question-then-finalize call count; an
+  unanswered dimension shows up in `assumptions`; `render_spec_md`
+  formatting; `run_intake` freezes `spec.md` to disk.
+- `test_v2_survey.py` (15) — `chunk_text` splits on headings and folds tiny
+  fragments into neighbors; `survey_chunks` converts window-local boundary
+  indices to global ones across multiple windows and makes zero calls on
+  fewer than 2 chunks; `assemble_spine` covers the no-votes/one-unit case,
+  a confident boundary actually splitting, a low-confidence boundary being
+  dropped, duplicate votes on one boundary keeping the higher-confidence
+  label, and an undersized unit getting folded into a neighbor;
+  `save_spine`/`load_spine` round-trip.
+- `test_v2_planner.py` (10) — `leaf_gate` unit tests for each of the three
+  data-dependent failure reasons; `build_tree` for a flat all-leaves
+  partition, a child that fails the leaf gate triggering a second
+  recursive call (asserts the resulting node id is
+  `<parent-candidate-id>.<child-id>`), the depth cap and the single-unit
+  case both forcing a leaf with **zero** provider calls, the node cap
+  cutting off recursion early, and a round trip of the built tree through
+  `TaskTree.save`/`TaskTree.load`.
+- `test_v2_pilot.py` (7) — `select_pilot_nodes` picks the id-sorted median
+  per shape, not the first; a full `run_pilot` → `approve_pilot` cycle
+  asserts the edit lands as the canonical artifact, exactly one
+  `complete_json` call happens, and both the `pilot_awaiting_approval` and
+  `pilot_approved` events are durable; approving with **no** edit asserts
+  zero rules and zero provider calls; `freeze_contract`/`amend_contract`
+  cover the round trip, the token-ceiling rejection leaving no partial
+  write, and amendment appending without erasing prior rules.
+
 Fixtures (`tests/fixtures/`):
 - `fake_stream_agent.py` — standalone script mimicking Claude Code's
   `stream-json` output: writes its own pid to `--pidfile` immediately (so a
@@ -265,13 +395,19 @@ Fixtures (`tests/fixtures/`):
 - `run_node_subprocess.py` — CLI wrapper so `run_node` can be launched as an
   independently-killable OS process.
 
-## Explicitly out of scope for v1 (do not build here)
+## Explicitly out of scope for v2 (do not build here)
 
-Planner (recursive decomposition), intake, survey/`spine.json`, pilot,
-contract derivation/`contract.md`, assembly, node-type templates (so no
-`headers:std`/`terms_defined`/`problems>=N` gates yet, and `rubric` text is
-hand-authored on the node rather than contract-derived), Codex per-node
-tool restriction, concurrent/parallel dispatch (round loop is sequential —
-`depends_on` is tracked so this is a config change later, not a redesign,
-per §4.5), the CLI/dashboard wiring (`cli.py`, `dashboard/`). All of these
-are `PLAN.md` §13 v2+.
+Node-type template system (so leaves still carry only v1's generic gates —
+no `headers:std`/`terms_defined`/`problems>=N` — and no judgment/rubric
+items; `v2/planner.py`'s and `v1/gates.py`'s docstrings both flag this same
+gap), assembly (concatenation, cross-cutting checks, compile gate),
+re-validation triage of already-passed nodes after a contract amendment
+(clean/patchable/regenerate, §10 — `contract.amend_contract` only appends
+to `contract.md`, it never touches `tree.json`), research tools (web
+search, current-docs retrieval), Codex per-node tool restriction,
+concurrent/parallel dispatch (round loop is sequential — `depends_on` is
+tracked so this is a config change later, not a redesign, per §4.5), and
+the CLI/dashboard wiring that would actually chain
+intake→survey→plan→pilot→execute into one pipeline run (`cli.py`,
+`dashboard/`) — v2 ships four composable library modules, not a driver.
+All of these are `PLAN.md` §13 v3+.

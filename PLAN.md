@@ -1,6 +1,7 @@
 # PLAN.md — Recursive Decomposition Harness
 
-**Status:** v0 (resumability) and v1 (round loop) implemented and tested.
+**Status:** v0 (resumability), v1 (round loop), and v2 (intake, survey,
+recursive planning, pilot + contract derivation) implemented and tested.
 See Progress below.
 **Scope:** general-purpose long-horizon task executor. Not a coding harness.
 
@@ -34,10 +35,31 @@ See Progress below.
   (`tests/test_v0_resume.py`, `tests/test_v1_units.py`,
   `tests/test_v1_round_loop.py`), all against fakes — no network, no real
   provider/agent-CLI credentials needed to run the suite.
-- **v2–v4:** not started. v1's `rubric` field on `TaskNode` (per-node
-  judgment text) and its generic content-agnostic gates are the v1-only
-  stand-ins v2's planner/contract-derivation is meant to replace — see
-  `tree.py` and `gates.py` docstrings.
+- **v2 — intake, survey, recursive planning (§13): done.**
+  `src/lh_harness/v2/` — bounded assumptions-list intake (one question call
+  per rubric dimension, one finalize call, freezes `spec.md`); mechanical
+  chunking + windowed-survey + harness-merged `spine.json` (§4.2, three
+  stages, one file); a recursive level-at-a-time planner (§4.3) whose leaf
+  gate, depth cap (4), and node cap (400) are all harness code, never model
+  judgment, producing a v1 `TaskTree` of independent leaves
+  (`depends_on=[]`, per §4.5); pilot-per-shape + diff-derived contract
+  rules frozen into `contract.md` under a hard token ceiling (§4.4), with
+  `amend_contract` as the only other allowed writer. Four composable
+  library modules, not a pipeline driver — nothing chains
+  intake→survey→plan→pilot→execute yet, and the node-type template system
+  (richer gates/rubrics) still doesn't exist, so leaves carry only v1's
+  generic gates. 61/61 tests passing (`tests/test_v0_resume.py`,
+  `tests/test_v1_units.py`, `tests/test_v1_round_loop.py`,
+  `tests/test_v2_intake.py`, `tests/test_v2_survey.py`,
+  `tests/test_v2_planner.py`, `tests/test_v2_pilot.py`), all against fakes.
+  See `CLAUDE.md` for the file-by-file breakdown and what's explicitly
+  still out of scope.
+- **v3–v4:** not started. Next up per §13: assembly/repair (deterministic
+  concatenation, cross-cutting checks, compile gate, scoped repair nodes,
+  re-validation triage for contract amendments), then research tools (web
+  search subagent, current-docs retrieval). The node-type template system
+  v2's planner and v1's gates both flag as missing is also still open —
+  see `v2/planner.py`'s and `v1/gates.py`'s docstrings.
 
 ---
 
