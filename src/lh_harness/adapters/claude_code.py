@@ -25,6 +25,12 @@ from .cli_agent import CommandAgentAdapter
 
 
 class ClaudeCodeAdapter(CommandAgentAdapter):
+    # Claude Code's stream-json first line carries a session_id, and
+    # `claude --resume <id> --print ...` continues that same session — this
+    # is v0's actual resumability mechanism for a Writer node (PLAN.md §3:
+    # the Writer's whole agent-CLI invocation is one opaque unit).
+    supports_session_resume = True
+
     def __init__(
         self,
         *,
@@ -105,6 +111,11 @@ class ClaudeCodeAdapter(CommandAgentAdapter):
 
         self.role = role
         self.policy = policy
+        # Kept alongside command_template so a resumed call can splice in
+        # `--resume <id>` without disturbing the fresh-dispatch template (deny
+        # rules, model, mcp config, ...) that every other call site relies on.
+        self._env_prefix = env_prefix
+        self._command_parts = command_parts
         super().__init__(
             command_template=f"{env_prefix}{' '.join(command_parts)} < {{prompt_path}}",
             prompt_dir=prompt_dir,
@@ -119,17 +130,25 @@ class ClaudeCodeAdapter(CommandAgentAdapter):
         env: Environment,
         budget: EpisodeBudget,
         live_trajectory_path: str | None = None,
+        *,
+        resume_session_id: str | None = None,
     ) -> EpisodeResult:
         before = (
             snapshot_workspace(self.workspace_path, self.hidden_paths)
             if is_auditor_role(self.role)
             else None
         )
+        command_override = None
+        if resume_session_id is not None:
+            resumed_parts = [self._command_parts[0], "--resume", shlex.quote(resume_session_id)]
+            resumed_parts.extend(self._command_parts[1:])
+            command_override = f"{self._env_prefix}{' '.join(resumed_parts)} < {{prompt_path}}"
         result = await super().run_episode(
             prompt,
             env,
             budget,
             live_trajectory_path=live_trajectory_path,
+            command_override=command_override,
         )
         result.metadata.update(
             {

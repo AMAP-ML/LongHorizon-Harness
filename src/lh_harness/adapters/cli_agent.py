@@ -29,6 +29,11 @@ def redact_secrets(text: str) -> str:
 
 
 class CommandAgentAdapter:
+    # Overridden True by adapters that can continue a prior run rather than
+    # starting over (see ClaudeCodeAdapter). v0's runner falls back to a fresh
+    # redispatch whenever this is False instead of erroring.
+    supports_session_resume = False
+
     def __init__(
         self,
         *,
@@ -50,6 +55,8 @@ class CommandAgentAdapter:
         env: Environment,
         budget: EpisodeBudget,
         live_trajectory_path: str | None = None,
+        *,
+        command_override: str | None = None,
     ) -> EpisodeResult:
         start = time.monotonic()
         # Never reuse one global prompt.md. A run owns its prompt directory and
@@ -64,7 +71,10 @@ class CommandAgentAdapter:
         # Substituted by explicit replace, not str.format: templates embed literal
         # braces (e.g. Codex passes inline-TOML `-c` overrides) that format() would
         # try to interpret as placeholders.
-        command_body = self.command_template
+        # command_override lets a subclass swap in a session-resume invocation
+        # (e.g. `claude --resume <id>`) for one call without mutating the
+        # instance's own command_template, which stays the fresh-dispatch form.
+        command_body = command_override if command_override is not None else self.command_template
         for placeholder, value in (
             ("{prompt_path}", shlex.quote(prompt_path)),
             ("{timeout}", str(budget.max_duration_seconds)),
