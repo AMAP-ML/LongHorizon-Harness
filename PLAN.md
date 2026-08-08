@@ -1,8 +1,9 @@
 # PLAN.md — Recursive Decomposition Harness
 
 **Status:** v0 (resumability), v1 (round loop), v2 (intake, survey,
-recursive planning, pilot + contract derivation), and v3 (assembly and
-repair) implemented and tested. See Progress below.
+recursive planning, pilot + contract derivation), v3 (assembly and
+repair), and v4 (research tools) implemented and tested. See Progress
+below.
 **Scope:** general-purpose long-horizon task executor. Not a coding harness.
 
 ## Progress
@@ -87,11 +88,38 @@ repair) implemented and tested. See Progress below.
   provider/agent-CLI credentials. Glossary tracking (`glossary.json`) and
   refs/terms-based checks remain unbuilt: they need the node-type template
   system, still open (see below).
-- **v4:** not started. Next up per §13: research tools (web search
-  subagent, current-docs retrieval) — lowest priority, retrieval fixes
-  rather than correctness fixes. The node-type template system v2's
-  planner and v1's gates both flag as missing is also still open — see
-  `v2/planner.py`'s and `v1/gates.py`'s docstrings.
+- **v4 — research tools (§13): done.** `src/lh_harness/v4/` — a scoped,
+  budget-capped research subagent, run as its own phase before the round
+  loop dispatches any Writer, not wired into a Writer's own tool loop
+  (§8: raw search transcripts are exactly the "raw tool results" waste §8
+  ranks second-worst). `mcp_research.py` supplies the MCP seam §15.2
+  insists on rather than reimplementing search: `web_search` needs no MCP
+  server at all (Claude Code's built-in `WebSearch`/`WebFetch`, narrowed
+  in via the existing per-node `allowed_tools` mechanism); `doc_retrieval`
+  wires in Context7 (§15.7's one concrete named donor) via the existing
+  `ClaudeCodeAdapter(mcp_config=...)` seam, env-overridable the same way
+  `LH_HARNESS_CLAUDECODE_MCP_CONFIG` already is. `research.py` dispatches
+  each query under a derived id (`"<node>~research~<slug>"`, same
+  reasoning as `v3/repair.py`'s `"<id>~repair<n>"`: a query isn't the
+  node's own dispatch, so it can't collide with that node's own
+  `episode_completed` event) through v0's `run_node`, caps the result to
+  300 tokens, and layers its own idempotency on top of v0's per-episode
+  idempotency — a second call for an already-answered query is a pure
+  cache read, no redispatch. `research_loop.py` is the v4 entrypoint:
+  folds each finding's path straight into the target node's existing
+  `inputs` list (§6 — a finding is just another input, no new `tree.json`
+  field), skipping only findings that failed their own `nonempty` gate
+  (a missing citation degrades gracefully rather than blocking a run, per
+  §13's "lowest priority: these are retrieval fixes"). Composable library
+  module, not pipeline wiring — same posture v2/v3 already took; nothing
+  here is called from `cli.py`. Zero modifications to v0/v1/v2/v3. 103/103
+  tests passing (adds `tests/test_v4_mcp_research.py`,
+  `tests/test_v4_research.py`, `tests/test_v4_research_loop.py`), all
+  against fakes — no network, no real MCP server, no provider/agent-CLI
+  credentials. The node-type template system v2's planner and v1's gates
+  both flag as missing is still open — see `v2/planner.py`'s and
+  `v1/gates.py`'s docstrings. Per §13, v4 was the last item on the build
+  ladder; anything past this is v5+ and not yet scoped in this file.
 
 ---
 

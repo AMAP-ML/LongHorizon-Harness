@@ -11,9 +11,11 @@ directories. See README.md for the shipped product.
 On top of this codebase, the repo is also building the **Recursive
 Decomposition Harness** described in `PLAN.md` (repo root). `PLAN.md` §13
 defines a build ladder: v0 (resumability), v1 (the round loop), v2
-(intake/survey/planning/pilot), and v3 (assembly and repair) are done and
-live in `src/lh_harness/v0/`, `src/lh_harness/v1/`, `src/lh_harness/v2/`,
-and `src/lh_harness/v3/`; see PLAN.md's Progress section for what's next.
+(intake/survey/planning/pilot), v3 (assembly and repair), and v4 (research
+tools) are done and live in `src/lh_harness/v0/`, `src/lh_harness/v1/`,
+`src/lh_harness/v2/`, `src/lh_harness/v3/`, and `src/lh_harness/v4/`; v4
+was the last item on the §13 build ladder, so anything past it is v5+ and
+not yet scoped in `PLAN.md`. See PLAN.md's Progress section for detail.
 
 ## v0 — resumability (`src/lh_harness/v0/`)
 
@@ -368,6 +370,82 @@ work (`"pending"`) nor still confirmed-good (`"passed"`), so neither
 existing status fit. Nothing that never amends a contract ever produces
 this value — every v1/v2 code path is unaffected.
 
+## v4 — research tools (`src/lh_harness/v4/`)
+
+A scoped, budget-capped research subagent (§13: "web search subagent,
+current-docs retrieval") — run as its own phase *before* the round loop
+dispatches any Writer, not offered as a tool inside a Writer's own loop.
+Reasoning: §8 ranks raw tool results (a search's result list, fetched
+pages) as the second-worst context-discipline offender after unrestricted
+tool schemas; a Writer that could call `WebSearch` itself would pay for
+every one of those tokens on every subsequent turn. A research subagent
+pays that cost once, in its own isolated episode, and hands back only a
+300-token capped finding — the same shape `v1/writer.py`'s promotion
+mechanism already uses, applied one step earlier in the pipeline. Zero
+modifications to v0/v1/v2/v3.
+
+- `v4/run_dir.py` — re-exports v0-v3's path helpers and adds
+  `research_dir`/`research_finding_path`/`research_raw_finding_path`,
+  all under a node's existing `scratch/<node>/` (never `out/`, so
+  `v3/assemble.py`'s tree-order concatenation — which only walks node ids
+  actually present in `tree.json` — never mistakes a finding for document
+  content). Two paths per query rather than one: `research_raw_finding_path`
+  is written once, by the agent itself, during its own episode (durable
+  regardless of when a crash lands relative to this module's own
+  post-processing); `research_finding_path` is the harness-written capped
+  canonical finding, and its mere existence is what makes a repeated call
+  a no-op.
+- `v4/mcp_research.py` (§15.2, §15.7) — the MCP seam §15.2 insists on
+  ("Do not write web search or fetch. Use MCP servers") rather than a
+  search implementation. `web_search` needs no MCP server at all — Claude
+  Code already ships `WebSearch`/`WebFetch` as built-in tools, narrowed in
+  via the same per-node `allowed_tools` mechanism v1 already uses for
+  everything else. `doc_retrieval` wires in Context7, §15.7's one
+  concretely-named donor for version-specific library docs, via the
+  existing `ClaudeCodeAdapter(mcp_config=...)` seam; `context7_server()`
+  is env-overridable (`LH_HARNESS_CONTEXT7_MCP_COMMAND`/`_MCP_ARGS`,
+  `CONTEXT7_API_KEY`) the same way `adapters/claude_code.py` already reads
+  `LH_HARNESS_CLAUDECODE_MCP_CONFIG` instead of hardcoding a path.
+  `RESEARCH_TOOL_ALLOWLIST` is the `allowed_tools` value per kind;
+  `write_mcp_config` writes nothing (returns `None`) for an all-`web_search`
+  plan, since those tools need no MCP config at all.
+- `v4/research.py` — `run_research_query(run_dir, node_id, query, adapter,
+  env, budget)` dispatches one `ResearchQuery` under a derived id
+  (`research_node_id`: `"<node>~research~<slug>"`, same reasoning as
+  `v3/repair.py`'s `"<id>~repair<n>"` — a query isn't the node's own
+  dispatch, so it must not collide with that node's own
+  `episode_completed` event) through v0's unmodified `run_node`, so the
+  episode itself inherits full crash-resume for free. On top of that, this
+  module adds its own idempotency layer for its post-processing step:
+  before ever calling `run_node`, it checks whether
+  `research_finding_path` already holds nonempty text and returns a cached
+  read if so — "resume-after-complete is a pure no-op," one call frame up
+  from v0's own proof of the same property. The finding text itself is
+  read from `research_raw_finding_path` (the file the agent was instructed
+  to write, persisted on disk regardless of replay) rather than from the
+  episode result's metadata, which goes empty on a replayed completion —
+  falling back to the episode's own visible-output/log text only on a
+  genuinely fresh dispatch, mirroring `v1/writer.py`'s promotion fallback.
+  `RESEARCH_FINDING_TOKEN_CAP = 300` (smaller than writer.py's 400: a
+  finding is one prompt segment among several on some *other* node's turn,
+  not that node's own full handoff), enforced via `v1/manifest.py`'s
+  existing `cap_promotion`. The only gate is `nonempty` — a finding has no
+  rubric the way a chapter does, it either found something or it didn't.
+- `v4/research_loop.py` — the v4 entrypoint, composable like v2's four
+  modules and v3's `assembly_loop.py` (nothing here is called from
+  `cli.py`). `run_research_loop(run_dir, tree_path, plan, adapter_factory,
+  env, budget)` takes a `plan: dict[node_id, list[ResearchQuery]]`
+  supplied by the caller — not a new `tree.json`/`TaskNode` field, since
+  §6's `inputs` is already "what this node's prompt should include"
+  (`["source.pdf#pp.184-211"]` in the schema example), so a finding's path
+  folds straight into the target node's existing `inputs` list via
+  `attach_finding`. `attach_finding` skips a finding that failed its own
+  gate (§13: "lowest priority... retrieval fixes" — a missing citation
+  degrades gracefully rather than blocking a run) and never duplicates a
+  path already present (resume-safe: re-running the loop after a crash is
+  safe to do again). Raises `KeyError` loudly if the plan names a node id
+  outside the tree, rather than silently skipping it.
+
 ## Adapter changes (additive, backward compatible)
 
 - `adapters/cli_agent.py` — `CommandAgentAdapter.run_episode` gained a
@@ -400,7 +478,7 @@ no API key. Run everything:
 python3 -m unittest discover -s tests -p "test_*.py" -v
 ```
 
-~7s, 89 tests, all passing as of the v3 build.
+~7s, 103 tests, all passing as of the v4 build.
 
 ### v0 (`tests/test_v0_resume.py`, 4 tests)
 
@@ -542,6 +620,38 @@ toolchain needed since the compile gate is a generic injected command).
   `"stale"`; `apply_revalidation_triage` leaves clean nodes untouched and
   routes patchable through `repair.run_repair`.
 
+### v4 (`tests/test_v4_*.py`, 14 tests)
+
+Same fakes as v0-v3, no new fixtures — `FakeStreamAgentAdapter`/
+`fake_stream_agent.py` for research-query dispatch. Since the fake CLI
+never actually writes a file, every dispatch test here exercises the
+"agent ignored the write-to-file instruction, fall back to the episode's
+own visible output" path documented in `research.py`, the same fallback
+`v1/writer.py`'s promotion mechanism already relies on for the same
+reason.
+
+- `test_v4_mcp_research.py` (7) — `web_search`'s allowlist contains no
+  `mcp__*` tools; `doc_retrieval`'s contains exactly the two Context7 tool
+  names; `context7_server()`'s default command/args and its env-var
+  overrides (`LH_HARNESS_CONTEXT7_MCP_COMMAND`/`_MCP_ARGS`,
+  `CONTEXT7_API_KEY`); `write_mcp_config` writes nothing for an
+  all-`web_search` plan and writes exactly one `context7` entry for a plan
+  containing `doc_retrieval` (mixed or not).
+- `test_v4_research.py` (2) — a fresh query dispatches a genuinely new
+  episode under `research_node_id`'s derived id and caps a 2,000-word fake
+  result down to the token budget (asserted via the truncation marker); a
+  second call for the *same* query returns byte-identical cached text and
+  appends zero new `episode_completed` events, even though a fresh
+  dispatch would have produced different content — proving the cache is
+  actually being hit, not that the two dispatches coincidentally agreed.
+- `test_v4_research_loop.py` (5) — `attach_finding` unit tests covering all
+  three cases (passing finding attaches, failing/empty finding is skipped,
+  attaching twice never duplicates the path) without needing a real
+  dispatch; an end-to-end `run_research_loop` asserts the finding path
+  lands in `node.inputs` and that mutation survives a `TaskTree.load`
+  round trip from disk; an unknown node id in the plan raises `KeyError`
+  rather than silently no-oping.
+
 Fixtures (`tests/fixtures/`):
 - `fake_stream_agent.py` — standalone script mimicking Claude Code's
   `stream-json` output: writes its own pid to `--pidfile` immediately (so a
@@ -557,18 +667,22 @@ Fixtures (`tests/fixtures/`):
 - `run_node_subprocess.py` — CLI wrapper so `run_node` can be launched as an
   independently-killable OS process.
 
-## Explicitly out of scope for v3 (do not build here)
+## Explicitly out of scope (do not build here)
 
-Node-type template system (so leaves still carry only v1's generic gates —
-no `headers:std`/`terms_defined`/`problems>=N` — and no judgment/rubric
-items; `v1/gates.py`, `v2/planner.py`, and `v3/checks.py`'s docstrings all
-flag this same gap — it's also why `checks.py` can't check `refs_out`
-resolution or glossary terms, and why `glossary.json` from `PLAN.md` §5 is
-still unbuilt), research tools (web search, current-docs retrieval), Codex
+**Still open after v4** — the node-type template system (so leaves still
+carry only v1's generic gates — no `headers:std`/`terms_defined`/
+`problems>=N` — and no judgment/rubric items; `v1/gates.py`,
+`v2/planner.py`, and `v3/checks.py`'s docstrings all flag this same gap —
+it's also why `checks.py` can't check `refs_out` resolution or glossary
+terms, and why `glossary.json` from `PLAN.md` §5 is still unbuilt), Codex
 per-node tool restriction, concurrent/parallel dispatch (round loop and
 assembly loop are both sequential — `depends_on` is tracked so this is a
-config change later, not a redesign, per §4.5), and the CLI/dashboard
-wiring that would actually chain
-intake→survey→plan→pilot→execute→assemble into one pipeline run (`cli.py`,
-`dashboard/`) — v0-v3 ship composable library modules, not a driver. All of
-these are `PLAN.md` §13 v4+ or later.
+config change later, not a redesign, per §4.5), an automatic research-query
+planner (v4's `research_loop.py` takes an explicit caller-supplied
+`plan` — deciding *which* nodes need *which* questions answered is not
+built, the same "hand- or script-authored" starting point v1's trees had
+before v2's planner existed), and the CLI/dashboard wiring that would
+actually chain intake→survey→plan→pilot→research→execute→assemble into one
+pipeline run (`cli.py`, `dashboard/`) — v0-v4 ship composable library
+modules, not a driver. `PLAN.md` §13's build ladder ends at v4; none of
+this is scoped in `PLAN.md` yet.
