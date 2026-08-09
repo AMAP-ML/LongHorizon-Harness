@@ -135,7 +135,12 @@ class RecursiveRunState:
     def snapshot(self) -> dict[str, Any]:
         run_dir = self._attached_dir()
         if run_dir is None:
-            return {"attached": False, "runs": self.list_runs(), "server_time": _now()}
+            return {
+                "attached": False,
+                "runs": self.list_runs(),
+                "control_enabled": self.control_enabled,
+                "server_time": _now(),
+            }
         spec = _read_json(run_spec_path(run_dir)) or {}
         phase = _read_json(phase_path(run_dir)) or {}
         events = EventLog(events_path(run_dir)).read_all()
@@ -145,6 +150,7 @@ class RecursiveRunState:
             "attached": True,
             "run_id": self.attached_run_id,
             "runs": self.list_runs(),
+            "control_enabled": self.control_enabled,
             "goal": str(spec.get("goal", "")),
             "backend": str(spec.get("backend", "")),
             "phase": str(phase.get("phase", "")),
@@ -176,33 +182,35 @@ class RecursiveRunState:
     # Hosted runs (hosted state drives the driver in a background thread)
     # ------------------------------------------------------------------
     def start_run(self, body: dict[str, Any], *, driver=None) -> tuple[str | None, str]:
-        """Create and start a recursive run. Returns (run_id, error)."""
+        """Create and start a recursive run, or resume an existing one.
+        Returns (run_id, error). Reusing an already-dispatched ``run_id`` is
+        a resume (§10/§13: "resume is exactly run with an existing run-id");
+        in that case ``run.spec.json`` on disk — not this call's body — is
+        authoritative for goal/source/backend/etc, the same rule
+        ``pipeline/run.py``'s ``run_from_args`` already applies for the CLI
+        path. Only ``run_id`` from the body is used for a resume."""
         if not self.control_enabled:
             return None, "control is disabled"
         if self.runs_root is None:
             return None, "no runs_root configured"
-        goal = str(body.get("goal", "")).strip()
-        if not goal:
-            return None, "goal is required"
         run_id = str(body.get("run_id") or "").strip()
-        if not run_id:
-            run_id = f"{_DEFAULT_RUN_ID_PREFIX}{int(_now())}{uuid.uuid4().hex[:6]}"
-        if "/" in run_id or "\\" in run_id or run_id in {".", ".."}:
+        if run_id and ("/" in run_id or "\\" in run_id or run_id in {".", ".."}):
             return None, "invalid run_id"
-        run_dir = self.runs_root / run_id
+        run_dir = self.runs_root / run_id if run_id else None
+        resuming = run_dir is not None and run_spec_path(run_dir).exists()
+        if resuming:
+            options = RunOptions.from_spec(_read_json(run_spec_path(run_dir)) or {})
+        else:
+            goal = str(body.get("goal", "")).strip()
+            if not goal:
+                return None, "goal is required"
+            if not run_id:
+                run_id = f"{_DEFAULT_RUN_ID_PREFIX}{int(_now())}{uuid.uuid4().hex[:6]}"
+            run_dir = self.runs_root / run_id
+            options = self._options_from_body(body, goal)
         from ..v0.run_dir import create_run_dir
 
         create_run_dir(self.runs_root, run_id)
-        options = RunOptions(
-            goal=goal,
-            backend=str(body.get("backend") or _default_backend()),
-            model=body.get("model") or None,
-            source_text=str(body.get("source", "")),
-            compile_command=body.get("compile_command") or None,
-            research_plan=_parse_plan_payload(body.get("research_plan")),
-            max_rounds=int(body.get("max_rounds", 100)),
-            max_attempts=int(body.get("max_attempts", 3)),
-        )
         if driver is None:
             driver = self._default_driver(run_dir, options)
         thread = threading.Thread(
@@ -213,6 +221,19 @@ class RecursiveRunState:
             self._attached = run_id
         thread.start()
         return run_id, ""
+
+    @staticmethod
+    def _options_from_body(body: dict[str, Any], goal: str) -> RunOptions:
+        return RunOptions(
+            goal=goal,
+            backend=str(body.get("backend") or _default_backend()),
+            model=body.get("model") or None,
+            source_text=str(body.get("source", "")),
+            compile_command=body.get("compile_command") or None,
+            research_plan=_parse_plan_payload(body.get("research_plan")),
+            max_rounds=int(body.get("max_rounds", 100)),
+            max_attempts=int(body.get("max_attempts", 3)),
+        )
 
     def _default_driver(self, run_dir: Path, options: RunOptions) -> RecursiveDriver:
         from ..v1.provider import OpenAICompatibleProvider

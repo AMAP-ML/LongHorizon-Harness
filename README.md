@@ -29,6 +29,7 @@ Kusudaemon began as a fork of [LongHorizon-Harness](https://arxiv.org/abs/2608.0
 
 ## ✨ News
 
+- **[2026-08-09]** A web view is now wired up: `kusudaemon serve` (or `run --dashboard`) serves a live dashboard over the run directory — phase timeline, node tree, approvals queue, contract, and an SSE event tail — no build step, stdlib server. See [Watch it in a browser](#4-watch-it-in-a-browser-optional).
 - **[2026-08-09]** Kusudaemon is a new name for what was this fork's copy of LongHorizon-Harness — the package, CLI, and every `LH_HARNESS_*` setting are now `kusudaemon`/`KUSUDAEMON_*`. (Briefly renamed to "Waypoint" earlier the same day; that name didn't stick, so this supersedes it — no `waypoint`/`WAYPOINT_*` should remain anywhere in the tree.) See [Credits](#credits) for why, and for attribution to the original project.
 - **[2026-08-09]** A local web-search tool (backed by a self-hosted [SearXNG](https://docs.searxng.org/) instance via Docker) is now wired into the research phase — see [Web search (optional)](#web-search-optional).
 - **[2026-08-08]** The harness is now gptme-only: the classic role-based manager/executor/auditor loop and the Claude Code/Codex backends are gone. The pipeline CLI (`run` / `status` / `approve` / `amend` / `resume`) is the control surface, and the provider is user-configurable through `provider.json` and `.env` at the repo root (default: OpenCode Zen).
@@ -288,22 +289,55 @@ kusudaemon amend <run-id> --text "..."   # amend the contract, re-validate
 Every run lives under `./.kusudaemon/runs/<run-id>/`; the tree state,
 events log, and assembled output stay there for audit.
 
+#### 4. Watch it in a browser (optional)
+
+The CLI is the complete control surface; the web view is purely additive
+(PLAN.md §11: "It can crash without touching the run; it can be attached
+from anywhere"). Two ways to reach it:
+
+```bash
+# Alongside a foreground run — starts the server on a background thread
+# and auto-attaches to this run as soon as it exists:
+kusudaemon run --goal "..." --source @source.md --dashboard
+
+# Or standalone, watching (and controlling) whatever is under a runs
+# directory — including runs started elsewhere with --detach:
+kusudaemon serve --runs-root ./.kusudaemon/runs
+```
+
+Then open `http://127.0.0.1:8765/`. The sidebar lists every run under
+`--runs-root`; click one to attach, or use "+ New run" to start (or
+resume — reuse an existing run id) one from the browser. Tabs cover the
+phase timeline, the node tree (click a node for gates/judgment/artifact/
+promotion/versions, plus a "reopen" action once it's passed), pending
+approvals (intake questions, pilot edits, contract-amendment triage —
+each renders from the approval's own shape, so answering one just means
+filling in the box or clicking a button), the frozen contract (with an
+amend box), spec/spine/assembly, and a live event tail over SSE.
+
+`kusudaemon serve --no-control` mounts a **read-only** view: browsing and
+attaching still work, but every mutating action (start/resume, approve,
+amend, reopen, halt) 403s. There is no authentication — `serve` binds to
+`127.0.0.1` by default; only pass `--host 0.0.0.0` on a network you trust,
+since anyone who can reach the port gets full control unless
+`--no-control` is also set.
+
 #### CLI and provider reference
 
-There is currently **no web UI** wired up — `kusudaemon`'s CLI is the
-complete, live control surface (PLAN.md §11). Commands operate purely on
-the run directory, so `status`/`approve`/`amend` are safe to run from a
-second terminal while a driver is still attached. (There's unmounted
-server-side dashboard state code in `dashboard/recursive.py` for a future
-web view, but no server or frontend currently serves it.)
+`kusudaemon`'s CLI is the complete, live control surface (PLAN.md §11);
+`kusudaemon serve` (or `run --dashboard`) is the optional view surface on
+top of it, described above. Commands operate purely on the run directory,
+so `status`/`approve`/`amend`/`serve` are all safe to run from a second
+terminal while a driver is still attached.
 
 | Command | Description |
 |---|---|
-| `kusudaemon run` | Run (or resume) the pipeline: `--goal`, `--source` (`@file` or `-`), `--backend` (only `gptme`), `--model`, `--compile-command`, `--research-plan`, `--max-rounds`, `--max-attempts`, `--detach` |
+| `kusudaemon run` | Run (or resume) the pipeline: `--goal`, `--source` (`@file` or `-`), `--backend` (only `gptme`), `--model`, `--compile-command`, `--research-plan`, `--max-rounds`, `--max-attempts`, `--detach`, `--dashboard`/`--dashboard-host`/`--dashboard-port` |
 | `kusudaemon resume <run-id>` | Resume a halted run; the disk state is authoritative |
 | `kusudaemon status <run-id>` | Phase, tree statuses, pending approvals, event count |
 | `kusudaemon approve <run-id>` | Resolve the oldest pending approval (`--answer`, `--file`, `--action`) |
 | `kusudaemon amend <run-id> --text "..."` | Append a contract rule, run the read-only re-validation pass, and (on confirmation) apply the repairs |
+| `kusudaemon serve` | Serve the web view over `--runs-root`: `--host`, `--port`, `--run-id` (attach on startup), `--no-control` (read-only) |
 
 Provider settings resolve per field, highest first:
 

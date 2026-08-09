@@ -12,8 +12,8 @@ classic role-based harness (manager/executor/auditor over Claude Code/Codex
 CLIs) and its web dashboard were **removed** — this worktree is the
 recursive-decomposition harness only (`src/kusudaemon/v0`..`v5`/`pipeline/`).
 The `kusudaemon` CLI is now exactly the §11 control surface: `run` / `resume`
-/ `status` / `approve` / `amend`. See README.md for the shipped product,
-and PLAN.md's Progress section for the v0-v5 build ladder detail.
+/ `status` / `approve` / `amend` / `serve`. See README.md for the shipped
+product, and PLAN.md's Progress section for the v0-v5 build ladder detail.
 
 On top of this codebase, the repo is also building the **Recursive
 Decomposition Harness** described in `PLAN.md` (repo root). `PLAN.md` §13
@@ -24,8 +24,10 @@ tools) are done and live in `src/kusudaemon/v0/`, `src/kusudaemon/v1/`,
 was the last item on the §13 build ladder, so anything past it is v5+ and
 not yet scoped in `PLAN.md`. v5 has been built here anyway as the pipeline
 driver and §11 control surface (`src/kusudaemon/pipeline/`) plus the
-recursive-view server state (`dashboard/recursive.py`) — see the v5
-section below. See PLAN.md's Progress section for detail.
+recursive-view web app (`dashboard/recursive.py` + `dashboard/server.py` +
+`dashboard/static/`, mounted via `kusudaemon serve` / `kusudaemon run
+--dashboard`, 2026-08-09) — see the v5 section below. See PLAN.md's
+Progress section for detail.
 
 ## v0 — resumability (`src/kusudaemon/v0/`)
 
@@ -527,32 +529,90 @@ state is a small v5 path set layered on the existing run-directory layout.
   `--detach` mode spawn, so one argument parser stays in sync with one run
   loop. A run id whose `run.spec.json` already exists *resumes*: the disk
   is authoritative, argv contributes nothing but the id.
-- `pipeline/cli.py` — the `kusudaemon pipeline` group (§11's control
-  surface): run (foreground, or `--detach` in a background subprocess, or
-  `--dashboard` alongside), resume (= run with an existing id), status
-  (phase/tree/approval status/events lengths straight from disk), approve
-  (resolve the oldest pending approval, with `--answer`/`--file`/
-  `--action`), amend (append a rule, print the re-validation counts, ask
-  before applying the triage — or `--yes`). Every handler operates purely
-  on the run directory, so they work from a second terminal while a
-  driver (or web view) is still attached.
+- `pipeline/cli.py` — builds the `kusudaemon` CLI itself (§11's control
+  surface; note it is a *flat* set of subcommands — `kusudaemon run`,
+  `kusudaemon status <id>`, etc. — not a `kusudaemon pipeline <cmd>`
+  group, despite this module's own docstring/§11 phrasing suggesting
+  otherwise): run (foreground, or `--detach` in a background subprocess,
+  or `--dashboard`/`--dashboard-host`/`--dashboard-port` to also serve the
+  web view on a background thread of the same process), resume (= run
+  with an existing id), status (phase/tree/approval status/events lengths
+  straight from disk), approve (resolve the oldest pending approval, with
+  `--answer`/`--file`/`--action`), amend (append a rule, print the
+  re-validation counts, ask before applying the triage — or `--yes`), and
+  **serve** (2026-08-09: `--runs-root`/`--host`/`--port`/`--run-id`/
+  `--no-control`, the standalone view surface — PLAN.md §11's "separate
+  process watching the run directory... can be attached from anywhere").
+  `--dashboard`'s auto-attach polls `state.attach(run_id)` from a
+  background thread until the driver's `create_run_dir` call makes
+  `events.jsonl` exist, rather than attaching synchronously, since the run
+  directory doesn't exist yet at the moment `--dashboard`'s server thread
+  starts. Every handler operates purely on the run directory, so they
+  work from a second terminal while a driver (or web view) is still
+  attached.
 - `dashboard/recursive.py` — `RecursiveRunState`, the server-side state
   for the recursive-decomposition web view (PLAN.md §11): browse/attach
   runs under a `runs_root`, `snapshot()` reads everything fresh from disk
   in one call (phase, tree summary + counts, approvals, events tail,
-  jobs, halted flag, spec/contract/assembly presence), hosted runs (the
-  dashboard drives a `RecursiveDriver` in a background thread and writes
-  `phase.json` from its report), operator actions through the same
-  approvals.jsonl protocol, per-node `node_detail` (gates re-evaluated
-  live, audit, manifest line, versions, promotion, inputs resolved to
+  jobs, halted flag, spec/contract/assembly presence, and — 2026-08-09,
+  added once the frontend needed to know whether to render mutating
+  controls — `control_enabled`), hosted runs (the dashboard drives a
+  `RecursiveDriver` in a background thread and writes `phase.json` from
+  its report), operator actions through the same approvals.jsonl
+  protocol, per-node `node_detail` (gates re-evaluated live, audit,
+  manifest line, versions, promotion, inputs resolved to
   token/existence), artifact/trace/version/assembly readers, and the
   amend/reopen request surfaces that *create* approvals (never run jobs
   directly) while the apply halves — amend → re-validate → surface a
   `triage` approval; apply-triage repairs; reopen repairs — run as
-  `jobs.jsonl`-tracked background threads. Not yet mounted in
-  `server.py` : additive library module, the same "scaffolding now,
-  wiring later" pattern v0-v4 followed; it bridges pipeline/ and
-  dashboard/ only through the run directory, never shared memory.
+  `jobs.jsonl`-tracked background threads. `start_run` (2026-08-09 fix):
+  reusing an already-dispatched `run_id` now loads `RunOptions` from that
+  run's own `run.spec.json` instead of the request body — the same "disk
+  is authoritative on resume" rule `pipeline/run.py`'s `run_from_args`
+  already applied for the CLI path, which `start_run` had never matched
+  (a web-UI "resume" resubmitting the new-run form would previously have
+  silently overridden the original goal/backend/research-plan/etc. for
+  every phase not yet reached). Mounted by `dashboard/server.py` below —
+  no longer a library module waiting to be wired in.
+- `dashboard/server.py` (new, 2026-08-09) — the stdlib HTTP server (
+  `http.server.ThreadingHTTPServer`, no new dependency) that actually
+  mounts `RecursiveRunState`: a small regex route table for the JSON API
+  (`/api/snapshot`, `/api/runs`, `/api/attach`, `/api/runs` POST to
+  start/resume, `/api/halt`, `/api/approvals/<id>/resolve`, `/api/amend`,
+  `/api/reopen`, `/api/node/<id>[/artifact|/trace|/version/<tag>]`,
+  `/api/spec`, `/api/contract`, `/api/spine`, `/api/manifest`,
+  `/api/assembly`), path-traversal-safe static file serving for
+  `dashboard/static/`, and `/api/stream` — a per-connection loop writing
+  `event: snapshot` SSE frames every 1.5s (PLAN.md §11: "local web app...
+  SSE streaming"), safe because `ThreadingHTTPServer` gives every
+  connection its own thread. `control_enabled=False` (the `serve
+  --no-control` / read-only view mode) is enforced **here**, uniformly,
+  for every mutating route (`require_control()` before dispatch) —
+  `RecursiveRunState` itself only self-gates `start_run` and
+  `resolve_approval`, not `halt`/`request_amend`/`request_reopen`, so the
+  transport layer is what actually makes read-only mode read-only.
+  `make_server`/`serve_in_background`/`run_forever` are the three entry
+  points `pipeline/cli.py`'s `serve` command and `run --dashboard` flag
+  both build on.
+- `dashboard/static/{index.html,app.js,style.css}` (new, 2026-08-09) — the
+  actual frontend, replacing the classic harness's now-deleted
+  manager/executor/auditor dashboard. Vanilla JS, no build step, no
+  framework (matches the CLI's own "stdlib first" rule): `app.js` opens
+  `/api/stream` (falling back to polling `/api/snapshot` every 2s if SSE
+  isn't available) and re-renders from one `state` object on every tick.
+  Views: a phase strip over PLAN.md §4's seven phases
+  (intake/survey/plan/pilot/research/execute/assemble), a tree table that
+  opens a per-node detail panel (gates, judgment/rubric + reviewer
+  verdict, inputs, artifact, promotion, versions, and — if the node has
+  passed and control is enabled — a "reopen" action), an approvals queue
+  that renders each pending record's own `options`/`allow_input` shape
+  generically (so intake questions, pilot edits, and amend/triage/reopen
+  confirmations all render from the same card without kind-specific UI
+  code), contract/spec/spine/assembly raw-text tabs (contract tab also
+  has an amend box), and an events tail. The sidebar's "+ New run" form
+  doubles as the resume UI: submitting it with an existing run id resumes
+  that run (per the `start_run` fix above, the form's own goal/source
+  fields are then ignored in favor of the run's saved spec).
 ## Adapters (gptme-only)
 
 The Claude Code and Codex adapters, the classic role adapters
@@ -684,16 +744,41 @@ no API key. Run everything:
 python3 -m unittest discover -s tests -p "test_*.py" -v
 ```
 
-~7s, 148 tests, all passing. `test_provider_config.py`'s `_EnvIsolatedTest`
+**From a worktree (or any checkout other than the one this machine's
+`kusudaemon`/`lh_harness`/`waypoint` was last `pip install -e`'d from),
+prefix that with `PYTHONPATH=./src`.** Found 2026-08-09 while testing the
+dashboard server: this machine's conda base env still carries leftover
+`_editable_impl_lh_harness.pth` / `_editable_impl_waypoint.pth` files from
+earlier (pre-rename) editable installs of this same project, and — because
+`.pth` files add a bare directory to `sys.path`, not a specific
+package — they make `.../LongHorizon-Harness/src` (the *original*
+checkout, not whichever worktree you're actually in) importable as
+`kusudaemon` regardless of `cwd`. Bare `python3 -m unittest discover -s
+tests` from a worktree will happily run that worktree's *test files*
+against the original checkout's (unmodified) *package code* and report a
+false green. `PYTHONPATH=./src` puts the worktree's own `src/` first on
+`sys.path`, which wins.
+
+~16s, 164 tests, all passing. `test_provider_config.py`'s `_EnvIsolatedTest`
 snapshots and restores the *entire* `os.environ` around each test now
 (2026-08-09 fix) — the previous partial-restore logic only put back keys
 that had a prior value, so a test setting e.g. `KUSUDAEMON_PROVIDER`
 fresh (no prior value) leaked it into every test running after it in the
 same process, intermittently breaking unrelated suites
 (`test_v1_units.py`, `test_v1_round_loop.py`) depending on run order.
-`test_searxng_tool.py` (10, new) and the rewritten `test_v4_mcp_research.py`
+`test_searxng_tool.py` (10) and the rewritten `test_v4_mcp_research.py`
 (2, was 7 — see the v4/pipeline sections above) cover the SearXNG web-search
-tool and its allowlist wiring.
+tool and its allowlist wiring. `test_dashboard_server.py` (16, new
+2026-08-09) covers `dashboard/server.py`: a real `ThreadingHTTPServer` on
+an OS-assigned loopback port (not a mock — this is our own server, not an
+external network call) driven with `urllib` against a hand-built run
+directory — static/index serving, path-traversal rejection on
+`/static/..`, the full API surface (attach, snapshot, node detail +
+artifact, approval resolution, halt toggling, malformed-JSON-body 400,
+unknown-route 404), and a second test class asserting every mutating
+route 403s under `control_enabled=False` while `attach` still works
+(read-only view can still change *which* run you're looking at, just not
+*act* on it).
 
 ### `tests/test_provider_config.py` (13 tests)
 
@@ -919,9 +1004,16 @@ config change later, not a redesign, per §4.5), an automatic research-query
 planner (v4's `research_loop.py` takes an explicit caller-supplied
 `plan` — deciding *which* nodes need *which* questions answered is not
 built, the same "hand- or script-authored" starting point v1's trees had
-before v2's planner existed), and the dashboard *view* for the recursive
-harness — `RecursiveRunState` (v5 section above) is an additive library
-module not yet mounted in `server.py`/`dashboard/static`, so there is no
-web page for the recursive pipeline yet (the CLI `kusudaemon pipeline`
-group is the live control surface). `PLAN.md` §13's build ladder ends at
-v4; none of this is scoped in `PLAN.md` yet.
+before v2's planner existed). The dashboard *view* for the recursive
+harness (§11's "View surface: local web app") **is now built and mounted**
+(2026-08-09: `dashboard/server.py` + `dashboard/static/`, reachable via
+`kusudaemon serve` or `kusudaemon run --dashboard` — see the v5 section
+above) — earlier revisions of this file listed it here as unbuilt; it no
+longer belongs in this section. Still genuinely unbuilt on the web view
+itself: no auth (`serve` binds to `127.0.0.1` by default and has no
+notion of a user — treat `--host 0.0.0.0` as exposing full run control to
+anyone who can reach the port, unless `--no-control` is also set), and no
+multi-run dashboard-hosted concurrency limit (nothing stops the operator
+from clicking "+ New run" enough times to hit local resource limits).
+`PLAN.md` §13's build ladder ends at v4; none of this is scoped in
+`PLAN.md` yet.
