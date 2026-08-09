@@ -20,17 +20,8 @@ dependencies = [
 # gptme -- the core package, every other adapter, and the test suite stay
 # gptme-free. Install with `pip install "waypoint[gptme]"` to actually run
 # GptmeAdapter as a Writer backend.
-#
-# Pinned to a minor version, not left open: gptme is pre-1.0, so a minor
-# bump (0.32 -> 0.33) can break API compatibility under semver convention,
-# and the worker calls a few gptme internals (gptme.chat, gptme.get_prompt,
-# gptme.tools.init_tools/ToolSpec/load_from_file) that were verified
-# against a real installed package via inspect, not against a documented,
-# version-guaranteed public API. Bump this deliberately -- after running
-# the test suite and a real GptmeAdapter episode by hand -- not by letting
-# `pip install --upgrade` silently pull a newer minor version.
 [project.optional-dependencies]
-gptme = ["gptme>=0.32.1,<0.33"]
+gptme = ["gptme"]
 
 # Points at this fork's actual GitHub location, which has not itself been
 # renamed (only the package/CLI/docs have) -- update if/when it is.
