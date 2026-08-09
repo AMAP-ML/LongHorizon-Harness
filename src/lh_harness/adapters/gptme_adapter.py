@@ -85,9 +85,8 @@ class GptmeAdapter(CommandAgentAdapter):
         if not resolved.api_key:
             raise ValueError(
                 "GptmeAdapter needs an API key: pass api_key=, set "
-                "LH_HARNESS_PROVIDER_API_KEY / OPENAI_API_KEY / OPENCODE_API_KEY, "
-                "or add it to the provider config file "
-                "(~/.lh-harness/provider.json)."
+                "OPENAI_API_KEY / LH_HARNESS_PROVIDER_API_KEY, or add it "
+                "to a .env file (see provider_config.py)."
             )
         resolved_model = _gptme_model(resolved.model)
 

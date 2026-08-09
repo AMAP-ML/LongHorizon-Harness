@@ -66,6 +66,9 @@ def _parse_plan(raw: str | None) -> dict:
 
 
 def run_from_args(argv: list[str] | None = None, *, env: Environment | None = None) -> int:
+    from ..provider_config import load_env_file
+
+    load_env_file()
     args = build_parser().parse_args(argv)
     run_id = args.run_id or f"{time.strftime('%Y%m%dT%H%M%SZ', time.gmtime())}_{uuid.uuid4().hex[:8]}"
     run_dir = Path(args.runs_root).expanduser() / run_id

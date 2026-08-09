@@ -30,6 +30,7 @@ tmp/
 env.local.sh
 *.local.sh
 *.mcp.json
+provider.json
 
 # Editor/system
 .DS_Store

@@ -1,38 +1,49 @@
-"""User provider configuration: any OpenAI-compatible endpoint, opencode default.
+"""User provider configuration: named providers, opencode default, keys in .env.
 
 The harness talks to OpenAI-compatible ``/chat/completions`` endpoints only.
 The **default** is OpenCode Zen (``https://opencode.ai/zen/v1`` with model
-``opencode/deepseek-v4-flash-free``, the same dev target the adapter layer
-was built against) so a fresh install works out of the box — but that default
-is **user-customizable** through exactly one file:
+``opencode/deepseek-v4-flash-free``) so a fresh install works out of the
+box — but the default is **user-customizable** with two pieces:
 
-    ~/.lh-harness/provider.json          (or $LH_HARNESS_PROVIDER_CONFIG)
+- **Which providers exist and their endpoints**: ``~/.lh-harness/provider.json``
+  (or ``$LH_HARNESS_PROVIDER_CONFIG``) holds *named* providers. Each entry
+  carries its ``base_url`` and ``model`` plus ``api_key_env`` — the name of
+  the environment variable that holds that provider's key. Keys themselves
+  never live in this file:
 
-with the shape:
+      {
+        "default": "opencode",
+        "providers": {
+          "opencode": {
+            "base_url": "https://opencode.ai/zen/v1",
+            "model": "opencode/deepseek-v4-flash-free",
+            "api_key_env": "OPENAI_API_KEY"
+          }
+        }
+      }
 
-    {
-        "api_key": "sk-...",
-        "base_url": "https://api.example.com/v1",
-        "model": "gpt-5-mini"
-    }
+  A flat legacy shape (no ``providers`` key) is accepted and treated as one
+  provider named ``opencode``.
 
-A sample with the default opencode values lives at the repository root as
-``provider.example.json`` — copy it to ``~/.lh-harness/provider.json`` to
-pin your own endpoint/model.
+- **The keys themselves**: environment variables, loaded from a root
+  ``.env`` file by CLI startup (see ``load_env_file``), e.g.
+  ``OPENAI_API_KEY=sk-...`` in ``.env`` for the opencode provider above.
+  Add a provider to ``provider.json`` with ``"api_key_env": "DEEPSEEK_API_KEY"``
+  and a matching ``DEEPSEEK_API_KEY=...`` line in ``.env`` to give it a key.
 
-Precedence per field (highest first):
+Which provider a call uses: explicit ``provider=`` argument >
+``LH_HARNESS_PROVIDER`` env var > the file's ``default`` > ``opencode``.
+
+Per-field precedence (highest first):
 
 1. explicit constructor argument (``api_key=``/``base_url=``/``model=``)
 2. ``LH_HARNESS_PROVIDER_API_KEY`` / ``LH_HARNESS_PROVIDER_BASE_URL`` /
    ``LH_HARNESS_PROVIDER_MODEL`` environment variables
-3. the config file above
+3. the selected provider's entry in the config file (its ``base_url`` /
+   ``model``; its key comes from the env var its ``api_key_env`` names)
 4. the generic ``OPENAI_API_KEY`` / ``OPENAI_BASE_URL`` / ``OPENAI_MODEL``
    environment variables
-5. the built-in default: OpenCode Zen (opencode's api key is read from
-   ``OPENCODE_API_KEY``, the variable the OpenCode Zen CLI already uses)
-
-Setting 1-4 for a field overrides the built-in default for that field only —
-the default opencode endpoint is not all-or-nothing.
+5. the built-in default: OpenCode Zen
 """
 
 from __future__ import annotations
@@ -45,6 +56,9 @@ from pathlib import Path
 CONFIG_FILE_NAME = "provider.json"
 DEFAULT_CONFIG_PATH = Path.home() / ".lh-harness" / CONFIG_FILE_NAME
 
+DEFAULT_PROVIDER = "opencode"
+DEFAULT_API_KEY_ENV = "OPENAI_API_KEY"
+
 # The built-in default: OpenCode Zen, the endpoint this harness itself was
 # developed against (mirrors the "testing on a weak free model is the correct
 # development target" note in v1/provider.py). Any of the higher-precedence
@@ -54,11 +68,16 @@ DEFAULT_MODEL = "opencode/deepseek-v4-flash-free"
 
 # The sample config a user gets on first run (and provider.example.json at
 # the repo root, kept in sync by a comment there): the default endpoint,
-# default model, blank api key (filled from the env or edited in place).
+# default model, and the env var the key comes from (filled in .env).
 SAMPLE_SETTINGS = {
-    "api_key": "",
-    "base_url": DEFAULT_BASE_URL,
-    "model": DEFAULT_MODEL,
+    "default": DEFAULT_PROVIDER,
+    "providers": {
+        DEFAULT_PROVIDER: {
+            "base_url": DEFAULT_BASE_URL,
+            "model": DEFAULT_MODEL,
+            "api_key_env": DEFAULT_API_KEY_ENV,
+        }
+    },
 }
 
 
@@ -79,11 +98,19 @@ def config_file_path() -> Path:
     return Path(raw).expanduser() if raw else DEFAULT_CONFIG_PATH
 
 
-def read_config_file(path: Path | None = None) -> dict[str, str]:
-    """Read the provider file; a missing file yields {}."""
+def read_config_file(path: Path | None = None) -> dict[str, object]:
+    """Read and normalize the provider file.
+
+    Returns ``{"default": name, "providers": {name: {base_url, model,
+    api_key_env}, ...}}``. A missing file yields an empty provider map, and
+    ``opencode`` (the built-in default) applies at resolve time. The legacy
+    flat shape ({"api_key", "base_url", "model"}) is normalized to a single
+    provider named ``opencode``; a legacy ``api_key`` value is treated as
+    the env var name the key lives in.
+    """
     target = path or config_file_path()
     if not target.is_file():
-        return {}
+        return {"default": DEFAULT_PROVIDER, "providers": {}}
     try:
         raw = target.read_text(encoding="utf-8")
     except OSError as exc:
@@ -94,14 +121,37 @@ def read_config_file(path: Path | None = None) -> dict[str, str]:
         raise ProviderConfigError(f"invalid JSON in provider config {target}: {exc}") from exc
     if not isinstance(data, dict):
         raise ProviderConfigError(f"provider config {target} must be a JSON object")
-    return {str(key): str(value) for key, value in data.items() if str(key) in ("api_key", "base_url", "model")}
+
+    raw_providers = data.get("providers")
+    if isinstance(raw_providers, dict):
+        providers = {str(name): _normalize_entry(entry, target) for name, entry in raw_providers.items()}
+        default = str(data.get("default") or DEFAULT_PROVIDER)
+        if default not in providers:
+            raise ProviderConfigError(
+                f"provider config {target}: default {default!r} is not a "
+                f"defined provider ({sorted(providers)})"
+            )
+        return {"default": default, "providers": providers}
+
+    # Legacy flat shape: one provider named after the built-in default.
+    return {"default": DEFAULT_PROVIDER, "providers": {DEFAULT_PROVIDER: _normalize_entry(data, target)}}
+
+
+def _normalize_entry(entry: object, target: Path) -> dict[str, str]:
+    if not isinstance(entry, dict):
+        raise ProviderConfigError(f"provider config {target}: each provider must be an object")
+    return {
+        "base_url": str(entry.get("base_url") or ""),
+        "model": str(entry.get("model") or ""),
+        "api_key_env": str(entry.get("api_key_env") or entry.get("api_key") or DEFAULT_API_KEY_ENV),
+    }
 
 
 def ensure_user_config(path: Path | None = None) -> Path | None:
     """Create the user's provider config from the sample if it doesn't exist.
 
     Called from the CLI entry points, not from library code: materializing
-    ``~/.lh-harness/provider.json`` (the sample's opencode default values)
+    ``~/.lh-harness/provider.json`` (the sample's named opencode provider)
     is what makes "customize the default" concrete — the user edits that
     file instead of the harness assuming anything. Returns the path
     written, or None if the file already existed.
@@ -115,6 +165,61 @@ def ensure_user_config(path: Path | None = None) -> Path | None:
     except OSError:
         return None
     return target
+
+
+def parse_env_lines(text: str) -> dict[str, str]:
+    """Parse ``KEY=VALUE`` lines (dotenv-style) into a dict.
+
+    Minimal stdlib-only subset, matching what a root ``.env`` needs: blank
+    lines and full-line ``#`` comments are skipped, an ``export `` prefix is
+    accepted (bash-style), values may be single- or double-quoted (quotes
+    stripped), and the split happens at the first ``=`` so values may
+    contain ``=``. No interpolation, no line continuations.
+    """
+    out: dict[str, str] = {}
+    for line in text.splitlines():
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        if stripped.startswith("export "):
+            stripped = stripped[len("export "):].lstrip()
+        if "=" not in stripped:
+            continue
+        key, _, raw_value = stripped.partition("=")
+        key = key.strip()
+        value = raw_value.strip()
+        if len(value) >= 2 and value[0] == value[-1] and value[0] in ("'", '"'):
+            value = value[1:-1]
+        if key:
+            out[key] = value
+    return out
+
+
+def load_env_file(path: Path | None = None) -> Path | None:
+    """Load a ``.env`` file's variables into ``os.environ``.
+
+    With ``path=None``, looks for ``.env`` in the current directory, then
+    each ancestor up to the filesystem root — so the root ``.env`` the
+    README tells you to create is found no matter where the CLI is invoked
+    from. Variables already set in the real environment are **never**
+    overwritten (dotenv convention: the shell wins). Returns the path
+    actually loaded, or ``None`` when no ``.env`` exists.
+    """
+    if path is None:
+        cwd = Path.cwd()
+        for candidate in (cwd, *cwd.parents):
+            if (candidate / ".env").is_file():
+                path = candidate / ".env"
+                break
+    if path is None or not path.is_file():
+        return None
+    try:
+        text = path.read_text(encoding="utf-8")
+    except OSError:
+        return None
+    for key, value in parse_env_lines(text).items():
+        os.environ.setdefault(key, value)
+    return path
 
 
 def _pick(
@@ -134,32 +239,53 @@ def _pick(
     return default
 
 
-def resolve(*, api_key: str = "", base_url: str = "", model: str = "") -> ProviderSettings:
+def resolve(*, provider: str = "", api_key: str = "", base_url: str = "", model: str = "") -> ProviderSettings:
     """Resolve the three provider fields with the documented precedence.
 
     ``base_url`` and ``model`` always come back populated: the built-in
-    default is OpenCode Zen. ``api_key`` falls back to the generic
-    ``OPENAI_API_KEY``, then ``OPENCODE_API_KEY`` (the variable the OpenCode
-    Zen CLI itself reads), and may be empty — the caller decides whether a
-    key-less call is acceptable.
+    default is OpenCode Zen. The api key comes from the env var the
+    selected provider's ``api_key_env`` names (default ``OPENAI_API_KEY``)
+    and may be empty — the caller decides whether a key-less call is
+    acceptable.
     """
     file_data = read_config_file()
+    providers: dict[str, dict[str, str]] = file_data.get("providers") or {}  # type: ignore[assignment]
+    name = (
+        provider
+        or os.getenv("LH_HARNESS_PROVIDER")
+        or str(file_data.get("default") or "")
+        or DEFAULT_PROVIDER
+    )
+    if not providers:
+        # No config file at all: the built-in opencode default applies only
+        # as the last-resort fallback, so generic OPENAI_* env vars still
+        # beat it (empty entry -> _pick falls through to its default).
+        entry: dict[str, str] = {}
+    else:
+        entry = providers.get(name)
+        if entry is None:
+            raise ProviderConfigError(
+                f"provider {name!r} is not defined in {config_file_path()} "
+                f"(available: {sorted(providers) or [DEFAULT_PROVIDER]})"
+            )
+    key_env = entry.get("api_key_env") or DEFAULT_API_KEY_ENV
+
     resolved = ProviderSettings(
         api_key=api_key or _pick(
             ("LH_HARNESS_PROVIDER_API_KEY",),
-            ("OPENAI_API_KEY", "OPENCODE_API_KEY"),
-            file_data.get("api_key", ""),
+            (key_env,),
+            "",
         ),
         base_url=base_url or _pick(
             ("LH_HARNESS_PROVIDER_BASE_URL",),
             ("OPENAI_BASE_URL",),
-            file_data.get("base_url", ""),
+            entry.get("base_url", ""),
             DEFAULT_BASE_URL,
         ),
         model=model or _pick(
             ("LH_HARNESS_PROVIDER_MODEL",),
             ("OPENAI_MODEL",),
-            file_data.get("model", ""),
+            entry.get("model", ""),
             DEFAULT_MODEL,
         ),
     )
@@ -167,12 +293,8 @@ def resolve(*, api_key: str = "", base_url: str = "", model: str = "") -> Provid
         resolved.source = "argument"
     elif os.getenv("LH_HARNESS_PROVIDER_API_KEY"):
         resolved.source = "LH_HARNESS_PROVIDER_API_KEY"
-    elif file_data.get("api_key"):
-        resolved.source = str(config_file_path())
-    elif os.getenv("OPENAI_API_KEY"):
-        resolved.source = "OPENAI_API_KEY"
-    elif os.getenv("OPENCODE_API_KEY"):
-        resolved.source = "OPENCODE_API_KEY"
+    elif os.getenv(key_env):
+        resolved.source = f"{key_env} (.env / environment)"
     return resolved
 
 
@@ -186,7 +308,6 @@ def require(settings: ProviderSettings) -> ProviderSettings:
         return settings
     raise ProviderConfigError(
         "provider api key missing\n"
-        f"  Add it to the config file ({config_file_path()}) or via "
-        "LH_HARNESS_PROVIDER_API_KEY / OPENAI_API_KEY / OPENCODE_API_KEY "
-        "environment variables (or a .env file)."
+        f"  Add it to the .env file (e.g. OPENAI_API_KEY=...) or set "
+        "OPENAI_API_KEY / LH_HARNESS_PROVIDER_API_KEY in the environment."
     )

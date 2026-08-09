@@ -10,7 +10,7 @@ the real installed package, not from documentation alone.)
 
 Coverage:
 - API key resolution order (explicit arg > LH_HARNESS_PROVIDER_API_KEY >
-  config file > OPENAI_API_KEY > OPENCODE_API_KEY) and the loud failure
+  OPENAI_API_KEY from the provider's api_key_env) and the loud failure
   when none are set
 - env vars (OPENAI_BASE_URL/OPENAI_API_KEY/GPTME_CONTEXT_LENGTH) and the
   --tool-allowlist/--model/--tool-format flags reach the command line
@@ -55,7 +55,7 @@ class _EnvGuard:
         "OPENAI_API_KEY",
         "OPENAI_BASE_URL",
         "OPENAI_MODEL",
-        "OPENCODE_API_KEY",
+        "LH_HARNESS_PROVIDER",
     )
 
     def __enter__(self) -> "_EnvGuard":
@@ -84,24 +84,24 @@ class ApiKeyResolutionTest(unittest.TestCase):
 
     def test_explicit_key_wins_over_env(self) -> None:
         with _EnvGuard():
-            os.environ["OPENCODE_API_KEY"] = "env-key"
+            os.environ["OPENAI_API_KEY"] = "env-key"
             adapter = GptmeAdapter(api_key="explicit-key")
             self.assertIn("explicit-key", adapter.command_template)
             self.assertNotIn("env-key", adapter.command_template)
 
-    def test_provider_env_key_wins_over_opencode_fallback(self) -> None:
+    def test_provider_env_key_wins_over_generic(self) -> None:
         with _EnvGuard():
             os.environ["LH_HARNESS_PROVIDER_API_KEY"] = "provider-key"
-            os.environ["OPENCODE_API_KEY"] = "opencode-key"
+            os.environ["OPENAI_API_KEY"] = "generic-key"
             adapter = GptmeAdapter()
             self.assertIn("provider-key", adapter.command_template)
-            self.assertNotIn("opencode-key", adapter.command_template)
+            self.assertNotIn("generic-key", adapter.command_template)
 
-    def test_opencode_fallback_used_when_provider_key_unset(self) -> None:
+    def test_generic_key_used_when_provider_key_unset(self) -> None:
         with _EnvGuard():
-            os.environ["OPENCODE_API_KEY"] = "opencode-key"
+            os.environ["OPENAI_API_KEY"] = "generic-key"
             adapter = GptmeAdapter()
-            self.assertIn("opencode-key", adapter.command_template)
+            self.assertIn("generic-key", adapter.command_template)
 
 
 class CommandConstructionTest(unittest.TestCase):

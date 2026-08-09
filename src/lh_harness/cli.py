@@ -12,7 +12,7 @@ from __future__ import annotations
 import sys
 
 from . import __version__
-from .provider_config import ensure_user_config
+from .provider_config import ensure_user_config, load_env_file
 
 _EPILOG = (
     "Provider: any OpenAI-compatible endpoint; the default is OpenCode Zen. "
@@ -35,6 +35,7 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.epilog = _EPILOG
 
+    load_env_file()
     written = ensure_user_config()
 
     args = parser.parse_args(raw_argv)
