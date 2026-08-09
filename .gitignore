@@ -43,3 +43,5 @@ provider.json
 # as a broken gitlink instead of real content. Keep it ignored so that can't
 # happen again.
 .claude/worktrees/
+
+LongHorizon-Harness-main
