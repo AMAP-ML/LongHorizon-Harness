@@ -81,8 +81,9 @@ async function guarded(fn) {
 // Live SSE Stream / Polling
 // ---------------------------------------------------------------------
 function applySnapshot(snap) {
+  const unchanged = JSON.stringify(snap) === JSON.stringify(state.snapshot);
   state.snapshot = snap;
-  render();
+  if (!unchanged) render();
 }
 
 function startLive() {
@@ -348,7 +349,7 @@ function renderCenterStream() {
           });
         }
         if (a.allow_input) {
-          const inputEl = el("input", { type: "text", placeholder: a.input_label || "Provide response details...", style: "margin-top:8px;" });
+          const inputEl = el("input", { type: "text", "data-key": `approval-input-${a.approval_id}`, placeholder: a.input_label || "Provide response details...", style: "margin-top:8px;" });
           parts.push(inputEl);
           actionBtns.push(
             el("button", { class: "primary", disabled: state.busy ? "" : null, onclick: () => guarded(async () => {
@@ -404,6 +405,7 @@ function renderPromptBar() {
 
   const ta = el("textarea", {
     class: "prompt-textarea",
+    "data-key": "prompt-textarea",
     placeholder: state.promptMode === "amend" ? "Enter contract amendment rule to append..." : state.promptMode === "reopen" ? "Node ID and defect description..." : "Type a run goal (or @path/to/file)...",
     rows: 1,
     disabled: disabled ? "" : null,
@@ -697,7 +699,7 @@ function renderNodeDrawer() {
   else body = renderThinkingTab();
 
   const live = isLive(id);
-  const interjectInput = el("input", { type: "text", placeholder: live ? "Message the running agent…" : "(not currently running)", disabled: live ? null : "" });
+  const interjectInput = el("input", { type: "text", "data-key": `interject-${id}`, placeholder: live ? "Message the running agent…" : "(not currently running)", disabled: live ? null : "" });
   const interjectBtn = el("button", { class: "primary", disabled: live && !state.busy ? null : "", onclick: () => guarded(async () => {
     const text = interjectInput.value.trim();
     if (!text) return;
@@ -707,7 +709,7 @@ function renderNodeDrawer() {
   interjectInput.addEventListener("keydown", (e) => { if (e.key === "Enter") interjectBtn.click(); });
 
   const reopenable = !!(state.nodeDetail && state.nodeDetail.status === "passed");
-  const reopenInput = el("input", { type: "text", placeholder: reopenable ? "describe what's wrong…" : "(only for passed nodes)", disabled: reopenable ? null : "" });
+  const reopenInput = el("input", { type: "text", "data-key": `reopen-${id}`, placeholder: reopenable ? "describe what's wrong…" : "(only for passed nodes)", disabled: reopenable ? null : "" });
   const reopenBtn = el("button", { disabled: reopenable && !state.busy ? null : "", onclick: () => guarded(async () => {
     const text = reopenInput.value.trim();
     if (!text) return;
@@ -738,11 +740,11 @@ function renderNodeDrawer() {
 // ---------------------------------------------------------------------
 function renderNewRunModal() {
   if (!state.newRunOpen) return null;
-  const runIdInput = el("input", { type: "text", placeholder: "leave blank to generate" });
-  const goalInput = el("textarea", { placeholder: "Goal (or @path/to/file)...", rows: 3 });
-  const sourceInput = el("textarea", { placeholder: "Source: text, @path, or blank", rows: 2 });
-  const modelInput = el("input", { type: "text", placeholder: "Model (blank = provider default)" });
-  const compileInput = el("input", { type: "text", placeholder: "Compile command (optional)" });
+  const runIdInput = el("input", { type: "text", "data-key": "new-run-run-id", placeholder: "leave blank to generate" });
+  const goalInput = el("textarea", { "data-key": "new-run-goal", placeholder: "Goal (or @path/to/file)...", rows: 3 });
+  const sourceInput = el("textarea", { "data-key": "new-run-source", placeholder: "Source: text, @path, or blank", rows: 2 });
+  const modelInput = el("input", { type: "text", "data-key": "new-run-model", placeholder: "Model (blank = provider default)" });
+  const compileInput = el("input", { type: "text", "data-key": "new-run-compile", placeholder: "Compile command (optional)" });
 
   const submit = el("button", { class: "primary", disabled: state.busy ? "" : null, onclick: () => guarded(async () => {
     const goal = goalInput.value.trim();
@@ -778,7 +780,42 @@ function renderNewRunModal() {
 // ---------------------------------------------------------------------
 // Root Render
 // ---------------------------------------------------------------------
+// render() rebuilds the whole DOM tree from scratch on every call (no
+// diffing), and it's called on every live snapshot tick (SSE ~1.5s /
+// polling 2s). Plain <input>/<textarea> elements hold their in-progress
+// value only in the DOM node itself, so a naive rebuild would wipe
+// whatever the operator is mid-typing on every tick. Capture the focused
+// field's value/selection (keyed by its stable data-key) and the feed's
+// scroll position before tearing down, then restore both afterward.
+function captureFocusState() {
+  const active = document.activeElement;
+  if (!active || !root.contains(active)) return null;
+  const key = active.getAttribute("data-key");
+  if (!key) return null;
+  return {
+    key,
+    value: active.value,
+    selectionStart: active.selectionStart,
+    selectionEnd: active.selectionEnd,
+  };
+}
+
+function restoreFocusState(saved) {
+  if (!saved) return;
+  const field = root.querySelector(`[data-key="${CSS.escape(saved.key)}"]`);
+  if (!field) return;
+  field.value = saved.value;
+  field.focus();
+  if (typeof saved.selectionStart === "number") {
+    try { field.setSelectionRange(saved.selectionStart, saved.selectionEnd); } catch (e) {}
+  }
+}
+
 function render() {
+  const focusState = captureFocusState();
+  const feedBefore = document.getElementById("chat-feed-scroll");
+  const feedScrollTop = feedBefore ? feedBefore.scrollTop : null;
+
   root.innerHTML = "";
   root.appendChild(renderHeader());
 
@@ -797,6 +834,12 @@ function render() {
 
   if (state.toast) {
     root.appendChild(el("div", { class: "toast" + (state.toast.isError ? " err" : "") }, state.toast.message));
+  }
+
+  restoreFocusState(focusState);
+  if (feedScrollTop !== null) {
+    const feedAfter = document.getElementById("chat-feed-scroll");
+    if (feedAfter) feedAfter.scrollTop = feedScrollTop;
   }
 }
 
