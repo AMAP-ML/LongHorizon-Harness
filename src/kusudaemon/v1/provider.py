@@ -145,7 +145,7 @@ class OpenAICompatibleProvider:
         )
 
     def _call(self, payload: dict[str, Any]) -> dict[str, Any]:
-        headers = {"Content-Type": "application/json"}
+        headers = {"Content-Type": "application/json", "User-Agent": "kusudaemon/1.0 (Python)"}
         if self.api_key:
             headers["Authorization"] = f"Bearer {self.api_key}"
         return self._transport(f"{self.base_url}/chat/completions", payload, headers)

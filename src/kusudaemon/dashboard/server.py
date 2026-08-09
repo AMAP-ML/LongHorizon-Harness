@@ -187,6 +187,12 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
         if self.verbose:
             super().log_message(fmt, *args)
 
+    def handle(self) -> None:
+        try:
+            super().handle()
+        except (BrokenPipeError, ConnectionResetError, OSError):
+            pass
+
     # -- dispatch --------------------------------------------------------
     def do_GET(self) -> None:  # noqa: N802
         self._dispatch("GET")
