@@ -1,64 +1,41 @@
 <div align="center">
 
-# LongHorizon-Harness
+# Waypoint
 
-### Advancing Long-Horizon Agents for Real-World Tasks
-
-**Operate the whole computer like a human. Work across desktop apps and the command line for dozens of hours.**
+**A recursive-decomposition harness for long-horizon tasks, driven by [gptme](https://github.com/gptme/gptme).**
 
 **No state drift. Verifiable progress. Complex tasks carried through to completion.**
 
 <p align="center">
-<a href="https://lh-harness.pages.dev"><img src="https://img.shields.io/badge/🌐-Website-1f6feb.svg?style=flat-square" alt="Website" /></a>
-<a href="https://arxiv.org/abs/2608.01964"><img src="https://img.shields.io/badge/arXiv-2608.01964-b31b1b.svg?style=flat-square" alt="arXiv 2608.01964" /></a>
-<a href="https://github.com/AMAP-ML/LongHorizon-Harness"><img src="https://img.shields.io/badge/GitHub-Repository-181717.svg?style=flat-square&logo=github&logoColor=white" alt="GitHub repository" /></a>
-<img src="https://img.shields.io/badge/🤗-Trajectory_Coming_Soon-ffce00.svg?style=flat-square" alt="Hugging Face trajectory" />
-<a href="https://huggingface.co/papers/2608.01964"><img src="https://img.shields.io/badge/🤗_Daily_Papers-2608.01964-ff8800.svg?style=flat-square" alt="Hugging Face Daily Papers" /></a>
+<a href="https://github.com/OrigamiKoala/LongHorizon-Harness"><img src="https://img.shields.io/badge/GitHub-Repository-181717.svg?style=flat-square&logo=github&logoColor=white" alt="GitHub repository" /></a>
 <a href="./LICENSE"><img src="https://img.shields.io/badge/License-MIT-2ea44f.svg?style=flat-square" alt="MIT License" /></a>
 </p>
 
 [![Python](https://img.shields.io/badge/python-≥3.10-blue?logo=python&logoColor=white)](https://www.python.org/)
-[![Agents](https://img.shields.io/badge/backend-gptme-8A2BE2)](#any-model-any-agent-backend)
-[![Benchmarks](https://img.shields.io/badge/benchmarks-WeaveBench%20|%20OSWorld%202.0%20|%20Terminal--Bench%202.1-orange)](#hundreds-of-real-tasks-measured-gains)
+[![Agents](https://img.shields.io/badge/backend-gptme-8A2BE2)](#any-model-any-openai-compatible-provider)
+[![Search](https://img.shields.io/badge/web%20search-SearXNG-3050ff)](#web-search-optional)
 
-[Usage](#one-command-full-visibility) · [What You Get](#desktop-apps-and-cli-one-continuous-task) · [How It Works](#three-roles-one-trusted-state) · [Results](#hundreds-of-real-tasks-measured-gains) · [Project Website](https://lh-harness.pages.dev) · [简体中文](README.zh-CN.md)
-
-<br>
-<img src="assets/quickstart.gif" alt="Install and run LongHorizon-Harness from the command line" width="720">
+[Usage](#one-command-full-visibility) · [How It Works](#recursive-decomposition-one-trusted-state) · [Credits](#credits)
 
 </div>
 
-> **The model determines what an agent can do in one round. LongHorizon-Harness determines whether that work can be verified, preserved, and continued until the task is actually complete.**
+> **The model determines what an agent can do in one round. Waypoint determines whether that work can be verified, preserved, and continued until the task is actually complete.**
 
 **Works with any OpenAI-compatible provider (default: OpenCode Zen). One-command install, ready to run.**
 
-LongHorizon-Harness is an execution, state-management, and result-verification system for long-horizon tasks. It does not train a new model or replace an existing agent. It decomposes a long task into a tree of verifiable nodes, dispatches each node to a bounded agent episode (via gptme's tool-use loop against your provider of choice), gates and reviews every artifact, and assembles the verified result — continuously moving complex tasks forward without state drift.
+Waypoint is an execution, state-management, and result-verification system for long-horizon tasks. It does not train a new model or replace an existing agent. It decomposes a long task into a tree of verifiable nodes, dispatches each node to a bounded [gptme](https://github.com/gptme/gptme) episode against your provider of choice, gates and reviews every artifact, and assembles the verified result — continuously moving complex tasks forward without state drift.
+
+Waypoint began as a fork of [LongHorizon-Harness](https://arxiv.org/abs/2608.01964) and has since diverged substantially — see [Credits](#credits) for the full lineage.
 
 ## ✨ News
 
+- **[2026-08-09]** Waypoint is a new name for what was this fork's copy of LongHorizon-Harness — the package, CLI, and every `LH_HARNESS_*` setting are now `waypoint`/`WAYPOINT_*`. See [Credits](#credits) for why, and for attribution to the original project.
 - **[2026-08-09]** A local web-search tool (backed by a self-hosted [SearXNG](https://docs.searxng.org/) instance via Docker) is now wired into the research phase — see [Web search (optional)](#web-search-optional).
 - **[2026-08-08]** The harness is now gptme-only: the classic role-based manager/executor/auditor loop and the Claude Code/Codex backends are gone. The pipeline CLI (`run` / `status` / `approve` / `amend` / `resume`) is the control surface, and the provider is user-configurable through `provider.json` and `.env` at the repo root (default: OpenCode Zen).
-- **[2026-08-07]** A new, more user-friendly Dashboard is in the works. Stay tuned.
-- **[2026-08-06]** LongHorizon-Harness reaches **#1** on the [Hugging Face Daily Papers weekly ranking](https://huggingface.co/papers/week/2026-W32).
-- **[2026-08-06]** The WeChat group is open. Scan the QR code below to join.
-
-> 🚀 We’re iterating rapidly. Stay tuned!
-
-<div align="center">
-<img src="assets/wechat_group.JPG" alt="WeChat group QR code" width="240">
-<br>
-<sub>The QR code is refreshed periodically. If it has expired, open an issue and we will post a new one.</sub>
-</div>
-
-## Video Demo
-
-https://github.com/user-attachments/assets/ca8b77ce-9220-4d85-a272-b346009b2454
-
-<p align="center"><a href="assets/promotional_video_1440p.mp4"><strong>Open the promotional video (1440p MP4)</strong></a></p>
 
 ## Recursive decomposition. One trusted state.
 
-LongHorizon-Harness turns a long task into a tree of small, verifiable nodes rather than one growing context responsible for everything.
+Waypoint turns a long task into a tree of small, verifiable nodes rather than one growing context responsible for everything.
 
 | | Phase | One responsibility |
 |---|---|---|
@@ -69,23 +46,21 @@ LongHorizon-Harness turns a long task into a tree of small, verifiable nodes rat
 
 Only results that pass independent verification enter persistent task state. Even when an episode crashes, an action fails, or a deliverable does not pass inspection, the harness resumes from durable, fsync'd events — no double work, no lost work.
 
-## Desktop apps and CLI. One continuous task.
+## Code, files, shell, and the web. One continuous task.
 
-LongHorizon-Harness supports both GUI and CLI workflows.
+Each Writer episode is a [gptme](https://github.com/gptme/gptme) tool-use loop, narrowed per node:
 
-| 🖥️ Operate the desktop | ⌨️ Work in the terminal |
+| Tool | What it's for |
 |---|---|
-| 🌐 Click, type, scroll, and browse | 💻 Write and modify code |
-| 📊 Operate spreadsheets | ▶️ Run commands and scripts |
-| 📄 Edit documents | 📦 Install dependencies and environments |
-| 🎨 Use design software | 🔧 Configure and debug systems |
-| 🧊 Operate 3D tools | 📁 Process files and data |
+| `shell` | Run commands, scripts, and build/test tooling |
+| `read` / `save` / `patch` | Read, write, and scoped-edit files |
+| `websearch` *(research nodes only)* | Query a local SearXNG instance — see [Web search (optional)](#web-search-optional) |
 
-One task can begin in a browser, move to the command line for data processing, continue in desktop software to produce an artifact, and return to the terminal for validation or debugging. The goal, progress, and evidence remain under the same state-management system throughout.
+That's deliberately narrow: a Writer leaf gets exactly the tools its node declares (`node.tools`), never gptme's browser/computer-use/MCP tools, so token cost and blast radius stay bounded per episode. A task can span writing code, processing data, running shell commands, and pulling in current web results — all under the same verified, resumable task state.
 
 ## Any model. Any OpenAI-compatible provider.
 
-LongHorizon-Harness is not tied to a specific model. The provider is configured in `provider.json` at the repo root (any OpenAI-compatible endpoint); the default is OpenCode Zen.
+Waypoint is not tied to a specific model. The provider is configured in `provider.json` at the repo root (any OpenAI-compatible endpoint); the default is OpenCode Zen.
 
 | | Layer | Supported choices |
 |---|---|---|
@@ -94,33 +69,11 @@ LongHorizon-Harness is not tied to a specific model. The provider is configured 
 | 🎛️ | **Decomposition** | Recursive intake → survey → planning → pilot/contract → execute → assemble, with per-node tool narrowing |
 | 🖥️ | **Execution environment** | Local, with a pluggable `Environment` protocol |
 
-A lightweight `AgentAdapter` preserves the agent's native execution loop while LongHorizon-Harness coordinates verified task state, machine-checkable gates, and crash-resumable progress around it.
+A lightweight `AgentAdapter` preserves gptme's native execution loop while Waypoint coordinates verified task state, machine-checkable gates, and crash-resumable progress around it.
 
-## Hundreds of real tasks. Measured gains.
+## The research this is built on
 
-LongHorizon-Harness is not demonstrated only on a handful of carefully selected success cases.
-
-We ran it on hundreds of complex tasks across GUI, CLI, and mixed computer environments:
-
-| Task domain | What the tasks involve |
-|---|---|
-| 🌐 **Web Frontend** | Developing, fixing, and validating websites and web applications through browser interaction, developer tools, and code changes |
-| 📊 **Data Analysis & Visualization** | Processing data, producing charts and dashboards, and checking analytical results and visual deliverables |
-| 🛠️ **Operations & Debugging** | Investigating logs, networks, performance, and service failures; configuring, diagnosing, and repairing systems |
-| 🎨 **Design & Image Processing** | Editing visual assets, matching design references, processing images, and verifying final visual quality |
-| 🎮 **Games & Interaction** | Building, operating, and debugging games or interactive applications; checking interaction logic and runtime behavior |
-| 📄 **Documents & Presentations** | Editing documents and slide decks, including content, formatting, references, layout, and final delivery |
-| 🧊 **Spatial Reasoning** | Completing tasks involving spatial relationships, geometry, precise placement, and 3D operations |
-| 🖥️ **Desktop & System Settings** | Operating desktop applications, files, and system settings across multi-application workflows |
-| 🔬 **Research & Education** | Completing literature research, coursework, teaching materials, forms, and research-support workflows |
-| 🎬 **Creative Production** | Producing presentations, video, audio, and other media while coordinating assets across tools |
-| ⚙️ **Engineering & Computing** | Using CAD, EDA, scientific software, development tools, and cloud or DevOps toolchains |
-| 🎫 **Personal Services** | Handling event ticketing, everyday services, games, and visual-search workflows |
-| 🏛️ **Administration & Compliance** | Completing office, legal, policy-sensitive form, institutional, and safety-aware submission workflows |
-| 💼 **Business & Finance** | Handling market analysis, procurement, loans, sales, reimbursements, and cross-application enterprise workflows |
-| 🏥 **Healthcare** | Completing medical quality-control, insurance, immunization, and structured health-form workflows |
-
-### Same model. Same execution backend. Only the harness changes.
+> Waypoint's current pipeline (the gptme-only backend, this decomposition/gate/review loop) has not itself been benchmarked yet. The numbers below are what the original [LongHorizon-Harness](https://arxiv.org/abs/2608.01964) research measured, using its own role-based harness (Claude Code/Codex backends with computer-use) — the code that produced them was removed from this fork during the gptme-only rewrite. They're included here as attribution to the research this project builds on, not as a claim about this codebase. See [Credits](#credits).
 
 <table>
 <tr>
@@ -143,10 +96,11 @@ We ran it on hundreds of complex tasks across GUI, CLI, and mixed computer envir
 </table>
 
 <div align="center">
-<img src="assets/harness_perf.png" alt="Performance gains across benchmarks and backbones" width="72%">
+<img src="assets/harness_perf.png" alt="Performance gains measured by the original LongHorizon-Harness research, across benchmarks and backbones" width="72%">
 </div>
 
-### 📊 Full benchmark results and experimental settings
+<details>
+<summary>Full benchmark results and experimental settings (original LongHorizon-Harness research)</summary>
 
 | Benchmark | Metric | Agent baseline | **LongHorizon-Harness** | Gain |
 |---|---|:-:|:-:|:-:|
@@ -156,9 +110,9 @@ We ran it on hundreds of complex tasks across GUI, CLI, and mixed computer envir
 | **OSWorld 2.0** | Partial | 21.5 | **35.2** | **+13.7** |
 | **Terminal-Bench 2.1** | Success rate | 69.7 | **77.2** | **+7.5** |
 
-<sub>Rows use a Qwen 3.7-Plus backbone with an agent CLI execution backend.</sub>
+<sub>Rows use a Qwen 3.7-Plus backbone with an agent CLI execution backend. Measured on the original LongHorizon-Harness codebase, not Waypoint's current gptme-only pipeline.</sub>
 
-Full result tables and case trajectories are available on the [LongHorizon-Harness project website](https://lh-harness.pages.dev).
+</details>
 
 ## One command. Full visibility.
 
@@ -173,18 +127,18 @@ Steps 1–2 are once per machine; steps 3–4 are once per project.
 | [uv](https://docs.astral.sh/uv/getting-started/installation/) | The recommended isolated install. Skip it if you prefer pip. |
 | Python 3.10 or later | Running the harness. `uv tool install` brings its own; a pip install uses yours. |
 | A provider API key | Any OpenAI-compatible endpoint. The default (OpenCode Zen) reads `OPENCODE_API_KEY` from `.env`. |
-| gptme (`pip install "lh-harness[gptme]"`) | The Writer backend: gptme's tool-use loop. The core package and tests stay gptme-free. |
+| gptme (`pip install "waypoint[gptme]"`) | The Writer backend: gptme's tool-use loop. The core package and tests stay gptme-free. |
 | [Docker](https://docs.docker.com/get-docker/) *(optional)* | Running a local [SearXNG](https://docs.searxng.org/) instance so research nodes can search the web. Skip it if you don't need web search. |
 
 > **Platform status:** Currently tested on macOS. Windows support is included but has not yet been thoroughly tested.
 
-#### 1. Install LongHorizon-Harness
+#### 1. Install Waypoint
 
 ```bash
-uv tool install "lh-harness[gptme]"     # or: pip install "lh-harness[gptme]"
+uv tool install "waypoint[gptme]"     # or: pip install "waypoint[gptme]"
 ```
 
-Upgrade later with `uv tool upgrade lh-harness` or `pip install --upgrade lh-harness`.
+Upgrade later with `uv tool upgrade waypoint` or `pip install --upgrade waypoint`.
 
 #### 2. Configure your provider
 
@@ -222,16 +176,16 @@ OPENAI_API_KEY=sk-...
 The CLI loads `.env` automatically at startup (a variable already exported
 in your shell wins over the file). To add another provider, add an entry
 to `provider.json` with its own `api_key_env` (e.g. `DEEPSEEK_API_KEY`)
-and a matching line in `.env`; select it with `LH_HARNESS_PROVIDER=<name>`
+and a matching line in `.env`; select it with `WAYPOINT_PROVIDER=<name>`
 or `provider.json`'s `"default"` field.
 
 Precedence per field, highest first: explicit CLI/constructor arguments >
-`LH_HARNESS_PROVIDER_API_KEY` / `LH_HARNESS_PROVIDER_BASE_URL` /
-`LH_HARNESS_PROVIDER_MODEL` env vars > the selected provider's entry in
+`WAYPOINT_PROVIDER_API_KEY` / `WAYPOINT_PROVIDER_BASE_URL` /
+`WAYPOINT_PROVIDER_MODEL` env vars > the selected provider's entry in
 `provider.json` > generic `OPENAI_API_KEY` / `OPENAI_BASE_URL` /
 `OPENAI_MODEL` env vars > the built-in OpenCode Zen default.
 
-If you skip this step, `lh-harness run` creates a default `provider.json`
+If you skip this step, `waypoint run` creates a default `provider.json`
 for you on first launch (pointing at OpenCode Zen) — you still need to put
 a key in `.env` for it to actually authenticate.
 
@@ -277,7 +231,7 @@ is optional: skip it and any `--research-plan` step just gets marked
    your instance runs elsewhere, set it in `.env`:
 
    ```bash
-   LH_HARNESS_SEARXNG_URL=http://localhost:8080
+   WAYPOINT_SEARXNG_URL=http://localhost:8080
    ```
 
 4. **Verify it works:**
@@ -290,7 +244,7 @@ is optional: skip it and any `--research-plan` step just gets marked
    means step 2 didn't take — double check `settings.yml` and that the
    container actually restarted.
 
-Once running, pass a `--research-plan` to `lh-harness run` naming the
+Once running, pass a `--research-plan` to `waypoint run` naming the
 nodes that need a search (see the CLI reference below); the harness
 dispatches a scoped, single-tool gptme episode per query and folds the
 capped finding into that node's inputs.
@@ -298,21 +252,21 @@ capped finding into that node's inputs.
 #### 3. Run a task
 
 ```bash
-lh-harness run --goal "Summarize the files in this directory." --source @README.md
+waypoint run --goal "Summarize the files in this directory." --source @README.md
 ```
 
 The pipeline decomposes the goal (intake → survey → plan → pilot →
 contract), executes each node in a bounded gptme episode with per-node
 tool narrowing, gates and reviews every artifact, and assembles the
 verified result. Phases that are already done are skipped on resume;
-`lh-harness pipeline resume <run-id>` picks up a halted run exactly where
+`waypoint pipeline resume <run-id>` picks up a halted run exactly where
 it stopped.
 
 To give a specific node a scoped web search (see [Web search
 (optional)](#web-search-optional) above), pass `--research-plan`:
 
 ```bash
-lh-harness run --goal "..." --source @source.md \
+waypoint run --goal "..." --source @source.md \
   --research-plan '[{"node_id": "2.1", "kind": "web_search", "question": "current stable Python release"}]'
 ```
 
@@ -326,55 +280,81 @@ Control surface (all operate on the run directory, safe from a second
 terminal while a run is in flight):
 
 ```bash
-lh-harness status <run-id>          # phase, tree statuses, pending approvals
-lh-harness approve <run-id>         # resolve the oldest pending approval
-lh-harness amend <run-id> --text "..."   # amend the contract, re-validate
+waypoint status <run-id>          # phase, tree statuses, pending approvals
+waypoint approve <run-id>         # resolve the oldest pending approval
+waypoint amend <run-id> --text "..."   # amend the contract, re-validate
 ```
 
-Every run lives under `./.lh-harness/runs/<run-id>/`; the tree state,
+Every run lives under `./.waypoint/runs/<run-id>/`; the tree state,
 events log, and assembled output stay there for audit.
 
 #### CLI and provider reference
 
-The `lh-harness` CLI is the PLAN.md §11 control surface. Commands operate
-purely on the run directory, so `status`/`approve`/`amend` are safe to run
-from a second terminal while a driver is still attached.
+There is currently **no web UI** wired up — `waypoint`'s CLI is the
+complete, live control surface (PLAN.md §11). Commands operate purely on
+the run directory, so `status`/`approve`/`amend` are safe to run from a
+second terminal while a driver is still attached. (There's unmounted
+server-side dashboard state code in `dashboard/recursive.py` for a future
+web view, but no server or frontend currently serves it.)
 
 | Command | Description |
 |---|---|
-| `lh-harness run` | Run (or resume) the pipeline: `--goal`, `--source` (`@file` or `-`), `--backend` (only `gptme`), `--model`, `--compile-command`, `--research-plan`, `--max-rounds`, `--max-attempts`, `--detach` |
-| `lh-harness resume <run-id>` | Resume a halted run; the disk state is authoritative |
-| `lh-harness status <run-id>` | Phase, tree statuses, pending approvals, event count |
-| `lh-harness approve <run-id>` | Resolve the oldest pending approval (`--answer`, `--file`, `--action`) |
-| `lh-harness amend <run-id> --text "..."` | Append a contract rule, run the read-only re-validation pass, and (on confirmation) apply the repairs |
+| `waypoint run` | Run (or resume) the pipeline: `--goal`, `--source` (`@file` or `-`), `--backend` (only `gptme`), `--model`, `--compile-command`, `--research-plan`, `--max-rounds`, `--max-attempts`, `--detach` |
+| `waypoint resume <run-id>` | Resume a halted run; the disk state is authoritative |
+| `waypoint status <run-id>` | Phase, tree statuses, pending approvals, event count |
+| `waypoint approve <run-id>` | Resolve the oldest pending approval (`--answer`, `--file`, `--action`) |
+| `waypoint amend <run-id> --text "..."` | Append a contract rule, run the read-only re-validation pass, and (on confirmation) apply the repairs |
 
 Provider settings resolve per field, highest first:
 
 1. Explicit constructor/CLI arguments
-2. `LH_HARNESS_PROVIDER_API_KEY` / `LH_HARNESS_PROVIDER_BASE_URL` /
-   `LH_HARNESS_PROVIDER_MODEL` environment variables
-3. `provider.json` at the repo root (or `$LH_HARNESS_PROVIDER_CONFIG`)
+2. `WAYPOINT_PROVIDER_API_KEY` / `WAYPOINT_PROVIDER_BASE_URL` /
+   `WAYPOINT_PROVIDER_MODEL` environment variables
+3. `provider.json` at the repo root (or `$WAYPOINT_PROVIDER_CONFIG`)
 4. `OPENAI_API_KEY` / `OPENAI_BASE_URL` / `OPENAI_MODEL` environment variables
 5. Built-in default: OpenCode Zen (api key via `OPENCODE_API_KEY`)
 
 Every run is stored in an isolated `runs/<run-id>/` directory under
-`./.lh-harness/runs/` (or `--runs-root`) in the project folder. The
-complete task state and audit trail — `tree.json`, the fsync'd
-`events.jsonl`, per-node traces and versions — make the agent's progress
-inspectable, recoverable, and reproducible.
+`./.waypoint/runs/` (or `--runs-root`) in the project folder — nothing
+Waypoint writes by default lives outside the project folder it was
+launched from. The complete task state and audit trail — `tree.json`, the
+fsync'd `events.jsonl`, per-node traces and versions — make the agent's
+progress inspectable, recoverable, and reproducible.
 
 ## Evaluation Reproduction
 
-`eval/` provides frozen reproduction suites for two benchmarks:
+`eval/` provides frozen reproduction suites for two benchmarks, from the
+original LongHorizon-Harness research (see [The research this is built
+on](#the-research-this-is-built-on) and [Credits](#credits) — these
+reproduce that project's original role-based harness, not Waypoint's
+current gptme-only pipeline):
 
 | Directory | Benchmark | Description |
 |---|---|---|
 | [`eval/WeaveBench-harness/`](eval/WeaveBench-harness/) | WeaveBench (114 tasks) | Hybrid GUI+CLI tasks and a reproduction skill |
 | [`eval/OSWorldv2-harness/`](eval/OSWorldv2-harness/) | OSWorld-V2 (108 tasks) | Hybrid runner aligned with the official release |
 
-See each directory's `README.md` or `README.zh-CN.md` for environment setup, parameters, and launch commands. The nested `cua_harness` packages are frozen compatibility copies used for evaluation; new integrations should use `src/lh_harness/`.
+See each directory's `README.md` for environment setup, parameters, and launch commands. The nested `cua_harness` packages are frozen compatibility copies used for evaluation, independent of `src/waypoint/`.
 
-## Citation
+## Credits
+
+Waypoint is built on two projects:
+
+- **[gptme](https://github.com/gptme/gptme)** (MIT) — the tool-use loop
+  (shell/read/save/patch) that actually drives every Writer episode.
+  Waypoint is a thin coordination layer around it: task decomposition,
+  gating, review, and crash-resumable state. None of the actual
+  code/file/shell work happens in Waypoint's own code.
+- **[LongHorizon-Harness](https://arxiv.org/abs/2608.01964)** ("LongHorizon-Harness: Advancing
+  Long-Horizon Agents for Real-World Tasks", Ma et al., 2026) — the
+  research this project was originally forked from. Waypoint's recursive
+  decomposition design (intake → survey → plan → pilot → execute →
+  assemble, machine-checkable gates, fsync'd resumable state) descends
+  directly from that work. The benchmark results in [The research this is
+  built on](#the-research-this-is-built-on) are that project's, measured
+  on its original role-based (Claude Code/Codex, computer-use) harness —
+  code this fork has since replaced with a gptme-only pipeline and has not
+  independently re-benchmarked.
 
 ```bibtex
 @article{longhorizonharness2026,
@@ -390,6 +370,6 @@ See each directory's `README.md` or `README.zh-CN.md` for environment setup, par
 
 <div align="center">
 
-**Operate the whole computer. Preserve verified progress. Keep working until the task is done.**
+**Verifiable progress. No state drift. Keep working until the task is done.**
 
 </div>

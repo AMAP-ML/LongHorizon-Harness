@@ -14,9 +14,9 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "src"))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from fake_adapter import FakeStreamAgentAdapter  # noqa: E402
-from lh_harness.environment.local import LocalEnvironment  # noqa: E402
-from lh_harness.types import EpisodeBudget  # noqa: E402
-from lh_harness.v0.runner import run_node  # noqa: E402
+from waypoint.environment.local import LocalEnvironment  # noqa: E402
+from waypoint.types import EpisodeBudget  # noqa: E402
+from waypoint.v0.runner import run_node  # noqa: E402
 
 
 def main() -> int:

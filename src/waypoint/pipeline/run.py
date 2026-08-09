@@ -1,10 +1,10 @@
-"""Standalone pipeline entry point (``python -m lh_harness.pipeline.run``).
+"""Standalone pipeline entry point (``python -m waypoint.pipeline.run``).
 
-Both the ``lh-harness pipeline run`` command and its ``--detach`` mode
+Both the ``waypoint pipeline run`` command and its ``--detach`` mode
 spawn exactly this module with the same arguments, so one argument parser
 stays in sync with one run loop. Parsing is intentionally minimal: the
 interactive surface (``status`` / ``approve`` / ``amend``) lives in the
-``lh-harness pipeline`` group, not here.
+``waypoint pipeline`` group, not here.
 """
 
 from __future__ import annotations
@@ -23,12 +23,12 @@ from .backends import parse_research_plan
 from .driver import RunOptions, RecursiveDriver
 from .run_dir import run_spec_path
 
-_RUNS_ROOT_DEFAULT = "./.lh-harness/runs"
+_RUNS_ROOT_DEFAULT = "./.waypoint/runs"
 
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        prog="lh-harness pipeline run",
+        prog="waypoint pipeline run",
         description="Run the recursive decomposition pipeline (intake -> survey -> plan -> pilot -> research -> execute -> assemble).",
     )
     parser.add_argument("--runs-root", default=_RUNS_ROOT_DEFAULT, help="Base directory holding one isolated subfolder per run.")

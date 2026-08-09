@@ -25,13 +25,13 @@ sys.path.insert(0, str(_REPO_ROOT / "tests" / "fixtures"))
 
 from fake_adapter import FakeStreamAgentAdapter  # noqa: E402
 
-from lh_harness.environment.local import LocalEnvironment  # noqa: E402
-from lh_harness.types import EpisodeBudget  # noqa: E402
-from lh_harness.v0.run_dir import create_run_dir  # noqa: E402
-from lh_harness.v1.gates import GateResult  # noqa: E402
-from lh_harness.v1.tree import TaskNode, TaskTree  # noqa: E402
-from lh_harness.v4.research import ResearchFinding, ResearchQuery  # noqa: E402
-from lh_harness.v4.research_loop import attach_finding, run_research_loop  # noqa: E402
+from waypoint.environment.local import LocalEnvironment  # noqa: E402
+from waypoint.types import EpisodeBudget  # noqa: E402
+from waypoint.v0.run_dir import create_run_dir  # noqa: E402
+from waypoint.v1.gates import GateResult  # noqa: E402
+from waypoint.v1.tree import TaskNode, TaskTree  # noqa: E402
+from waypoint.v4.research import ResearchFinding, ResearchQuery  # noqa: E402
+from waypoint.v4.research_loop import attach_finding, run_research_loop  # noqa: E402
 
 FAKE_CLI = _REPO_ROOT / "tests" / "fixtures" / "fake_stream_agent.py"
 

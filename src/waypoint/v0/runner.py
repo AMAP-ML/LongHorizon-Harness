@@ -129,7 +129,7 @@ async def run_node(
     # v0 does not write manifest.jsonl: a single Writer node has no gates to
     # evaluate and no way to derive the PLAN.md §6 manifest schema. That
     # line is written by the caller once gates have actually run — v1's
-    # round loop (src/lh_harness/v1/manifest.py) is the first caller that
+    # round loop (src/waypoint/v1/manifest.py) is the first caller that
     # can do so correctly.
     log.append(
         {

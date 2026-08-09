@@ -13,10 +13,10 @@ from pathlib import Path
 _REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(_REPO_ROOT / "src"))
 
-from lh_harness.v1.gates import estimate_tokens, evaluate_gates  # noqa: E402
-from lh_harness.v1.manifest import cap_promotion  # noqa: E402
-from lh_harness.v1.provider import OpenAICompatibleProvider, ProviderError  # noqa: E402
-from lh_harness.v1.tree import TaskTree, TreeValidationError  # noqa: E402
+from waypoint.v1.gates import estimate_tokens, evaluate_gates  # noqa: E402
+from waypoint.v1.manifest import cap_promotion  # noqa: E402
+from waypoint.v1.provider import OpenAICompatibleProvider, ProviderError  # noqa: E402
+from waypoint.v1.tree import TaskTree, TreeValidationError  # noqa: E402
 
 
 class GatesTest(unittest.TestCase):

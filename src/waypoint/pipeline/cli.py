@@ -1,4 +1,4 @@
-"""Command handlers for the ``lh-harness pipeline`` group (PLAN.md §11's
+"""Command handlers for the ``waypoint pipeline`` group (PLAN.md §11's
 control surface: run / status / approve / amend / resume).
 
 The run command drives :class:`RecursiveDriver` in the foreground by
@@ -36,12 +36,12 @@ from .run_dir import (
     tree_path,
 )
 
-_RUNS_ROOT_DEFAULT = "./.lh-harness/runs"
+_RUNS_ROOT_DEFAULT = "./.waypoint/runs"
 
 
 def build_pipeline_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        prog="lh-harness pipeline",
+        prog="waypoint pipeline",
         description="PLAN.md §11 control surface for the recursive decomposition harness.",
     )
     sub = parser.add_subparsers(dest="pipeline_command")
@@ -101,7 +101,7 @@ def cmd_run_detach(argv: argparse.Namespace) -> int:
     command = [
         sys.executable,
         "-m",
-        "lh_harness.pipeline.run",
+        "waypoint.pipeline.run",
         "--runs-root", argv.runs_root,
         "--run-id", run_id,
         "--goal", argv.goal,
@@ -119,7 +119,7 @@ def cmd_run_detach(argv: argparse.Namespace) -> int:
             command += [flag, value]
     subprocess.Popen(command, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
     print(f"detached pipeline run: run_id={run_id}")
-    print(f"watch with: lh-harness pipeline status {run_id} --runs-root {argv.runs_root}")
+    print(f"watch with: waypoint pipeline status {run_id} --runs-root {argv.runs_root}")
     return 0
 
 

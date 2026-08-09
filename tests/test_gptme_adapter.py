@@ -9,7 +9,7 @@ line shape `gptme_visible_output` parses below all came from inspecting
 the real installed package, not from documentation alone.)
 
 Coverage:
-- API key resolution order (explicit arg > LH_HARNESS_PROVIDER_API_KEY >
+- API key resolution order (explicit arg > WAYPOINT_PROVIDER_API_KEY >
   OPENAI_API_KEY from the provider's api_key_env) and the loud failure
   when none are set
 - env vars (OPENAI_BASE_URL/OPENAI_API_KEY/GPTME_CONTEXT_LENGTH) and the
@@ -30,12 +30,12 @@ from pathlib import Path
 _REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(_REPO_ROOT / "src"))
 
-from lh_harness.adapters.gptme_adapter import (  # noqa: E402
+from waypoint.adapters.gptme_adapter import (  # noqa: E402
     _WORKER_SCRIPT,
     GptmeAdapter,
     gptme_visible_output,
 )
-from lh_harness.provider_config import DEFAULT_BASE_URL  # noqa: E402
+from waypoint.provider_config import DEFAULT_BASE_URL  # noqa: E402
 
 _OPCODE_MODEL = "local/deepseek-v4-flash-free"
 
@@ -43,24 +43,24 @@ _OPCODE_MODEL = "local/deepseek-v4-flash-free"
 class _EnvGuard:
     """Snapshots and restores the env vars GptmeAdapter reads, so tests
     never leak credentials into each other regardless of pass/fail. Also
-    points LH_HARNESS_PROVIDER_CONFIG at a nonexistent path so a real
-    ~/.lh-harness/provider.json on the developer machine can't leak into
-    tests."""
+    points WAYPOINT_PROVIDER_CONFIG at a nonexistent path so a real
+    provider.json sitting in the repo root the tests run from can't leak
+    into tests."""
 
     _KEYS = (
-        "LH_HARNESS_PROVIDER_BASE_URL",
-        "LH_HARNESS_PROVIDER_API_KEY",
-        "LH_HARNESS_PROVIDER_MODEL",
-        "LH_HARNESS_PROVIDER_CONFIG",
+        "WAYPOINT_PROVIDER_BASE_URL",
+        "WAYPOINT_PROVIDER_API_KEY",
+        "WAYPOINT_PROVIDER_MODEL",
+        "WAYPOINT_PROVIDER_CONFIG",
         "OPENAI_API_KEY",
         "OPENAI_BASE_URL",
         "OPENAI_MODEL",
-        "LH_HARNESS_PROVIDER",
+        "WAYPOINT_PROVIDER",
     )
 
     def __enter__(self) -> "_EnvGuard":
         self._backup = {key: os.environ.pop(key, None) for key in self._KEYS}
-        os.environ["LH_HARNESS_PROVIDER_CONFIG"] = "/nonexistent/provider.json"
+        os.environ["WAYPOINT_PROVIDER_CONFIG"] = "/nonexistent/provider.json"
         return self
 
     def __exit__(self, *exc_info: object) -> None:
@@ -91,7 +91,7 @@ class ApiKeyResolutionTest(unittest.TestCase):
 
     def test_provider_env_key_wins_over_generic(self) -> None:
         with _EnvGuard():
-            os.environ["LH_HARNESS_PROVIDER_API_KEY"] = "provider-key"
+            os.environ["WAYPOINT_PROVIDER_API_KEY"] = "provider-key"
             os.environ["OPENAI_API_KEY"] = "generic-key"
             adapter = GptmeAdapter()
             self.assertIn("provider-key", adapter.command_template)

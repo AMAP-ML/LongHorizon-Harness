@@ -10,13 +10,13 @@ third-party search API key is required.
 This file is loaded by gptme itself, by path, via
 ``init_tools(["...", str(SEARXNG_TOOL_PATH)])`` ->
 ``gptme.tools.base.load_from_file`` — never imported as part of the
-``lh_harness`` package (that loader uses
+``waypoint`` package (that loader uses
 ``importlib.util.spec_from_file_location`` on the raw path, independent of
 any package context). Keep this module stdlib-only and self-contained for
 exactly that reason: it runs however gptme's tool loader chooses to load
 it, not through the harness's own import machinery.
 
-Configuration is a single env var, ``LH_HARNESS_SEARXNG_URL`` (defaults to
+Configuration is a single env var, ``WAYPOINT_SEARXNG_URL`` (defaults to
 ``http://localhost:8080``, SearXNG's own default Docker port) — set in the
 project's ``.env`` alongside every other environment-sourced setting (see
 ``provider_config.py``); this is not harness "provider" config, so it does
@@ -49,7 +49,7 @@ REQUEST_TIMEOUT_SECONDS = 15
 def searxng_base_url() -> str:
     """The configured SearXNG instance, env-overridable like every other
     external endpoint this harness talks to."""
-    return os.getenv("LH_HARNESS_SEARXNG_URL", DEFAULT_SEARXNG_URL).rstrip("/")
+    return os.getenv("WAYPOINT_SEARXNG_URL", DEFAULT_SEARXNG_URL).rstrip("/")
 
 
 class SearxngSearchError(RuntimeError):
@@ -84,7 +84,7 @@ def search(query: str, *, base_url: str | None = None, num_results: int = DEFAUL
     except urllib.error.URLError as exc:
         raise SearxngSearchError(
             f"Could not reach SearXNG at {url} ({exc.reason}). Is the "
-            f"container running (`docker ps`)? Set LH_HARNESS_SEARXNG_URL "
+            f"container running (`docker ps`)? Set WAYPOINT_SEARXNG_URL "
             f"in .env if it's not on the default port."
         ) from exc
     except TimeoutError as exc:

@@ -168,7 +168,7 @@ class LocalEnvironment:
 
     async def screenshot(self) -> bytes:
         self._tmp_dir.mkdir(parents=True, exist_ok=True)
-        path = self._tmp_dir / "_lh_harness_screenshot.png"
+        path = self._tmp_dir / "_waypoint_screenshot.png"
         await self.exec(f"gnome-screenshot -f {path} 2>/dev/null || import -window root {path} 2>/dev/null", timeout=10)
         return path.read_bytes() if path.exists() else b""
 

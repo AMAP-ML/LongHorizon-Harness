@@ -1,9 +1,9 @@
-"""The ``lh-harness`` entry point: PLAN.md §11's control surface.
+"""The ``waypoint`` entry point: PLAN.md §11's control surface.
 
 This is a thin shim over ``pipeline/cli.py``'s command handlers — the
 pipeline group (run / status / approve / amend / resume) *is* the CLI now,
 since the classic role-based harness (manager/executor/auditor plus the
-claude/codex backends) was removed. Run ``lh-harness --help`` from a
+claude/codex backends) was removed. Run ``waypoint --help`` from a
 terminal for the full command list.
 """
 
@@ -11,14 +11,14 @@ from __future__ import annotations
 
 import sys
 
-from . import __version__
+from . import HOMEPAGE, __version__
 from .provider_config import ensure_user_config, load_env_file
 
 _EPILOG = (
     "Provider: any OpenAI-compatible endpoint; the default is OpenCode Zen. "
     "Configure it in the provider config file (shown on the run command) — "
     "copy provider.example.json from the repo root. See "
-    "https://github.com/AMAP-ML/LongHorizon-Harness"
+    f"{HOMEPAGE}"
 )
 
 
@@ -28,9 +28,9 @@ def main(argv: list[str] | None = None) -> int:
     from .pipeline.cli import build_pipeline_parser, dispatch
 
     parser = build_pipeline_parser()
-    parser.prog = "lh-harness"
+    parser.prog = "waypoint"
     parser.description = (
-        f"LongHorizon-Harness {__version__}: recursive decomposition harness "
+        f"Waypoint {__version__}: recursive decomposition harness "
         "(intake -> survey -> plan -> pilot -> execute -> assemble)."
     )
     parser.epilog = _EPILOG

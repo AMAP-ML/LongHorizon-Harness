@@ -26,19 +26,19 @@ sys.path.insert(0, str(_REPO_ROOT / "tests" / "fixtures"))
 
 from fake_adapter import FakeStreamAgentAdapter  # noqa: E402
 from fake_provider import FakeProvider  # noqa: E402
-from lh_harness.environment.local import LocalEnvironment  # noqa: E402
-from lh_harness.types import EpisodeBudget  # noqa: E402
-from lh_harness.v0.events import EventLog  # noqa: E402
-from lh_harness.v0.run_dir import create_run_dir, events_path, node_artifact_path  # noqa: E402
-from lh_harness.v1.tree import TaskNode, TaskTree  # noqa: E402
-from lh_harness.v2.contract import (  # noqa: E402
+from waypoint.environment.local import LocalEnvironment  # noqa: E402
+from waypoint.types import EpisodeBudget  # noqa: E402
+from waypoint.v0.events import EventLog  # noqa: E402
+from waypoint.v0.run_dir import create_run_dir, events_path, node_artifact_path  # noqa: E402
+from waypoint.v1.tree import TaskNode, TaskTree  # noqa: E402
+from waypoint.v2.contract import (  # noqa: E402
     ContractCeilingExceeded,
     ContractRule,
     amend_contract,
     freeze_contract,
     load_contract,
 )
-from lh_harness.v2.pilot import approve_pilot, run_pilot, select_pilot_nodes  # noqa: E402
+from waypoint.v2.pilot import approve_pilot, run_pilot, select_pilot_nodes  # noqa: E402
 
 FAKE_CLI = _REPO_ROOT / "tests" / "fixtures" / "fake_stream_agent.py"
 

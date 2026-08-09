@@ -15,8 +15,8 @@ sys.path.insert(0, str(_REPO_ROOT / "src"))
 sys.path.insert(0, str(_REPO_ROOT / "tests" / "fixtures"))
 
 from fake_provider import FakeProvider  # noqa: E402
-from lh_harness.v2.planner import Candidate, build_tree, leaf_gate  # noqa: E402
-from lh_harness.v2.survey import SpineUnit  # noqa: E402
+from waypoint.v2.planner import Candidate, build_tree, leaf_gate  # noqa: E402
+from waypoint.v2.survey import SpineUnit  # noqa: E402
 
 
 def _units(n: int, tokens: int = 1000) -> list[SpineUnit]:
@@ -175,7 +175,7 @@ class BuildTreeTest(unittest.TestCase):
         import json
         import tempfile
 
-        from lh_harness.v1.tree import TaskTree
+        from waypoint.v1.tree import TaskTree
 
         units = _units(3, tokens=1000)
         provider = FakeProvider(

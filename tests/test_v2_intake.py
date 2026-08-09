@@ -16,8 +16,8 @@ sys.path.insert(0, str(_REPO_ROOT / "src"))
 sys.path.insert(0, str(_REPO_ROOT / "tests" / "fixtures"))
 
 from fake_provider import FakeProvider  # noqa: E402
-from lh_harness.v0.run_dir import create_run_dir, spec_path  # noqa: E402
-from lh_harness.v2.intake import (  # noqa: E402
+from waypoint.v0.run_dir import create_run_dir, spec_path  # noqa: E402
+from waypoint.v2.intake import (  # noqa: E402
     RUBRIC_DIMENSIONS,
     elicit_global_rubric,
     render_spec_md,
@@ -74,7 +74,7 @@ class IntakeTest(unittest.TestCase):
         self.assertIn("target length", rubric.assumptions[0].lower())
 
     def test_render_spec_md_includes_goal_rubric_and_assumptions(self) -> None:
-        from lh_harness.v2.intake import GlobalRubric
+        from waypoint.v2.intake import GlobalRubric
 
         rubric = GlobalRubric(
             goal="produce chapter summaries",
