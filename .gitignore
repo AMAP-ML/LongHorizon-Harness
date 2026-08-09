@@ -18,7 +18,7 @@ dist/
 *.egg-info/
 
 # Local run outputs
-.waypoint/
+.kusudaemon/
 runs/
 logs/
 results/

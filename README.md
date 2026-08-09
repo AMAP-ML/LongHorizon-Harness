@@ -1,6 +1,6 @@
 <div align="center">
 
-# Waypoint
+# Kusudaemon
 
 **A recursive-decomposition harness for long-horizon tasks, driven by [gptme](https://github.com/gptme/gptme).**
 
@@ -19,23 +19,23 @@
 
 </div>
 
-> **The model determines what an agent can do in one round. Waypoint determines whether that work can be verified, preserved, and continued until the task is actually complete.**
+> **The model determines what an agent can do in one round. Kusudaemon determines whether that work can be verified, preserved, and continued until the task is actually complete.**
 
 **Works with any OpenAI-compatible provider (default: OpenCode Zen). One-command install, ready to run.**
 
-Waypoint is an execution, state-management, and result-verification system for long-horizon tasks. It does not train a new model or replace an existing agent. It decomposes a long task into a tree of verifiable nodes, dispatches each node to a bounded [gptme](https://github.com/gptme/gptme) episode against your provider of choice, gates and reviews every artifact, and assembles the verified result — continuously moving complex tasks forward without state drift.
+Kusudaemon is an execution, state-management, and result-verification system for long-horizon tasks. It does not train a new model or replace an existing agent. It decomposes a long task into a tree of verifiable nodes, dispatches each node to a bounded [gptme](https://github.com/gptme/gptme) episode against your provider of choice, gates and reviews every artifact, and assembles the verified result — continuously moving complex tasks forward without state drift.
 
-Waypoint began as a fork of [LongHorizon-Harness](https://arxiv.org/abs/2608.01964) and has since diverged substantially — see [Credits](#credits) for the full lineage.
+Kusudaemon began as a fork of [LongHorizon-Harness](https://arxiv.org/abs/2608.01964) and has since diverged substantially — see [Credits](#credits) for the full lineage.
 
 ## ✨ News
 
-- **[2026-08-09]** Waypoint is a new name for what was this fork's copy of LongHorizon-Harness — the package, CLI, and every `LH_HARNESS_*` setting are now `waypoint`/`WAYPOINT_*`. See [Credits](#credits) for why, and for attribution to the original project.
+- **[2026-08-09]** Kusudaemon is a new name for what was this fork's copy of LongHorizon-Harness — the package, CLI, and every `LH_HARNESS_*` setting are now `kusudaemon`/`KUSUDAEMON_*`. (Briefly renamed to "Waypoint" earlier the same day; that name didn't stick, so this supersedes it — no `waypoint`/`WAYPOINT_*` should remain anywhere in the tree.) See [Credits](#credits) for why, and for attribution to the original project.
 - **[2026-08-09]** A local web-search tool (backed by a self-hosted [SearXNG](https://docs.searxng.org/) instance via Docker) is now wired into the research phase — see [Web search (optional)](#web-search-optional).
 - **[2026-08-08]** The harness is now gptme-only: the classic role-based manager/executor/auditor loop and the Claude Code/Codex backends are gone. The pipeline CLI (`run` / `status` / `approve` / `amend` / `resume`) is the control surface, and the provider is user-configurable through `provider.json` and `.env` at the repo root (default: OpenCode Zen).
 
 ## Recursive decomposition. One trusted state.
 
-Waypoint turns a long task into a tree of small, verifiable nodes rather than one growing context responsible for everything.
+Kusudaemon turns a long task into a tree of small, verifiable nodes rather than one growing context responsible for everything.
 
 | | Phase | One responsibility |
 |---|---|---|
@@ -60,7 +60,7 @@ That's deliberately narrow: a Writer leaf gets exactly the tools its node declar
 
 ## Any model. Any OpenAI-compatible provider.
 
-Waypoint is not tied to a specific model. The provider is configured in `provider.json` at the repo root (any OpenAI-compatible endpoint); the default is OpenCode Zen.
+Kusudaemon is not tied to a specific model. The provider is configured in `provider.json` at the repo root (any OpenAI-compatible endpoint); the default is OpenCode Zen.
 
 | | Layer | Supported choices |
 |---|---|---|
@@ -69,11 +69,11 @@ Waypoint is not tied to a specific model. The provider is configured in `provide
 | 🎛️ | **Decomposition** | Recursive intake → survey → planning → pilot/contract → execute → assemble, with per-node tool narrowing |
 | 🖥️ | **Execution environment** | Local, with a pluggable `Environment` protocol |
 
-A lightweight `AgentAdapter` preserves gptme's native execution loop while Waypoint coordinates verified task state, machine-checkable gates, and crash-resumable progress around it.
+A lightweight `AgentAdapter` preserves gptme's native execution loop while Kusudaemon coordinates verified task state, machine-checkable gates, and crash-resumable progress around it.
 
 ## The research this is built on
 
-> Waypoint's current pipeline (the gptme-only backend, this decomposition/gate/review loop) has not itself been benchmarked yet. The numbers below are what the original [LongHorizon-Harness](https://arxiv.org/abs/2608.01964) research measured, using its own role-based harness (Claude Code/Codex backends with computer-use) — the code that produced them was removed from this fork during the gptme-only rewrite. They're included here as attribution to the research this project builds on, not as a claim about this codebase. See [Credits](#credits).
+> Kusudaemon's current pipeline (the gptme-only backend, this decomposition/gate/review loop) has not itself been benchmarked yet. The numbers below are what the original [LongHorizon-Harness](https://arxiv.org/abs/2608.01964) research measured, using its own role-based harness (Claude Code/Codex backends with computer-use) — the code that produced them was removed from this fork during the gptme-only rewrite. They're included here as attribution to the research this project builds on, not as a claim about this codebase. See [Credits](#credits).
 
 <table>
 <tr>
@@ -110,7 +110,7 @@ A lightweight `AgentAdapter` preserves gptme's native execution loop while Waypo
 | **OSWorld 2.0** | Partial | 21.5 | **35.2** | **+13.7** |
 | **Terminal-Bench 2.1** | Success rate | 69.7 | **77.2** | **+7.5** |
 
-<sub>Rows use a Qwen 3.7-Plus backbone with an agent CLI execution backend. Measured on the original LongHorizon-Harness codebase, not Waypoint's current gptme-only pipeline.</sub>
+<sub>Rows use a Qwen 3.7-Plus backbone with an agent CLI execution backend. Measured on the original LongHorizon-Harness codebase, not Kusudaemon's current gptme-only pipeline.</sub>
 
 </details>
 
@@ -127,18 +127,18 @@ Steps 1–2 are once per machine; steps 3–4 are once per project.
 | [uv](https://docs.astral.sh/uv/getting-started/installation/) | The recommended isolated install. Skip it if you prefer pip. |
 | Python 3.10 or later | Running the harness. `uv tool install` brings its own; a pip install uses yours. |
 | A provider API key | Any OpenAI-compatible endpoint. The default (OpenCode Zen) reads `OPENCODE_API_KEY` from `.env`. |
-| gptme (`pip install "waypoint[gptme]"`) | The Writer backend: gptme's tool-use loop. The core package and tests stay gptme-free. |
+| gptme (`pip install "kusudaemon[gptme]"`) | The Writer backend: gptme's tool-use loop. The core package and tests stay gptme-free. |
 | [Docker](https://docs.docker.com/get-docker/) *(optional)* | Running a local [SearXNG](https://docs.searxng.org/) instance so research nodes can search the web. Skip it if you don't need web search. |
 
 > **Platform status:** Currently tested on macOS. Windows support is included but has not yet been thoroughly tested.
 
-#### 1. Install Waypoint
+#### 1. Install Kusudaemon
 
 ```bash
-uv tool install "waypoint[gptme]"     # or: pip install "waypoint[gptme]"
+uv tool install "kusudaemon[gptme]"     # or: pip install "kusudaemon[gptme]"
 ```
 
-Upgrade later with `uv tool upgrade waypoint` or `pip install --upgrade waypoint`.
+Upgrade later with `uv tool upgrade kusudaemon` or `pip install --upgrade kusudaemon`.
 
 #### 2. Configure your provider
 
@@ -176,16 +176,16 @@ OPENAI_API_KEY=sk-...
 The CLI loads `.env` automatically at startup (a variable already exported
 in your shell wins over the file). To add another provider, add an entry
 to `provider.json` with its own `api_key_env` (e.g. `DEEPSEEK_API_KEY`)
-and a matching line in `.env`; select it with `WAYPOINT_PROVIDER=<name>`
+and a matching line in `.env`; select it with `KUSUDAEMON_PROVIDER=<name>`
 or `provider.json`'s `"default"` field.
 
 Precedence per field, highest first: explicit CLI/constructor arguments >
-`WAYPOINT_PROVIDER_API_KEY` / `WAYPOINT_PROVIDER_BASE_URL` /
-`WAYPOINT_PROVIDER_MODEL` env vars > the selected provider's entry in
+`KUSUDAEMON_PROVIDER_API_KEY` / `KUSUDAEMON_PROVIDER_BASE_URL` /
+`KUSUDAEMON_PROVIDER_MODEL` env vars > the selected provider's entry in
 `provider.json` > generic `OPENAI_API_KEY` / `OPENAI_BASE_URL` /
 `OPENAI_MODEL` env vars > the built-in OpenCode Zen default.
 
-If you skip this step, `waypoint run` creates a default `provider.json`
+If you skip this step, `kusudaemon run` creates a default `provider.json`
 for you on first launch (pointing at OpenCode Zen) — you still need to put
 a key in `.env` for it to actually authenticate.
 
@@ -231,7 +231,7 @@ is optional: skip it and any `--research-plan` step just gets marked
    your instance runs elsewhere, set it in `.env`:
 
    ```bash
-   WAYPOINT_SEARXNG_URL=http://localhost:8080
+   KUSUDAEMON_SEARXNG_URL=http://localhost:8080
    ```
 
 4. **Verify it works:**
@@ -244,7 +244,7 @@ is optional: skip it and any `--research-plan` step just gets marked
    means step 2 didn't take — double check `settings.yml` and that the
    container actually restarted.
 
-Once running, pass a `--research-plan` to `waypoint run` naming the
+Once running, pass a `--research-plan` to `kusudaemon run` naming the
 nodes that need a search (see the CLI reference below); the harness
 dispatches a scoped, single-tool gptme episode per query and folds the
 capped finding into that node's inputs.
@@ -252,21 +252,21 @@ capped finding into that node's inputs.
 #### 3. Run a task
 
 ```bash
-waypoint run --goal "Summarize the files in this directory." --source @README.md
+kusudaemon run --goal "Summarize the files in this directory." --source @README.md
 ```
 
 The pipeline decomposes the goal (intake → survey → plan → pilot →
 contract), executes each node in a bounded gptme episode with per-node
 tool narrowing, gates and reviews every artifact, and assembles the
 verified result. Phases that are already done are skipped on resume;
-`waypoint pipeline resume <run-id>` picks up a halted run exactly where
+`kusudaemon pipeline resume <run-id>` picks up a halted run exactly where
 it stopped.
 
 To give a specific node a scoped web search (see [Web search
 (optional)](#web-search-optional) above), pass `--research-plan`:
 
 ```bash
-waypoint run --goal "..." --source @source.md \
+kusudaemon run --goal "..." --source @source.md \
   --research-plan '[{"node_id": "2.1", "kind": "web_search", "question": "current stable Python release"}]'
 ```
 
@@ -280,17 +280,17 @@ Control surface (all operate on the run directory, safe from a second
 terminal while a run is in flight):
 
 ```bash
-waypoint status <run-id>          # phase, tree statuses, pending approvals
-waypoint approve <run-id>         # resolve the oldest pending approval
-waypoint amend <run-id> --text "..."   # amend the contract, re-validate
+kusudaemon status <run-id>          # phase, tree statuses, pending approvals
+kusudaemon approve <run-id>         # resolve the oldest pending approval
+kusudaemon amend <run-id> --text "..."   # amend the contract, re-validate
 ```
 
-Every run lives under `./.waypoint/runs/<run-id>/`; the tree state,
+Every run lives under `./.kusudaemon/runs/<run-id>/`; the tree state,
 events log, and assembled output stay there for audit.
 
 #### CLI and provider reference
 
-There is currently **no web UI** wired up — `waypoint`'s CLI is the
+There is currently **no web UI** wired up — `kusudaemon`'s CLI is the
 complete, live control surface (PLAN.md §11). Commands operate purely on
 the run directory, so `status`/`approve`/`amend` are safe to run from a
 second terminal while a driver is still attached. (There's unmounted
@@ -299,24 +299,24 @@ web view, but no server or frontend currently serves it.)
 
 | Command | Description |
 |---|---|
-| `waypoint run` | Run (or resume) the pipeline: `--goal`, `--source` (`@file` or `-`), `--backend` (only `gptme`), `--model`, `--compile-command`, `--research-plan`, `--max-rounds`, `--max-attempts`, `--detach` |
-| `waypoint resume <run-id>` | Resume a halted run; the disk state is authoritative |
-| `waypoint status <run-id>` | Phase, tree statuses, pending approvals, event count |
-| `waypoint approve <run-id>` | Resolve the oldest pending approval (`--answer`, `--file`, `--action`) |
-| `waypoint amend <run-id> --text "..."` | Append a contract rule, run the read-only re-validation pass, and (on confirmation) apply the repairs |
+| `kusudaemon run` | Run (or resume) the pipeline: `--goal`, `--source` (`@file` or `-`), `--backend` (only `gptme`), `--model`, `--compile-command`, `--research-plan`, `--max-rounds`, `--max-attempts`, `--detach` |
+| `kusudaemon resume <run-id>` | Resume a halted run; the disk state is authoritative |
+| `kusudaemon status <run-id>` | Phase, tree statuses, pending approvals, event count |
+| `kusudaemon approve <run-id>` | Resolve the oldest pending approval (`--answer`, `--file`, `--action`) |
+| `kusudaemon amend <run-id> --text "..."` | Append a contract rule, run the read-only re-validation pass, and (on confirmation) apply the repairs |
 
 Provider settings resolve per field, highest first:
 
 1. Explicit constructor/CLI arguments
-2. `WAYPOINT_PROVIDER_API_KEY` / `WAYPOINT_PROVIDER_BASE_URL` /
-   `WAYPOINT_PROVIDER_MODEL` environment variables
-3. `provider.json` at the repo root (or `$WAYPOINT_PROVIDER_CONFIG`)
+2. `KUSUDAEMON_PROVIDER_API_KEY` / `KUSUDAEMON_PROVIDER_BASE_URL` /
+   `KUSUDAEMON_PROVIDER_MODEL` environment variables
+3. `provider.json` at the repo root (or `$KUSUDAEMON_PROVIDER_CONFIG`)
 4. `OPENAI_API_KEY` / `OPENAI_BASE_URL` / `OPENAI_MODEL` environment variables
 5. Built-in default: OpenCode Zen (api key via `OPENCODE_API_KEY`)
 
 Every run is stored in an isolated `runs/<run-id>/` directory under
-`./.waypoint/runs/` (or `--runs-root`) in the project folder — nothing
-Waypoint writes by default lives outside the project folder it was
+`./.kusudaemon/runs/` (or `--runs-root`) in the project folder — nothing
+Kusudaemon writes by default lives outside the project folder it was
 launched from. The complete task state and audit trail — `tree.json`, the
 fsync'd `events.jsonl`, per-node traces and versions — make the agent's
 progress inspectable, recoverable, and reproducible.
@@ -326,7 +326,7 @@ progress inspectable, recoverable, and reproducible.
 `eval/` provides frozen reproduction suites for two benchmarks, from the
 original LongHorizon-Harness research (see [The research this is built
 on](#the-research-this-is-built-on) and [Credits](#credits) — these
-reproduce that project's original role-based harness, not Waypoint's
+reproduce that project's original role-based harness, not Kusudaemon's
 current gptme-only pipeline):
 
 | Directory | Benchmark | Description |
@@ -334,20 +334,20 @@ current gptme-only pipeline):
 | [`eval/WeaveBench-harness/`](eval/WeaveBench-harness/) | WeaveBench (114 tasks) | Hybrid GUI+CLI tasks and a reproduction skill |
 | [`eval/OSWorldv2-harness/`](eval/OSWorldv2-harness/) | OSWorld-V2 (108 tasks) | Hybrid runner aligned with the official release |
 
-See each directory's `README.md` for environment setup, parameters, and launch commands. The nested `cua_harness` packages are frozen compatibility copies used for evaluation, independent of `src/waypoint/`.
+See each directory's `README.md` for environment setup, parameters, and launch commands. The nested `cua_harness` packages are frozen compatibility copies used for evaluation, independent of `src/kusudaemon/`.
 
 ## Credits
 
-Waypoint is built on two projects:
+Kusudaemon is built on two projects:
 
 - **[gptme](https://github.com/gptme/gptme)** (MIT) — the tool-use loop
   (shell/read/save/patch) that actually drives every Writer episode.
-  Waypoint is a thin coordination layer around it: task decomposition,
+  Kusudaemon is a thin coordination layer around it: task decomposition,
   gating, review, and crash-resumable state. None of the actual
-  code/file/shell work happens in Waypoint's own code.
+  code/file/shell work happens in Kusudaemon's own code.
 - **[LongHorizon-Harness](https://arxiv.org/abs/2608.01964)** ("LongHorizon-Harness: Advancing
   Long-Horizon Agents for Real-World Tasks", Ma et al., 2026) — the
-  research this project was originally forked from. Waypoint's recursive
+  research this project was originally forked from. Kusudaemon's recursive
   decomposition design (intake → survey → plan → pilot → execute →
   assemble, machine-checkable gates, fsync'd resumable state) descends
   directly from that work. The benchmark results in [The research this is

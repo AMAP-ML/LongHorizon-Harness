@@ -8,7 +8,7 @@ below.
 
 ## Progress
 
-- **v0 — prove resumability (§13): done.** `src/waypoint/v0/` — fsync'd
+- **v0 — prove resumability (§13): done.** `src/kusudaemon/v0/` — fsync'd
   append-only `EventLog`, idempotent `run_node()` that converges to exactly
   one artifact/terminal event no matter when a `kill -9` lands, and session
   continuation for `ClaudeCodeAdapter` via `claude --resume <id>` (Codex has
@@ -17,10 +17,10 @@ below.
   in-process mocks) — 4/4 passing. Existing role files
   (`manager.py`/`auditor_agent.py`/`cli.py`/`role_prompts.py`) untouched;
   this is additive scaffolding. Decision on file placement: build directly
-  inside `src/waypoint/`, eventually replacing Manager→Orchestrator,
+  inside `src/kusudaemon/`, eventually replacing Manager→Orchestrator,
   Executor→Writer, Auditor→Reviewer in place (not a separate package).
   See `CLAUDE.md` for the file-by-file breakdown.
-- **v1 — the round loop (§13): done.** `src/waypoint/v1/` —
+- **v1 — the round loop (§13): done.** `src/kusudaemon/v1/` —
   OpenAI-compatible provider module (§12, stdlib-only), stateless-per-round
   Orchestrator, Reviewer, and a Writer wrapper over v0's `run_node`, all
   tied together by `round_loop.run_round_loop`. Task state lives in
@@ -37,7 +37,7 @@ below.
   `tests/test_v1_round_loop.py`), all against fakes — no network, no real
   provider/agent-CLI credentials needed to run the suite.
 - **v2 — intake, survey, recursive planning (§13): done.**
-  `src/waypoint/v2/` — bounded assumptions-list intake (one question call
+  `src/kusudaemon/v2/` — bounded assumptions-list intake (one question call
   per rubric dimension, one finalize call, freezes `spec.md`); mechanical
   chunking + windowed-survey + harness-merged `spine.json` (§4.2, three
   stages, one file); a recursive level-at-a-time planner (§4.3) whose leaf
@@ -55,7 +55,7 @@ below.
   `tests/test_v2_planner.py`, `tests/test_v2_pilot.py`), all against fakes.
   See `CLAUDE.md` for the file-by-file breakdown and what's explicitly
   still out of scope.
-- **v3 — assembly and repair (§13): done.** `src/waypoint/v3/` —
+- **v3 — assembly and repair (§13): done.** `src/kusudaemon/v3/` —
   deterministic concatenation + index ordered straight from `tree.json`'s
   own array order (`assemble.py`, zero model tokens); cross-cutting
   checks over what's actually derivable pre-node-type-templates: missing/
@@ -88,7 +88,7 @@ below.
   provider/agent-CLI credentials. Glossary tracking (`glossary.json`) and
   refs/terms-based checks remain unbuilt: they need the node-type template
   system, still open (see below).
-- **v4 — research tools (§13): done.** `src/waypoint/v4/` — a scoped,
+- **v4 — research tools (§13): done.** `src/kusudaemon/v4/` — a scoped,
   budget-capped research subagent, run as its own phase before the round
   loop dispatches any Writer, not wired into a Writer's own tool loop
   (§8: raw search transcripts are exactly the "raw tool results" waste §8
@@ -98,7 +98,7 @@ below.
   in via the existing per-node `allowed_tools` mechanism); `doc_retrieval`
   wires in Context7 (§15.7's one concrete named donor) via the existing
   `ClaudeCodeAdapter(mcp_config=...)` seam, env-overridable the same way
-  `WAYPOINT_CLAUDECODE_MCP_CONFIG` already is. `research.py` dispatches
+  `KUSUDAEMON_CLAUDECODE_MCP_CONFIG` already is. `research.py` dispatches
   each query under a derived id (`"<node>~research~<slug>"`, same
   reasoning as `v3/repair.py`'s `"<id>~repair<n>"`: a query isn't the
   node's own dispatch, so it can't collide with that node's own

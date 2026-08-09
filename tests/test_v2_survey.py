@@ -15,8 +15,8 @@ sys.path.insert(0, str(_REPO_ROOT / "src"))
 sys.path.insert(0, str(_REPO_ROOT / "tests" / "fixtures"))
 
 from fake_provider import FakeProvider  # noqa: E402
-from waypoint.v0.run_dir import create_run_dir  # noqa: E402
-from waypoint.v2.survey import (  # noqa: E402
+from kusudaemon.v0.run_dir import create_run_dir  # noqa: E402
+from kusudaemon.v2.survey import (  # noqa: E402
     BoundaryVote,
     Chunk,
     assemble_spine,

@@ -12,9 +12,9 @@ from pathlib import Path
 _REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(_REPO_ROOT / "src"))
 
-from waypoint.v0.run_dir import create_run_dir, node_artifact_path  # noqa: E402
-from waypoint.v1.tree import TaskNode, TaskTree  # noqa: E402
-from waypoint.v3.assemble import (  # noqa: E402
+from kusudaemon.v0.run_dir import create_run_dir, node_artifact_path  # noqa: E402
+from kusudaemon.v1.tree import TaskNode, TaskTree  # noqa: E402
+from kusudaemon.v3.assemble import (  # noqa: E402
     AssemblyNotReadyError,
     assemble,
     ordered_node_ids,

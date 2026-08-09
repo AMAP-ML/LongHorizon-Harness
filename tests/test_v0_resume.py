@@ -25,11 +25,11 @@ sys.path.insert(0, str(_REPO_ROOT / "src"))
 sys.path.insert(0, str(_REPO_ROOT / "tests" / "fixtures"))
 
 from fake_adapter import FakeStreamAgentAdapter  # noqa: E402
-from waypoint.environment.local import LocalEnvironment  # noqa: E402
-from waypoint.types import EpisodeBudget  # noqa: E402
-from waypoint.v0.events import EventLog  # noqa: E402
-from waypoint.v0.run_dir import create_run_dir  # noqa: E402
-from waypoint.v0.runner import run_node  # noqa: E402
+from kusudaemon.environment.local import LocalEnvironment  # noqa: E402
+from kusudaemon.types import EpisodeBudget  # noqa: E402
+from kusudaemon.v0.events import EventLog  # noqa: E402
+from kusudaemon.v0.run_dir import create_run_dir  # noqa: E402
+from kusudaemon.v0.runner import run_node  # noqa: E402
 
 FAKE_CLI = _REPO_ROOT / "tests" / "fixtures" / "fake_stream_agent.py"
 RUN_NODE_SUBPROCESS = _REPO_ROOT / "tests" / "fixtures" / "run_node_subprocess.py"
@@ -121,7 +121,7 @@ def _crash_and_verify_dead(proc: subprocess.Popen, fake_pid: int) -> None:
     `start_new_session=True` — it becomes a session leader in a *different*
     process group from the runner script the instant it's spawned. Killing
     only the runner's group would leave it running, orphaned, exactly the
-    leak waypoint.utils.process_group exists to prevent for SIGTERM; SIGKILL
+    leak kusudaemon.utils.process_group exists to prevent for SIGTERM; SIGKILL
     can't be caught, so the test has to reap both groups itself.
     """
     _kill_pgid(fake_pid)
@@ -330,7 +330,7 @@ class EventLogFsyncTest(unittest.TestCase):
             path = Path(root_str) / "events.jsonl"
             log = EventLog(path)
 
-            with mock.patch("waypoint.v0.events.os.fsync") as fsync_mock:
+            with mock.patch("kusudaemon.v0.events.os.fsync") as fsync_mock:
                 log.append({"node_id": "n1", "role": "writer", "round": 0, "type": "node_dispatched"})
 
             fsync_mock.assert_called_once()
@@ -341,7 +341,7 @@ class EventLogFsyncTest(unittest.TestCase):
             self.assertEqual(record["type"], "node_dispatched")
             self.assertIn("ts", record)
 
-            with mock.patch("waypoint.v0.events.os.fsync") as fsync_mock_2:
+            with mock.patch("kusudaemon.v0.events.os.fsync") as fsync_mock_2:
                 log.append(
                     {"node_id": "n1", "role": "writer", "round": 0, "type": "session_captured", "session_id": "s1"}
                 )

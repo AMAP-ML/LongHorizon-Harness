@@ -1,8 +1,8 @@
 import asyncio
 
-from lh_harness.adapters.gptme_adapter import GptmeAdapter
-from lh_harness.environment.local import LocalEnvironment
-from lh_harness.types import EpisodeBudget
+from kusudaemon.adapters.gptme_adapter import GptmeAdapter
+from kusudaemon.environment.local import LocalEnvironment
+from kusudaemon.types import EpisodeBudget
 
 
 async def main():

@@ -1,4 +1,4 @@
-"""Waypoint: a recursive-decomposition harness for long-horizon tasks
+"""Kusudaemon: a recursive-decomposition harness for long-horizon tasks
 (gptme backend). Forked from and built on LongHorizon-Harness
 (arXiv:2608.01964) and gptme (github.com/gptme/gptme) — see README.md's
 Credits section.
@@ -14,7 +14,7 @@ HOMEPAGE = "https://github.com/OrigamiKoala/LongHorizon-Harness"
 ISSUES_URL = f"{HOMEPAGE}/issues"
 
 try:
-    __version__ = _package_version("waypoint")
+    __version__ = _package_version("kusudaemon")
 except PackageNotFoundError:
     __version__ = "0.0.0+unknown"
 

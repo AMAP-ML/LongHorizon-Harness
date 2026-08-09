@@ -68,7 +68,7 @@ def main() -> int:
 
     allowlist = [tool for tool in args.tool_allowlist.split(",") if tool]
     workspace = Path.cwd()
-    logdir = Path(tempfile.mkdtemp(prefix="waypoint-gptme-"))
+    logdir = Path(tempfile.mkdtemp(prefix="kusudaemon-gptme-"))
 
     try:
         import gptme

@@ -14,7 +14,7 @@ from typing import Any
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "src"))
 
-from waypoint.v1.json_schema import validate  # noqa: E402
+from kusudaemon.v1.json_schema import validate  # noqa: E402
 
 
 class FakeProvider:

@@ -15,7 +15,7 @@ from typing import Any, Literal
 
 
 def _launch_directory() -> str:
-    """Directory waypoint was started from, captured once at import."""
+    """Directory kusudaemon was started from, captured once at import."""
     try:
         return str(Path.cwd())
     except OSError:
@@ -25,8 +25,8 @@ def _launch_directory() -> str:
 DEFAULT_WORKSPACE_PATH = _launch_directory()
 # Repo-local, not $HOME: everything this harness writes lives inside the
 # project folder it was launched from (matches provider_config.py's
-# DEFAULT_CONFIG_PATH and pipeline/run.py's ./.waypoint/runs default).
-DEFAULT_TMP_DIR = f"{Path(DEFAULT_WORKSPACE_PATH) / '.waypoint'}/tmp"
+# DEFAULT_CONFIG_PATH and pipeline/run.py's ./.kusudaemon/runs default).
+DEFAULT_TMP_DIR = f"{Path(DEFAULT_WORKSPACE_PATH) / '.kusudaemon'}/tmp"
 
 
 @dataclass

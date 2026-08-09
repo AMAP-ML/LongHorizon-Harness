@@ -14,9 +14,9 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "src"))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from fake_adapter import FakeStreamAgentAdapter  # noqa: E402
-from waypoint.environment.local import LocalEnvironment  # noqa: E402
-from waypoint.types import EpisodeBudget  # noqa: E402
-from waypoint.v0.runner import run_node  # noqa: E402
+from kusudaemon.environment.local import LocalEnvironment  # noqa: E402
+from kusudaemon.types import EpisodeBudget  # noqa: E402
+from kusudaemon.v0.runner import run_node  # noqa: E402
 
 
 def main() -> int:

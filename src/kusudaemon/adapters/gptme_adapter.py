@@ -1,10 +1,10 @@
 """GptmeAdapter — the only Writer backend: a tool-use loop, no agent CLI.
 
-Drives gptme (github.com/gptme/gptme, MIT, ``pip install "waypoint[gptme]"``)
+Drives gptme (github.com/gptme/gptme, MIT, ``pip install "kusudaemon[gptme]"``)
 — a small tool-use loop (shell/read/save/patch) that talks to any OpenAI-compatible
 endpoint — so the user's configured provider (see
 ``..provider_config``; default OpenCode Zen, customizable via
-``./provider.json`` / ``WAYPOINT_PROVIDER_*`` /
+``./provider.json`` / ``KUSUDAEMON_PROVIDER_*`` /
 ``OPENAI_*``) acts as the Writer itself. The same settings
 ``v1/provider.py`` already resolves for the Orchestrator/Reviewer feeds
 this adapter's ``OPENAI_BASE_URL``/``OPENAI_API_KEY``.
@@ -85,7 +85,7 @@ class GptmeAdapter(CommandAgentAdapter):
         if not resolved.api_key:
             raise ValueError(
                 "GptmeAdapter needs an API key: pass api_key=, set "
-                "OPENAI_API_KEY / WAYPOINT_PROVIDER_API_KEY, or add it "
+                "OPENAI_API_KEY / KUSUDAEMON_PROVIDER_API_KEY, or add it "
                 "to a .env file (see provider_config.py)."
             )
         resolved_model = _gptme_model(resolved.model)

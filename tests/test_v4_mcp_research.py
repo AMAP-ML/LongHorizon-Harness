@@ -16,8 +16,8 @@ from pathlib import Path
 _REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(_REPO_ROOT / "src"))
 
-from waypoint.adapters.tools.searxng_search import SEARXNG_TOOL_PATH  # noqa: E402
-from waypoint.v4.mcp_research import allowed_tools_for  # noqa: E402
+from kusudaemon.adapters.tools.searxng_search import SEARXNG_TOOL_PATH  # noqa: E402
+from kusudaemon.v4.mcp_research import allowed_tools_for  # noqa: E402
 
 
 class ToolAllowlistTest(unittest.TestCase):

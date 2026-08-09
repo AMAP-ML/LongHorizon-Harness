@@ -8,7 +8,7 @@ at the repo root, both gitignored, both shipped as ``*.example`` templates
 the user copies and edits:
 
 - **Which providers exist and their endpoints**: ``provider.json`` (or
-  ``$WAYPOINT_PROVIDER_CONFIG`` to point elsewhere) holds *named*
+  ``$KUSUDAEMON_PROVIDER_CONFIG`` to point elsewhere) holds *named*
   providers. Each entry carries its ``base_url`` and ``model`` plus
   ``api_key_env`` — the name of the environment variable that holds that
   provider's key. Keys themselves never live in this file:
@@ -34,13 +34,13 @@ the user copies and edits:
   and a matching ``DEEPSEEK_API_KEY=...`` line in ``.env`` to give it a key.
 
 Which provider a call uses: explicit ``provider=`` argument >
-``WAYPOINT_PROVIDER`` env var > the file's ``default`` > ``opencode``.
+``KUSUDAEMON_PROVIDER`` env var > the file's ``default`` > ``opencode``.
 
 Per-field precedence (highest first):
 
 1. explicit constructor argument (``api_key=``/``base_url=``/``model=``)
-2. ``WAYPOINT_PROVIDER_API_KEY`` / ``WAYPOINT_PROVIDER_BASE_URL`` /
-   ``WAYPOINT_PROVIDER_MODEL`` environment variables
+2. ``KUSUDAEMON_PROVIDER_API_KEY`` / ``KUSUDAEMON_PROVIDER_BASE_URL`` /
+   ``KUSUDAEMON_PROVIDER_MODEL`` environment variables
 3. the selected provider's entry in the config file (its ``base_url`` /
    ``model``; its key comes from the env var its ``api_key_env`` names)
 4. the generic ``OPENAI_API_KEY`` / ``OPENAI_BASE_URL`` / ``OPENAI_MODEL``
@@ -60,7 +60,7 @@ CONFIG_FILE_NAME = "provider.json"
 # not a dotfile under $HOME: the harness's config lives entirely inside the
 # project folder, next to provider.example.json, the same way .env sits
 # next to .env.example. Run the CLI from the repo root (or set
-# $WAYPOINT_PROVIDER_CONFIG) so this resolves to the right file.
+# $KUSUDAEMON_PROVIDER_CONFIG) so this resolves to the right file.
 DEFAULT_CONFIG_PATH = Path(CONFIG_FILE_NAME)
 
 DEFAULT_PROVIDER = "opencode"
@@ -101,7 +101,7 @@ class ProviderSettings:
 
 
 def config_file_path() -> Path:
-    raw = os.getenv("WAYPOINT_PROVIDER_CONFIG")
+    raw = os.getenv("KUSUDAEMON_PROVIDER_CONFIG")
     return Path(raw).expanduser() if raw else DEFAULT_CONFIG_PATH
 
 
@@ -259,7 +259,7 @@ def resolve(*, provider: str = "", api_key: str = "", base_url: str = "", model:
     providers: dict[str, dict[str, str]] = file_data.get("providers") or {}  # type: ignore[assignment]
     name = (
         provider
-        or os.getenv("WAYPOINT_PROVIDER")
+        or os.getenv("KUSUDAEMON_PROVIDER")
         or str(file_data.get("default") or "")
         or DEFAULT_PROVIDER
     )
@@ -279,18 +279,18 @@ def resolve(*, provider: str = "", api_key: str = "", base_url: str = "", model:
 
     resolved = ProviderSettings(
         api_key=api_key or _pick(
-            ("WAYPOINT_PROVIDER_API_KEY",),
+            ("KUSUDAEMON_PROVIDER_API_KEY",),
             (key_env,),
             "",
         ),
         base_url=base_url or _pick(
-            ("WAYPOINT_PROVIDER_BASE_URL",),
+            ("KUSUDAEMON_PROVIDER_BASE_URL",),
             ("OPENAI_BASE_URL",),
             entry.get("base_url", ""),
             DEFAULT_BASE_URL,
         ),
         model=model or _pick(
-            ("WAYPOINT_PROVIDER_MODEL",),
+            ("KUSUDAEMON_PROVIDER_MODEL",),
             ("OPENAI_MODEL",),
             entry.get("model", ""),
             DEFAULT_MODEL,
@@ -298,8 +298,8 @@ def resolve(*, provider: str = "", api_key: str = "", base_url: str = "", model:
     )
     if api_key:
         resolved.source = "argument"
-    elif os.getenv("WAYPOINT_PROVIDER_API_KEY"):
-        resolved.source = "WAYPOINT_PROVIDER_API_KEY"
+    elif os.getenv("KUSUDAEMON_PROVIDER_API_KEY"):
+        resolved.source = "KUSUDAEMON_PROVIDER_API_KEY"
     elif os.getenv(key_env):
         resolved.source = f"{key_env} (.env / environment)"
     return resolved
@@ -316,5 +316,5 @@ def require(settings: ProviderSettings) -> ProviderSettings:
     raise ProviderConfigError(
         "provider api key missing\n"
         f"  Add it to the .env file (e.g. OPENAI_API_KEY=...) or set "
-        "OPENAI_API_KEY / WAYPOINT_PROVIDER_API_KEY in the environment."
+        "OPENAI_API_KEY / KUSUDAEMON_PROVIDER_API_KEY in the environment."
     )

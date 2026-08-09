@@ -14,10 +14,10 @@ from pathlib import Path
 _REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(_REPO_ROOT / "src"))
 
-from waypoint.environment.local import LocalEnvironment  # noqa: E402
-from waypoint.v0.run_dir import create_run_dir  # noqa: E402
-from waypoint.v3.compile import run_compile  # noqa: E402
-from waypoint.v3.run_dir import assembly_dir, compile_log_path  # noqa: E402
+from kusudaemon.environment.local import LocalEnvironment  # noqa: E402
+from kusudaemon.v0.run_dir import create_run_dir  # noqa: E402
+from kusudaemon.v3.compile import run_compile  # noqa: E402
+from kusudaemon.v3.run_dir import assembly_dir, compile_log_path  # noqa: E402
 
 
 class CompileGateTest(unittest.TestCase):

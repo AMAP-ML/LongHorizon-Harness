@@ -3,7 +3,7 @@
 Bridges three worlds without coupling them:
 
 * the pipeline driver (possibly running in this process, possibly in a
-  detached ``waypoint run`` process — the state never tells the
+  detached ``kusudaemon run`` process — the state never tells the
   difference, because the only contract is the run directory),
 * an HTTP server thread (snapshots for a web UI, SSE pushes) if one is
   ever mounted,
@@ -450,7 +450,7 @@ class RecursiveRunState:
 def _default_backend() -> str:
     import os
 
-    return os.getenv("WAYPOINT_BACKEND", "gptme")
+    return os.getenv("KUSUDAEMON_BACKEND", "gptme")
 
 
 def _host_driver(run_dir: Path, driver: RecursiveDriver) -> None:

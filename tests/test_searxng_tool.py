@@ -21,7 +21,7 @@ from unittest.mock import patch
 _REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(_REPO_ROOT / "src"))
 
-from waypoint.adapters.tools.searxng_search import (  # noqa: E402
+from kusudaemon.adapters.tools.searxng_search import (  # noqa: E402
     DEFAULT_SEARXNG_URL,
     SearxngSearchError,
     _format_results,
@@ -46,18 +46,18 @@ class _FakeResponse:
 
 class SearxngBaseUrlTest(unittest.TestCase):
     def setUp(self) -> None:
-        self._prev = os.environ.pop("WAYPOINT_SEARXNG_URL", None)
+        self._prev = os.environ.pop("KUSUDAEMON_SEARXNG_URL", None)
 
     def tearDown(self) -> None:
-        os.environ.pop("WAYPOINT_SEARXNG_URL", None)
+        os.environ.pop("KUSUDAEMON_SEARXNG_URL", None)
         if self._prev is not None:
-            os.environ["WAYPOINT_SEARXNG_URL"] = self._prev
+            os.environ["KUSUDAEMON_SEARXNG_URL"] = self._prev
 
     def test_default_url(self) -> None:
         self.assertEqual(searxng_base_url(), DEFAULT_SEARXNG_URL)
 
     def test_env_override_strips_trailing_slash(self) -> None:
-        os.environ["WAYPOINT_SEARXNG_URL"] = "http://example.com:8080/"
+        os.environ["KUSUDAEMON_SEARXNG_URL"] = "http://example.com:8080/"
         self.assertEqual(searxng_base_url(), "http://example.com:8080")
 
 

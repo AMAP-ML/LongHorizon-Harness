@@ -31,7 +31,7 @@ from .json_schema import describe_schema, validate
 from ..provider_config import DEFAULT_BASE_URL, DEFAULT_MODEL, require, resolve
 
 # Defaults: OpenCode Zen (see ..provider_config — the user can override via
-# ./provider.json, WAYPOINT_PROVIDER_*, or OPENAI_* env vars).
+# ./provider.json, KUSUDAEMON_PROVIDER_*, or OPENAI_* env vars).
 _DEFAULT_STRUCTURED_RETRIES = 2
 
 

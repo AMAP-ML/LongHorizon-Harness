@@ -28,15 +28,15 @@ sys.path.insert(0, str(_REPO_ROOT / "tests" / "fixtures"))
 
 from fake_adapter import FakeStreamAgentAdapter  # noqa: E402
 from fake_provider import FakeProvider  # noqa: E402
-from waypoint.environment.local import LocalEnvironment  # noqa: E402
-from waypoint.types import EpisodeBudget  # noqa: E402
-from waypoint.v0.events import EventLog  # noqa: E402
-from waypoint.v0.run_dir import create_run_dir, events_path, manifest_path, node_artifact_path  # noqa: E402
-from waypoint.v1.gates import evaluate_gates  # noqa: E402
-from waypoint.v1.manifest import append_manifest_line  # noqa: E402
-from waypoint.v1.reviewer import ReviewVerdict  # noqa: E402
-from waypoint.v1.tree import TaskNode, TaskTree  # noqa: E402
-from waypoint.v3.revalidate import (  # noqa: E402
+from kusudaemon.environment.local import LocalEnvironment  # noqa: E402
+from kusudaemon.types import EpisodeBudget  # noqa: E402
+from kusudaemon.v0.events import EventLog  # noqa: E402
+from kusudaemon.v0.run_dir import create_run_dir, events_path, manifest_path, node_artifact_path  # noqa: E402
+from kusudaemon.v1.gates import evaluate_gates  # noqa: E402
+from kusudaemon.v1.manifest import append_manifest_line  # noqa: E402
+from kusudaemon.v1.reviewer import ReviewVerdict  # noqa: E402
+from kusudaemon.v1.tree import TaskNode, TaskTree  # noqa: E402
+from kusudaemon.v3.revalidate import (  # noqa: E402
     Triage,
     apply_revalidation_triage,
     classify_verdict,
@@ -44,7 +44,7 @@ from waypoint.v3.revalidate import (  # noqa: E402
     run_revalidation_pass,
     summarize_triage,
 )
-from waypoint.v3.run_dir import revalidation_audit_path  # noqa: E402
+from kusudaemon.v3.run_dir import revalidation_audit_path  # noqa: E402
 
 FAKE_CLI = _REPO_ROOT / "tests" / "fixtures" / "fake_stream_agent.py"
 

@@ -1,8 +1,8 @@
-# CLAUDE.md — Waypoint (this worktree)
+# CLAUDE.md — Kusudaemon (this worktree)
 
 ## What this repo is
 
-Waypoint (`src/waypoint/`) is an execution/state-management harness that
+Kusudaemon (`src/kusudaemon/`) is an execution/state-management harness that
 shells out to one agent backend (**gptme**) to carry long-horizon tasks to
 verified completion. Originally forked from LongHorizon-Harness
 (arXiv:2608.01964; see README.md's Credits section) and renamed
@@ -10,8 +10,8 @@ verified completion. Originally forked from LongHorizon-Harness
 role-based Claude Code/Codex harness) to no longer be that project. The
 classic role-based harness (manager/executor/auditor over Claude Code/Codex
 CLIs) and its web dashboard were **removed** — this worktree is the
-recursive-decomposition harness only (`src/waypoint/v0`..`v5`/`pipeline/`).
-The `waypoint` CLI is now exactly the §11 control surface: `run` / `resume`
+recursive-decomposition harness only (`src/kusudaemon/v0`..`v5`/`pipeline/`).
+The `kusudaemon` CLI is now exactly the §11 control surface: `run` / `resume`
 / `status` / `approve` / `amend`. See README.md for the shipped product,
 and PLAN.md's Progress section for the v0-v5 build ladder detail.
 
@@ -19,15 +19,15 @@ On top of this codebase, the repo is also building the **Recursive
 Decomposition Harness** described in `PLAN.md` (repo root). `PLAN.md` §13
 defines a build ladder: v0 (resumability), v1 (the round loop), v2
 (intake/survey/planning/pilot), v3 (assembly and repair), and v4 (research
-tools) are done and live in `src/waypoint/v0/`, `src/waypoint/v1/`,
-`src/waypoint/v2/`, `src/waypoint/v3/`, and `src/waypoint/v4/`; v4
+tools) are done and live in `src/kusudaemon/v0/`, `src/kusudaemon/v1/`,
+`src/kusudaemon/v2/`, `src/kusudaemon/v3/`, and `src/kusudaemon/v4/`; v4
 was the last item on the §13 build ladder, so anything past it is v5+ and
 not yet scoped in `PLAN.md`. v5 has been built here anyway as the pipeline
-driver and §11 control surface (`src/waypoint/pipeline/`) plus the
+driver and §11 control surface (`src/kusudaemon/pipeline/`) plus the
 recursive-view server state (`dashboard/recursive.py`) — see the v5
 section below. See PLAN.md's Progress section for detail.
 
-## v0 — resumability (`src/waypoint/v0/`)
+## v0 — resumability (`src/kusudaemon/v0/`)
 
 The load-bearing property (`PLAN.md` §10): `events.jsonl` is append-only and
 fsync'd, and replaying it after a `kill -9` at any point converges to exactly
@@ -68,7 +68,7 @@ Event `type` vocabulary: `node_dispatched`, `session_captured` (carries
 `node_redispatched` (carries `reason`: `resumed_session` |
 `no_session_captured` | `resume_unsupported`).
 
-## v1 — the round loop (`src/waypoint/v1/`)
+## v1 — the round loop (`src/kusudaemon/v1/`)
 
 Orchestrator/Writer/Reviewer with schema-constrained JSON returns and
 per-node tool restriction, task state kept entirely in `tree.json`
@@ -90,7 +90,7 @@ this required.
   varies by endpoint, so the fallback path is the one actually exercised in
   practice, not a rarely-hit backstop. HTTP via `urllib` (no new dependency);
   the transport is an injectable callable so tests never need a real network
-  call or API key. Reads `WAYPOINT_PROVIDER_MODEL` / `_BASE_URL` / `_API_KEY`
+  call or API key. Reads `KUSUDAEMON_PROVIDER_MODEL` / `_BASE_URL` / `_API_KEY`
   (falls back to `OPENCODE_API_KEY`), defaulting to OpenCode Zen's
   `opencode/deepseek-v4-flash-free`.
 - `v1/tree.py` — `TaskNode`/`TaskTree`, the `PLAN.md` §6 Node schema as the
@@ -167,7 +167,7 @@ this required.
   `escalate` on the next round instead of looping forever (§4.5: "Three
   failed submits → escalate to the user, don't loop").
 
-## v2 — intake, survey, recursive planning, pilot + contract (`src/waypoint/v2/`)
+## v2 — intake, survey, recursive planning, pilot + contract (`src/kusudaemon/v2/`)
 
 Four library modules, composed by a future pipeline driver rather than
 wired into `cli.py` here (same "additive scaffolding, wiring is later"
@@ -259,7 +259,7 @@ pattern v0/v1 followed). Nothing in v0/v1 was modified beyond the one
   nodes (§10) is v3 scope (§13: "re-validation pass for contract
   amendments" is listed under v3, not v2).
 
-## v3 — assembly and repair (`src/waypoint/v3/`)
+## v3 — assembly and repair (`src/kusudaemon/v3/`)
 
 Deterministic concatenation, cross-cutting checks, a compile gate, and
 scoped repair — the last piece being what makes the first three matter,
@@ -380,7 +380,7 @@ work (`"pending"`) nor still confirmed-good (`"passed"`), so neither
 existing status fit. Nothing that never amends a contract ever produces
 this value — every v1/v2 code path is unaffected.
 
-## v4 — research tools (`src/waypoint/v4/`)
+## v4 — research tools (`src/kusudaemon/v4/`)
 
 A scoped, budget-capped research subagent (§13: "web search subagent,
 current-docs retrieval") — run as its own phase *before* the round loop
@@ -459,7 +459,7 @@ modifications to v0/v1/v2/v3.
   safe to do again). Raises `KeyError` loudly if the plan names a node id
   outside the tree, rather than silently skipping it.
 
-## v5 — the pipeline driver and PLAN.md §11 control surface (`src/waypoint/pipeline/`, `dashboard/recursive.py`)
+## v5 — the pipeline driver and PLAN.md §11 control surface (`src/kusudaemon/pipeline/`, `dashboard/recursive.py`)
 
 The thing v0-v4 deliberately didn't provide: a driver that chains intake →
 survey → plan → pilot → contract → research → execute → assemble into one
@@ -523,11 +523,11 @@ state is a small v5 path set layered on the existing run-directory layout.
   contract, inputs list — spine unit ids and v4 finding paths the agent
   reads with its own tools — and judgment rubric). No model calls.
 - `pipeline/run.py` — the standalone entrypoint (`python -m
-  waypoint.pipeline.run`) that both `waypoint pipeline run` and its
+  kusudaemon.pipeline.run`) that both `kusudaemon pipeline run` and its
   `--detach` mode spawn, so one argument parser stays in sync with one run
   loop. A run id whose `run.spec.json` already exists *resumes*: the disk
   is authoritative, argv contributes nothing but the id.
-- `pipeline/cli.py` — the `waypoint pipeline` group (§11's control
+- `pipeline/cli.py` — the `kusudaemon pipeline` group (§11's control
   surface): run (foreground, or `--detach` in a background subprocess, or
   `--dashboard` alongside), resume (= run with an existing id), status
   (phase/tree/approval status/events lengths straight from disk), approve
@@ -572,7 +572,7 @@ classic harness. What remains is the gptme-only surface:
 - `adapters/gptme_adapter.py` + `adapters/_gptme_worker.py` — the **only**
   Writer backend: `GptmeAdapter`, an `AgentAdapter` with no agent CLI
   anywhere in the chain. It drives gptme (github.com/gptme/gptme, MIT,
-  `pip install "waypoint[gptme]"` — an optional extra, so the core
+  `pip install "kusudaemon[gptme]"` — an optional extra, so the core
   package and the test suite stay gptme-free) — a small
   shell/read/save/patch tool-use loop that talks to the user's configured
   OpenAI-compatible endpoint (see `provider_config.py` below; the built-in
@@ -604,12 +604,12 @@ classic harness. What remains is the gptme-only surface:
   gptme tool, self-contained and stdlib-only (`urllib`), querying a local
   [SearXNG](https://docs.searxng.org/) instance's JSON API
   (`GET {base_url}/search?q=...&format=json`; base URL from
-  `WAYPOINT_SEARXNG_URL`, default `http://localhost:8080`). Loaded by
+  `KUSUDAEMON_SEARXNG_URL`, default `http://localhost:8080`). Loaded by
   *file path*, not by name — gptme's `init_tools()` accepts `.py` file
   paths as allowlist entries and imports them via
   `gptme.tools.base.load_from_file`
   (`importlib.util.spec_from_file_location`, independent of the
-  `waypoint` package), which is why this module avoids relative imports
+  `kusudaemon` package), which is why this module avoids relative imports
   and only reaches for `gptme.message`/`gptme.tools.base` inside function
   bodies — never at module import time — so it stays importable (and its
   pure-Python helpers unit-testable) without gptme installed; `tool =
@@ -624,7 +624,7 @@ classic harness. What remains is the gptme-only surface:
 ## Provider configuration (`provider_config.py`)
 
 Provider defaults and customization live in exactly one module, `src/
-waypoint/provider_config.py`, so the endpoint the agents and planner
+kusudaemon/provider_config.py`, so the endpoint the agents and planner
 talk to is never scattered across adapters. Configuration is split across
 **exactly two files, both at the repo root, both gitignored, both shipped
 as `.example` templates** the user copies and edits — never a third
@@ -634,7 +634,7 @@ location:
   and `api_key_env`, the name of the env var holding *that* provider's
   key — never the key itself). Repo-local by design
   (`DEFAULT_CONFIG_PATH = Path("provider.json")`, resolved against the
-  cwd the CLI is run from — not `$HOME`; `WAYPOINT_PROVIDER_CONFIG`
+  cwd the CLI is run from — not `$HOME`; `KUSUDAEMON_PROVIDER_CONFIG`
   overrides the path). A sample sits at the repo root
   (`provider.example.json`); the CLI also writes this file from the same
   sample on first invocation if it's missing (`ensure_user_config`), so
@@ -655,15 +655,15 @@ in the environment still works.
 Per-field precedence (highest first):
 
 1. explicit constructor argument (`api_key=`/`base_url=`/`model=`)
-2. `WAYPOINT_PROVIDER_API_KEY` / `WAYPOINT_PROVIDER_BASE_URL` /
-   `WAYPOINT_PROVIDER_MODEL` env vars
+2. `KUSUDAEMON_PROVIDER_API_KEY` / `KUSUDAEMON_PROVIDER_BASE_URL` /
+   `KUSUDAEMON_PROVIDER_MODEL` env vars
 3. the selected provider's entry in `provider.json` (its key comes from
    the env var its `api_key_env` names, itself normally set via `.env`)
 4. `OPENAI_API_KEY` / `OPENAI_BASE_URL` / `OPENAI_MODEL` env vars
 5. built-in default (opencode; key from `OPENCODE_API_KEY`)
 
 `types.py`'s `DEFAULT_TMP_DIR` follows the same repo-local rule
-(`<cwd>/.waypoint/tmp`, not `~/.waypoint/tmp`) — nothing this harness
+(`<cwd>/.kusudaemon/tmp`, not `~/.kusudaemon/tmp`) — nothing this harness
 writes by default lives outside the project folder it was launched from.
 
 `resolve()` always returns populated `base_url`/`model`; only `api_key`
@@ -687,7 +687,7 @@ python3 -m unittest discover -s tests -p "test_*.py" -v
 ~7s, 148 tests, all passing. `test_provider_config.py`'s `_EnvIsolatedTest`
 snapshots and restores the *entire* `os.environ` around each test now
 (2026-08-09 fix) — the previous partial-restore logic only put back keys
-that had a prior value, so a test setting e.g. `WAYPOINT_PROVIDER`
+that had a prior value, so a test setting e.g. `KUSUDAEMON_PROVIDER`
 fresh (no prior value) leaked it into every test running after it in the
 same process, intermittently breaking unrelated suites
 (`test_v1_units.py`, `test_v1_round_loop.py`) depending on run order.
@@ -883,7 +883,7 @@ ever runs inside the gptme worker subprocess; testing it would break the
 holds to. `urllib.request.urlopen` is monkeypatched (`unittest.mock.patch`)
 with a fake response object rather than hitting a real SearXNG instance —
 no network, no Docker dependency for `python3 -m unittest discover`.
-Covers: default/env-overridden `WAYPOINT_SEARXNG_URL`; a successful
+Covers: default/env-overridden `KUSUDAEMON_SEARXNG_URL`; a successful
 query parses and caps `results` to `MAX_NUM_RESULTS`; connection-refused
 and non-JSON/HTTP-error responses raise `SearxngSearchError` with a
 message pointing at the actual fix (`docker ps`, enabling `json` in
@@ -922,6 +922,6 @@ built, the same "hand- or script-authored" starting point v1's trees had
 before v2's planner existed), and the dashboard *view* for the recursive
 harness — `RecursiveRunState` (v5 section above) is an additive library
 module not yet mounted in `server.py`/`dashboard/static`, so there is no
-web page for the recursive pipeline yet (the CLI `waypoint pipeline`
+web page for the recursive pipeline yet (the CLI `kusudaemon pipeline`
 group is the live control surface). `PLAN.md` §13's build ladder ends at
 v4; none of this is scoped in `PLAN.md` yet.

@@ -1,15 +1,15 @@
-"""Provider config tests (src/waypoint/provider_config.py).
+"""Provider config tests (src/kusudaemon/provider_config.py).
 
 The harness talks to the user's OpenAI-compatible endpoint with a built-in
 opencode default. provider.json holds named providers (base_url/model +
 which env var holds the key); api keys themselves live in the environment
-/.env. Precedence per field: explicit argument > WAYPOINT_PROVIDER_* env
+/.env. Precedence per field: explicit argument > KUSUDAEMON_PROVIDER_* env
 > the selected provider entry > OPENAI_* env > built-in opencode default.
 
 Coverage:
 - the built-in default resolves when nothing else is set (opencode Zen)
 - each precedence level wins over the ones below it
-- provider selection: explicit arg > WAYPOINT_PROVIDER env > file default;
+- provider selection: explicit arg > KUSUDAEMON_PROVIDER env > file default;
   an unknown provider name raises
 - a provider's api_key_env pulls its key from the env var it names
 - legacy flat config shape still normalizes to a single provider
@@ -31,7 +31,7 @@ from pathlib import Path
 _REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(_REPO_ROOT / "src"))
 
-from waypoint.provider_config import (  # noqa: E402
+from kusudaemon.provider_config import (  # noqa: E402
     DEFAULT_BASE_URL,
     DEFAULT_MODEL,
     DEFAULT_PROVIDER,
@@ -47,11 +47,11 @@ from waypoint.provider_config import (  # noqa: E402
 )
 
 _ENV_KEYS = (
-    "WAYPOINT_PROVIDER_BASE_URL",
-    "WAYPOINT_PROVIDER_API_KEY",
-    "WAYPOINT_PROVIDER_MODEL",
-    "WAYPOINT_PROVIDER_CONFIG",
-    "WAYPOINT_PROVIDER",
+    "KUSUDAEMON_PROVIDER_BASE_URL",
+    "KUSUDAEMON_PROVIDER_API_KEY",
+    "KUSUDAEMON_PROVIDER_MODEL",
+    "KUSUDAEMON_PROVIDER_CONFIG",
+    "KUSUDAEMON_PROVIDER",
     "OPENAI_API_KEY",
     "OPENAI_BASE_URL",
     "OPENAI_MODEL",
@@ -64,14 +64,14 @@ class _EnvIsolatedTest(unittest.TestCase):
         # tests set ad-hoc provider-specific vars (DEEPSEEK_API_KEY,
         # LEGACY_KEY, ...) that aren't in that fixed list, and a partial
         # snapshot silently leaks them into every test that runs after —
-        # e.g. a test setting WAYPOINT_PROVIDER=deepseek with no prior
+        # e.g. a test setting KUSUDAEMON_PROVIDER=deepseek with no prior
         # value would never be unset, breaking unrelated tests elsewhere in
         # the suite that share this process.
         self._env_backup = dict(os.environ)
         for key in _ENV_KEYS:
             os.environ.pop(key, None)
         self._tmp = tempfile.TemporaryDirectory()
-        os.environ["WAYPOINT_PROVIDER_CONFIG"] = (
+        os.environ["KUSUDAEMON_PROVIDER_CONFIG"] = (
             str(Path(self._tmp.name) / "provider.json")
         )
 
@@ -115,7 +115,7 @@ class ResolveTest(_EnvIsolatedTest):
 
     def test_scoped_env_overrides_provider_entry(self) -> None:
         self._write_config(self._multi_provider_config())
-        os.environ["WAYPOINT_PROVIDER_BASE_URL"] = "https://env.example.com/v1"
+        os.environ["KUSUDAEMON_PROVIDER_BASE_URL"] = "https://env.example.com/v1"
         settings = resolve()
         self.assertEqual(settings.base_url, "https://env.example.com/v1")
         self.assertEqual(settings.model, DEFAULT_MODEL)
@@ -154,14 +154,14 @@ class ResolveTest(_EnvIsolatedTest):
 
     def test_selection_explicit_arg_wins_choice(self) -> None:
         self._write_config(self._multi_provider_config())
-        os.environ["WAYPOINT_PROVIDER"] = "opencode"
+        os.environ["KUSUDAEMON_PROVIDER"] = "opencode"
         os.environ["OPENAI_API_KEY"] = "openai-secret"
         settings = resolve(provider="deepseek")
         self.assertEqual(settings.base_url, "https://api.deepseek.com/v1")
 
     def test_selection_env_var_wins_choice(self) -> None:
         self._write_config(self._multi_provider_config())
-        os.environ["WAYPOINT_PROVIDER"] = "deepseek"
+        os.environ["KUSUDAEMON_PROVIDER"] = "deepseek"
         settings = resolve()
         self.assertEqual(settings.base_url, "https://api.deepseek.com/v1")
         self.assertEqual(settings.model, "deepseek-chat")
@@ -182,7 +182,7 @@ class ResolveTest(_EnvIsolatedTest):
 
     def test_explicit_arguments_win_over_everything(self) -> None:
         self._write_config(self._multi_provider_config())
-        os.environ["WAYPOINT_PROVIDER_BASE_URL"] = "https://env.example.com/v1"
+        os.environ["KUSUDAEMON_PROVIDER_BASE_URL"] = "https://env.example.com/v1"
         settings = resolve(api_key="explicit", base_url="https://arg.example.com/v1", model="arg-model")
         self.assertEqual(settings.base_url, "https://arg.example.com/v1")
         self.assertEqual(settings.api_key, "explicit")
@@ -191,10 +191,10 @@ class ResolveTest(_EnvIsolatedTest):
     def test_scoped_env_api_key_overrides_provider_api_key_env(self) -> None:
         self._write_config(self._multi_provider_config())
         os.environ["OPENAI_API_KEY"] = "openai-secret"
-        os.environ["WAYPOINT_PROVIDER_API_KEY"] = "scoped-secret"
+        os.environ["KUSUDAEMON_PROVIDER_API_KEY"] = "scoped-secret"
         settings = resolve()
         self.assertEqual(settings.api_key, "scoped-secret")
-        self.assertEqual(settings.source, "WAYPOINT_PROVIDER_API_KEY")
+        self.assertEqual(settings.source, "KUSUDAEMON_PROVIDER_API_KEY")
 
     def test_legacy_flat_shape_normalizes_to_single_provider(self) -> None:
         self._write_config({"base_url": "https://legacy.example.com/v1", "model": "legacy-model", "api_key": "LEGACY_KEY"})
@@ -278,11 +278,11 @@ class EnvFileLoaderTest(_EnvIsolatedTest):
         self.assertNotIn("", parsed)
 
     def test_load_env_file_sets_unset_vars(self) -> None:
-        self._write_env("OPENAI_API_KEY=from-env-file\nWAYPOINT_PROVIDER_MODEL=envfile-model\n")
+        self._write_env("OPENAI_API_KEY=from-env-file\nKUSUDAEMON_PROVIDER_MODEL=envfile-model\n")
         loaded = load_env_file(Path(self._tmp.name, ".env"))
         self.assertEqual(Path(self._tmp.name, ".env"), loaded)
         self.assertEqual(os.environ["OPENAI_API_KEY"], "from-env-file")
-        self.assertEqual(os.environ["WAYPOINT_PROVIDER_MODEL"], "envfile-model")
+        self.assertEqual(os.environ["KUSUDAEMON_PROVIDER_MODEL"], "envfile-model")
 
     def test_load_env_file_never_overrides_existing(self) -> None:
         os.environ["OPENAI_API_KEY"] = "real-shell"

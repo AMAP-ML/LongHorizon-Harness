@@ -11,11 +11,11 @@ from pathlib import Path
 _REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(_REPO_ROOT / "src"))
 
-from waypoint.v0.run_dir import create_run_dir, manifest_path, node_artifact_path  # noqa: E402
-from waypoint.v1.manifest import append_manifest_line  # noqa: E402
-from waypoint.v1.gates import evaluate_gates  # noqa: E402
-from waypoint.v1.tree import TaskNode, TaskTree  # noqa: E402
-from waypoint.v3.checks import (  # noqa: E402
+from kusudaemon.v0.run_dir import create_run_dir, manifest_path, node_artifact_path  # noqa: E402
+from kusudaemon.v1.manifest import append_manifest_line  # noqa: E402
+from kusudaemon.v1.gates import evaluate_gates  # noqa: E402
+from kusudaemon.v1.tree import TaskNode, TaskTree  # noqa: E402
+from kusudaemon.v3.checks import (  # noqa: E402
     check_all_nodes_passed,
     check_artifacts_exist_and_nonempty,
     check_manifest_recorded,
@@ -23,7 +23,7 @@ from waypoint.v3.checks import (  # noqa: E402
     run_cross_cutting_checks,
     write_checks_json,
 )
-from waypoint.v3.run_dir import assembly_checks_path  # noqa: E402
+from kusudaemon.v3.run_dir import assembly_checks_path  # noqa: E402
 
 
 def _node(node_id: str, *, status: str = "passed", gates: list[str] | None = None) -> TaskNode:

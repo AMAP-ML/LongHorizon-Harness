@@ -11,9 +11,9 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "src"))
 
-from waypoint.adapters.cli_agent import CommandAgentAdapter  # noqa: E402
-from waypoint.environment.base import Environment  # noqa: E402
-from waypoint.types import EpisodeBudget, EpisodeResult  # noqa: E402
+from kusudaemon.adapters.cli_agent import CommandAgentAdapter  # noqa: E402
+from kusudaemon.environment.base import Environment  # noqa: E402
+from kusudaemon.types import EpisodeBudget, EpisodeResult  # noqa: E402
 
 
 class FakeStreamAgentAdapter(CommandAgentAdapter):

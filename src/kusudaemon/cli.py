@@ -1,9 +1,9 @@
-"""The ``waypoint`` entry point: PLAN.md §11's control surface.
+"""The ``kusudaemon`` entry point: PLAN.md §11's control surface.
 
 This is a thin shim over ``pipeline/cli.py``'s command handlers — the
 pipeline group (run / status / approve / amend / resume) *is* the CLI now,
 since the classic role-based harness (manager/executor/auditor plus the
-claude/codex backends) was removed. Run ``waypoint --help`` from a
+claude/codex backends) was removed. Run ``kusudaemon --help`` from a
 terminal for the full command list.
 """
 
@@ -28,9 +28,9 @@ def main(argv: list[str] | None = None) -> int:
     from .pipeline.cli import build_pipeline_parser, dispatch
 
     parser = build_pipeline_parser()
-    parser.prog = "waypoint"
+    parser.prog = "kusudaemon"
     parser.description = (
-        f"Waypoint {__version__}: recursive decomposition harness "
+        f"Kusudaemon {__version__}: recursive decomposition harness "
         "(intake -> survey -> plan -> pilot -> execute -> assemble)."
     )
     parser.epilog = _EPILOG
