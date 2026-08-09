@@ -31,7 +31,7 @@ Kusudaemon began as a fork of [LongHorizon-Harness](https://arxiv.org/abs/2608.0
 
 - **[2026-08-09]** A web view is now wired up: `kusudaemon serve` (or `run --dashboard`) serves a live dashboard over the run directory — phase timeline, node tree, approvals queue, contract, and an SSE event tail — no build step, stdlib server. See [Watch it in a browser](#4-watch-it-in-a-browser-optional).
 - **[2026-08-09]** Kusudaemon is a new name for what was this fork's copy of LongHorizon-Harness — the package, CLI, and every `LH_HARNESS_*` setting are now `kusudaemon`/`KUSUDAEMON_*`. (Briefly renamed to "Waypoint" earlier the same day; that name didn't stick, so this supersedes it — no `waypoint`/`WAYPOINT_*` should remain anywhere in the tree.) See [Credits](#credits) for why, and for attribution to the original project.
-- **[2026-08-09]** A local web-search tool (backed by a self-hosted [SearXNG](https://docs.searxng.org/) instance via Docker) is now wired into the research phase — see [Web search (optional)](#web-search-optional).
+- **[2026-08-09]** Every Writer node can search the web on its own now (backed by a self-hosted [SearXNG](https://docs.searxng.org/) instance via Docker) — no `--research-plan` required; that flag is now only for forcing a lookup to happen *before* a node's episode starts. See [Web search (optional)](#web-search-optional).
 - **[2026-08-08]** The harness is now gptme-only: the classic role-based manager/executor/auditor loop and the Claude Code/Codex backends are gone. The pipeline CLI (`run` / `status` / `approve` / `amend` / `resume`) is the control surface, and the provider is user-configurable through `provider.json` and `.env` at the repo root (default: OpenCode Zen).
 
 ## Recursive decomposition. One trusted state.
@@ -55,7 +55,7 @@ Each Writer episode is a [gptme](https://github.com/gptme/gptme) tool-use loop, 
 |---|---|
 | `shell` | Run commands, scripts, and build/test tooling |
 | `read` / `save` / `patch` | Read, write, and scoped-edit files |
-| `websearch` *(research nodes only)* | Query a local SearXNG instance — see [Web search (optional)](#web-search-optional) |
+| `websearch` | Query a local SearXNG instance, any time the model decides it needs to — see [Web search (optional)](#web-search-optional) |
 
 That's deliberately narrow: a Writer leaf gets exactly the tools its node declares (`node.tools`), never gptme's browser/computer-use/MCP tools, so token cost and blast radius stay bounded per episode. A task can span writing code, processing data, running shell commands, and pulling in current web results — all under the same verified, resumable task state.
 
@@ -66,7 +66,7 @@ Kusudaemon is not tied to a specific model. The provider is configured in `provi
 | | Layer | Supported choices |
 |---|---|---|
 | 🧠 | **Provider** | Any OpenAI-compatible endpoint, configured per project in `provider.json` (default: OpenCode Zen) |
-| 🤖 | **Agent backend** | gptme's tool-use loop (shell/read/save/patch, plus a web-search tool for research nodes) against the configured provider |
+| 🤖 | **Agent backend** | gptme's tool-use loop (shell/read/save/patch, plus web search) against the configured provider |
 | 🎛️ | **Decomposition** | Recursive intake → survey → planning → pilot/contract → execute → assemble, with per-node tool narrowing |
 | 🖥️ | **Execution environment** | Local, with a pluggable `Environment` protocol |
 
@@ -129,7 +129,7 @@ Steps 1–2 are once per machine; steps 3–4 are once per project.
 | Python 3.10 or later | Running the harness. `uv tool install` brings its own; a pip install uses yours. |
 | A provider API key | Any OpenAI-compatible endpoint. The default (OpenCode Zen) reads `OPENCODE_API_KEY` from `.env`. |
 | gptme (`pip install "kusudaemon[gptme]"`) | The Writer backend: gptme's tool-use loop. The core package and tests stay gptme-free. |
-| [Docker](https://docs.docker.com/get-docker/) *(optional)* | Running a local [SearXNG](https://docs.searxng.org/) instance so research nodes can search the web. Skip it if you don't need web search. |
+| [Docker](https://docs.docker.com/get-docker/) *(optional)* | Running a local [SearXNG](https://docs.searxng.org/) instance so Writer nodes can search the web. Skip it if you don't need web search. |
 
 > **Platform status:** Currently tested on macOS. Windows support is included but has not yet been thoroughly tested.
 
@@ -192,11 +192,14 @@ a key in `.env` for it to actually authenticate.
 
 #### Web search (optional)
 
-Research nodes (the harness's `web_search` phase) use a `websearch` gptme
-tool backed by a **local [SearXNG](https://docs.searxng.org/)** instance —
-no third-party search API key, no results leaving your machine. This step
-is optional: skip it and any `--research-plan` step just gets marked
-`skipped` instead of failing the run.
+Every Writer episode has a `websearch` gptme tool backed by a **local
+[SearXNG](https://docs.searxng.org/)** instance — no third-party search
+API key, no results leaving your machine. It's available unconditionally
+(the model decides on its own, mid-episode, whether a given node needs to
+look something up); this step is entirely optional in the sense that
+nothing *requires* it — a node that never calls it just doesn't search,
+and if you also pass `--research-plan` without SearXNG running, that step
+is simply marked `skipped` instead of failing the run.
 
 1. **Run SearXNG via Docker.** The official docker-compose setup is the
    easiest path — see [SearXNG's own installation
@@ -245,10 +248,13 @@ is optional: skip it and any `--research-plan` step just gets marked
    means step 2 didn't take — double check `settings.yml` and that the
    container actually restarted.
 
-Once running, pass a `--research-plan` to `kusudaemon run` naming the
-nodes that need a search (see the CLI reference below); the harness
-dispatches a scoped, single-tool gptme episode per query and folds the
-capped finding into that node's inputs.
+Once running, every Writer node can search on its own — no further setup
+needed. If you want to *guarantee* a specific question gets answered
+*before* a node's writer episode even starts (rather than leaving it to
+the model's judgment mid-episode), pass a `--research-plan` to
+`kusudaemon run` naming the nodes and questions (see the CLI reference
+below); the harness dispatches a scoped, single-tool gptme episode per
+query ahead of time and folds the capped finding into that node's inputs.
 
 #### 3. Run a task
 

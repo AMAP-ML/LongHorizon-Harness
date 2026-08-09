@@ -11,13 +11,24 @@ tiny — this harness has exactly one backend:
 Research queries (v4): ``web_search`` is served by a ``GptmeAdapter``
 scoped to exactly one tool — ``adapters/tools/searxng_search.py``, a
 self-hosted SearXNG metasearch query, loaded via gptme's own
-file-path-allowlist mechanism (see that module's docstring). This keeps
-v4's "pay the search-result token cost once, in an isolated episode, not
-on every Writer turn" design intact — the tool is never in a plain
-Writer's ``DEFAULT_TOOL_ALLOWLIST``, only in a research query's adapter.
-``doc_retrieval`` (Context7) has no gptme equivalent wired up yet — it
-needed Claude Code's MCP integration, which was removed along with that
-adapter — so it still raises loudly rather than silently degrading.
+file-path-allowlist mechanism (see that module's docstring). ``doc_retrieval``
+(Context7) has no gptme equivalent wired up yet — it needed Claude Code's
+MCP integration, which was removed along with that adapter — so it still
+raises loudly rather than silently degrading.
+
+**Every Writer also gets the same ``websearch`` tool directly** (added
+2026-08-09, superseding v4's original "only an isolated research episode
+may search" rule): a Writer can now call it mid-episode, at will, without
+a caller having pre-planned a ``research_plan`` entry for that node. The
+isolated v4 research phase (``v4/research_loop.py``) still exists
+alongside this and is still useful — it *guarantees* a specific question
+gets answered and capped to 300 tokens *before* the writer episode even
+starts, which "the writer happened to think to search" doesn't — but it's
+no longer the only way a node can reach the web. The tradeoff v4's design
+note flagged (PLAN.md §8: raw search results are expensive, uncapped
+context) is now the Writer's own token budget to manage
+(``node.budget.tokens``, default 24k) rather than something the harness
+prevents structurally.
 
 The workspace is always the run directory itself: the writer sees
 ``source.txt``, ``contract.md``, ``out/``, ``scratch/``, and its own
@@ -31,7 +42,7 @@ from pathlib import Path
 from typing import Any
 
 from ..adapters.base import AgentAdapter
-from ..adapters.gptme_adapter import GptmeAdapter
+from ..adapters.gptme_adapter import DEFAULT_TOOL_ALLOWLIST, GptmeAdapter
 from ..v1.tree import TaskNode
 from ..v4.mcp_research import allowed_tools_for
 from ..v4.research import ResearchQuery
@@ -50,15 +61,22 @@ def build_writer_adapter(
     mcp_config: str | None = None,
 ) -> AgentAdapter:
     """A Writer adapter for one node. ``node.tools`` narrows the tool set
-    (the adapter's ``tool_allowlist``) the same way v1's round loop does."""
+    (the adapter's ``tool_allowlist``) the same way v1's round loop does —
+    web search is layered on top of that narrowed (or default) set
+    unconditionally, so even a node scoped down via ``node.tools`` keeps
+    search access; only ``node.tools`` itself can narrow shell/read/save/
+    patch."""
     workspace = str(workspace_path)
     prompts = str(prompt_dir)
     if backend == "gptme":
         kwargs: dict[str, Any] = dict(
             model=model, workspace_path=workspace, prompt_dir=prompts
         )
-        if node and node.tools:
-            kwargs["tool_allowlist"] = tuple(node.tools)
+        base_tools = tuple(node.tools) if node and node.tools else DEFAULT_TOOL_ALLOWLIST
+        web_search_tools = allowed_tools_for("web_search")
+        kwargs["tool_allowlist"] = base_tools + tuple(
+            tool for tool in web_search_tools if tool not in base_tools
+        )
         return GptmeAdapter(**kwargs)
     raise ValueError(f"unknown backend: {backend!r}")
 
