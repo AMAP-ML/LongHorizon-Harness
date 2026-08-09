@@ -1,13 +1,15 @@
 """Provider config tests (src/kusudaemon/provider_config.py).
 
-The harness talks to the user's OpenAI-compatible endpoint with a built-in
-opencode default. provider.json holds named providers (base_url/model +
-which env var holds the key); api keys themselves live in the environment
-/.env. Precedence per field: explicit argument > KUSUDAEMON_PROVIDER_* env
-> the selected provider entry > OPENAI_* env > built-in opencode default.
+The harness talks to the user's OpenAI-compatible endpoint. provider.json
+holds named providers (base_url/model + which env var holds the key); api
+keys themselves live in the environment/.env. Precedence per field:
+explicit argument > KUSUDAEMON_PROVIDER_* env > the selected provider entry
+> OPENAI_* env. There is no built-in fallback endpoint: resolve() raises
+ProviderConfigError when a field resolves to nothing from any of those.
 
 Coverage:
-- the built-in default resolves when nothing else is set (opencode Zen)
+- resolve() raises when nothing is configured, instead of silently
+  substituting a hardcoded endpoint
 - each precedence level wins over the ones below it
 - provider selection: explicit arg > KUSUDAEMON_PROVIDER env > file default;
   an unknown provider name raises
@@ -109,11 +111,21 @@ class _EnvIsolatedTest(unittest.TestCase):
 
 
 class ResolveTest(_EnvIsolatedTest):
-    def test_builtin_default_is_opencode(self) -> None:
-        settings = resolve()
-        self.assertEqual(settings.base_url, DEFAULT_BASE_URL)
-        self.assertEqual(settings.model, DEFAULT_MODEL)
-        self.assertEqual(settings.api_key, "")
+    def test_raises_when_nothing_configured(self) -> None:
+        # No provider.json, no KUSUDAEMON_PROVIDER_*/OPENAI_* env vars: no
+        # base_url/model can be resolved from anywhere, so this must raise
+        # rather than silently returning the opencode sample values.
+        with self.assertRaises(ProviderConfigError) as ctx:
+            resolve()
+        self.assertIn("base_url", str(ctx.exception))
+        self.assertIn("model", str(ctx.exception))
+
+    def test_raises_names_only_the_missing_field(self) -> None:
+        os.environ["OPENAI_BASE_URL"] = "https://generic.example.com/v1"
+        with self.assertRaises(ProviderConfigError) as ctx:
+            resolve()
+        self.assertIn("model", str(ctx.exception))
+        self.assertNotIn("base_url not configured", str(ctx.exception))
 
     def test_scoped_env_overrides_provider_entry(self) -> None:
         self._write_config(self._multi_provider_config())
@@ -131,7 +143,7 @@ class ResolveTest(_EnvIsolatedTest):
         self.assertEqual(settings.model, "opencode/deepseek-v4-flash-free")
         self.assertEqual(settings.api_key, "")
 
-    def test_generic_env_overrides_default(self) -> None:
+    def test_generic_env_used_when_no_file_or_scoped_env(self) -> None:
         os.environ["OPENAI_BASE_URL"] = "https://generic.example.com/v1"
         os.environ["OPENAI_MODEL"] = "generic-model"
         settings = resolve()

@@ -35,9 +35,14 @@ from kusudaemon.adapters.gptme_adapter import (  # noqa: E402
     GptmeAdapter,
     gptme_visible_output,
 )
-from kusudaemon.provider_config import DEFAULT_BASE_URL  # noqa: E402
 
 _OPCODE_MODEL = "local/deepseek-v4-flash-free"
+# resolve() no longer has a built-in fallback (see provider_config.py) --
+# tests that aren't specifically exercising base_url/model resolution set
+# these via _EnvGuard so a missing/absent real provider.json in the repo
+# root the tests happen to run from can't make resolve() raise.
+_TEST_BASE_URL = "https://test.example.com/v1"
+_TEST_MODEL = "opencode/deepseek-v4-flash-free"
 
 
 class _EnvGuard:
@@ -45,7 +50,9 @@ class _EnvGuard:
     never leak credentials into each other regardless of pass/fail. Also
     points KUSUDAEMON_PROVIDER_CONFIG at a nonexistent path so a real
     provider.json sitting in the repo root the tests run from can't leak
-    into tests."""
+    into tests, and fills OPENAI_BASE_URL/OPENAI_MODEL with fixture values
+    so resolve() (which now raises rather than falling back to a built-in
+    default) has something to find regardless."""
 
     _KEYS = (
         "KUSUDAEMON_PROVIDER_BASE_URL",
@@ -61,6 +68,8 @@ class _EnvGuard:
     def __enter__(self) -> "_EnvGuard":
         self._backup = {key: os.environ.pop(key, None) for key in self._KEYS}
         os.environ["KUSUDAEMON_PROVIDER_CONFIG"] = "/nonexistent/provider.json"
+        os.environ["OPENAI_BASE_URL"] = _TEST_BASE_URL
+        os.environ["OPENAI_MODEL"] = _TEST_MODEL
         return self
 
     def __exit__(self, *exc_info: object) -> None:
@@ -106,29 +115,34 @@ class ApiKeyResolutionTest(unittest.TestCase):
 
 class CommandConstructionTest(unittest.TestCase):
     def test_default_model_and_base_url(self) -> None:
-        adapter = GptmeAdapter(api_key="k")
+        with _EnvGuard():
+            adapter = GptmeAdapter(api_key="k")
         self.assertIn(_OPCODE_MODEL, adapter.command_template)
-        self.assertIn(DEFAULT_BASE_URL, adapter.command_template)
+        self.assertIn(_TEST_BASE_URL, adapter.command_template)
         self.assertIn("OPENAI_BASE_URL=", adapter.command_template)
         self.assertIn("OPENAI_API_KEY=", adapter.command_template)
 
     def test_custom_model_and_base_url_override_defaults(self) -> None:
-        adapter = GptmeAdapter(api_key="k", model="local/custom", base_url="https://example.com/v1")
+        with _EnvGuard():
+            adapter = GptmeAdapter(api_key="k", model="local/custom", base_url="https://example.com/v1")
         self.assertIn("local/custom", adapter.command_template)
         self.assertIn("https://example.com/v1", adapter.command_template)
-        self.assertNotIn(DEFAULT_BASE_URL, adapter.command_template)
+        self.assertNotIn(_TEST_BASE_URL, adapter.command_template)
 
     def test_tool_allowlist_reaches_command_line(self) -> None:
-        adapter = GptmeAdapter(api_key="k", tool_allowlist=("shell", "read"))
+        with _EnvGuard():
+            adapter = GptmeAdapter(api_key="k", tool_allowlist=("shell", "read"))
         self.assertIn("--tool-allowlist", adapter.command_template)
         self.assertIn("shell,read", adapter.command_template)
 
     def test_context_length_omitted_by_default(self) -> None:
-        adapter = GptmeAdapter(api_key="k")
+        with _EnvGuard():
+            adapter = GptmeAdapter(api_key="k")
         self.assertNotIn("GPTME_CONTEXT_LENGTH", adapter.command_template)
 
     def test_context_length_set_when_given(self) -> None:
-        adapter = GptmeAdapter(api_key="k", context_length=128_000)
+        with _EnvGuard():
+            adapter = GptmeAdapter(api_key="k", context_length=128_000)
         self.assertIn("GPTME_CONTEXT_LENGTH=128000", adapter.command_template)
 
     def test_no_session_resume_support(self) -> None:

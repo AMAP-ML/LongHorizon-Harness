@@ -99,9 +99,10 @@ this required.
   varies by endpoint, so the fallback path is the one actually exercised in
   practice, not a rarely-hit backstop. HTTP via `urllib` (no new dependency);
   the transport is an injectable callable so tests never need a real network
-  call or API key. Reads `KUSUDAEMON_PROVIDER_MODEL` / `_BASE_URL` / `_API_KEY`
-  (falls back to `OPENCODE_API_KEY`), defaulting to OpenCode Zen's
-  `opencode/deepseek-v4-flash-free`.
+  call or API key. Model/base-url/key all come from `provider_config.py`'s
+  `resolve()` (see the Provider configuration section below) — no
+  per-module default of its own; `resolve()` raises if nothing configures
+  a `base_url`/`model` rather than silently picking one.
 - `v1/tree.py` — `TaskNode`/`TaskTree`, the `PLAN.md` §6 Node schema as the
   run's source of truth (§13: "task state in JSON; markdown only as a
   rendered view"). `TaskNode.__post_init__` raises `TreeValidationError` if
@@ -765,8 +766,10 @@ classic harness. What remains is the gptme-only surface:
   `pip install "kusudaemon[gptme]"` — an optional extra, so the core
   package and the test suite stay gptme-free) — a small
   shell/read/save/patch tool-use loop that talks to the user's configured
-  OpenAI-compatible endpoint (see `provider_config.py` below; the built-in
-  default is DeepSeek V4 Flash Free via OpenCode Zen). Model id gets the
+  OpenAI-compatible endpoint (see `provider_config.py` below — a fresh
+  install's sample `provider.json` points at DeepSeek V4 Flash Free via
+  OpenCode Zen, but that's starter content in an editable file, not a
+  runtime fallback; `resolve()` raises if it's missing). Model id gets the
   `local/` provider prefix (`_gptme_model`), because gptme routes
   `local/<name>` through whatever `OPENAI_BASE_URL` points at. Still
   subclasses `CommandAgentAdapter` and still shells a subprocess — of
@@ -884,15 +887,25 @@ location:
   the automatic fallback can't cover: a non-editable/wheel install with no
   `pyproject.toml` on disk next to the installed code.
 
-There **is** a built-in default if neither file exists — OpenCode Zen
-(`https://opencode.ai/zen/v1`, model `opencode/deepseek-v4-flash-free`).
-Despite the name, its api key is read from the generic `OPENAI_API_KEY`
-env var like every other provider, **not** `OPENCODE_API_KEY` — there is
-no code path in `provider_config.py` that reads `OPENCODE_API_KEY`
-(`DEFAULT_API_KEY_ENV = "OPENAI_API_KEY"`); a fresh clone with just
-`OPENAI_API_KEY` set in the environment or `.env` works, but
-`OPENCODE_API_KEY` alone silently does not, and this file previously said
-otherwise.
+**No built-in fallback endpoint** (changed 2026-08-09, in response to a
+real report that an edited `provider.json` appeared to be silently
+ignored — see the `ConfigFilePathTest` docstring in
+`tests/test_provider_config.py`): if neither the config file nor any env
+var yields a `base_url`/`model`, `resolve()` raises `ProviderConfigError`
+naming the missing field(s), the exact config path it checked, and what
+to set — rather than quietly substituting OpenCode Zen's endpoint. The
+one place OpenCode Zen's values (`https://opencode.ai/zen/v1`, model
+`opencode/deepseek-v4-flash-free`) still appear in code is
+`SAMPLE_SETTINGS`, the **starter content** `ensure_user_config()` writes
+into a fresh `provider.json` at CLI startup if none exists yet (printed
+to the user, not hidden) — a fresh clone still works out of the box by
+getting a real, editable file, not by `resolve()` falling back to a
+constant at call time. Its api key is read from the generic
+`OPENAI_API_KEY` env var like every other provider, **not**
+`OPENCODE_API_KEY` — there is no code path in `provider_config.py` that
+reads `OPENCODE_API_KEY` (`DEFAULT_API_KEY_ENV = "OPENAI_API_KEY"`); a
+fresh clone with just `OPENAI_API_KEY` set in the environment or `.env`
+works, but `OPENCODE_API_KEY` alone silently does not.
 
 Per-field precedence (highest first):
 
@@ -902,20 +915,22 @@ Per-field precedence (highest first):
 3. the selected provider's entry in `provider.json` (its key comes from
    the env var its `api_key_env` names, itself normally set via `.env`)
 4. `OPENAI_API_KEY` / `OPENAI_BASE_URL` / `OPENAI_MODEL` env vars
-5. built-in default (opencode; key from `OPENCODE_API_KEY`)
+
+No step 5: `resolve()` raises `ProviderConfigError` for `base_url`/`model`
+if nothing above yields a value.
 
 `types.py`'s `DEFAULT_TMP_DIR` follows the same repo-local rule
 (`<cwd>/.kusudaemon/tmp`, not `~/.kusudaemon/tmp`) — nothing this harness
 writes by default lives outside the project folder it was launched from.
 
-`resolve()` always returns populated `base_url`/`model`; only `api_key`
-may be empty and only `require()` (called by callers that must not
-proceed without credentials, and by `GptmeAdapter.__init__`) errors on it
-— with a message naming exactly which knob to set. The old per-module
-defaults (`DEFAULT_BASE_URL`/`DEFAULT_MODEL` in `v1/provider.py`,
-`DEFAULT_GPTME_*` in `gptme_adapter.py`) were folded into this module;
-`v1/provider.py` and the adapter now call `resolve()` with the same
-lookup chain.
+`resolve()` either returns a fully-populated `base_url`/`model`, or
+raises — only `api_key` may come back empty, and only `require()` (called
+by callers that must not proceed without credentials, and by
+`GptmeAdapter.__init__`) errors on that, with a message naming exactly
+which knob to set. `v1/provider.py`'s and the adapter's own model/key
+defaults were folded into this module; both now call `resolve()` with the
+same lookup chain and let it raise rather than catching and substituting
+anything themselves.
 
 ## Tests
 

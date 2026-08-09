@@ -1,11 +1,18 @@
-"""User provider configuration: named providers, opencode default, keys in .env.
+"""User provider configuration: named providers, keys in .env.
 
 The harness talks to OpenAI-compatible ``/chat/completions`` endpoints only.
-The **default** is OpenCode Zen (``https://opencode.ai/zen/v1`` with model
-``opencode/deepseek-v4-flash-free``) so a fresh install works out of the
-box — but the default is **user-customizable** with exactly two files, both
-at the repo root, both gitignored, both shipped as ``*.example`` templates
-the user copies and edits:
+There is no built-in fallback endpoint: ``resolve()`` raises
+``ProviderConfigError`` if a ``base_url``/``model`` can't be found from an
+explicit argument, a ``KUSUDAEMON_PROVIDER_*`` env var, the config file, or
+a generic ``OPENAI_*`` env var (see "Per-field precedence" below) — a
+misconfigured or unreadable provider file surfaces as a loud error, not a
+silent switch to some other endpoint the caller didn't ask for. What a
+*fresh* install gets is a **sample** ``provider.json`` (OpenCode Zen: see
+``SAMPLE_SETTINGS``), materialized once by ``ensure_user_config()`` at CLI
+startup so there's something to edit — that's a real file on disk the CLI
+tells you it wrote, not a hidden runtime substitution. Configuration lives
+in exactly two files, both at the repo root, both gitignored, both shipped
+as ``*.example`` templates the user copies and edits:
 
 - **Which providers exist and their endpoints**: ``provider.json`` (or
   ``$KUSUDAEMON_PROVIDER_CONFIG`` to point elsewhere) holds *named*
@@ -47,7 +54,11 @@ Per-field precedence (highest first):
    ``model``; its key comes from the env var its ``api_key_env`` names)
 4. the generic ``OPENAI_API_KEY`` / ``OPENAI_BASE_URL`` / ``OPENAI_MODEL``
    environment variables
-5. the built-in default: OpenCode Zen
+
+If none of the above yields a ``base_url``/``model``, ``resolve()`` raises
+``ProviderConfigError`` naming exactly which field is missing and which
+config file it checked — there is no step 5 that silently falls back to a
+hardcoded endpoint.
 """
 
 from __future__ import annotations
@@ -68,10 +79,13 @@ DEFAULT_CONFIG_PATH = Path(CONFIG_FILE_NAME)
 DEFAULT_PROVIDER = "opencode"
 DEFAULT_API_KEY_ENV = "OPENAI_API_KEY"
 
-# The built-in default: OpenCode Zen, the endpoint this harness itself was
-# developed against (mirrors the "testing on a weak free model is the correct
-# development target" note in v1/provider.py). Any of the higher-precedence
-# knobs above can change it per field.
+# OpenCode Zen, the endpoint this harness itself was developed against
+# (mirrors the "testing on a weak free model is the correct development
+# target" note in v1/provider.py). NOT a runtime fallback used by
+# resolve() -- these two constants exist only to seed SAMPLE_SETTINGS, the
+# file ensure_user_config() writes once for a fresh install to edit. A
+# missing/unreadable config with no matching env var is a ProviderConfigError,
+# never a silent substitution of these values.
 DEFAULT_BASE_URL = "https://opencode.ai/zen/v1"
 DEFAULT_MODEL = "opencode/deepseek-v4-flash-free"
 
@@ -350,13 +364,11 @@ def resolve(*, provider: str = "", api_key: str = "", base_url: str = "", model:
             ("KUSUDAEMON_PROVIDER_BASE_URL",),
             ("OPENAI_BASE_URL",),
             entry.get("base_url", ""),
-            DEFAULT_BASE_URL,
         ),
         model=model or _pick(
             ("KUSUDAEMON_PROVIDER_MODEL",),
             ("OPENAI_MODEL",),
             entry.get("model", ""),
-            DEFAULT_MODEL,
         ),
     )
     if api_key:
@@ -365,14 +377,31 @@ def resolve(*, provider: str = "", api_key: str = "", base_url: str = "", model:
         resolved.source = "KUSUDAEMON_PROVIDER_API_KEY"
     elif os.getenv(key_env):
         resolved.source = f"{key_env} (.env / environment)"
+    if not resolved.base_url or not resolved.model:
+        missing = ", ".join(
+            field for field, value in (("base_url", resolved.base_url), ("model", resolved.model)) if not value
+        )
+        raise ProviderConfigError(
+            f"provider {missing} not configured (checked {config_file_path()}, "
+            "KUSUDAEMON_PROVIDER_BASE_URL/KUSUDAEMON_PROVIDER_MODEL, and "
+            "OPENAI_BASE_URL/OPENAI_MODEL)\n"
+            f"  Selected provider: {name!r}. Set it in the provider config "
+            f"file's {name!r} entry (copy provider.example.json to "
+            f"{CONFIG_FILE_NAME} at the repo root if it doesn't exist yet), "
+            "or set the env vars above."
+        )
     return resolved
 
 
 def require(settings: ProviderSettings) -> ProviderSettings:
     """Raise a clear error if the api key is missing, or return as-is.
 
-    ``base_url``/``model`` can never be missing — the built-in opencode
-    default covers them; only the api key has no bundled value.
+    ``base_url``/``model`` can never be missing on a ``ProviderSettings``
+    that came from ``resolve()`` — it raises ``ProviderConfigError`` itself
+    rather than silently substituting a built-in default when neither is
+    configured. Only the api key has no such check baked into ``resolve()``
+    (a key-less call may be a legitimate intermediate state for some
+    callers), which is what this function covers.
     """
     if settings.api_key:
         return settings

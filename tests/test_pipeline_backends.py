@@ -34,6 +34,10 @@ class _EnvGuard:
         self._backup = {key: os.environ.pop(key, None) for key in _ENV_KEYS}
         os.environ["KUSUDAEMON_PROVIDER_CONFIG"] = "/nonexistent/provider.json"
         os.environ["OPENAI_API_KEY"] = "test-key"
+        # resolve() has no built-in fallback (provider_config.py) -- fill
+        # base_url/model with fixture values so it doesn't raise.
+        os.environ["OPENAI_BASE_URL"] = "https://test.example.com/v1"
+        os.environ["OPENAI_MODEL"] = "test-model"
         return self
 
     def __exit__(self, *exc_info: object) -> None:

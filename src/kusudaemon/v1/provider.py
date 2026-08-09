@@ -28,7 +28,7 @@ from dataclasses import dataclass, field
 from typing import Any, Callable
 
 from .json_schema import describe_schema, validate
-from ..provider_config import DEFAULT_BASE_URL, DEFAULT_MODEL, require, resolve
+from ..provider_config import require, resolve
 
 # Defaults: OpenCode Zen (see ..provider_config — the user can override via
 # ./provider.json, KUSUDAEMON_PROVIDER_*, or OPENAI_* env vars).
