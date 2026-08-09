@@ -27,6 +27,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 _REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(_REPO_ROOT / "src"))
@@ -52,6 +53,7 @@ _ENV_KEYS = (
     "KUSUDAEMON_PROVIDER_MODEL",
     "KUSUDAEMON_PROVIDER_CONFIG",
     "KUSUDAEMON_PROVIDER",
+    "KUSUDAEMON_ENV_FILE",
     "OPENAI_API_KEY",
     "OPENAI_BASE_URL",
     "OPENAI_MODEL",
@@ -303,6 +305,58 @@ class EnvFileLoaderTest(_EnvIsolatedTest):
             self.assertEqual(os.environ["OPENAI_API_KEY"], "from-cwd")
         finally:
             os.chdir(old)
+
+    def test_load_env_file_respects_kusudaemon_env_file_override(self) -> None:
+        # cwd has no .env of its own, and is not an ancestor of self._tmp,
+        # so the plain ancestor search would find nothing here.
+        with tempfile.TemporaryDirectory() as elsewhere:
+            self._write_env("OPENAI_API_KEY=from-override\n")
+            os.environ["KUSUDAEMON_ENV_FILE"] = str(Path(self._tmp.name, ".env"))
+            old = Path.cwd()
+            try:
+                os.chdir(elsewhere)
+                loaded = load_env_file()
+            finally:
+                os.chdir(old)
+            self.assertEqual(loaded, Path(self._tmp.name, ".env"))
+            self.assertEqual(os.environ["OPENAI_API_KEY"], "from-override")
+
+    def test_load_env_file_override_missing_returns_none(self) -> None:
+        os.environ["KUSUDAEMON_ENV_FILE"] = str(Path(self._tmp.name, "nope.env"))
+        self.assertIsNone(load_env_file())
+
+    def test_load_env_file_falls_back_to_installed_repo_root(self) -> None:
+        # Zero-config case: no KUSUDAEMON_ENV_FILE set, cwd (and its
+        # ancestors) have no .env of their own, but the installed package's
+        # own project root does -- e.g. `kusudaemon` invoked from a
+        # downloads folder while credentials live at the dev checkout root.
+        self._write_env("OPENAI_API_KEY=from-repo-root\n")
+        with tempfile.TemporaryDirectory() as elsewhere:
+            old = Path.cwd()
+            try:
+                os.chdir(elsewhere)
+                with mock.patch(
+                    "kusudaemon.provider_config._installed_repo_root",
+                    return_value=Path(self._tmp.name),
+                ):
+                    loaded = load_env_file()
+            finally:
+                os.chdir(old)
+            self.assertEqual(loaded, Path(self._tmp.name, ".env"))
+            self.assertEqual(os.environ["OPENAI_API_KEY"], "from-repo-root")
+
+    def test_load_env_file_no_fallback_available_returns_none(self) -> None:
+        with tempfile.TemporaryDirectory() as elsewhere:
+            old = Path.cwd()
+            try:
+                os.chdir(elsewhere)
+                with mock.patch(
+                    "kusudaemon.provider_config._installed_repo_root",
+                    return_value=None,
+                ):
+                    self.assertIsNone(load_env_file())
+            finally:
+                os.chdir(old)
 
 
 if __name__ == "__main__":

@@ -28,7 +28,9 @@ the user copies and edits:
   provider named ``opencode``.
 
 - **The keys themselves**: environment variables, loaded from a root
-  ``.env`` file by CLI startup (see ``load_env_file``), e.g.
+  ``.env`` file by CLI startup (see ``load_env_file``, or
+  ``$KUSUDAEMON_ENV_FILE`` to point elsewhere — e.g. running the CLI from
+  outside the project tree while keeping one ``.env`` in it), e.g.
   ``OPENAI_API_KEY=sk-...`` in ``.env`` for the opencode provider above.
   Add a provider to ``provider.json`` with ``"api_key_env": "DEEPSEEK_API_KEY"``
   and a matching ``DEEPSEEK_API_KEY=...`` line in ``.env`` to give it a key.
@@ -202,22 +204,56 @@ def parse_env_lines(text: str) -> dict[str, str]:
     return out
 
 
+def _installed_repo_root() -> Path | None:
+    """Best-effort project root for the *installed* ``kusudaemon`` package.
+
+    Walks up from this very file (not the cwd) looking for ``pyproject.toml``.
+    For an editable install (``pip install -e``, this repo's normal dev
+    setup) that resolves to the actual checkout regardless of where the CLI
+    is invoked from — the mechanism ``load_env_file`` uses so that running
+    ``kusudaemon`` from an unrelated directory (e.g. a downloads folder
+    holding a source document) still finds the one ``.env`` at the project
+    root with no shell configuration required. A non-editable/wheel install
+    has no ``pyproject.toml`` alongside the installed code and this returns
+    ``None`` — same as having no fallback at all, not an error.
+    """
+    for candidate in Path(__file__).resolve().parents:
+        if (candidate / "pyproject.toml").is_file():
+            return candidate
+    return None
+
+
 def load_env_file(path: Path | None = None) -> Path | None:
     """Load a ``.env`` file's variables into ``os.environ``.
 
-    With ``path=None``, looks for ``.env`` in the current directory, then
-    each ancestor up to the filesystem root — so the root ``.env`` the
-    README tells you to create is found no matter where the CLI is invoked
-    from. Variables already set in the real environment are **never**
-    overwritten (dotenv convention: the shell wins). Returns the path
-    actually loaded, or ``None`` when no ``.env`` exists.
+    With ``path=None``: if ``KUSUDAEMON_ENV_FILE`` is set, that exact path is
+    used (an explicit escape hatch, e.g. for a non-editable install with no
+    discoverable repo root — see ``_installed_repo_root``). Otherwise looks
+    for ``.env`` in the current directory, then each ancestor up to the
+    filesystem root, then — if still not found — at the installed package's
+    own project root (``_installed_repo_root()``), so the root ``.env`` the
+    README tells you to create is found automatically no matter where the
+    CLI is invoked from, with zero shell configuration, as long as this is
+    an editable/source install (the normal dev setup; see that helper's
+    docstring for the one case it can't cover). Variables already set in
+    the real environment are **never** overwritten (dotenv convention: the
+    shell wins). Returns the path actually loaded, or ``None`` when no
+    ``.env`` exists anywhere in that search.
     """
     if path is None:
-        cwd = Path.cwd()
-        for candidate in (cwd, *cwd.parents):
-            if (candidate / ".env").is_file():
-                path = candidate / ".env"
-                break
+        env_override = os.getenv("KUSUDAEMON_ENV_FILE")
+        if env_override:
+            path = Path(env_override).expanduser()
+        else:
+            cwd = Path.cwd()
+            for candidate in (cwd, *cwd.parents):
+                if (candidate / ".env").is_file():
+                    path = candidate / ".env"
+                    break
+            else:
+                repo_root = _installed_repo_root()
+                if repo_root is not None and (repo_root / ".env").is_file():
+                    path = repo_root / ".env"
     if path is None or not path.is_file():
         return None
     try:

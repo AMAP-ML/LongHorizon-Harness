@@ -745,15 +745,34 @@ location:
   hand or just runs the CLI once.
 - **`.env`** — secret: the actual API key(s), one per `api_key_env` name
   used in `provider.json` (e.g. `OPENAI_API_KEY=...`). Loaded automatically
-  at CLI startup (`load_env_file`, searches the cwd then each parent
-  directory for a `.env`) into `os.environ`, never overwriting a value the
-  real shell environment already set. A sample sits at the repo root
-  (`.env.example`).
+  at CLI startup (`load_env_file`) into `os.environ`, never overwriting a
+  value the real shell environment already set. A sample sits at the repo
+  root (`.env.example`). Search order (2026-08-09, widened after a real
+  freeze/401 report): cwd, then each parent directory — but a cwd *outside*
+  the project tree entirely (e.g. `~/Downloads`, a sibling of `~/kusudaemon`
+  rather than an ancestor) makes that walk find nothing, and a missing key
+  fails silent-ish at `require()` time (a plain 401 from the provider, not
+  a loud "no .env found") rather than at load time, since an empty api key
+  was always a legitimate `resolve()` outcome. So as a last resort,
+  `load_env_file` now also checks the *installed package's own* project
+  root (`_installed_repo_root()`: walks up from `provider_config.py`'s own
+  `__file__` for a `pyproject.toml`) — for the normal editable/dev install
+  this is the actual checkout regardless of cwd, so `.env` is found with
+  **zero shell configuration** no matter which directory `kusudaemon` is
+  invoked from. `KUSUDAEMON_ENV_FILE` (added the same day, kept as a
+  narrower escape hatch) forces an exact path instead, for the one case
+  the automatic fallback can't cover: a non-editable/wheel install with no
+  `pyproject.toml` on disk next to the installed code.
 
 There **is** a built-in default if neither file exists — OpenCode Zen
-(`https://opencode.ai/zen/v1`, model `opencode/deepseek-v4-flash-free`,
-api key read from `OPENCODE_API_KEY`) — so a fresh clone with just a key
-in the environment still works.
+(`https://opencode.ai/zen/v1`, model `opencode/deepseek-v4-flash-free`).
+Despite the name, its api key is read from the generic `OPENAI_API_KEY`
+env var like every other provider, **not** `OPENCODE_API_KEY` — there is
+no code path in `provider_config.py` that reads `OPENCODE_API_KEY`
+(`DEFAULT_API_KEY_ENV = "OPENAI_API_KEY"`); a fresh clone with just
+`OPENAI_API_KEY` set in the environment or `.env` works, but
+`OPENCODE_API_KEY` alone silently does not, and this file previously said
+otherwise.
 
 Per-field precedence (highest first):
 
@@ -803,7 +822,9 @@ that worktree's *test files* against the original checkout's (unmodified)
 guards against exactly this — copy the guard into any new test file
 rather than assuming a bare `import kusudaemon` is safe.
 
-~8s, 167 tests, all passing. `test_provider_config.py`'s `_EnvIsolatedTest`
+~8s, 171 tests, all passing (167 + 4 covering `load_env_file`'s
+`KUSUDAEMON_ENV_FILE` override and its `_installed_repo_root()` fallback,
+2026-08-09). `test_provider_config.py`'s `_EnvIsolatedTest`
 snapshots and restores the *entire* `os.environ` around each test now
 (2026-08-09 fix) — the previous partial-restore logic only put back keys
 that had a prior value, so a test setting e.g. `KUSUDAEMON_PROVIDER`
