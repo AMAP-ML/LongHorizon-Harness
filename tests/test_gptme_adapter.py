@@ -10,7 +10,8 @@ the real installed package, not from documentation alone.)
 
 Coverage:
 - API key resolution order (explicit arg > LH_HARNESS_PROVIDER_API_KEY >
-  OPENCODE_API_KEY) and the loud failure when none are set
+  config file > OPENAI_API_KEY > OPENCODE_API_KEY) and the loud failure
+  when none are set
 - env vars (OPENAI_BASE_URL/OPENAI_API_KEY/GPTME_CONTEXT_LENGTH) and the
   --tool-allowlist/--model/--tool-format flags reach the command line
 - the worker script this adapter shells out to actually exists on disk
@@ -31,21 +32,35 @@ sys.path.insert(0, str(_REPO_ROOT / "src"))
 
 from lh_harness.adapters.gptme_adapter import (  # noqa: E402
     _WORKER_SCRIPT,
-    DEFAULT_GPTME_BASE_URL,
-    DEFAULT_GPTME_MODEL,
     GptmeAdapter,
     gptme_visible_output,
 )
+from lh_harness.provider_config import DEFAULT_BASE_URL  # noqa: E402
+
+_OPCODE_MODEL = "local/deepseek-v4-flash-free"
 
 
 class _EnvGuard:
     """Snapshots and restores the env vars GptmeAdapter reads, so tests
-    never leak credentials into each other regardless of pass/fail."""
+    never leak credentials into each other regardless of pass/fail. Also
+    points LH_HARNESS_PROVIDER_CONFIG at a nonexistent path so a real
+    ~/.lh-harness/provider.json on the developer machine can't leak into
+    tests."""
 
-    _KEYS = ("LH_HARNESS_PROVIDER_BASE_URL", "LH_HARNESS_PROVIDER_API_KEY", "OPENCODE_API_KEY")
+    _KEYS = (
+        "LH_HARNESS_PROVIDER_BASE_URL",
+        "LH_HARNESS_PROVIDER_API_KEY",
+        "LH_HARNESS_PROVIDER_MODEL",
+        "LH_HARNESS_PROVIDER_CONFIG",
+        "OPENAI_API_KEY",
+        "OPENAI_BASE_URL",
+        "OPENAI_MODEL",
+        "OPENCODE_API_KEY",
+    )
 
     def __enter__(self) -> "_EnvGuard":
         self._backup = {key: os.environ.pop(key, None) for key in self._KEYS}
+        os.environ["LH_HARNESS_PROVIDER_CONFIG"] = "/nonexistent/provider.json"
         return self
 
     def __exit__(self, *exc_info: object) -> None:
@@ -92,8 +107,8 @@ class ApiKeyResolutionTest(unittest.TestCase):
 class CommandConstructionTest(unittest.TestCase):
     def test_default_model_and_base_url(self) -> None:
         adapter = GptmeAdapter(api_key="k")
-        self.assertIn(DEFAULT_GPTME_MODEL, adapter.command_template)
-        self.assertIn(DEFAULT_GPTME_BASE_URL, adapter.command_template)
+        self.assertIn(_OPCODE_MODEL, adapter.command_template)
+        self.assertIn(DEFAULT_BASE_URL, adapter.command_template)
         self.assertIn("OPENAI_BASE_URL=", adapter.command_template)
         self.assertIn("OPENAI_API_KEY=", adapter.command_template)
 
@@ -101,7 +116,7 @@ class CommandConstructionTest(unittest.TestCase):
         adapter = GptmeAdapter(api_key="k", model="local/custom", base_url="https://example.com/v1")
         self.assertIn("local/custom", adapter.command_template)
         self.assertIn("https://example.com/v1", adapter.command_template)
-        self.assertNotIn(DEFAULT_GPTME_BASE_URL, adapter.command_template)
+        self.assertNotIn(DEFAULT_BASE_URL, adapter.command_template)
 
     def test_tool_allowlist_reaches_command_line(self) -> None:
         adapter = GptmeAdapter(api_key="k", tool_allowlist=("shell", "read"))

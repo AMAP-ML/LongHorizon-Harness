@@ -1,15 +1,8 @@
-"""Role-managed harness for long-horizon computer-use tasks."""
+"""Recursive-decomposition harness for long-horizon tasks (gptme backend)."""
 
 from importlib.metadata import PackageNotFoundError, version as _package_version
 
-from .types import (
-    EpisodeBudget,
-    EpisodeResult,
-    ExecResult,
-    HarnessConfig,
-    ManagedRound,
-    AuditReport,
-)
+from .types import EpisodeBudget, EpisodeResult, ExecResult
 
 HOMEPAGE = "https://github.com/AMAP-ML/LongHorizon-Harness"
 ISSUES_URL = f"{HOMEPAGE}/issues"
@@ -23,9 +16,6 @@ __all__ = [
     "EpisodeBudget",
     "EpisodeResult",
     "ExecResult",
-    "HarnessConfig",
-    "ManagedRound",
-    "AuditReport",
     "HOMEPAGE",
     "ISSUES_URL",
     "__version__",

@@ -1,4 +1,4 @@
-"""Agent CLI adapters with lazy public imports."""
+"""Agent adapters with lazy public imports (gptme is the only backend)."""
 
 from __future__ import annotations
 
@@ -6,18 +6,14 @@ from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
     from .base import AgentAdapter
-    from .claude_code import ClaudeCodeAdapter
-    from .codex import CodexAdapter
     from .gptme_adapter import GptmeAdapter
 
 _LAZY_EXPORTS = {
     "AgentAdapter": ".base",
-    "ClaudeCodeAdapter": ".claude_code",
-    "CodexAdapter": ".codex",
     "GptmeAdapter": ".gptme_adapter",
 }
 
-__all__ = ["AgentAdapter", "ClaudeCodeAdapter", "CodexAdapter", "GptmeAdapter"]
+__all__ = ["AgentAdapter", "GptmeAdapter"]
 
 
 def __getattr__(name: str) -> Any:

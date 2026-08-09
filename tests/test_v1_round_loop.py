@@ -14,7 +14,7 @@ Coverage:
   never re-dispatched, and a node still "dispatched" from a simulated crash
   is resumed via v0's session-resume path directly, before the orchestrator
   is asked anything
-- per-node tool restriction reaches the Claude Code command line
+- per-node tool restriction narrows the Writer's gptme tool allowlist
 """
 
 from __future__ import annotations
@@ -32,7 +32,7 @@ sys.path.insert(0, str(_REPO_ROOT / "tests" / "fixtures"))
 
 from fake_adapter import FakeStreamAgentAdapter  # noqa: E402
 from fake_provider import FakeProvider  # noqa: E402
-from lh_harness.adapters.claude_code import ClaudeCodeAdapter  # noqa: E402
+from lh_harness.adapters.gptme_adapter import GptmeAdapter  # noqa: E402
 from lh_harness.environment.local import LocalEnvironment  # noqa: E402
 from lh_harness.types import EpisodeBudget  # noqa: E402
 from lh_harness.v0.events import EventLog  # noqa: E402
@@ -329,15 +329,16 @@ class ResumeInFlightWriterNodeTest(unittest.TestCase):
 
 
 class PerNodeToolRestrictionTest(unittest.TestCase):
-    def test_allowed_tools_reach_the_command_line(self) -> None:
-        adapter = ClaudeCodeAdapter(role="cli_executor", allowed_tools=("Read", "Grep"))
-        self.assertIn("--allowedTools", adapter.command_template)
-        self.assertIn("Read", adapter.command_template)
-        self.assertIn("Grep", adapter.command_template)
+    def test_tool_allowlist_reaches_the_command_line(self) -> None:
+        adapter = GptmeAdapter(api_key="k", tool_allowlist=("shell", "read"))
+        self.assertIn("--tool-allowlist", adapter.command_template)
+        self.assertIn("shell", adapter.command_template)
+        self.assertIn("read", adapter.command_template)
 
-    def test_no_allowed_tools_omits_the_flag(self) -> None:
-        adapter = ClaudeCodeAdapter(role="cli_executor")
-        self.assertNotIn("--allowedTools", adapter.command_template)
+    def test_default_allowlist_used_when_not_narrowed(self) -> None:
+        adapter = GptmeAdapter(api_key="k")
+        self.assertIn("--tool-allowlist", adapter.command_template)
+        self.assertIn("shell,read,save,patch", adapter.command_template)
 
 
 if __name__ == "__main__":

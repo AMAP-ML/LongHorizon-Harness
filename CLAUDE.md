@@ -3,10 +3,14 @@
 ## What this repo is
 
 LongHorizon-Harness (`src/lh_harness/`) is an execution/state-management
-harness that shells out to agent CLIs (Claude Code, Codex) to carry
-long-horizon tasks to verified completion. Manager/Executor/Auditor role
-separation, `AgentAdapter` protocol per backend, isolated `runs/<run-id>/`
-directories. See README.md for the shipped product.
+harness that shells out to one agent backend (**gptme**) to carry
+long-horizon tasks to verified completion. The classic role-based harness
+(manager/executor/auditor over Claude Code/Codex CLIs) and its web dashboard
+were **removed** — this worktree is the recursive-decomposition harness only
+(`src/lh_harness/v0`..`v5`/`pipeline/`). The `lh-harness` CLI is now exactly
+the §11 control surface: `run` / `resume` / `status` / `approve` / `amend`.
+See README.md for the shipped product, and PLAN.md's Progress section for
+the v0-v5 build ladder detail.
 
 On top of this codebase, the repo is also building the **Recursive
 Decomposition Harness** described in `PLAN.md` (repo root). `PLAN.md` §13
@@ -15,7 +19,10 @@ defines a build ladder: v0 (resumability), v1 (the round loop), v2
 tools) are done and live in `src/lh_harness/v0/`, `src/lh_harness/v1/`,
 `src/lh_harness/v2/`, `src/lh_harness/v3/`, and `src/lh_harness/v4/`; v4
 was the last item on the §13 build ladder, so anything past it is v5+ and
-not yet scoped in `PLAN.md`. See PLAN.md's Progress section for detail.
+not yet scoped in `PLAN.md`. v5 has been built here anyway as the pipeline
+driver and §11 control surface (`src/lh_harness/pipeline/`) plus the
+recursive-view server state (`dashboard/recursive.py`) — see the v5
+section below. See PLAN.md's Progress section for detail.
 
 ## v0 — resumability (`src/lh_harness/v0/`)
 
@@ -446,71 +453,175 @@ modifications to v0/v1/v2/v3.
   safe to do again). Raises `KeyError` loudly if the plan names a node id
   outside the tree, rather than silently skipping it.
 
-## Adapter changes (additive, backward compatible)
+## v5 — the pipeline driver and PLAN.md §11 control surface (`src/lh_harness/pipeline/`, `dashboard/recursive.py`)
 
-- `adapters/cli_agent.py` — `CommandAgentAdapter.run_episode` gained a
-  keyword-only `command_override: str | None = None`, and the class gained
-  `supports_session_resume = False` and `supports_tool_restriction = False`
-  class attributes. Existing positional/kwarg call sites (`manager.py`,
-  `auditor_agent.py` via `manager.py`'s `_run_role_episode`) are unaffected.
-- `adapters/claude_code.py` — `ClaudeCodeAdapter.supports_session_resume =
-  True`, `supports_tool_restriction = True`. `run_episode` gained a
-  keyword-only `resume_session_id: str | None = None`; when set, it splices
-  `--resume <id>` into the same command parts used for a fresh dispatch
-  (deny-tools, model, mcp-config all preserved) and passes it as
-  `command_override`. `__init__` gained `allowed_tools: tuple[str, ...] |
-  None = None`; when set, appends `--allowedTools <tools...>` — this
-  *intersects* with (never widens past) the existing role-based
-  `--disallowedTools` deny list from `claude_permissions.py`, it doesn't
-  replace it.
-- `adapters/codex.py` — untouched. `codex exec` has no session-continuation
-  or tool-restriction flag, so `CodexAdapter` inherits both `False`
-  defaults; `v0/runner.py` falls back to fresh redispatch for resume, and
-  v1's round loop simply can't offer it per-node tool restriction (a
-  `writer_adapter_factory` targeting Codex would just ignore `node.tools`).
-- `adapters/gptme_adapter.py` + `adapters/_gptme_worker.py` (new) —
-  `GptmeAdapter`, a third `AgentAdapter` with no agent CLI anywhere in the
-  chain. `ClaudeCodeAdapter`/`CodexAdapter` shell out to an existing
-  coding-agent product; `GptmeAdapter` instead drives gptme
-  (github.com/gptme/gptme, MIT, `pip install "lh-harness[gptme]"` — an
-  optional extra, so the core package and every other adapter stay
-  gptme-free) — a small shell/read/save/patch tool-use loop that talks to
-  any OpenAI-compatible endpoint, by default this harness's own dev
-  target: DeepSeek V4 Flash Free via OpenCode Zen, the exact host
-  `v1/provider.py` already talks to for Orchestrator/Reviewer
-  (`LH_HARNESS_PROVIDER_BASE_URL`/`_API_KEY` env vars, falling back to
-  `OPENCODE_API_KEY`, same lookup order). Still subclasses
-  `CommandAgentAdapter` and still shells a subprocess — but of
+The thing v0-v4 deliberately didn't provide: a driver that chains intake →
+survey → plan → pilot → contract → research → execute → assemble into one
+run, plus the control surface (§11: run / status / approve / amend /
+resume) around it. v0-v4 are imported unmodified; the only new durable
+state is a small v5 path set layered on the existing run-directory layout.
+
+- `pipeline/run_dir.py` — v5 path helpers: `source_path` (the corpus the
+  run decomposes), `phase_path` (`{phase, status, detail, ts}` durable
+  progress marker), `approvals_path`, `halt_path`, `run_spec_path`
+  (immutable `{goal, backend, model, source_text, compile_command,
+  research_plan, ...}` written by the driver at first dispatch so a
+  detached web app or `pipeline resume` can rebuild the environment from
+  disk alone), `jobs_path` (background-job records for the web app).
+- `pipeline/approvals.py` — the cross-process human-gate protocol. Every
+  checkpoint (intake answers, pilot edits, amend/triage/reopen gates) is a
+  record in `approvals.jsonl`, append-only, latest record per
+  `approval_id` wins; `append`/`read_all`/`pending`/
+  `find_pending` (resume **reuses** the unanswered record instead of
+  stacking a duplicate question), `wait_for_resolution` (the driver blocks
+  polling the file — the operator is the one surface that must never be
+  rushed, so `timeout=None` waits forever), and `Approver` (a thread that
+  answers every pending record as it lands, so a driver run can be
+  scripted end to end over the exact same disk protocol the web UI uses).
+  Any surface — web app, CLI `pipeline approve` — resolves the same file,
+  so no surface owns a run.
+- `pipeline/driver.py` — `RunOptions` (persisted via `to_spec`/
+  `from_spec`) and `RunReport`, then `RecursiveDriver`, the phase machine.
+  Construction never touches the network; only `async run()` does. Phase
+  *skip* on resume is decided by artifact existence (`_phase_done`: `## Goal`
+  in `spec.md` for intake, `spine.json` for survey, `tree.json` for plan,
+  `contract.md` for pilot), not by `phase.json`'s word; research/execute/
+  assemble are always re-run, safe because v4's finding cache, v1's round
+  loop, and v3's assembly loop are themselves resume-idempotent. Human
+  gates go through `_ask()` (approval records, `find_pending`-reusing);
+  `halt.flag` is honored at phase boundaries only. Post-run interventions,
+  §10's "present counts, get approval, then execute" with no writer ever
+  running in the read-only half: `amend_and_revalidate` (append the rule →
+  run the read-only re-validation pass → return `{contract, counts,
+  triage}` for operator review), `apply_triage` (dispatch one
+  `repair.run_repair` per non-clean node, patch or regenerate per its
+  classification), `reopen_node` (mark one passed node stale and dispatch
+  a single scoped repair from operator defect text; refuses nodes that
+  are not `"passed"`).
+- `pipeline/backends.py` — one module deciding which agent backend a run's
+  writers and research queries use, so the driver never constructs an
+  adapter: `build_writer_adapter` (claude_code with per-node `allowed_tools`
+  when the node declares them; codex; gptme), `build_research_adapter`
+  (claude_code only — WebSearch/WebFetch are Claude Code built-ins and
+  Context7 is the one wired MCP server; **any other backend raises** rather
+  than silently granting full tool access to a research query), and
+  `parse_research_plan` (the loose web/CLI JSON — a list of
+  `{node_id, slug, kind, question}` objects or a dict by node_id — into
+  v4's typed plan dict).
+- `pipeline/prompts.py` — `build_node_prompt(node, run_dir)` assembles a
+  writer's whole prompt before its bounded episode starts (brief, frozen
+  contract, inputs list — spine unit ids and v4 finding paths the agent
+  reads with its own tools — and judgment rubric). No model calls.
+- `pipeline/run.py` — the standalone entrypoint (`python -m
+  lh_harness.pipeline.run`) that both `lh-harness pipeline run` and its
+  `--detach` mode spawn, so one argument parser stays in sync with one run
+  loop. A run id whose `run.spec.json` already exists *resumes*: the disk
+  is authoritative, argv contributes nothing but the id.
+- `pipeline/cli.py` — the `lh-harness pipeline` group (§11's control
+  surface): run (foreground, or `--detach` in a background subprocess, or
+  `--dashboard` alongside), resume (= run with an existing id), status
+  (phase/tree/approval status/events lengths straight from disk), approve
+  (resolve the oldest pending approval, with `--answer`/`--file`/
+  `--action`), amend (append a rule, print the re-validation counts, ask
+  before applying the triage — or `--yes`). Every handler operates purely
+  on the run directory, so they work from a second terminal while a
+  driver (or web view) is still attached.
+- `dashboard/recursive.py` — `RecursiveRunState`, the server-side state
+  for the recursive-decomposition web view (PLAN.md §11): browse/attach
+  runs under a `runs_root`, `snapshot()` reads everything fresh from disk
+  in one call (phase, tree summary + counts, approvals, events tail,
+  jobs, halted flag, spec/contract/assembly presence), hosted runs (the
+  dashboard drives a `RecursiveDriver` in a background thread and writes
+  `phase.json` from its report), operator actions through the same
+  approvals.jsonl protocol, per-node `node_detail` (gates re-evaluated
+  live, audit, manifest line, versions, promotion, inputs resolved to
+  token/existence), artifact/trace/version/assembly readers, and the
+  amend/reopen request surfaces that *create* approvals (never run jobs
+  directly) while the apply halves — amend → re-validate → surface a
+  `triage` approval; apply-triage repairs; reopen repairs — run as
+  `jobs.jsonl`-tracked background threads. Not yet mounted in
+  `server.py` : additive library module, the same "scaffolding now,
+  wiring later" pattern v0-v4 followed; it bridges pipeline/ and
+  dashboard/ only through the run directory, never shared memory.
+## Adapters (gptme-only)
+
+The Claude Code and Codex adapters, the classic role adapters
+(`manager.py`, `auditor_agent.py`, `plugins/`, `role_prompts.py`,
+`prompt_texts.py`, `config.py`, `agent_logs.py`), and their `utils/`
+helpers (`agent_cli.py`, `update_check.py`) were **deleted** along with the
+classic harness. What remains is the gptme-only surface:
+
+- `adapters/cli_agent.py` — `CommandAgentAdapter`, the shared base for the
+  one remaining adapter. `run_episode` builds the shell command from a
+  `command_template`, writes the prompt to a unique file under
+  `prompt_dir`, tees stdout to `live_trajectory_path` via the environment,
+  and produces an `EpisodeResult` (timeout → `"timeout"`, non-zero exit →
+  `"error"`, else `"done"`). `supports_session_resume = False` /
+  `supports_tool_restriction = False` class attributes, `command_override`
+  keyword for one-call command swaps.
+- `adapters/gptme_adapter.py` + `adapters/_gptme_worker.py` — the **only**
+  Writer backend: `GptmeAdapter`, an `AgentAdapter` with no agent CLI
+  anywhere in the chain. It drives gptme (github.com/gptme/gptme, MIT,
+  `pip install "lh-harness[gptme]"` — an optional extra, so the core
+  package and the test suite stay gptme-free) — a small
+  shell/read/save/patch tool-use loop that talks to the user's configured
+  OpenAI-compatible endpoint (see `provider_config.py` below; the built-in
+  default is DeepSeek V4 Flash Free via OpenCode Zen). Model id gets the
+  `local/` provider prefix (`_gptme_model`), because gptme routes
+  `local/<name>` through whatever `OPENAI_BASE_URL` points at. Still
+  subclasses `CommandAgentAdapter` and still shells a subprocess — of
   `_gptme_worker.py`, a few lines of code in *this* repo that call one
   gptme library function (`gptme.chat(...)`), not of a product this repo
   doesn't control. That subprocess boundary is deliberate, not a
   compromise: gptme's own `chat()` calls `os.chdir(workspace)` itself (a
   process-global mutation two concurrent in-process episodes would race)
   and, being a synchronous call, can't be forcibly cancelled once wrapped
-  in `asyncio.to_thread` (a timed-out `EpisodeBudget` would only stop
-  *awaiting* it — the worker thread keeps running invisibly in the
-  background). A subprocess gets both for free from machinery every other
-  adapter already relies on (`environment/local.py`'s real
-  timeout+killpg) — confirmed by an actual end-to-end run against a
-  scratch `pip install gptme` venv pointed at an unreachable host: the
-  harness's own budget timeout correctly killed the stuck subprocess
-  rather than leaking it. `supports_session_resume = False` — gptme's own
-  continuity model (re-point `chat()` at the same `logdir`) has no
+  in `asyncio.to_thread`. A subprocess gets both for free from machinery
+  (`environment/local.py`'s real timeout+killpg, `utils/process_group.py`
+ 's tracked process groups). `supports_session_resume = False` — gptme's
+  own continuity model (re-point `chat()` at the same `logdir`) has no
   fresh-vs-corrupted-log distinction the way `--resume <session_id>`
-  does, since gptme's conversation log is a full-file rewrite per append,
-  not append-only/fsync'd like this harness's own `EventLog`; every
-  `run_episode` call gets a fresh, never-reused `logdir`, so a redispatch
-  can never collide with a crashed attempt's partial log. Every exact API
-  detail here (the `chat()` signature, the `"local/<name>"` +
-  `OPENAI_BASE_URL`/`OPENAI_API_KEY` custom-endpoint mechanism, the
-  `--output-format json` line shape `gptme_visible_output` parses) was
-  confirmed against a real installed `gptme` package via `inspect`, not
-  guessed from documentation. `tests/test_gptme_adapter.py` (15 tests)
-  covers command construction and output parsing the same
-  no-real-network way every other adapter's tests do; there is no
-  automated test that actually runs gptme, since that needs a real API
-  key the same way no test here ever calls a real `claude`/`codex`
-  binary either.
+  does; every `run_episode` call gets a fresh, never-reused `logdir`, so
+  a redispatch can never collide with a crashed attempt's partial log.
+  `supports_tool_restriction = True` via the `tool_allowlist` constructor
+  arg (per-node narrowing flows from `node.tools` through
+  `pipeline/backends.py`). Every exact API detail here (the `chat()`
+  signature, the `"local/<name>"` + `OPENAI_BASE_URL`/`OPENAI_API_KEY`
+  custom-endpoint mechanism, the `--output-format json` line shape
+  `gptme_visible_output` parses) was confirmed against a real installed
+  `gptme` package via `inspect`, not guessed from documentation.
+
+## Provider configuration (`provider_config.py`)
+
+Provider defaults and customization live in exactly one module, `src/
+lh_harness/provider_config.py`, so the endpoint the agents and planner
+talk to is never scattered across adapters. There **is** a built-in
+default — OpenCode Zen (`https://opencode.ai/zen/v1`, model
+`opencode/deepseek-v4-flash-free`, api key read from `OPENCODE_API_KEY`)
+— and the user replaces it in `~/.lh-harness/provider.json`
+(`LH_HARNESS_PROVIDER_CONFIG` overrides the path). A sample with those
+opencode values sits at the repo root (`provider.example.json`); the CLI
+writes it to `~/.lh-harness/provider.json` on first invocation
+(`ensure_user_config`) so "customize the default" is a file edit, not a
+code change.
+
+Per-field precedence (highest first):
+
+1. explicit constructor argument (`api_key=`/`base_url=`/`model=`)
+2. `LH_HARNESS_PROVIDER_API_KEY` / `LH_HARNESS_PROVIDER_BASE_URL` /
+   `LH_HARNESS_PROVIDER_MODEL` env vars
+3. the config file (`~/.lh-harness/provider.json` / `$LH_HARNESS_PROVIDER_CONFIG`)
+4. `OPENAI_API_KEY` / `OPENAI_BASE_URL` / `OPENAI_MODEL` env vars
+5. built-in default (opencode; key from `OPENCODE_API_KEY`)
+
+`resolve()` always returns populated `base_url`/`model`; only `api_key`
+may be empty and only `require()` (called by callers that must not
+proceed without credentials, and by `GptmeAdapter.__init__`) errors on it
+— with a message naming exactly which knob to set. The old per-module
+defaults (`DEFAULT_BASE_URL`/`DEFAULT_MODEL` in `v1/provider.py`,
+`DEFAULT_GPTME_*` in `gptme_adapter.py`) were folded into this module;
+`v1/provider.py` and the adapter now call `resolve()` with the same
+lookup chain.
 
 ## Tests
 
@@ -521,9 +632,16 @@ no API key. Run everything:
 python3 -m unittest discover -s tests -p "test_*.py" -v
 ```
 
-~7s, 118 tests, all passing (103 as of the v4 build, plus 15 for
-`GptmeAdapter`, the adapters/-layer addition described above under
-"Adapter changes").
+~7s, 132 tests, all passing (118 as of the v4 build, plus 15 for
+`GptmeAdapter` and its allowlist/no-codex rework + 13 new
+`test_provider_config.py` tests).
+
+### `tests/test_provider_config.py` (13 tests)
+
+`resolve()`'s precedence chain frozen (built-in opencode default; each
+higher level wins; unknown config keys ignored; malformed/non-object
+config raises), `require()` passing/raising, and `ensure_user_config`
+writing the sample once and never overwriting an existing file.
 
 ### v0 (`tests/test_v0_resume.py`, 4 tests)
 
@@ -726,8 +844,9 @@ config change later, not a redesign, per §4.5), an automatic research-query
 planner (v4's `research_loop.py` takes an explicit caller-supplied
 `plan` — deciding *which* nodes need *which* questions answered is not
 built, the same "hand- or script-authored" starting point v1's trees had
-before v2's planner existed), and the CLI/dashboard wiring that would
-actually chain intake→survey→plan→pilot→research→execute→assemble into one
-pipeline run (`cli.py`, `dashboard/`) — v0-v4 ship composable library
-modules, not a driver. `PLAN.md` §13's build ladder ends at v4; none of
-this is scoped in `PLAN.md` yet.
+before v2's planner existed), and the dashboard *view* for the recursive
+harness — `RecursiveRunState` (v5 section above) is an additive library
+module not yet mounted in `server.py`/`dashboard/static`, so there is no
+web page for the recursive pipeline yet (the CLI `lh-harness pipeline`
+group is the live control surface). `PLAN.md` §13's build ladder ends at
+v4; none of this is scoped in `PLAN.md` yet.

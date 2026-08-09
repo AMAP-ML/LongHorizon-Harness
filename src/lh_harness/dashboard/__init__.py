@@ -1,24 +1,12 @@
-"""Self-contained dashboard for LongHorizon-Harness.
+"""Recursive-decomposition view state (PLAN.md §11).
 
-Everything the dashboard needs lives in this package. The rest of the harness
-only touches the small public surface below:
-
-* :func:`start_dashboard`: launch the web server in a background thread.
-* :func:`make_human_hook`: build the human-in-the-loop hook (round + end gates).
-* :class:`DashboardState` / :class:`ApprovalRules`: shared state and rules.
+Additive library module bridging pipeline/ and dashboard/ only through the
+run directory, never through shared memory. Not mounted in any web server
+yet — the CLI ``lh-harness`` control surface is the live operator path.
 """
 
 from __future__ import annotations
 
-from .gate import make_human_hook
-from .rules import ApprovalRules
-from .server import DashboardHandle, start_dashboard
-from .state import DashboardState
+from .recursive import RecursiveRunState
 
-__all__ = [
-    "start_dashboard",
-    "make_human_hook",
-    "DashboardHandle",
-    "DashboardState",
-    "ApprovalRules",
-]
+__all__ = ["RecursiveRunState"]

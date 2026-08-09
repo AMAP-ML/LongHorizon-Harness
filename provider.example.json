@@ -1,0 +1,5 @@
+{
+  "api_key": "",
+  "base_url": "https://opencode.ai/zen/v1",
+  "model": "opencode/deepseek-v4-flash-free"
+}

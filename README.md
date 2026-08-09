@@ -18,7 +18,7 @@
 </p>
 
 [![Python](https://img.shields.io/badge/python-≥3.10-blue?logo=python&logoColor=white)](https://www.python.org/)
-[![Agents](https://img.shields.io/badge/backends-Claude%20Code%20|%20Codex-8A2BE2)](#any-model-any-agent-backend)
+[![Agents](https://img.shields.io/badge/backend-gptme-8A2BE2)](#any-model-any-agent-backend)
 [![Benchmarks](https://img.shields.io/badge/benchmarks-WeaveBench%20|%20OSWorld%202.0%20|%20Terminal--Bench%202.1-orange)](#hundreds-of-real-tasks-measured-gains)
 
 [Usage](#one-command-full-visibility) · [What You Get](#desktop-apps-and-cli-one-continuous-task) · [How It Works](#three-roles-one-trusted-state) · [Results](#hundreds-of-real-tasks-measured-gains) · [Project Website](https://lh-harness.pages.dev) · [简体中文](README.zh-CN.md)
@@ -30,16 +30,15 @@
 
 > **The model determines what an agent can do in one round. LongHorizon-Harness determines whether that work can be verified, preserved, and continued until the task is actually complete.**
 
-**Works with Claude Code and Codex. One-command install, ready to run.**
+**Works with any OpenAI-compatible provider (default: OpenCode Zen). One-command install, ready to run.**
 
-LongHorizon-Harness is an execution, state-management, and result-verification system for long-horizon tasks. It does not train a new model or replace an existing agent. It runs on top of systems such as Codex and Claude Code, helping agents operate autonomously in real computer environments for extended periods and continuously move complex tasks forward.
+LongHorizon-Harness is an execution, state-management, and result-verification system for long-horizon tasks. It does not train a new model or replace an existing agent. It decomposes a long task into a tree of verifiable nodes, dispatches each node to a bounded agent episode (via gptme's tool-use loop against your provider of choice), gates and reviews every artifact, and assembles the verified result — continuously moving complex tasks forward without state drift.
 
 ## ✨ News
 
+- **[2026-08-08]** The harness is now gptme-only: the classic role-based manager/executor/auditor loop and the Claude Code/Codex backends are gone. The pipeline CLI (`run` / `status` / `approve` / `amend` / `resume`) is the control surface, and the provider is user-configurable through `~/.lh-harness/provider.json` (default: OpenCode Zen).
 - **[2026-08-07]** A new, more user-friendly Dashboard is in the works. Stay tuned.
-- **[v0.1.3 · 2026-08-07]** Every run now ends with a plain-language reply that answers your task from the verified state alone. Tasks act on the directory you launched from by default, and the console reports each round as it happens.
 - **[2026-08-06]** LongHorizon-Harness reaches **#1** on the [Hugging Face Daily Papers weekly ranking](https://huggingface.co/papers/week/2026-W32).
-- **[v0.1.2 · 2026-08-06]** Adds unified computer-use plugin management, stronger auditor read-only checks and role isolation, reliable process cleanup, and expanded `doctor` diagnostics. See [Manage computer-use plugins](#manage-computer-use-plugins).
 - **[2026-08-06]** The WeChat group is open. Scan the QR code below to join.
 
 > 🚀 We’re iterating rapidly. Stay tuned!
@@ -56,17 +55,18 @@ https://github.com/user-attachments/assets/ca8b77ce-9220-4d85-a272-b346009b2454
 
 <p align="center"><a href="assets/promotional_video_1440p.mp4"><strong>Open the promotional video (1440p MP4)</strong></a></p>
 
-## Three roles. One trusted state.
+## Recursive decomposition. One trusted state.
 
-LongHorizon-Harness separates planning, execution, and verification so that one growing context is not responsible for everything.
+LongHorizon-Harness turns a long task into a tree of small, verifiable nodes rather than one growing context responsible for everything.
 
-| | Role | One responsibility |
+| | Phase | One responsibility |
 |---|---|---|
-| 🧭 | **Manager** | Maintains the original goal, verified progress, and next step |
-| ⚡ | **Executor** | Starts each round with a fresh context and focuses on one clearly defined task |
-| 🔍 | **Auditor** | Independently inspects files, interfaces, logs, and tests in the real environment |
+| 🧭 | **Intake + survey** | Freeze the goal, the global rubric, and the source spine before any writing starts |
+| ⚡ | **Plan + pilot** | Recursively decompose into dependency-free leaves; pilot one chapter per shape and freeze a contract from the edits |
+| 🔍 | **Execute + verify** | Each node runs in a bounded episode; machine-checkable gates and an independent review must both pass before `passed` is written |
+| 🧩 | **Assemble + repair** | Concatenate in tree order, run cross-cutting checks and a compile gate, and repair only the offending nodes |
 
-Only results that pass independent verification enter persistent task state. Even when the context is refreshed, an action fails, or a deliverable does not pass inspection, the system retains previously verified progress and continues from what remains.
+Only results that pass independent verification enter persistent task state. Even when an episode crashes, an action fails, or a deliverable does not pass inspection, the harness resumes from durable, fsync'd events — no double work, no lost work.
 
 ## Desktop apps and CLI. One continuous task.
 
@@ -82,20 +82,18 @@ LongHorizon-Harness supports both GUI and CLI workflows.
 
 One task can begin in a browser, move to the command line for data processing, continue in desktop software to produce an artifact, and return to the terminal for validation or debugging. The goal, progress, and evidence remain under the same state-management system throughout.
 
-## Any model. Any agent backend.
+## Any model. Any OpenAI-compatible provider.
 
-LongHorizon-Harness is not tied to a specific model or agent backend. Existing models and agents connect through configuration without changing their original workflows.
+LongHorizon-Harness is not tied to a specific model. The provider is configured in `~/.lh-harness/provider.json` (any OpenAI-compatible endpoint); the default is OpenCode Zen.
 
 | | Layer | Supported choices |
 |---|---|---|
-| 🧠 | **Models** | Claude, GPT, Qwen, and other models exposed by an agent backend |
-| 🤖 | **Agent backends** | Claude Code, Codex CLI, and custom `AgentAdapter` implementations |
-| 🎛️ | **Role assignment** | The Manager, Executor, and Auditor can each use a different model or backend |
-| 🖥️ | **Execution environments** | Local, with a pluggable `Environment` protocol |
+| 🧠 | **Provider** | Any OpenAI-compatible endpoint, configured per user in `~/.lh-harness/provider.json` (default: OpenCode Zen) |
+| 🤖 | **Agent backend** | gptme's tool-use loop (shell/read/save/patch) against the configured provider |
+| 🎛️ | **Decomposition** | Recursive intake → survey → planning → pilot/contract → execute → assemble, with per-node tool narrowing |
+| 🖥️ | **Execution environment** | Local, with a pluggable `Environment` protocol |
 
-A lightweight `AgentAdapter` preserves each agent's native execution loop while LongHorizon-Harness coordinates role boundaries, verified task state, and cross-round progress around it.
-
-Use one model for all three roles, or combine different models and backends to balance quality, speed, and cost.
+A lightweight `AgentAdapter` preserves the agent's native execution loop while LongHorizon-Harness coordinates verified task state, machine-checkable gates, and crash-resumable progress around it.
 
 ## Hundreds of real tasks. Measured gains.
 
@@ -149,7 +147,7 @@ We ran it on hundreds of complex tasks across GUI, CLI, and mixed computer envir
 
 ### 📊 Full benchmark results and experimental settings
 
-| Benchmark | Metric | Claude Code | **LongHorizon-Harness** | Gain |
+| Benchmark | Metric | Agent baseline | **LongHorizon-Harness** | Gain |
 |---|---|:-:|:-:|:-:|
 | **WeaveBench** (114 tasks) | PassRate | 51.8 | **80.7** | **+28.9** |
 | **WeaveBench** | Overall | 0.702 | **0.835** | +0.133 |
@@ -157,7 +155,7 @@ We ran it on hundreds of complex tasks across GUI, CLI, and mixed computer envir
 | **OSWorld 2.0** | Partial | 21.5 | **35.2** | **+13.7** |
 | **Terminal-Bench 2.1** | Success rate | 69.7 | **77.2** | **+7.5** |
 
-<sub>All rows use Qwen 3.7-Plus as the backbone and Claude Code as the execution backend.</sub>
+<sub>Rows use a Qwen 3.7-Plus backbone with an agent CLI execution backend.</sub>
 
 Full result tables and case trajectories are available on the [LongHorizon-Harness project website](https://lh-harness.pages.dev).
 
@@ -173,271 +171,91 @@ Steps 1–2 are once per machine; steps 3–4 are once per project.
 |---|---|
 | [uv](https://docs.astral.sh/uv/getting-started/installation/) | The recommended isolated install. Skip it if you prefer pip. |
 | Python 3.10 or later | Running the harness. `uv tool install` brings its own; a pip install uses yours. |
-| One agent runtime on `PATH`: [`codex`](https://github.com/openai/codex#installing-and-running-codex-cli) or [`claude`](https://docs.anthropic.com/en/docs/claude-code/getting-started) | Actually executing the work. Install both if you want to mix them across roles. |
-| [Node.js](https://nodejs.org) 20 or later | Only the npm-distributed computer-use plugins. Not needed for `codex-computer-use` or CLI-only tasks. |
+| A provider API key | Any OpenAI-compatible endpoint. The default (OpenCode Zen) reads `OPENCODE_API_KEY`; set it in `~/.lh-harness/provider.json` or the environment. |
+| gptme (`pip install "lh-harness[gptme]"`) | The Writer backend: gptme's tool-use loop. The core package and tests stay gptme-free. |
 
 > **Platform status:** Currently tested on macOS. Windows support is included but has not yet been thoroughly tested.
-
-Run `lh-harness doctor` at any point to check all of the above; see [Verify the environment](#verify-the-environment).
 
 #### 1. Install LongHorizon-Harness
 
 ```bash
-uv tool install lh-harness            # or: pip install lh-harness
+uv tool install "lh-harness[gptme]"     # or: pip install "lh-harness[gptme]"
 ```
 
 Upgrade later with `uv tool upgrade lh-harness` or `pip install --upgrade lh-harness`.
 
-#### 2. Install a computer-use plugin
+#### 2. Configure your provider
 
-Skip this if your tasks never touch the GUI. Otherwise install the one that matches your agent. No plugin is enabled by default, and one install covers every project on the machine.
-
-Using Codex:
-
-```bash
-lh-harness plugin install codex-computer-use
-```
-
-Using Claude Code, or both agents:
-
-```bash
-lh-harness plugin install open-computer-use
-```
-
-`codex-computer-use` is the official plugin bundled with the Codex CLI and only works with Codex. `open-computer-use` is distributed on npm, needs Node.js 20+, and drives both agents. Both need OS permissions that **must be granted by hand on macOS**. See [Manage computer-use plugins](#manage-computer-use-plugins) for that, for `clawdcursor` as a third option, and for how each one is wired.
-
-#### 3. Generate a project configuration
-
-```bash
-cd /path/to/your/project
-lh-harness init
-```
-
-This creates `./.lh-harness/config.toml` without replacing an existing file; use `lh-harness init --force` to regenerate. Open it and adjust the defaults. Every field is documented in [Configuration reference](#configuration-reference).
-
-#### 4. Run a task
-
-```bash
-TASK="Inspect the current directory and summarize its files."
-lh-harness run --task "${TASK}" --agent codex
-```
-
-Explicit CLI arguments such as `--agent` override the matching values in `./.lh-harness/config.toml` for that run; drop them to use the configured defaults.
-
-The agents work in the directory you launched from, so the task acts on your real project. Set `workspace` or `--workspace` to point somewhere else. `./.lh-harness/` itself stays off limits, so the run's own logs and state are never mistaken for task content.
-
-The Dashboard opens in your browser automatically, and the console prints one line per role as the run progresses. At the end you get a plain-language reply that answers your request from the verified state alone, and says so plainly if the task did not finish.
-
-Every run is stored under `./.lh-harness/runs/<run-id>/`; the full report, including that reply, stays in the run's `logs/report.json`.
-
-#### Verify the environment
-
-```bash
-lh-harness doctor
-```
-
-`doctor` is read-only. It reports the Python runtime, the agent CLIs, Node.js, and plugin state, and exits non-zero when a required check fails.
-
-Agent CLIs are verified by running `<binary> --version`, not just by finding them on `PATH`, so one that is present but broken is reported as a failure instead of OK. This catches the Windows case where a Microsoft Store desktop install leaves a zero-byte `codex.exe` alias on `PATH` that is not the CLI; `doctor` prints how to fix it.
-
-It also checks [PyPI](https://pypi.org/project/lh-harness) for a newer version. To check on its own:
-
-```bash
-lh-harness check-update
-```
-
-#### Configuration reference
-
-`lh-harness run` reads `./.lh-harness/config.toml` automatically. Precedence is:
-
-1. Explicit CLI arguments
-2. Values in `./.lh-harness/config.toml`
-3. Built-in defaults
-
-Task text, run IDs, and API keys are deliberately **not** configurable here; they stay command-line or environment inputs so they never land in a file you might commit.
-
-##### `[run]`
-
-| Field | Default | Description |
-|---|---|---|
-| `agent` | `"codex"` | Backend for every role unless a role overrides it: `codex` or `claude_code`. |
-| `model` | `"gpt-5.6-sol"` | Model for every role unless a role overrides it. Must be a model the chosen backend exposes. |
-| `env` | `"local"` | Execution environment. Only `local` today. |
-| `runs_root` | `"./.lh-harness/runs"` | Where run directories are created. Each run gets `<runs_root>/<run-id>/`. |
-| `workspace` | commented out | Working directory the agents operate in. Defaults to the directory `lh-harness` was started from, so a task acts on your real project; set it to isolate the run somewhere else. |
-| `harness_dir` | commented out | Where harness task state is written. Defaults to the run's own `harness/`, keeping it out of the workspace. |
-| `log_dir` | commented out | Where logs are written. Defaults to the run's own `logs/`. |
-| `base_url` | commented out | OpenAI-compatible endpoint override, for a proxy or a self-hosted model. |
-| `prompt_language` | `"en"` | Language of the harness-generated prompts and reports: `en` or `zh`. Does not restrict the task language. |
-| `claude_mcp_config` | commented out | Path to a `.mcp.json` for Claude Code. Overrides the installed plugin. |
-| `codex_mcp_config` | commented out | Path to a `[mcp_servers.*]` TOML for Codex. Overrides the installed plugin. |
-| `mcp_add_dirs` | `[]` | Extra directories the MCP server may read. Claude Code rejects these, because its role isolation requires task files to live inside the workspace. |
-| `max_rounds` | `30` | Upper bound on Manage-Execute-Audit rounds before the run stops. |
-| `dashboard` | `true` | Start the web dashboard with each run. |
-| `dashboard_port` | `0` | Dashboard port; `0` lets the OS pick a free one. |
-
-##### `[run.timeouts]`
-
-Per-episode limits in seconds. One episode is a single role invocation, not the whole run.
-
-| Field | Default | Description |
-|---|---|---|
-| `manager` | `600` | Planning the next step. |
-| `gui_executor` | `1800` | Executing a GUI/visual subtask. |
-| `cli_executor` | `1800` | Executing a CLI/non-GUI subtask. |
-| `auditor` | `600` | Verifying a subtask. Applies to both auditors. |
-
-##### `[run.roles.*]`
-
-Each role can take its own `agent` and `model`, so you can pay for a strong model only where it matters: a capable Manager and Auditor with a cheaper Executor, for example. Every field is commented out by default, meaning "inherit".
-
-Resolution walks the chain until it finds a value:
-
-```
-gui_executor → executor → [run].agent / [run].model
-cli_auditor  → auditor  → [run].agent / [run].model
-```
-
-| Section | Falls back to | Covers |
-|---|---|---|
-| `[run.roles.manager]` | `[run]` | The scheduler role |
-| `[run.roles.executor]` | `[run]` | Both executor roles |
-| `[run.roles.gui_executor]` | `executor` | GUI/visual subtasks |
-| `[run.roles.cli_executor]` | `executor` | CLI/non-GUI subtasks |
-| `[run.roles.auditor]` | `[run]` | Both auditor roles |
-| `[run.roles.gui_auditor]` | `auditor` | GUI audit |
-| `[run.roles.cli_auditor]` | `auditor` | CLI audit |
-| `[run.roles.final_response]` | `manager` | The closing reply written for you |
-
-Every field above also has a CLI flag (`--agent`, `--max-rounds`, `--gui-executor-model`, `--auditor-timeout`, and so on) that overrides it for a single run. Run `lh-harness run --help` for the full list.
-
-#### Manage computer-use plugins
-
-Computer-use setup is intentionally separate from task execution: `doctor` only reports status, and `lh-harness run` never installs, removes, or changes plugins. All changes go through `lh-harness plugin`.
-
-List the available plugins with their install state, supported agents, and homepages:
-
-```bash
-lh-harness plugin list
-```
-
-| Plugin | Source | Agents | Platforms |
-| --- | --- | --- | --- |
-| `codex-computer-use` | Official plugin bundled with the Codex CLI | `codex` | whatever your Codex build offers |
-| `open-computer-use` | npm ([open-codex-computer-use](https://github.com/iFurySt/open-codex-computer-use)) | `codex`, `claude_code` | macOS, Windows, Linux |
-| `clawdcursor` | npm ([clawdcursor](https://github.com/AmrDab/clawdcursor)) | `codex`, `claude_code` | macOS, Windows, Linux |
-
-Installing needs no agent flag. Every agent the plugin supports is configured, since the per-agent difference is only one more config file:
-
-```bash
-lh-harness plugin install clawdcursor
-```
-
-One install covers every project on the machine. It installs the package, runs whatever consent or permission step the plugin needs on the current OS, and writes one MCP config per agent under `~/.lh-harness/plugins/`. Agents missing from `PATH` are skipped; `--agent` narrows the selection, and `--no-activate` skips the permission step on a headless machine.
-
-`lh-harness run` then loads the right server automatically. When several are installed, the first available one wins:
-
-```
-codex-computer-use > open-computer-use > clawdcursor
-```
-
-`--claude-mcp-config` and `--codex-mcp-config` override that choice. `plugin list` and `doctor` both print which plugin each agent will load and whether its permissions are granted.
-
-To remove one:
-
-```bash
-lh-harness plugin uninstall clawdcursor
-```
-
-**GUI access stays scoped to the harness.** The npm plugins live entirely inside `~/.lh-harness/` and are passed per run, so `~/.codex/config.toml`, `~/.claude.json`, and the user-scope MCP registries are never touched. `codex-computer-use` is the unavoidable exception: Codex loads it from its own registry, so `codex plugin add` records it there.
-
-**`codex-computer-use` needs manual grants on macOS.** It raises no permission dialog, so an unauthorized GUI call just fails. The install opens the two panes for you; tick *Codex Computer Use* under Privacy & Security → **Accessibility** and → **Screen & System Audio Recording**, then re-run the install to verify. On Windows there is nothing to grant, but the harness has to run in a signed-in desktop session and stay unelevated.
-
-Any missing prerequisite is printed during install.
-
-#### Configure MCP servers
-
-Any MCP server can be passed to the agents, not just computer-use ones. Each backend reads its own native format; nothing is translated between them.
-
-Claude Code takes a `.mcp.json` file through `--claude-mcp-config`:
+The first `lh-harness` run creates `~/.lh-harness/provider.json` from the
+sample (also at the repo root as `provider.example.json`) with the default
+opencode settings:
 
 ```json
 {
-  "mcpServers": {
-    "computer-use": {
-      "command": "/path/to/mcp-server",
-      "args": ["--option", "value"],
-      "env": {
-        "EXAMPLE_VARIABLE": "value"
-      }
-    }
-  }
+  "api_key": "",
+  "base_url": "https://opencode.ai/zen/v1",
+  "model": "opencode/deepseek-v4-flash-free"
 }
 ```
 
-Codex takes a TOML file of `[mcp_servers.<name>]` tables through `--codex-mcp-config`, matching `~/.codex/config.toml`:
+Edit it to point at any OpenAI-compatible endpoint, or set
+`LH_HARNESS_PROVIDER_API_KEY` / `LH_HARNESS_PROVIDER_BASE_URL` /
+`LH_HARNESS_PROVIDER_MODEL` (or the generic `OPENAI_*` equivalents)
+instead. Precedence: explicit flags/arguments > `LH_HARNESS_PROVIDER_*`
+env > config file > `OPENAI_*` env > built-in opencode default.
 
-```toml
-[mcp_servers.my-server]
-command = "/path/to/mcp-server"
-args = ["--option", "value"]
-
-[mcp_servers.my-server.env]
-EXAMPLE_VARIABLE = "value"
-```
-
-Pass the config for the backend in use, plus any directory the server needs to read:
+#### 3. Run a task
 
 ```bash
-lh-harness run --task @task.md --agent codex \
-  --codex-mcp-config /path/to/mcp.toml \
-  --mcp-add-dir /path/to/mcp/files
+lh-harness run --goal "Summarize the files in this directory." --source @README.md
 ```
 
-Both flags can be given together when roles use different backends, and `--mcp-add-dir` may be repeated. The equivalent environment variables are `LH_HARNESS_CLAUDECODE_MCP_CONFIG`, `LH_HARNESS_CODEX_MCP_CONFIG`, and `LH_HARNESS_MCP_ADD_DIRS`, the last separated by `:` on macOS/Linux and `;` on Windows.
+The pipeline decomposes the goal (intake → survey → plan → pilot →
+contract), executes each node in a bounded gptme episode with per-node
+tool narrowing, gates and reviews every artifact, and assembles the
+verified result. Phases that are already done are skipped on resume;
+`lh-harness pipeline resume <run-id>` picks up a halted run exactly where
+it stopped.
 
-Prefer letting the server read API keys from its environment over writing them into the config file.
-
-### Dashboard commands
+Control surface (all operate on the run directory, safe from a second
+terminal while a run is in flight):
 
 ```bash
-lh-harness run --task @task.md --dashboard      # Monitor a live run
-lh-harness dashboard                            # Browse completed and active runs
+lh-harness status <run-id>          # phase, tree statuses, pending approvals
+lh-harness approve <run-id>         # resolve the oldest pending approval
+lh-harness amend <run-id> --text "..."   # amend the contract, re-validate
 ```
 
-### Common CLI options
+Every run lives under `./.lh-harness/runs/<run-id>/`; the tree state,
+events log, and assembled output stay there for audit.
 
-| Option | Description |
+#### CLI and provider reference
+
+The `lh-harness` CLI is the PLAN.md §11 control surface. Commands operate
+purely on the run directory, so `status`/`approve`/`amend` are safe to run
+from a second terminal while a driver is still attached.
+
+| Command | Description |
 |---|---|
-| `--task` | Task text or `@task.md` |
-| `--agent` | `claude_code` or `codex` |
-| `--env` | `local` |
-| `--max-rounds` | Maximum number of Manage-Execute-Audit rounds; the CLI default is 30 |
-| `--dashboard` | Start live monitoring and human intervention |
-| `--no-dashboard` | Disable a Dashboard enabled by the project configuration |
+| `lh-harness run` | Run (or resume) the pipeline: `--goal`, `--source` (`@file` or `-`), `--backend` (only `gptme`), `--model`, `--compile-command`, `--research-plan`, `--max-rounds`, `--max-attempts`, `--detach` |
+| `lh-harness resume <run-id>` | Resume a halted run; the disk state is authoritative |
+| `lh-harness status <run-id>` | Phase, tree statuses, pending approvals, event count |
+| `lh-harness approve <run-id>` | Resolve the oldest pending approval (`--answer`, `--file`, `--action`) |
+| `lh-harness amend <run-id> --text "..."` | Append a contract rule, run the read-only re-validation pass, and (on confirmation) apply the repairs |
 
-Run a longer task from a file and open the Dashboard:
+Provider settings resolve per field, highest first:
 
-```bash
-lh-harness run --task @task.md --dashboard
-```
+1. Explicit constructor/CLI arguments
+2. `LH_HARNESS_PROVIDER_API_KEY` / `LH_HARNESS_PROVIDER_BASE_URL` /
+   `LH_HARNESS_PROVIDER_MODEL` environment variables
+3. `~/.lh-harness/provider.json` (or `$LH_HARNESS_PROVIDER_CONFIG`)
+4. `OPENAI_API_KEY` / `OPENAI_BASE_URL` / `OPENAI_MODEL` environment variables
+5. Built-in default: OpenCode Zen (api key via `OPENCODE_API_KEY`)
 
-The Dashboard shows every round's plan, execution result, audit evidence, and reason for rework. It also provides human gates when a task completes, becomes blocked, needs input, or fails repeatedly.
-
-| 📋 Plan | ⚡ Execution | 🔍 Audit | ♻️ Rework |
-|:---:|:---:|:---:|:---:|
-| What happens next | What the agent did | What the environment proves | Why another round is needed |
-
-Every run is stored in an isolated `runs/<run-id>/` directory. The complete task state and audit trail make the agent's progress inspectable, recoverable, and reproducible.
-
-| Run record | What it preserves |
-|---|---|
-| 📋 **Task state** | Original goal, requirements, verified progress, and remaining work |
-| 🧾 **Event stream** | What happened throughout the run |
-| 🔍 **Audit reports** | Evidence and acceptance decisions for every round |
-| 🧠 **Role trajectories** | Manager, Executor, and Auditor inputs and outputs |
-| 📁 **Workspace** | Files and artifacts produced during execution |
-| ✅ **Final report** | The verified outcome of the task |
+Every run is stored in an isolated `runs/<run-id>/` directory under
+`~/.lh-harness/` or `--runs-root`. The complete task state and audit trail —
+`tree.json`, the fsync'd `events.jsonl`, per-node traces and versions — make
+the agent's progress inspectable, recoverable, and reproducible.
 
 ## Evaluation Reproduction
 

@@ -1,8 +1,21 @@
+"""Runtime crash-signal detection for agent logs (gptme JSONL only).
+
+gptme's worker emits one JSON object per message
+(``{"type": "message", "role": ..., "content": ...}``); everything not JSON is
+free text. Crash detection must skip the assistant's own prose (a script
+raising inside the task legitimately prints a Traceback into tool output) and
+hunt for the markers that mean the agent *runtime* itself died — non-zero
+command exits, gptme's own failed-turn marker, connection failures.
+"""
+
 from __future__ import annotations
 
+import json
 import re
 
-from .agent_logs import TURN_FAILED_SIGNAL, tool_output_view
+# Harness-normalized label for a gptme turn that died before answering, so it
+# joins the same runtime-signal path as the `AGENT_EXIT=` convention.
+TURN_FAILED_SIGNAL = "AGENT_TURN_FAILED"
 
 _CRASH_PATTERNS = (
     re.compile(r"AGENT_EXIT=([1-9]\d*)"),
@@ -17,6 +30,32 @@ _CRASH_PATTERNS = (
 # hard failures.
 _HARD_SIGNAL_PREFIXES = ("AGENT_EXIT=", TURN_FAILED_SIGNAL)
 _HARD_SIGNAL_VALUES = frozenset({"Connection error.", "response.failed"})
+
+
+def tool_output_view(raw: str) -> str:
+    """Isolate tool output from assistant/user prose, for crash detection.
+
+    Keeps every non-JSON line plus any JSON record that is not a plain
+    assistant/user message (tool results, system notes, gptme metadata),
+    which is where crashes actually surface.
+    """
+    parts: list[str] = []
+    for line in str(raw or "").splitlines():
+        stripped = line.strip()
+        if not stripped:
+            continue
+        if stripped.startswith("{"):
+            try:
+                record = json.loads(stripped)
+            except json.JSONDecodeError:
+                parts.append(line)
+                continue
+            if isinstance(record, dict) and record.get("type") == "message" and record.get("role") in ("assistant", "user"):
+                continue
+            parts.append(line)
+            continue
+        parts.append(line)
+    return "\n".join(part for part in parts if part)
 
 
 def detect_runtime_signals(log: str) -> list[dict[str, str]]:

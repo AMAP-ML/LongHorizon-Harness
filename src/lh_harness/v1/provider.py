@@ -22,16 +22,16 @@ Two things this module owns:
 from __future__ import annotations
 
 import json
-import os
 import urllib.error
 import urllib.request
 from dataclasses import dataclass, field
 from typing import Any, Callable
 
 from .json_schema import describe_schema, validate
+from ..provider_config import DEFAULT_BASE_URL, DEFAULT_MODEL, require, resolve
 
-DEFAULT_BASE_URL = "https://opencode.ai/zen/v1"
-DEFAULT_MODEL = "opencode/deepseek-v4-flash-free"
+# Defaults: OpenCode Zen (see ..provider_config — the user can override via
+# ~/.lh-harness/provider.json, LH_HARNESS_PROVIDER_*, or OPENAI_* env vars).
 _DEFAULT_STRUCTURED_RETRIES = 2
 
 
@@ -67,15 +67,10 @@ class OpenAICompatibleProvider:
         transport: Transport | None = None,
         timeout: float = 120.0,
     ) -> None:
-        self.model = model or os.getenv("LH_HARNESS_PROVIDER_MODEL", DEFAULT_MODEL)
-        self.base_url = (
-            base_url or os.getenv("LH_HARNESS_PROVIDER_BASE_URL", DEFAULT_BASE_URL)
-        ).rstrip("/")
-        self.api_key = (
-            api_key
-            or os.getenv("LH_HARNESS_PROVIDER_API_KEY")
-            or os.getenv("OPENCODE_API_KEY")
-        )
+        resolved = resolve(api_key=api_key or "", base_url=base_url or "", model=model or "")
+        self.model = resolved.model
+        self.base_url = resolved.base_url.rstrip("/")
+        self.api_key = resolved.api_key
         self.timeout = timeout
         self._transport = transport or self._http_transport
 

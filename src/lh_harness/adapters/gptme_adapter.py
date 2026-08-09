@@ -1,13 +1,13 @@
-"""GptmeAdapter — a Writer backend with no agent CLI anywhere in the chain.
+"""GptmeAdapter — the only Writer backend: a tool-use loop, no agent CLI.
 
-``ClaudeCodeAdapter``/``CodexAdapter`` shell out to an existing, pre-built
-coding-agent CLI binary we don't control. This adapter instead drives
-gptme (github.com/gptme/gptme, MIT, ``pip install gptme``) — a small
+Drives gptme (github.com/gptme/gptme, MIT, ``pip install gptme``) — a small
 tool-use loop (shell/read/save/patch) that talks to any OpenAI-compatible
-endpoint — so an arbitrary model, in particular this harness's own default
-dev target (DeepSeek V4 Flash Free via OpenCode Zen, same host
-``v1/provider.py`` already talks to for Orchestrator/Reviewer), can act as
-the Writer itself.
+endpoint — so the user's configured provider (see
+``..provider_config``; default OpenCode Zen, customizable via
+``~/.lh-harness/provider.json`` / ``LH_HARNESS_PROVIDER_*`` /
+``OPENAI_*``) acts as the Writer itself. The same settings
+``v1/provider.py`` already resolves for the Orchestrator/Reviewer feeds
+this adapter's ``OPENAI_BASE_URL``/``OPENAI_API_KEY``.
 
 It still subclasses ``CommandAgentAdapter`` and still shells a subprocess
 — but of ``_gptme_worker.py``, a few lines of code in *this* repo that
@@ -24,22 +24,13 @@ already relies on.
 from __future__ import annotations
 
 import json
-import os
 import shlex
 import sys
 from pathlib import Path
 
+from ..provider_config import resolve
 from ..types import DEFAULT_TMP_DIR, DEFAULT_WORKSPACE_PATH
 from .cli_agent import CommandAgentAdapter
-
-# Matches v1/provider.py's own OpenCode Zen dev target (PLAN.md §12: "testing
-# on a weak free model is the correct development target"). gptme's model
-# string needs the "local/" provider prefix (routes to whatever
-# OPENAI_BASE_URL points at, per gptme/llm/models/data.py) rather than the
-# bare "opencode/deepseek-v4-flash-free" v1/provider.py uses directly against
-# the same host's OpenAI-compatible endpoint.
-DEFAULT_GPTME_MODEL = "local/deepseek-v4-flash-free"
-DEFAULT_GPTME_BASE_URL = "https://opencode.ai/zen/v1"
 
 # shell: bash. read/save: file read/write. patch: scoped file edits. Deliberately
 # excludes gptme's browser/computer-use/MCP tools -- out of scope for a Writer
@@ -47,6 +38,22 @@ DEFAULT_GPTME_BASE_URL = "https://opencode.ai/zen/v1"
 DEFAULT_TOOL_ALLOWLIST: tuple[str, ...] = ("shell", "read", "save", "patch")
 
 _WORKER_SCRIPT = Path(__file__).with_name("_gptme_worker.py")
+
+
+def _gptme_model(model: str) -> str:
+    """Map a provider-config model id onto gptme's ``local/`` prefix.
+
+    gptme's model string needs the ``local/`` provider prefix (routes to
+    whatever ``OPENAI_BASE_URL`` points at, per gptme/llm/models/data.py)
+    rather than the bare id ``v1/provider.py`` sends to the same host's
+    OpenAI-compatible endpoint. The model id itself is unchanged: only the
+    routing prefix is added.
+    """
+    if "/" in model:
+        if model.startswith(("local/", "openai/")):
+            return model
+        return f"local/{model.split('/', 1)[1]}"
+    return f"local/{model}"
 
 
 class GptmeAdapter(CommandAgentAdapter):
@@ -64,7 +71,7 @@ class GptmeAdapter(CommandAgentAdapter):
     def __init__(
         self,
         *,
-        model: str = DEFAULT_GPTME_MODEL,
+        model: str | None = None,
         base_url: str | None = None,
         api_key: str | None = None,
         context_length: int | None = None,
@@ -74,24 +81,19 @@ class GptmeAdapter(CommandAgentAdapter):
         prompt_dir: str = f"{DEFAULT_TMP_DIR}/prompts",
         python_executable: str = sys.executable,
     ) -> None:
-        resolved_base_url = base_url or os.getenv(
-            "LH_HARNESS_PROVIDER_BASE_URL", DEFAULT_GPTME_BASE_URL
-        )
-        resolved_api_key = (
-            api_key
-            or os.getenv("LH_HARNESS_PROVIDER_API_KEY")
-            or os.getenv("OPENCODE_API_KEY")
-        )
-        if not resolved_api_key:
+        resolved = resolve(api_key=api_key or "", base_url=base_url or "", model=model or "")
+        if not resolved.api_key:
             raise ValueError(
-                "GptmeAdapter needs an API key: pass api_key=, or set "
-                "LH_HARNESS_PROVIDER_API_KEY / OPENCODE_API_KEY (the same "
-                "lookup v1/provider.py already uses for OpenCode Zen)."
+                "GptmeAdapter needs an API key: pass api_key=, set "
+                "LH_HARNESS_PROVIDER_API_KEY / OPENAI_API_KEY / OPENCODE_API_KEY, "
+                "or add it to the provider config file "
+                "(~/.lh-harness/provider.json)."
             )
+        resolved_model = _gptme_model(resolved.model)
 
         env_parts = [
-            f"OPENAI_BASE_URL={shlex.quote(resolved_base_url)}",
-            f"OPENAI_API_KEY={shlex.quote(resolved_api_key)}",
+            f"OPENAI_BASE_URL={shlex.quote(resolved.base_url)}",
+            f"OPENAI_API_KEY={shlex.quote(resolved.api_key)}",
         ]
         if context_length:
             env_parts.append(f"GPTME_CONTEXT_LENGTH={int(context_length)}")
@@ -101,14 +103,14 @@ class GptmeAdapter(CommandAgentAdapter):
             shlex.quote(python_executable),
             shlex.quote(str(_WORKER_SCRIPT)),
             "--model",
-            shlex.quote(model),
+            shlex.quote(resolved_model),
             "--tool-allowlist",
             shlex.quote(",".join(tool_allowlist)),
             "--tool-format",
             shlex.quote(tool_format),
         ]
 
-        self.model = model
+        self.model = resolved_model
         self.tool_allowlist = tuple(tool_allowlist)
         self._env_prefix = env_prefix
         self._command_parts = command_parts
@@ -126,12 +128,8 @@ def gptme_visible_output(raw: str) -> str:
     ``{"type": "message", "role": ..., "content": ...}`` — gptme's own
     documented structured-output mode (verified against a real
     ``pip install gptme``; not guessed from docs), not something this
-    module invents. Deliberately separate from ``agent_logs.py``'s
-    ``visible_output`` dispatcher rather than added as a fourth format
-    there: that module's three formats all come from shelled-out agent
-    CLIs this repo doesn't control the output shape of, while gptme's
-    shape is ours to keep stable since we wrote the worker script that
-    requests it.
+    module invents. It exists because the worker script controls the output
+    shape — there is no external CLI whose format we'd have to tolerate.
     """
     last_assistant_text = ""
     for line in raw.splitlines():
