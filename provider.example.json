@@ -1,10 +1,10 @@
 {
-  "default": "opencode",
+  "default": "[PROVIDER]",
   "providers": {
-    "opencode": {
-      "base_url": "https://opencode.ai/zen/v1",
-      "model": "opencode/deepseek-v4-flash-free",
-      "api_key_env": "OPENAI_API_KEY"
+    "[PROVIDER]": {
+      "base_url": "[BASE_URL]",
+      "model": "[MODEL_ID]",
+      "api_key_env": "[API_KEY_NAME]"
     }
   }
 }
