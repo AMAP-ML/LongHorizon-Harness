@@ -150,14 +150,14 @@ class RecursiveDriver:
         self.writer_adapter_factory = writer_adapter_factory or self._default_writer_factory()
         self.research_adapter_factory = research_adapter_factory or self._default_research_factory()
         self.poll_interval = poll_interval
+        create_run_dir(self.run_dir.parent, self.run_dir.name)
+        self._write_source_and_spec()
         self.log = EventLog(events_path(self.run_dir))
 
     # ------------------------------------------------------------------
     # Entry
     # ------------------------------------------------------------------
     async def run(self) -> RunReport:
-        create_run_dir(self.run_dir.parent, self.run_dir.name)
-        self._write_source_and_spec()
         report: RunReport | None = None
         for index, phase in enumerate(PHASES):
             if self._halted():
@@ -375,8 +375,8 @@ class RecursiveDriver:
             return contract_path(self.run_dir).exists()
         return False  # research/execute/assemble: idempotent, so always re-run
 
-    def _has_plan_run_dir(self) -> bool:
-        return (self.run_dir / "events.jsonl").exists()
+    def _has_run_dir(self) -> bool:
+        return self.run_dir.exists() and (self.run_dir / "events.jsonl").exists()
 
     def _set_phase(self, phase: str, status: str, detail: str = "") -> None:
         payload = {"phase": phase, "status": status, "detail": detail, "ts": time.time()}

@@ -1,24 +1,13 @@
-// Kusudaemon recursive-decomposition dashboard (PLAN.md §11 view surface).
-// Vanilla JS, no build step, no framework: fetch + a plain re-render on
-// every snapshot tick. The run directory on disk is the only authority —
-// this file never keeps state the server snapshot doesn't already have,
-// except which tab/node is currently open in the UI.
+// OpenCode · Kusudaemon Interactive Coder Web Interface
+// Preserves all backend API hooks (/api/snapshot, /api/runs, /api/halt, /api/amend, /api/approvals)
+// while rendering a 3-pane interactive coder interface.
 
 const PHASES = ["intake", "survey", "plan", "pilot", "research", "execute", "assemble"];
-const TABS = [
-  ["overview", "Overview"],
-  ["tree", "Tree"],
-  ["approvals", "Approvals"],
-  ["contract", "Contract"],
-  ["spec", "Spec"],
-  ["spine", "Spine"],
-  ["assembly", "Assembly"],
-  ["events", "Events"],
-];
 
 const state = {
   snapshot: { attached: false, runs: [], control_enabled: true },
-  tab: "overview",
+  sidebarTab: "sessions", // 'sessions' | 'tree' | 'phases'
+  workbenchTab: "code",   // 'code' | 'contract' | 'spec' | 'spine' | 'assembly' | 'terminal'
   selectedNode: null,
   nodeDetail: null,
   nodeDetailLoading: false,
@@ -29,13 +18,14 @@ const state = {
   specText: "",
   spineText: "",
   assembly: null,
-  amendText: "",
+  promptText: "",
+  promptMode: "auto", // 'auto' | 'amend' | 'reopen'
 };
 
 const root = document.getElementById("app");
 
 // ---------------------------------------------------------------------
-// API
+// API Transport
 // ---------------------------------------------------------------------
 async function apiGet(path) {
   const res = await fetch(path);
@@ -80,7 +70,7 @@ async function guarded(fn) {
 }
 
 // ---------------------------------------------------------------------
-// Live updates: SSE with a polling fallback
+// Live SSE Stream / Polling
 // ---------------------------------------------------------------------
 function applySnapshot(snap) {
   state.snapshot = snap;
@@ -113,7 +103,7 @@ function startPolling() {
 }
 
 // ---------------------------------------------------------------------
-// Helpers
+// DOM Helpers
 // ---------------------------------------------------------------------
 function el(tag, attrs, children) {
   const node = document.createElement(tag);
@@ -135,7 +125,7 @@ function badge(status) {
 
 function fmtTime(ts) {
   if (!ts) return "-";
-  return new Date(ts * 1000).toLocaleString();
+  return new Date(ts * 1000).toLocaleTimeString();
 }
 
 function truncate(text, n) {
@@ -144,106 +134,353 @@ function truncate(text, n) {
 }
 
 // ---------------------------------------------------------------------
-// Render: header
+// Header Component
 // ---------------------------------------------------------------------
 function renderHeader() {
   const snap = state.snapshot;
-  const children = [
-    el("span", { class: "brand" }, "🪷 Kusudaemon"),
-  ];
+  const brand = el("div", { class: "brand" }, [
+    el("div", { class: "logo-icon" }, "⚡"),
+    el("span", null, "OpenCode"),
+    el("span", { class: "brand-tag" }, "Kusudaemon Coder"),
+  ]);
+
+  const children = [brand];
+
   if (snap.attached) {
-    children.push(el("span", { class: "run-id" }, snap.run_id));
-    children.push(badge(snap.phase_status || "pending"));
-    if (snap.halted) children.push(badge("halted"));
+    children.push(
+      el("div", { class: "run-selector-badge" }, [
+        el("span", { style: "color:var(--text-muted);" }, "Session:"),
+        el("span", { style: "font-weight:600;" }, snap.run_id),
+        badge(snap.phase_status || "running"),
+        snap.halted ? badge("halted") : null,
+      ])
+    );
+  } else {
+    children.push(el("div", { class: "run-selector-badge" }, "No Active Session"));
   }
+
   children.push(el("span", { class: "spacer" }));
+
   if (!snap.control_enabled) {
-    children.push(el("span", { class: "badge" }, "read-only view"));
+    children.push(el("span", { class: "badge" }, "Read-Only"));
   }
+
+  const actions = [];
   if (snap.attached && snap.control_enabled) {
     if (snap.halted) {
-      children.push(
-        el("button", {
-          class: "primary",
-          disabled: state.busy ? "" : null,
-          onclick: () => guarded(resumeAttached),
-        }, "Resume")
+      actions.push(
+        el("button", { class: "primary", disabled: state.busy ? "" : null, onclick: () => guarded(resumeAttached) }, "▶ Resume Agent")
       );
     } else {
-      children.push(
-        el("button", {
-          class: "danger",
-          disabled: state.busy ? "" : null,
-          onclick: () => guarded(async () => {
-            await apiPost("/api/halt", { value: true });
-            showToast("halt requested — stops at the next phase boundary");
-          }),
-        }, "Halt")
+      actions.push(
+        el("button", { class: "danger", disabled: state.busy ? "" : null, onclick: () => guarded(async () => {
+          await apiPost("/api/halt", { value: true });
+          showToast("Halt signal sent to agent");
+        }) }, "⏸ Halt Execution")
       );
     }
   }
-  return el("div", { class: "hdr" }, children);
+
+  actions.push(
+    el("button", { class: "primary", disabled: snap.control_enabled ? null : "", onclick: () => { state.newRunOpen = true; render(); } }, "+ New Session")
+  );
+
+  children.push(el("div", { class: "hdr-actions" }, actions));
+  return el("header", { class: "hdr" }, children);
 }
 
 async function resumeAttached() {
   const runId = state.snapshot.run_id;
   await apiPost("/api/halt", { value: false });
   await apiPost("/api/runs", { run_id: runId });
-  showToast(`resuming ${runId}`);
+  showToast(`Resumed session ${runId}`);
 }
 
 // ---------------------------------------------------------------------
-// Render: sidebar
+// Left Sidebar Component
 // ---------------------------------------------------------------------
 function renderSidebar() {
   const snap = state.snapshot;
-  const runs = snap.runs || [];
-  const items = runs.length
-    ? runs.map((r) =>
-        el(
-          "li",
-          { class: "run-item" + (r.attached ? " active" : ""), onclick: () => guarded(() => apiPost("/api/attach", { run_id: r.id }).then(() => { state.tab = "overview"; })) },
-          [
+  const navTabs = el("div", { class: "sidebar-nav-tabs" }, [
+    el("div", { class: "nav-tab" + (state.sidebarTab === "sessions" ? " active" : ""), onclick: () => { state.sidebarTab = "sessions"; render(); } }, "Sessions"),
+    el("div", { class: "nav-tab" + (state.sidebarTab === "tree" ? " active" : ""), onclick: () => { state.sidebarTab = "tree"; render(); } }, "Task Tree"),
+    el("div", { class: "nav-tab" + (state.sidebarTab === "phases" ? " active" : ""), onclick: () => { state.sidebarTab = "phases"; render(); } }, "Phases"),
+  ]);
+
+  let content = null;
+  if (state.sidebarTab === "sessions") {
+    const runs = snap.runs || [];
+    const items = runs.length
+      ? runs.map((r) =>
+          el("li", {
+            class: "run-item" + (r.attached ? " active" : ""),
+            onclick: () => guarded(() => apiPost("/api/attach", { run_id: r.id })),
+          }, [
             el("div", { class: "goal" }, r.goal || r.id),
-            el("div", { class: "meta" }, [badge(r.status || r.phase || "-"), el("span", null, r.phase || "")]),
-          ]
+            el("div", { class: "meta" }, [badge(r.status || r.phase || "-"), el("span", null, r.id)]),
+          ])
         )
-      )
-    : [el("div", { class: "run-empty" }, "No runs yet.")];
+      : [el("div", { class: "empty-state" }, "No coding sessions found.")];
+    content = el("ul", { class: "run-list" }, items);
+  } else if (state.sidebarTab === "tree") {
+    const nodes = snap.tree || [];
+    if (!nodes.length) {
+      content = el("div", { class: "empty-state" }, "No plan tree generated yet.");
+    } else {
+      content = el("div", { class: "node-tree-list" }, nodes.map((n) =>
+        el("div", { class: "node-card", onclick: () => openNode(n.id) }, [
+          el("div", { class: "node-hdr" }, [el("span", null, `[${n.id}] ${n.shape}`), badge(n.status)]),
+          el("div", { class: "brief" }, n.brief),
+        ])
+      ));
+    }
+  } else if (state.sidebarTab === "phases") {
+    content = el("div", { class: "phase-pipeline" }, PHASES.map((p) => {
+      const status = (snap.phases || {})[p] || "pending";
+      const isCurrent = snap.phase === p;
+      return el("div", { class: "phase-step", "data-status": status }, [
+        el("span", { class: "indicator" }),
+        el("span", { style: isCurrent ? "font-weight:600; color:var(--text-bright);" : "" }, p.toUpperCase() + (isCurrent ? " (Active)" : "")),
+        el("span", { class: "spacer" }),
+        badge(status),
+      ]);
+    }));
+  }
 
-  const newRunBtn = el(
-    "button",
-    { class: "primary", style: "width:100%", disabled: snap.control_enabled ? null : "", onclick: () => { state.newRunOpen = true; render(); } },
-    "+ New run"
-  );
-
-  return el("div", { class: "sidebar" }, [
-    el("div", { class: "sidebar-section" }, [newRunBtn]),
-    el("div", { class: "sidebar-section", style: "flex:1; overflow-y:auto;" }, [
-      el("h3", null, "Runs"),
-      el("ul", { class: "run-list" }, items),
+  return el("aside", { class: "sidebar-nav" }, [
+    el("div", { class: "sidebar-header" }, [
+      el("h3", null, "Workspace Explorer"),
+      el("button", { class: "icon-btn", onclick: () => { state.newRunOpen = true; render(); } }, "+ New"),
     ]),
+    navTabs,
+    el("div", { class: "sidebar-content" }, content),
   ]);
 }
 
 // ---------------------------------------------------------------------
-// Render: tabs
+// Center Chat & Interactive Stream Component
 // ---------------------------------------------------------------------
-function renderTabs() {
-  return el(
-    "div",
-    { class: "tabs" },
-    TABS.map(([id, label]) =>
-      el(
-        "div",
-        { class: "tab" + (state.tab === id ? " active" : ""), onclick: () => { state.tab = id; onTabOpen(id); render(); } },
-        label
-      )
-    )
-  );
+function renderCenterStream() {
+  const snap = state.snapshot;
+  const feed = el("div", { class: "chat-feed", id: "chat-feed-scroll" });
+
+  if (!snap.attached) {
+    feed.appendChild(
+      el("div", { class: "empty-state" }, [
+        el("h3", { style: "color:var(--text-bright); margin-bottom:8px;" }, "Welcome to OpenCode Coder"),
+        el("p", null, "Start a new session or pick an existing task session from the sidebar to begin interactive coding."),
+      ])
+    );
+  } else {
+    // Goal prompt message
+    feed.appendChild(
+      el("div", { class: "stream-msg user" }, [
+        el("div", { class: "msg-hdr" }, [el("span", { class: "author" }, "User Prompt"), el("span", null, "Initial Goal")]),
+        el("div", { class: "msg-body" }, snap.goal || "(No prompt specified)"),
+      ])
+    );
+
+    // Agent status card
+    if (snap.phase) {
+      feed.appendChild(
+        el("div", { class: "stream-card" }, [
+          el("div", { class: "card-title" }, [
+            el("span", null, `🤖 Agent Phase: ${snap.phase.toUpperCase()}`),
+            badge(snap.phase_status || "running"),
+          ]),
+          snap.phase_detail ? el("div", { style: "color:var(--accent-amber); font-size:12px; margin-top:4px;" }, snap.phase_detail) : null,
+        ])
+      );
+    }
+
+    // Pending Approvals in Stream
+    const approvals = snap.approvals || [];
+    approvals.forEach((a) => {
+      const parts = [
+        el("div", { class: "card-title" }, [
+          el("span", null, `⚡ ${a.kind.toUpperCase()}: ${a.title}`),
+          badge(a.status),
+        ]),
+      ];
+      if (a.message) parts.push(el("div", { class: "card-text" }, a.message));
+
+      if (a.status === "pending" && snap.control_enabled) {
+        const actionBtns = [];
+        if ((a.options || []).length) {
+          a.options.forEach((opt) => {
+            actionBtns.push(
+              el("button", {
+                class: opt.style === "primary" ? "primary" : "",
+                disabled: state.busy ? "" : null,
+                onclick: () => guarded(() => apiPost(`/api/approvals/${encodeURIComponent(a.approval_id)}/resolve`, { action: opt.value }).then(() => showToast("Approval resolved"))),
+              }, opt.label)
+            );
+          });
+        }
+        if (a.allow_input) {
+          const inputEl = el("input", { type: "text", placeholder: a.input_label || "Provide response details...", style: "margin-top:8px;" });
+          parts.push(inputEl);
+          actionBtns.push(
+            el("button", { class: "primary", disabled: state.busy ? "" : null, onclick: () => guarded(async () => {
+              await apiPost(`/api/approvals/${encodeURIComponent(a.approval_id)}/resolve`, { action: "answer", user_input: inputEl.value });
+              showToast("Submitted answer");
+            }) }, "Submit Input")
+          );
+        }
+        parts.push(el("div", { class: "approval-actions" }, actionBtns));
+      } else if (a.status === "resolved") {
+        parts.push(el("div", { style: "font-size:11px; color:var(--text-muted); margin-top:4px;" }, `Resolved via action: ${a.action || "completed"}`));
+      }
+
+      feed.appendChild(el("div", { class: "stream-card approval" }, parts));
+    });
+
+    // Recent events stream
+    const events = (snap.events || []).slice(-15);
+    events.forEach((ev) => {
+      feed.appendChild(
+        el("div", { class: "stream-msg agent" }, [
+          el("div", { class: "msg-hdr" }, [
+            el("span", { class: "author" }, "Agent Event"),
+            el("span", null, fmtTime(ev.ts)),
+            ev.node_id && ev.node_id !== "-" ? badge(ev.node_id) : null,
+          ]),
+          el("div", { class: "msg-body" }, `${ev.type}${ev.phase ? ` [${ev.phase}]` : ""}${ev.status ? ` - ${ev.status}` : ""}`),
+        ])
+      );
+    });
+  }
+
+  // Interactive Prompt Controls at Bottom
+  const promptBar = renderPromptBar();
+
+  return el("main", { class: "chat-stream-panel" }, [
+    el("div", { class: "chat-header" }, [
+      el("div", { class: "title" }, ["💬 Interactive Agent Stream", snap.halted ? badge("halted") : null]),
+      el("span", { style: "font-size:11px; color:var(--text-muted);" }, snap.attached ? `${snap.events_count || 0} events` : ""),
+    ]),
+    feed,
+    promptBar,
+  ]);
 }
 
-function onTabOpen(id) {
+function renderPromptBar() {
+  const snap = state.snapshot;
+  const disabled = !snap.control_enabled || state.busy;
+
+  const modeSelector = el("div", { class: "prompt-mode-selector" }, [
+    el("button", { class: "mode-btn" + (state.promptMode === "auto" ? " active" : ""), onclick: () => { state.promptMode = "auto"; render(); } }, "New Task"),
+    el("button", { class: "mode-btn" + (state.promptMode === "amend" ? " active" : ""), onclick: () => { state.promptMode = "amend"; render(); } }, "Amend Contract"),
+    el("button", { class: "mode-btn" + (state.promptMode === "reopen" ? " active" : ""), onclick: () => { state.promptMode = "reopen"; render(); } }, "Reopen Node"),
+  ]);
+
+  const ta = el("textarea", {
+    class: "prompt-textarea",
+    placeholder: state.promptMode === "amend" ? "Enter contract amendment rule to append..." : state.promptMode === "reopen" ? "Node ID and defect description..." : "Type instructions or code request for the agent...",
+    rows: 1,
+    disabled: disabled ? "" : null,
+  });
+
+  const sendBtn = el("button", { class: "primary", disabled: disabled ? "" : null, onclick: () => guarded(() => handlePromptSubmit(ta.value)) }, "Send ↵");
+
+  ta.addEventListener("keydown", (e) => {
+    if (e.key === "Enter" && !e.shiftKey) {
+      e.preventDefault();
+      handlePromptSubmit(ta.value);
+    }
+  });
+
+  return el("div", { class: "prompt-container" }, [
+    el("div", { class: "prompt-controls" }, [
+      modeSelector,
+      el("span", { style: "font-size:11px; color:var(--text-muted);" }, "Press Enter to submit, Shift+Enter for newline"),
+    ]),
+    el("div", { class: "prompt-input-wrapper" }, [ta, sendBtn]),
+  ]);
+}
+
+async function handlePromptSubmit(text) {
+  text = text.trim();
+  if (!text) return;
+
+  if (state.promptMode === "amend") {
+    await apiPost("/api/amend", { text, reason: "Web interaction prompt" });
+    showToast("Contract amendment queued");
+    fetchWorkbenchData("contract");
+  } else if (state.promptMode === "reopen") {
+    const parts = text.split(" ");
+    const nodeId = parts[0];
+    const defect = parts.slice(1).join(" ") || "Defect requested via prompt";
+    await apiPost("/api/reopen", { node_id: nodeId, defect });
+    showToast(`Reopen requested for node ${nodeId}`);
+  } else {
+    // Start or attach new task run
+    const res = await apiPost("/api/runs", { goal: text });
+    showToast(`Started session ${res.run_id}`);
+  }
+}
+
+// ---------------------------------------------------------------------
+// Right Workbench Component (Code, Spec, Logs, Assembly)
+// ---------------------------------------------------------------------
+function renderRightWorkbench() {
+  const wbTabs = [
+    ["code", "💻 Code & Artifacts"],
+    ["contract", "📜 Contract"],
+    ["spec", "📋 Spec"],
+    ["spine", "🦴 Spine"],
+    ["assembly", "🧩 Assembly"],
+    ["terminal", "🖥️ Terminal Logs"],
+  ];
+
+  const header = el("div", { class: "workbench-tabs" }, wbTabs.map(([id, label]) =>
+    el("div", {
+      class: "wb-tab" + (state.workbenchTab === id ? " active" : ""),
+      onclick: () => { state.workbenchTab = id; fetchWorkbenchData(id); render(); },
+    }, label)
+  ));
+
+  let body = null;
+  const snap = state.snapshot;
+
+  if (state.workbenchTab === "code") {
+    body = el("div", { class: "code-container" }, [
+      el("div", { class: "code-header" }, [
+        el("span", null, state.nodeDetail ? `Node Artifact: ${state.nodeDetail.id}` : "Assembled Code Output"),
+        el("button", { class: "icon-btn", onclick: () => navigator.clipboard.writeText(state.nodeDetail?.artifact || state.assembly?.output || "") }, "📋 Copy"),
+      ]),
+      el("pre", { class: "blob" }, state.nodeDetail?.artifact || state.assembly?.output || "(No active code artifact selected. Click a node in Task Tree to view code.)"),
+    ]);
+  } else if (state.workbenchTab === "contract") {
+    body = el("pre", { class: "blob" }, state.contractText || "(No contract frozen yet)");
+  } else if (state.workbenchTab === "spec") {
+    body = el("pre", { class: "blob" }, state.specText || "(No spec generated yet)");
+  } else if (state.workbenchTab === "spine") {
+    body = el("pre", { class: "blob" }, state.spineText || "(No spine generated yet)");
+  } else if (state.workbenchTab === "assembly") {
+    const a = state.assembly || {};
+    body = el("div", null, [
+      el("h3", { style: "color:var(--text-bright); margin-bottom:8px;" }, "Compilation & Cross-Checks"),
+      el("pre", { class: "blob" }, a.compile_log || "(No compile logs available)"),
+      el("h3", { style: "color:var(--text-bright); margin-top:16px; margin-bottom:8px;" }, "Assembly Output"),
+      el("pre", { class: "blob" }, a.output || "(Not assembled yet)"),
+    ]);
+  } else if (state.workbenchTab === "terminal") {
+    const events = (snap.events || []).slice().reverse();
+    body = el("table", { class: "tree" }, [
+      el("thead", null, el("tr", null, ["Time", "Node", "Type / Description"].map((h) => el("th", null, h)))),
+      el("tbody", null, events.map((e) => el("tr", null, [
+        el("td", { style: "font-family:var(--font-mono); font-size:11px;" }, fmtTime(e.ts)),
+        el("td", null, e.node_id || "-"),
+        el("td", null, `${e.type} ${e.phase ? `[${e.phase}]` : ""} ${e.status || ""}`),
+      ]))),
+    ]);
+  }
+
+  return el("section", { class: "workbench-panel" }, [header, el("div", { class: "workbench-content" }, body)]);
+}
+
+function fetchWorkbenchData(id) {
   if (!state.snapshot.attached) return;
   if (id === "contract") apiGet("/api/contract").then((d) => { state.contractText = d.text; render(); }).catch(() => {});
   if (id === "spec") apiGet("/api/spec").then((d) => { state.specText = d.text; render(); }).catch(() => {});
@@ -252,87 +489,13 @@ function onTabOpen(id) {
 }
 
 // ---------------------------------------------------------------------
-// Overview tab
+// Node Detail Drawer
 // ---------------------------------------------------------------------
-function renderOverview() {
-  const snap = state.snapshot;
-  const counts = snap.tree_counts || {};
-  const statOrder = ["passed", "dispatched", "awaiting_review", "pending", "stale", "blocked", "failed"];
-  const stats = statOrder
-    .filter((k) => counts[k])
-    .map((k) => el("div", { class: "stat-card" }, [el("div", { class: "n" }, String(counts[k])), el("div", { class: "l" }, k)]));
-  stats.push(el("div", { class: "stat-card" }, [el("div", { class: "n" }, String(snap.events_count || 0)), el("div", { class: "l" }, "events")]));
-  stats.push(el("div", { class: "stat-card" }, [el("div", { class: "n" }, String((snap.pending_approvals || []).length)), el("div", { class: "l" }, "pending approvals")]));
-
-  const phaseStrip = el(
-    "div",
-    { class: "phase-strip" },
-    PHASES.map((p) => {
-      const status = (snap.phases || {})[p] || "pending";
-      const isCurrent = snap.phase === p;
-      return el("div", { class: "phase-chip", "data-status": status }, [
-        el("span", { class: "dot" }),
-        el("span", null, p + (isCurrent ? " ●" : "")),
-      ]);
-    })
-  );
-
-  const parts = [
-    el("h2", { class: "section-title" }, "Goal"),
-    el("pre", { class: "blob" }, snap.goal || "(none)"),
-    el("h2", { class: "section-title" }, "Phases"),
-    phaseStrip,
-    snap.phase_detail ? el("div", { class: "error-banner" }, snap.phase_detail) : null,
-    el("h2", { class: "section-title" }, "Status"),
-    el("div", { class: "stat-row" }, stats),
-  ];
-
-  if ((snap.jobs || []).length) {
-    parts.push(el("h2", { class: "section-title" }, "Background jobs"));
-    parts.push(
-      el(
-        "table",
-        { class: "tree" },
-        el("tbody", null, snap.jobs.map((j) => el("tr", null, [
-          el("td", null, j.kind),
-          el("td", null, badge(j.status)),
-          el("td", null, j.detail || ""),
-          el("td", { class: "deps" }, fmtTime(j.ts)),
-        ])))
-      )
-    );
-  }
-
-  return el("div", null, parts);
-}
-
-// ---------------------------------------------------------------------
-// Tree tab
-// ---------------------------------------------------------------------
-function renderTree() {
-  const nodes = state.snapshot.tree || [];
-  if (!nodes.length) return el("div", { class: "empty-state" }, "No nodes yet — the plan phase hasn't produced a tree.");
-  const rows = nodes.map((n) =>
-    el("tr", { class: "node-row", onclick: () => openNode(n.id) }, [
-      el("td", { class: "id" }, n.id),
-      el("td", null, badge(n.status)),
-      el("td", { class: "brief" }, n.brief),
-      el("td", null, n.shape),
-      el("td", { class: "deps" }, (n.depends_on || []).join(", ") || "-"),
-      el("td", null, String(n.attempts || 0)),
-      el("td", null, `${n.gates} gate${n.gates === 1 ? "" : "s"}${n.judgment ? `, ${n.judgment} judgment` : ""}`),
-    ])
-  );
-  return el("table", { class: "tree" }, [
-    el("thead", null, el("tr", null, ["id", "status", "brief", "shape", "depends on", "attempts", "checks"].map((h) => el("th", null, h)))),
-    el("tbody", null, rows),
-  ]);
-}
-
 function openNode(id) {
   state.selectedNode = id;
   state.nodeDetail = null;
   state.nodeDetailLoading = true;
+  state.workbenchTab = "code";
   render();
   apiGet(`/api/node/${encodeURIComponent(id)}`)
     .then((d) => { state.nodeDetail = d; state.nodeDetailLoading = false; render(); })
@@ -345,305 +508,75 @@ function closeNode() {
   render();
 }
 
-function renderNodePanel() {
+function renderNodeDrawer() {
   if (!state.selectedNode) return null;
   const d = state.nodeDetail;
   const body = [];
   if (state.nodeDetailLoading || !d) {
-    body.push(el("div", { class: "empty-state" }, "Loading…"));
+    body.push(el("div", { class: "empty-state" }, "Loading node data…"));
   } else {
-    body.push(el("div", { class: "kv-row" }, [el("span", { class: "k" }, "status"), badge(d.status)]));
-    body.push(el("div", { class: "kv-row" }, [el("span", { class: "k" }, "shape"), el("span", null, d.shape)]));
-    body.push(el("div", { class: "kv-row" }, [el("span", { class: "k" }, "attempts"), el("span", null, String(d.attempts))]));
-    body.push(el("div", { class: "kv-row" }, [el("span", { class: "k" }, "budget"), el("span", null, `${d.budget.tokens} tokens / ${d.budget.calls} calls`)]));
-    body.push(el("div", { class: "kv-row" }, [el("span", { class: "k" }, "depends on"), el("span", null, (d.depends_on || []).join(", ") || "-")]));
-    body.push(el("div", { class: "kv-row" }, [el("span", { class: "k" }, "brief"), el("span", null, d.brief)]));
-
-    body.push(el("h2", { class: "section-title" }, "Gates"));
-    body.push(
-      el(
-        "ul",
-        { class: "gate-list" },
-        (d.gate_results || []).map((g) => el("li", null, [el("span", { class: g.passed ? "ok" : "bad" }, g.passed ? "✓" : "✗"), el("span", null, g.gate), el("span", { class: "meta" }, g.detail || "")]))
-      )
-    );
-
-    if ((d.judgment || []).length) {
-      body.push(el("h2", { class: "section-title" }, "Judgment rubric"));
-      body.push(
-        el(
-          "ul",
-          { class: "gate-list" },
-          d.judgment.map((id) => el("li", null, [el("span", null, id + ":"), el("span", null, d.rubric[id] || "")]))
-        )
-      );
-      if (d.audit && d.audit.verdict) {
-        body.push(el("div", { class: "kv-row" }, [el("span", { class: "k" }, "verdict"), badge(d.audit.verdict)]));
-        (d.audit.items || []).forEach((item) => {
-          body.push(el("div", { class: "kv-row" }, [el("span", { class: "k" }, item.id || "-"), el("span", null, `${item.pass ? "pass" : "fail"}${item.defect ? " — " + item.defect : ""}`)]));
-        });
-      }
-    }
-
-    if ((d.inputs || []).length) {
-      body.push(el("h2", { class: "section-title" }, "Inputs"));
-      body.push(
-        el(
-          "ul",
-          { class: "input-list" },
-          d.inputs.map((i) => el("li", null, [el("span", { class: i.exists ? "ok" : "bad" }, i.exists ? "✓" : "✗"), el("span", null, i.ref), el("span", { class: "meta" }, `${i.tokens} tok`)]))
-        )
-      );
-    }
-
-    if (d.promotion) {
-      body.push(el("h2", { class: "section-title" }, "Promotion (handoff summary)"));
-      body.push(el("pre", { class: "blob" }, d.promotion));
-    }
-
-    if (d.manifest) {
-      body.push(el("h2", { class: "section-title" }, "Manifest"));
-      body.push(el("div", { class: "kv-row" }, [el("span", { class: "k" }, "gates"), badge(d.manifest.gates)]));
-      body.push(el("div", { class: "kv-row" }, [el("span", { class: "k" }, "tokens"), el("span", null, String(d.manifest.tokens))]));
-    }
-
-    if ((d.versions || []).length) {
-      body.push(el("h2", { class: "section-title" }, "Versions (pre-repair snapshots)"));
-      body.push(el("div", null, d.versions.map((v) => el("span", { style: "margin-right:8px; font-family:var(--mono); color:var(--text-dim);" }, v))));
-    }
-
-    body.push(el("h2", { class: "section-title" }, `Artifact (${d.artifact_tokens} tokens)`));
-    body.push(el("pre", { class: "blob" }, truncate(d.artifact || "(empty)", 6000)));
-
-    if (state.snapshot.control_enabled && d.status === "passed") {
-      body.push(el("h2", { class: "section-title" }, "Reopen"));
-      const ta = el("textarea", { placeholder: "Describe the defect to fix…", style: "width:100%; min-height:60px;" });
-      body.push(ta);
-      body.push(
-        el("button", { onclick: () => guarded(async () => {
-          const defect = ta.value.trim();
-          if (!defect) return;
-          await apiPost("/api/reopen", { node_id: d.id, defect });
-          showToast("reopen requested — see Approvals");
-        }) }, "Request reopen")
-      );
-    }
+    body.push(el("div", { style: "display:flex; gap:12px; margin-bottom:12px;" }, [badge(d.status), el("span", null, `Shape: ${d.shape}`), el("span", null, `Attempts: ${d.attempts}`)]));
+    body.push(el("h3", { style: "color:var(--text-bright);" }, "Brief"), el("p", null, d.brief));
+    body.push(el("h3", { style: "color:var(--text-bright); margin-top:12px;" }, "Artifact"), el("pre", { class: "blob" }, truncate(d.artifact || "(empty)", 4000)));
   }
 
   const panel = el("div", { class: "panel" }, [
-    el("div", { class: "panel-hdr" }, [el("h2", null, state.selectedNode), el("button", { class: "close-btn", onclick: closeNode }, "Close")]),
-    ...body,
+    el("div", { class: "panel-hdr" }, [el("h2", null, `Node Details: ${state.selectedNode}`), el("button", { onclick: closeNode }, "Close")]),
+    el("div", { style: "padding:16px; overflow-y:auto;" }, body),
   ]);
   return el("div", { class: "overlay", onclick: (e) => { if (e.target.classList.contains("overlay")) closeNode(); } }, panel);
 }
 
 // ---------------------------------------------------------------------
-// Approvals tab
-// ---------------------------------------------------------------------
-function renderApprovals() {
-  const approvals = (state.snapshot.approvals || []).slice().reverse();
-  if (!approvals.length) return el("div", { class: "empty-state" }, "No approvals recorded for this run yet.");
-  return el("div", null, approvals.map(renderApprovalCard));
-}
-
-function renderApprovalCard(a) {
-  const control = state.snapshot.control_enabled;
-  const parts = [
-    el("div", { class: "kind" }, `${a.kind}${a.status === "resolved" ? " · resolved" : ""}`),
-    el("div", { class: "title" }, a.title),
-  ];
-  if (a.message) parts.push(el("pre", { class: "message" }, a.message));
-
-  if (a.status === "pending" && control) {
-    if ((a.options || []).length) {
-      parts.push(
-        el(
-          "div",
-          { class: "approval-actions" },
-          a.options.map((opt) =>
-            el(
-              "button",
-              { class: opt.style === "primary" ? "primary" : "", disabled: state.busy ? "" : null, onclick: () => guarded(() => apiPost(`/api/approvals/${encodeURIComponent(a.approval_id)}/resolve`, { action: opt.value }).then(() => showToast("resolved"))) },
-              opt.label
-            )
-          )
-        )
-      );
-    }
-    if (a.allow_input) {
-      const ta = el("textarea", { placeholder: a.input_label || "Your answer" });
-      parts.push(ta);
-      parts.push(
-        el("div", { class: "approval-actions" }, [
-          el("button", { class: "primary", disabled: state.busy ? "" : null, onclick: () => guarded(async () => {
-            await apiPost(`/api/approvals/${encodeURIComponent(a.approval_id)}/resolve`, { action: "answer", user_input: ta.value });
-            showToast("submitted");
-          }) }, "Submit"),
-        ])
-      );
-    }
-  } else if (a.status === "resolved") {
-    parts.push(el("div", { class: "kv-row" }, [el("span", { class: "k" }, "action"), el("span", null, a.action || "-")]));
-    if (a.user_input) parts.push(el("pre", { class: "message" }, truncate(a.user_input, 800)));
-  }
-  return el("div", { class: "approval-card" }, parts);
-}
-
-// ---------------------------------------------------------------------
-// Contract / spec / spine / assembly / events tabs
-// ---------------------------------------------------------------------
-function renderContract() {
-  const control = state.snapshot.control_enabled;
-  const parts = [
-    el("pre", { class: "blob" }, state.contractText || "(no contract frozen yet — runs the pilot phase first)"),
-  ];
-  if (control) {
-    parts.push(el("h2", { class: "section-title" }, "Amend"));
-    const ta = el("textarea", { placeholder: "Rule text to append to the contract…", style: "width:100%; min-height:70px;" });
-    parts.push(ta);
-    parts.push(
-      el("button", { class: "primary", disabled: state.busy ? "" : null, onclick: () => guarded(async () => {
-        const text = ta.value.trim();
-        if (!text) return;
-        await apiPost("/api/amend", { text, reason: "web amendment" });
-        ta.value = "";
-        showToast("amendment queued — see Approvals for the re-validation counts");
-        state.tab = "approvals";
-      }) }, "Request amendment")
-    );
-  }
-  return el("div", null, parts);
-}
-
-function renderSpec() {
-  return el("pre", { class: "blob" }, state.specText || "(no spec yet)");
-}
-
-function renderSpine() {
-  return el("pre", { class: "blob" }, state.spineText || "(no spine yet — runs the survey phase first)");
-}
-
-function renderAssembly() {
-  const a = state.assembly || {};
-  const parts = [];
-  if (a.checks && Object.keys(a.checks).length) {
-    parts.push(el("h2", { class: "section-title" }, "Cross-cutting checks"));
-    parts.push(el("pre", { class: "blob" }, JSON.stringify(a.checks, null, 2)));
-  }
-  if (a.compile_log) {
-    parts.push(el("h2", { class: "section-title" }, "Compile log"));
-    parts.push(el("pre", { class: "blob" }, a.compile_log));
-  }
-  parts.push(el("h2", { class: "section-title" }, "Assembled output"));
-  parts.push(el("pre", { class: "blob" }, a.output || "(not assembled yet)"));
-  return el("div", null, parts);
-}
-
-function renderEvents() {
-  const events = state.snapshot.events || [];
-  if (!events.length) return el("div", { class: "empty-state" }, "No events yet.");
-  return el(
-    "div",
-    { class: "events-list" },
-    events
-      .slice()
-      .reverse()
-      .map((e) =>
-        el("div", { class: "ev" }, [
-          el("span", { class: "t" }, fmtTime(e.ts)),
-          el("span", { class: "node" }, e.node_id && e.node_id !== "-" ? e.node_id : ""),
-          el("span", null, `${e.type}${e.phase ? ` (${e.phase})` : ""}${e.status ? ` — ${e.status}` : ""}`),
-        ])
-      )
-  );
-}
-
-// ---------------------------------------------------------------------
-// New run modal
+// New Session Modal
 // ---------------------------------------------------------------------
 function renderNewRunModal() {
   if (!state.newRunOpen) return null;
-  const f = {
-    run_id: el("input", { type: "text", placeholder: "auto-generated if empty" }),
-    goal: el("textarea", { placeholder: "Task goal (e.g. 'Write a 5-chapter primer on X')" }),
-    source: el("textarea", { placeholder: "Source document text (optional)" }),
-    model: el("input", { type: "text", placeholder: "provider default" }),
-    compile_command: el("input", { type: "text", placeholder: "e.g. latexmk -pdf (optional)" }),
-    research_plan: el("textarea", { placeholder: '[{"node_id": "2.1", "kind": "web_search", "question": "..."}]' }),
-    max_rounds: el("input", { type: "number", value: "100" }),
-    max_attempts: el("input", { type: "number", value: "3" }),
-  };
-  const rows = [
-    ["Run id", f.run_id],
-    ["Goal", f.goal],
-    ["Source", f.source],
-    ["Model", f.model],
-    ["Compile command", f.compile_command],
-    ["Research plan", f.research_plan],
-    ["Max rounds", f.max_rounds],
-    ["Max attempts", f.max_attempts],
-  ];
-  const form = el(
-    "div",
-    { class: "form-grid" },
-    rows.flatMap(([label, input]) => [el("label", null, label), input])
-  );
-  const note = el("div", { class: "footer-note" }, "Reusing an existing run id resumes that run from wherever it left off — goal/source/etc. are then read from the run's own saved spec, not this form.");
+  const goalInput = el("textarea", { placeholder: "Task Goal / Coding Instruction...", rows: 3 });
+  const modelInput = el("input", { type: "text", placeholder: "Model provider default" });
+
   const submit = el("button", { class: "primary", disabled: state.busy ? "" : null, onclick: () => guarded(async () => {
-    const body = {
-      run_id: f.run_id.value.trim(),
-      goal: f.goal.value,
-      source: f.source.value,
-      model: f.model.value.trim(),
-      compile_command: f.compile_command.value.trim(),
-      research_plan: f.research_plan.value.trim(),
-      max_rounds: parseInt(f.max_rounds.value || "100", 10),
-      max_attempts: parseInt(f.max_attempts.value || "3", 10),
-    };
-    const res = await apiPost("/api/runs", body);
+    const goal = goalInput.value.trim();
+    if (!goal) return;
+    const res = await apiPost("/api/runs", { goal, model: modelInput.value.trim() });
     state.newRunOpen = false;
-    state.tab = "overview";
-    showToast(`started ${res.run_id}`);
-  }) }, "Start");
+    showToast(`Started new session ${res.run_id}`);
+  }) }, "Start Interactive Session");
+
   const cancel = el("button", { onclick: () => { state.newRunOpen = false; render(); } }, "Cancel");
+
   const panel = el("div", { class: "panel" }, [
-    el("div", { class: "panel-hdr" }, [el("h2", null, "New / resume run"), el("button", { class: "close-btn", onclick: () => { state.newRunOpen = false; render(); } }, "Close")]),
-    form,
-    el("div", { style: "margin-top:14px; display:flex; gap:8px;" }, [submit, cancel]),
-    note,
+    el("div", { class: "panel-hdr" }, [el("h2", null, "New Coding Session"), el("button", { onclick: () => { state.newRunOpen = false; render(); } }, "Close")]),
+    el("div", { class: "form-grid" }, [
+      el("label", null, "Session Goal"), goalInput,
+      el("label", null, "Model"), modelInput,
+    ]),
+    el("div", { style: "padding:16px; display:flex; gap:8px;" }, [submit, cancel]),
   ]);
+
   return el("div", { class: "overlay", onclick: (e) => { if (e.target.classList.contains("overlay")) { state.newRunOpen = false; render(); } } }, panel);
 }
 
 // ---------------------------------------------------------------------
-// Root render
+// Root Render
 // ---------------------------------------------------------------------
-function renderTabContent() {
-  if (!state.snapshot.attached) {
-    return el("div", { class: "empty-state" }, "No run attached. Pick one from the sidebar, or start a new one.");
-  }
-  switch (state.tab) {
-    case "overview": return renderOverview();
-    case "tree": return renderTree();
-    case "approvals": return renderApprovals();
-    case "contract": return renderContract();
-    case "spec": return renderSpec();
-    case "spine": return renderSpine();
-    case "assembly": return renderAssembly();
-    case "events": return renderEvents();
-    default: return null;
-  }
-}
-
 function render() {
   root.innerHTML = "";
   root.appendChild(renderHeader());
-  const layout = el("div", { class: "layout" }, [renderSidebar(), el("div", { class: "main" }, [renderTabs(), el("div", { class: "tab-content" }, renderTabContent())])]);
-  root.appendChild(layout);
-  const nodePanel = renderNodePanel();
-  if (nodePanel) root.appendChild(nodePanel);
-  const newRunPanel = renderNewRunModal();
-  if (newRunPanel) root.appendChild(newRunPanel);
+
+  const workspace = el("div", { class: "opencode-workspace" }, [
+    renderSidebar(),
+    renderCenterStream(),
+    renderRightWorkbench(),
+  ]);
+  root.appendChild(workspace);
+
+  const nodeDrawer = renderNodeDrawer();
+  if (nodeDrawer) root.appendChild(nodeDrawer);
+
+  const newRunModal = renderNewRunModal();
+  if (newRunModal) root.appendChild(newRunModal);
+
   if (state.toast) {
     root.appendChild(el("div", { class: "toast" + (state.toast.isError ? " err" : "") }, state.toast.message));
   }

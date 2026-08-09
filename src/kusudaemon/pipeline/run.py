@@ -52,7 +52,18 @@ def _read_text_arg(raw: str | None) -> str:
     if not raw:
         return ""
     if raw.startswith("@"):
-        return Path(raw[1:]).read_text(encoding="utf-8").strip()
+        path = Path(raw[1:])
+        if path.suffix.lower() == ".pdf":
+            try:
+                import pypdf
+                reader = pypdf.PdfReader(path)
+                return "\n".join(page.extract_text() or "" for page in reader.pages).strip()
+            except ImportError:
+                pass
+        try:
+            return path.read_text(encoding="utf-8").strip()
+        except UnicodeDecodeError:
+            return path.read_text(encoding="utf-8", errors="replace").strip()
     if raw == "-":
         return sys.stdin.read().strip()
     return raw
