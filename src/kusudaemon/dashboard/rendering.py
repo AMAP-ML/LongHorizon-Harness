@@ -1,12 +1,11 @@
-"""Pure text-rendering helpers for the TUI — no ``textual`` import, so this
-module (unlike ``app.py``) is exercised directly by the test suite without
-the ``tui`` extra installed, matching how ``state.py`` stays optional-extra
-free too.
-
-Kept separate from ``app.py`` because diffing and trace-formatting are
-plain string-in/string-out transforms with no widget lifecycle attached to
-them — easy to unit test in isolation, and reusable if a second surface
-ever wants the same rendering (e.g. a non-interactive ``--diff`` CLI flag).
+"""Pure text/data-rendering helpers shared by the dashboard server and its
+tests. No ``textual`` import (this module predates the now-deleted TUI and
+outlived it unchanged), no HTTP import either — diffing and trace-parsing
+are plain string-in/structured-out transforms, easy to unit test in
+isolation and reusable by any surface that wants the same rendering
+(``dashboard/server.py``'s ``/api/node/<id>/diff/<tag>`` and
+``/api/node/<id>/thinking`` routes serialize these straight to JSON; a
+non-interactive ``--diff`` CLI flag could reuse them too).
 """
 
 from __future__ import annotations

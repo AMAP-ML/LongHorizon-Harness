@@ -29,7 +29,7 @@ Kusudaemon began as a fork of [LongHorizon-Harness](https://arxiv.org/abs/2608.0
 
 ## ✨ News
 
-- **[2026-08-09]** The web view is gone, replaced by a real TUI: `kusudaemon tui` (or bare `kusudaemon`) opens a terminal app over the run directory — phase timeline, node tree, a "Subagents" view over every dispatched Writer/repair/research episode with its live trace and a box to message it *mid-episode*, colored diffs, approvals queue, contract, and a live event tail. See [Control everything from the TUI](#4-control-everything-from-the-tui).
+- **[2026-08-09]** The control surface is a web dashboard again: `kusudaemon serve` (or bare `kusudaemon`) opens `http://127.0.0.1:8765/` over the run directory — task tree, a "Subagents" view over every dispatched Writer/repair/research episode with its live trace and a box to message it *mid-episode*, colored diffs, approvals queue, contract, and a live event tail. (This briefly shipped as a Textual TUI earlier the same day; the TUI is gone and every feature it added over the original web view — Subagents, interject, diffs, reopen — now lives here instead.) See [Control everything from the web dashboard](#4-control-everything-from-the-web-dashboard).
 - **[2026-08-09]** Kusudaemon is a new name for what was this fork's copy of LongHorizon-Harness — the package, CLI, and every `LH_HARNESS_*` setting are now `kusudaemon`/`KUSUDAEMON_*`. (Briefly renamed to "Waypoint" earlier the same day; that name didn't stick, so this supersedes it — no `waypoint`/`WAYPOINT_*` should remain anywhere in the tree.) See [Credits](#credits) for why, and for attribution to the original project.
 - **[2026-08-09]** Every Writer node can search the web on its own now (backed by a self-hosted [SearXNG](https://docs.searxng.org/) instance via Docker) — no `--research-plan` required; that flag is now only for forcing a lookup to happen *before* a node's episode starts. See [Web search (optional)](#web-search-optional).
 - **[2026-08-08]** The harness is now gptme-only: the classic role-based manager/executor/auditor loop and the Claude Code/Codex backends are gone. The pipeline CLI (`run` / `status` / `approve` / `amend` / `resume`) is the control surface, and the provider is user-configurable through `provider.json` and `.env` at the repo root (default: OpenCode Zen).
@@ -295,47 +295,57 @@ kusudaemon amend <run-id> --text "..."   # amend the contract, re-validate
 Every run lives under `./.kusudaemon/runs/<run-id>/`; the tree state,
 events log, and assembled output stay there for audit.
 
-#### 4. Control everything from the TUI
+#### 4. Control everything from the web dashboard
 
-`pip install "kusudaemon[tui]"` (adds [Textual](https://github.com/Textualize/textual); the core package and test suite stay Textual-free otherwise), then:
+No install step — the dashboard is stdlib `http.server` all the way down,
+same as every other part of the core package:
 
 ```bash
-kusudaemon tui --runs-root ./.kusudaemon/runs
-# or just: kusudaemon      -- bare kusudaemon (no subcommand) launches the TUI directly
+kusudaemon serve --runs-root ./.kusudaemon/runs
+# or just: kusudaemon      -- bare kusudaemon (no subcommand) launches the dashboard directly
 ```
 
-The scripted `status`/`approve`/`amend` commands above still work (safe
-from a second terminal, same disk protocol), but the TUI is the complete
-control surface — you shouldn't need the CLI for anything day to day. A
-sidebar lists every run under `--runs-root`; select one to attach, or
-press `n` for a new-run form (goal, source, model, compile command — reuse
-an existing run id to resume it instead). Once attached:
+Then open `http://127.0.0.1:8765/`. The scripted `status`/`approve`/`amend`
+commands above still work (safe from a second terminal, same disk
+protocol), but the dashboard is the complete control surface — you
+shouldn't need the CLI for anything day to day. A sidebar lists every run
+under `--runs-root`; click one to attach, or "+ New Run" for a new-run form
+(run id, goal, source, model, compile command — reuse an existing run id
+to resume it instead). Once attached:
 
-- **Tree** — the node table (status/shape/attempts/gates/judgment) with a
-  detail panel per node: gates, judgment/rubric, reviewer verdict, inputs,
-  the raw artifact, a **colored diff** against every prior version
+- **Task Tree** — every node (status/shape/attempts/gates/judgment); click
+  one to open its detail drawer: gates, judgment/rubric, reviewer verdict,
+  inputs, the raw artifact, a **colored diff** against every prior version
   (`out/.versions/`, populated by repairs and contract re-validation), and
   a **Thinking** tab rendering that node's live trace.
 - **Subagents** — every dispatched episode this run has ever spawned
   (Writer, repair, research query, pilot draft — this harness's own
   vocabulary for "subagent"), each with live status/duration and the same
-  detail panel. A subagent still actively running shows a message box:
-  type something and it's queued straight into that gptme session's own
-  external prompt queue, which gptme's chat loop drains between turns —
-  genuinely talking to a running episode mid-task, not just watching it.
-- **Approvals** — intake questions, pilot edits, contract-amendment
-  triage, reopen confirmations — each renders generically from the
-  approval's own shape (buttons for options, a text box when free-form
-  input is allowed).
-- **Contract / Spec / Spine / Assembly / Events** — read-only views plus
-  an amend box on the Contract tab; a passed node's detail panel has its
-  own "reopen" box that raises a scoped-repair approval the same way.
+  detail drawer. A subagent still actively running shows a message box in
+  its drawer: type something and it's queued straight into that gptme
+  session's own external prompt queue, which gptme's chat loop drains
+  between turns — genuinely talking to a running episode mid-task, not
+  just watching it.
+- **Run Stream** (center pane) — the goal, current phase, and pending
+  approvals (intake questions, pilot edits, contract-amendment triage,
+  reopen confirmations) rendered generically from each approval's own
+  shape (buttons for options, a text box when free-form input is allowed),
+  plus a live event tail and a bottom prompt bar that starts new runs,
+  amends the contract, or reopens a node by typing its id.
+- **Contract / Spec / Spine / Assembly / Events** (right pane) — read-only
+  views plus an amend box on the Contract tab; a node's detail drawer has
+  its own "reopen" box that raises a scoped-repair approval the same way.
+
+The dashboard updates live over server-sent events (falls back to polling
+if SSE is unavailable). Pass `--no-control` to serve a read-only view —
+every mutating route (start/halt/approve/amend/reopen/interject) 403s,
+attach/browsing still works.
 
 #### CLI and provider reference
 
 `kusudaemon`'s CLI is the scriptable half of the control surface (PLAN.md
-§11); `kusudaemon tui` is everything above it, described above. Commands
-operate purely on the run directory, so `status`/`approve`/`amend`/`tui`
+§11); `kusudaemon serve` is everything above it, described above. Commands
+operate purely on the run directory, so `status`/`approve`/`amend`/`serve`
 are all safe to run from a second terminal while a driver is still
 attached.
 
@@ -346,7 +356,7 @@ attached.
 | `kusudaemon status <run-id>` | Phase, tree statuses, pending approvals, event count |
 | `kusudaemon approve <run-id>` | Resolve the oldest pending approval (`--answer`, `--file`, `--action`) |
 | `kusudaemon amend <run-id> --text "..."` | Append a contract rule, run the read-only re-validation pass, and (on confirmation) apply the repairs |
-| `kusudaemon tui` | Launch the terminal UI over `--runs-root` (`--run-id` to attach on startup); bare `kusudaemon` is shorthand for this |
+| `kusudaemon serve` | Launch the web dashboard over `--runs-root` (`--host`, `--port`, `--run-id` to attach on startup, `--no-control` for read-only); bare `kusudaemon` is shorthand for this |
 
 Provider settings resolve per field, highest first:
 

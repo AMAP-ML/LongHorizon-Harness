@@ -12,7 +12,7 @@ classic role-based harness (manager/executor/auditor over Claude Code/Codex
 CLIs) and its web dashboard were **removed** — this worktree is the
 recursive-decomposition harness only (`src/kusudaemon/v0`..`v5`/`pipeline/`).
 The `kusudaemon` CLI is now exactly the §11 control surface: `run` / `resume`
-/ `status` / `approve` / `amend` / `tui`. See README.md for the shipped
+/ `status` / `approve` / `amend` / `serve`. See README.md for the shipped
 product, and PLAN.md's Progress section for the v0-v5 build ladder detail.
 
 On top of this codebase, the repo is also building the **Recursive
@@ -23,14 +23,18 @@ tools) are done and live in `src/kusudaemon/v0/`, `src/kusudaemon/v1/`,
 `src/kusudaemon/v2/`, `src/kusudaemon/v3/`, and `src/kusudaemon/v4/`; v4
 was the last item on the §13 build ladder, so anything past it is v5+ and
 not yet scoped in `PLAN.md`. v5 has been built here anyway as the pipeline
-driver and §11 control surface (`src/kusudaemon/pipeline/`) plus a terminal
-UI (`src/kusudaemon/tui/`, mounted via `kusudaemon tui` / bare `kusudaemon`,
-2026-08-09) — see the v5 section below. The original PLAN.md §11 plan called
-for a local *web app* as the view surface (`dashboard/`); that package was
-built, then **deleted and replaced by the TUI** the same day once it became
-clear the operator was already living in a terminal for the CLI half of this
-control surface anyway — see PLAN.md §11's 2026-08-09 revision note. See
-PLAN.md's Progress section for detail.
+driver and §11 control surface (`src/kusudaemon/pipeline/`) plus a web
+dashboard (`src/kusudaemon/dashboard/`, mounted via `kusudaemon serve` /
+bare `kusudaemon`) — see the v5 section below for the full history: this
+is the *second* build of the web view. The original PLAN.md §11 plan
+called for a local web app as the view surface, and that's what shipped
+first; it was then deleted and replaced by a Textual TUI the same day
+(2026-08-09) once it became clear the operator was already living in a
+terminal for the CLI half of this control surface anyway, and the TUI was
+in turn deleted and replaced by a rebuilt web dashboard — this one — later
+that same day, carrying forward every feature (Subagents view, live
+interject, diff history, reopen) the TUI had added over the original web
+view. See PLAN.md's Progress section for detail.
 
 ## v0 — resumability (`src/kusudaemon/v0/`)
 
@@ -464,7 +468,7 @@ modifications to v0/v1/v2/v3.
   safe to do again). Raises `KeyError` loudly if the plan names a node id
   outside the tree, rather than silently skipping it.
 
-## v5 — the pipeline driver and PLAN.md §11 control surface (`src/kusudaemon/pipeline/`, `src/kusudaemon/tui/`)
+## v5 — the pipeline driver and PLAN.md §11 control surface (`src/kusudaemon/pipeline/`, `src/kusudaemon/dashboard/`)
 
 The thing v0-v4 deliberately didn't provide: a driver that chains intake →
 survey → plan → pilot → contract → research → execute → assemble into one
@@ -472,13 +476,38 @@ run, plus the control surface (§11: run / status / approve / amend /
 resume) around it. v0-v4 are imported unmodified; the only new durable
 state is a small v5 path set layered on the existing run-directory layout.
 
+**History, in full, because it's genuinely gone back and forth twice in
+one day (2026-08-09) and every earlier revision of this file told a
+different story:** the original PLAN.md §11 plan called for a local *web
+app* as the view surface. That shipped first (`dashboard/server.py` +
+`dashboard/static/`, a stdlib `http.server` + hand-rolled JS frontend).
+It was then **deleted and replaced by a Textual TUI** (`tui/app.py` +
+`tui/state.py`, `pip install "kusudaemon[tui]"`) the same day, once it
+became clear the operator was already living in a terminal for the CLI
+half of this control surface anyway. The TUI added real features the
+original web view never had — a "Subagents" view, live mid-episode
+interject, colored diff history against `out/.versions/`, per-node
+reopen — while it was the only control surface. Then the TUI was **itself
+deleted and replaced by a rebuilt web dashboard** (`src/kusudaemon/
+dashboard/`, this section) later the same day, this time carrying every
+one of those TUI-only features over rather than dropping them again.
+`dashboard/state.py`'s `RunState` is a straight line all the way back to
+the original `dashboard/recursive.py`'s `RecursiveRunState` — it moved
+files twice (`dashboard/recursive.py` → `tui/state.py` → `dashboard/
+state.py`) but the class itself, and its "read everything fresh from disk
+on every call" design, never got rewritten from scratch. Net effect: the
+package name and the transport (`http.server`, not a terminal) are back to
+where they started, but the feature set is not — this is not a revert, it
+carries the TUI's additions forward.
+
 - `pipeline/run_dir.py` — v5 path helpers: `source_path` (the corpus the
   run decomposes), `phase_path` (`{phase, status, detail, ts}` durable
   progress marker), `approvals_path`, `halt_path`, `run_spec_path`
   (immutable `{goal, backend, model, source_text, compile_command,
   research_plan, ...}` written by the driver at first dispatch so a
-  detached TUI or `pipeline resume` can rebuild the environment from
-  disk alone), `jobs_path` (background-job records for the TUI).
+  detached dashboard server or `pipeline resume` can rebuild the
+  environment from disk alone), `jobs_path` (background-job records for
+  the dashboard).
 - `pipeline/approvals.py` — the cross-process human-gate protocol. Every
   checkpoint (intake answers, pilot edits, amend/triage/reopen gates) is a
   record in `approvals.jsonl`, append-only, latest record per
@@ -488,9 +517,9 @@ state is a small v5 path set layered on the existing run-directory layout.
   polling the file — the operator is the one surface that must never be
   rushed, so `timeout=None` waits forever), and `Approver` (a thread that
   answers every pending record as it lands, so a driver run can be
-  scripted end to end over the exact same disk protocol the TUI uses).
-  Any surface — TUI, CLI `pipeline approve` — resolves the same file,
-  so no surface owns a run.
+  scripted end to end over the exact same disk protocol the dashboard
+  uses). Any surface — the dashboard, CLI `pipeline approve` — resolves
+  the same file, so no surface owns a run.
 - `pipeline/driver.py` — `RunOptions` (persisted via `to_spec`/
   `from_spec`) and `RunReport`, then `RecursiveDriver`, the phase machine.
   Construction never touches the network; only `async run()` does. Phase
@@ -546,31 +575,36 @@ state is a small v5 path set layered on the existing run-directory layout.
   status/events lengths straight from disk), approve (resolve the oldest
   pending approval, with `--answer`/`--file`/`--action`), amend (append a
   rule, print the re-validation counts, ask before applying the triage —
-  or `--yes`), and **tui** (2026-08-09, replacing the deleted `serve` web
-  command: `--runs-root`/`--run-id`, launches `tui.app.KusudaemonApp` in
-  the foreground — the standalone view+control surface, PLAN.md §11's
-  "separate process watching the run directory... can be attached from
-  anywhere," now rendered in the terminal instead of a browser). Bare
-  `kusudaemon` (no subcommand, `src/kusudaemon/cli.py`) is shorthand for
-  `tui` with default `--runs-root` — "just run the thing" ergonomics
-  matching other modern agent CLIs, replacing the old bare-invocation
-  behavior of printing `--help`. Every handler operates purely on the run
-  directory, so they work from a second terminal while a driver (or the
-  TUI) is still attached.
-- `tui/state.py` — `RunState`, adapted line-for-line from the deleted
-  `dashboard/recursive.py`'s `RecursiveRunState` (same "read everything
-  fresh from disk on every call" design) minus every HTTP-only concept —
-  no `control_enabled`/403s, since the TUI *is* the operator's own
-  terminal and always has full control. Deliberately has **no `textual`
-  or `gptme` import** (mirrors the "core package stays gptme-free" rule
-  the rest of the codebase already follows for its own optional extra),
-  so `tests/test_tui_state.py` exercises it directly without either
-  extra installed. Keeps every method the web state had — `list_runs`/
-  `attach`/`snapshot`/`events_tail`/`start_run` (hosts a `RecursiveDriver`
-  in a background thread)/`halt`/`resolve_approval`/`request_amend`/
-  `request_reopen`/`node_detail`/`artifact`/`version_snapshot`/`trace`/
-  `spec_text`/`contract_text`/`spine_text`/`manifest_lines`/`assembly` —
-  and adds two the web view never had:
+  or `--yes`), and **serve** (2026-08-09, replacing the since-deleted
+  `tui` command: `--runs-root`/`--host`/`--port`/`--run-id`/`--no-control`,
+  launches `dashboard.server.run_forever` in the foreground — the
+  standalone view+control surface, PLAN.md §11's "separate process
+  watching the run directory... can be attached from anywhere," back to
+  being a browser rather than a terminal). Bare `kusudaemon` (no
+  subcommand, `src/kusudaemon/cli.py`) is shorthand for `serve` with
+  default `--runs-root`/`--host`/`--port` — "just run the thing"
+  ergonomics matching other modern agent CLIs, replacing the old
+  bare-invocation behavior of printing `--help`. Every handler operates
+  purely on the run directory, so they work from a second terminal while a
+  driver (or the dashboard) is still attached.
+- `dashboard/state.py` — `RunState`, unchanged in spirit across both of
+  its moves (`dashboard/recursive.py` → `tui/state.py` → here): same
+  "read everything fresh from disk on every call" design. No
+  `control_enabled`/403 concept lives on this class — that gate is back
+  one layer up in `dashboard/server.py` now (see below), same place the
+  very first web view kept it, since a web server (unlike a TUI or a
+  bound terminal) may be reachable from more than just the operator's own
+  machine. Deliberately has **no `http.server`, `textual`, or `gptme`
+  import** (mirrors the "core package stays gptme-free" rule the rest of
+  the codebase already follows for its own optional extra), so
+  `tests/test_dashboard_state.py` exercises it directly without any extra
+  installed. Every method the very first web state had is still here —
+  `list_runs`/`attach`/`snapshot`/`events_tail`/`start_run` (hosts a
+  `RecursiveDriver` in a background thread)/`halt`/`resolve_approval`/
+  `request_amend`/`request_reopen`/`node_detail`/`artifact`/
+  `version_snapshot`/`trace`/`spec_text`/`contract_text`/`spine_text`/
+  `manifest_lines`/`assembly` — plus two the TUI added and this rebuild
+  kept:
   - `subagents(events=...)` — every distinct dispatched id seen in
     `events.jsonl` (tree Writer nodes, and derived ids like
     `v3/repair.py`'s `<node>~repair<n>` and `v4/research.py`'s
@@ -578,67 +612,108 @@ state is a small v5 path set layered on the existing run-directory layout.
     attempts/duration/`live`. This is "subagents" in the harness's own
     vocabulary — the same word `v4`'s module docstrings already use for a
     research query — surfaced as a first-class view rather than only
-    reachable by knowing a tree node id.
+    reachable by knowing a tree node id. `dashboard/server.py` folds this
+    straight into `/api/snapshot`'s payload rather than giving it its own
+    route, since the frontend needs the whole list on every refresh
+    anyway (to compute per-id "live" status for both the Tree and
+    Subagents tabs).
   - `node_gptme_logdir(node_id)` / `interject(node_id, text)` — live
-    mid-episode messaging. `_gptme_worker.py` (see Adapters below) now
-    tees a `{"type": "logdir", "logdir": ...}` line to the node's
-    `trace.jsonl` before `gptme.chat()` starts; `node_gptme_logdir` scans
-    for it the same way `v0/runner.py`'s `_watch_for_session_id` already
-    scans the same file for `session_id`. `interject` then appends to
-    `<logdir>/prompt-queue.jsonl` via `tui/gptme_queue.py` (below) —
+    mid-episode messaging. `_gptme_worker.py` (see Adapters below) tees a
+    `{"type": "logdir", "logdir": ...}` line to the node's `trace.jsonl`
+    before `gptme.chat()` starts; `node_gptme_logdir` scans for it the
+    same way `v0/runner.py`'s `_watch_for_session_id` already scans the
+    same file for `session_id`. `interject` then appends to
+    `<logdir>/prompt-queue.jsonl` via `dashboard/gptme_queue.py` (below) —
     gptme's own chat loop (`gptme/chat.py`'s
     `_drain_external_prompt_queue`) already polls that exact file between
     turns and injects each line as the next user message, so this is
     "talk to a running subagent mid-episode" using a mechanism gptme
-    already ships, not a fork of its chat loop.
-  A bug fixed while porting: `node_detail` used to pass a possibly-`None`
-  artifact straight into `evaluate_gates`, which crashed inside
-  `_gate_nonempty`'s `.strip()` — unreachable from the old web tests
-  (which only ever inspected already-`"passed"` nodes with a real
-  artifact on disk) but routine for the TUI, which calls `node_detail` on
-  in-flight (`"dispatched"`) nodes too; now defaults to `""`.
-- `tui/gptme_queue.py` — `queue_prompt(logdir, content)`, a from-scratch
-  reimplementation of gptme's own `gptme/prompt_queue.py` file protocol
-  (`{"content", "queued_at"}` JSON lines, `fcntl.flock`-guarded append) —
-  not an import of it, so the long-lived TUI process stays independent of
-  whether the `gptme` optional extra is installed (only
-  `adapters/_gptme_worker.py` imports gptme itself; see that module's
-  docstring and the `tui`/`gptme` `pyproject.toml` extras).
-- `tui/rendering.py` — pure string-in/string-out helpers, no `textual`
-  import either (tested directly, same reasoning as `state.py`):
-  `status_style`/`status_glyph`/`phase_strip_text` (one color/glyph table
-  every table and the phase strip agree on), `diff_lines` (a
-  `difflib.unified_diff` wrapper pre-classified into
-  add/remove/context/header/hunk so a caller styles without re-parsing
-  `+`/`-`/`@@` markers itself — backs the Diff tab's colored history
-  against `out/.versions/`), and `parse_trace`/`role_style` (turns
-  `trace.jsonl` — the tee'd raw stdout of the agent subprocess, either
-  `{"type": "logdir", ...}` or gptme's own `--output-format json`
-  `{"type": "message", "role", "content"}` — into role-colored entries for
-  the Thinking tab; unparsable lines are shown dim and verbatim rather
-  than dropped).
-- `tui/app.py` — `KusudaemonApp` ([Textual](https://github.com/Textualize/textual);
-  the **only** module in the package that imports it — `pip install
-  "kusudaemon[tui]"`). Poll-driven, not push-driven: a 1s timer calls
-  `refresh_all()`, which re-reads `state.snapshot()` and pushes it into
-  whichever widgets are mounted; tables (`NodeTable`/`SubagentTable`/the
-  sidebar's run table) only rebuild rows when the underlying tuple list
-  actually changed, so an operator mid-keystroke in an approval's
-  `TextArea` or an interject/reopen/amend `Input` never gets interrupted
-  by a redraw. Layout: a run-browsing `Sidebar` (attach, "New run" →
-  `NewRunScreen` modal, halt/resume toggle) plus a tabbed content area —
-  `Tree` (the node table + a shared `NodeDetail` panel: Overview/
-  Artifact/Diff/Thinking sub-tabs, a live interject box, and a "reopen"
-  box shown once a node is `"passed"`), `Subagents` (same `NodeDetail`
-  panel, keyed by whatever id the row selection points at — for a
-  non-tree id like a repair's, `NodeDetail` degrades to
-  role/status/trace/interject only, since there's no standalone artifact
-  or gate set for a derived id), `Approvals` (`ApprovalCard` renders each
-  pending record generically from its own `options`/`allow_input` shape,
-  same "no kind-specific UI code" property the deleted web frontend had),
-  `Contract` (raw text + an amend `Input`), `Spec`/`Spine`/`Assembly`
-  (raw text), and `Events` (a `RichLog` tail, append-only against
-  `events_count` so it never redraws history it's already shown).
+    already ships, not a fork of its chat loop. `dashboard/server.py`
+    exposes it as `POST /api/node/<id>/interject`.
+  A bug fixed while this lived at `tui/state.py` and still relevant here:
+  `node_detail` used to pass a possibly-`None` artifact straight into
+  `evaluate_gates`, which crashed inside `_gate_nonempty`'s `.strip()` —
+  unreachable from the original web tests (which only ever inspected
+  already-`"passed"` nodes with a real artifact on disk) but routine once
+  a caller inspects in-flight (`"dispatched"`) nodes too; now defaults to
+  `""`.
+- `dashboard/gptme_queue.py` — `queue_prompt(logdir, content)`, a
+  from-scratch reimplementation of gptme's own `gptme/prompt_queue.py`
+  file protocol (`{"content", "queued_at"}` JSON lines,
+  `fcntl.flock`-guarded append) — not an import of it, so the long-lived
+  dashboard server process stays independent of whether the `gptme`
+  optional extra is installed (only `adapters/_gptme_worker.py` imports
+  gptme itself; see that module's docstring and `pyproject.toml`'s
+  `gptme` extra — the dashboard package has no optional extra of its
+  own).
+- `dashboard/rendering.py` — pure string/data-rendering helpers, no
+  `http.server` import either (tested indirectly through
+  `dashboard/server.py`'s routes): `diff_lines` (a `difflib.unified_diff`
+  wrapper pre-classified into add/remove/context/header/hunk so a caller
+  styles without re-parsing `+`/`-`/`@@` markers itself — backs the Diff
+  tab's colored history against `out/.versions/`), and `parse_trace`
+  (turns `trace.jsonl` — the tee'd raw stdout of the agent subprocess,
+  either `{"type": "logdir", ...}` or gptme's own `--output-format json`
+  `{"type": "message", "role", "content"}` — into role-tagged entries for
+  the Thinking tab; unparsable lines are shown verbatim rather than
+  dropped). Also carries `STATUS_STYLE`/`STATUS_GLYPH`/`phase_strip_text`
+  (rich-text-style helpers left over from the TUI; unused by the web
+  frontend, which keys its own CSS off the raw status string via
+  `[data-status]` selectors instead — harmless to keep, nothing imports
+  `rich` to use them).
+- `dashboard/server.py` — the stdlib `http.server` transport (no new
+  dependency: `http.server`/`urllib`/`json`, matching the rest of the
+  harness's "stdlib + packaging/tomli" rule). One `ThreadingHTTPServer` so
+  the long-lived `/api/stream` SSE connection never blocks any other
+  request. Owns *transport* only — routing, JSON encoding,
+  path-traversal-safe static serving, and `control_enabled` gating for
+  every mutating route (`start_run`/`halt`/`resolve_approval`/
+  `request_amend`/`request_reopen`/`interject`; `attach` is deliberately
+  ungated, same as the original web view). Routes mirror `RunState`
+  one-to-one (`/api/snapshot`, `/api/runs`, `/api/attach`, `/api/halt`,
+  `/api/approvals/<id>/resolve`, `/api/amend`, `/api/reopen`,
+  `/api/node/<id>`, `/api/node/<id>/artifact`, `/api/node/<id>/trace`,
+  `/api/node/<id>/version/<tag>`, `/api/spec`, `/api/contract`,
+  `/api/spine`, `/api/manifest`, `/api/assembly`) plus what the TUI added
+  and this rebuild carries forward as JSON endpoints instead of widget
+  state: `/api/node/<id>/thinking` (`rendering.parse_trace`, JSON-ified),
+  `/api/node/<id>/diff/<tag>` (`rendering.diff_lines` against one prior
+  version, JSON-ified — the frontend calls this once per entry in
+  `node_detail().versions`), and `POST /api/node/<id>/interject`.
+  `POST /api/runs`'s `goal`/`source` fields get server-side `@path`
+  resolution (`_read_text_field`, mirroring `pipeline/run.py`'s
+  `_read_text_arg`) before reaching `RunState.start_run` — a browser can't
+  read arbitrary server files the way the old TUI's same-process New-run
+  form could, so this has to happen in the handler instead of the
+  frontend. `make_server`/`serve_in_background`/`run_forever` are the
+  three entrypoints (`kusudaemon serve`, bare `kusudaemon`, and
+  `python -m kusudaemon.dashboard.server` respectively all end up at
+  `run_forever`).
+- `dashboard/static/{index.html,app.js,style.css}` — the frontend: a
+  dependency-free vanilla-JS single-page app (`el()` helper builds DOM
+  nodes directly, no framework, no build step) polling `/api/snapshot`
+  every 2s as a fallback and preferring `/api/stream` (SSE) when
+  available. Three-pane layout — a left `Sidebar` (Runs/Task Tree/
+  Subagents/Phases tabs), a center `Run Stream` (goal, phase card,
+  pending approvals rendered generically from each approval's own
+  `options`/`allow_input` shape, a live event tail, and a bottom prompt
+  bar that starts new runs / amends the contract / reopens a node by
+  typing its id), and a right `Workbench` (Code & Artifacts / Contract /
+  Spec / Spine / Assembly / Events Log tabs) — plus a node/subagent
+  **drawer** (`openNode(id)`, shared by clicks from the Tree tab, the
+  Subagents tab, and any event's node-id link) with four sub-tabs mirroring
+  the TUI's `NodeDetail` widget: Overview (gates/judgment/rubric/reviewer
+  verdict/inputs/depends_on/budget), Artifact (raw text), Diff (one block
+  per prior version, fetched from `/api/node/<id>/diff/<tag>` and
+  colored via CSS classes matching `rendering.DiffLine.kind`), and
+  Thinking (role-colored trace entries from `/api/node/<id>/thinking`).
+  The drawer also carries the interject bar (enabled only when the node's
+  entry in `snapshot().subagents` has `live: true`) and the reopen bar
+  (enabled only when `node_detail().status === "passed"`) — the same two
+  conditions the TUI's `NodeDetail._send_interject`/`_send_reopen` gated
+  on. `control_enabled` (stitched into `/api/snapshot`'s payload by the
+  server, since `RunState` itself doesn't carry it) greys out every
+  mutating control when the dashboard is served with `--no-control`.
 ## Adapters (gptme-only)
 
 The Claude Code and Codex adapters, the classic role adapters
@@ -687,17 +762,17 @@ classic harness. What remains is the gptme-only surface:
   `gptme_visible_output` parses) was confirmed against a real installed
   `gptme` package via `inspect`, not guessed from documentation.
   `_gptme_worker.py` also emits one `{"type": "logdir", "logdir": ...}`
-  line (2026-08-09, for the TUI) before `gptme.chat()` starts —
-  `gptme_visible_output` already ignores any line whose `type` isn't
-  `"message"`, so this is invisible to it; it exists purely so
-  `tui/state.py`'s `node_gptme_logdir` (watching the same tee'd
-  `trace.jsonl` this bullet's `live_trajectory_path` already writes) can
-  find *this attempt's* logdir while the episode is still running, and
+  line (2026-08-09, added for the TUI and unchanged since) before
+  `gptme.chat()` starts — `gptme_visible_output` already ignores any line
+  whose `type` isn't `"message"`, so this is invisible to it; it exists
+  purely so `dashboard/state.py`'s `node_gptme_logdir` (watching the same
+  tee'd `trace.jsonl` this bullet's `live_trajectory_path` already writes)
+  can find *this attempt's* logdir while the episode is still running, and
   append to its `prompt-queue.jsonl` — gptme's own already-shipped
   mid-conversation message queue — to let the operator talk to a running
-  Writer/repair/research episode mid-task. See the `tui/state.py` and
-  `tui/gptme_queue.py` bullets in the v5 section above for the other half
-  of this mechanism.
+  Writer/repair/research episode mid-task. See the `dashboard/state.py`
+  and `dashboard/gptme_queue.py` bullets in the v5 section above for the
+  other half of this mechanism.
 - `adapters/tools/searxng_search.py` (new, 2026-08-09) — a `websearch`
   gptme tool, self-contained and stdlib-only (`urllib`), querying a local
   [SearXNG](https://docs.searxng.org/) instance's JSON API
@@ -822,37 +897,53 @@ that worktree's *test files* against the original checkout's (unmodified)
 guards against exactly this — copy the guard into any new test file
 rather than assuming a bare `import kusudaemon` is safe.
 
-~8s, 171 tests, all passing (167 + 4 covering `load_env_file`'s
-`KUSUDAEMON_ENV_FILE` override and its `_installed_repo_root()` fallback,
-2026-08-09). `test_provider_config.py`'s `_EnvIsolatedTest`
-snapshots and restores the *entire* `os.environ` around each test now
-(2026-08-09 fix) — the previous partial-restore logic only put back keys
-that had a prior value, so a test setting e.g. `KUSUDAEMON_PROVIDER`
-fresh (no prior value) leaked it into every test running after it in the
-same process, intermittently breaking unrelated suites
-(`test_v1_units.py`, `test_v1_round_loop.py`) depending on run order.
-`test_searxng_tool.py` (10) and the rewritten `test_v4_mcp_research.py`
-(2, was 7 — see the v4/pipeline sections above) cover the SearXNG web-search
-tool and its allowlist wiring. `test_dashboard_server.py` (the deleted
-web view's 16 HTTP-level tests) is gone along with `dashboard/server.py`;
-`tests/test_tui_state.py` (16, new 2026-08-09) is its replacement, but
-calls `tui/state.py`'s `RunState` methods directly rather than over HTTP
-(no server, no `urllib`, no port) — covers everything the old suite did
-(run listing, attach, snapshot reflecting tree/approvals, node detail +
-artifact, unknown-node/unknown-run handling, approval resolution, halt
-toggling, event tail) plus the TUI-only additions: `subagents()` deriving
-distinct dispatched ids (including a `<node>~repair1` shape) from
-`events.jsonl`, `node_gptme_logdir` discovering a session from a forged
+~19s, 193 tests, all passing. `test_provider_config.py`'s
+`_EnvIsolatedTest` snapshots and restores the *entire* `os.environ` around
+each test — the previous partial-restore logic only put back keys that
+had a prior value, so a test setting e.g. `KUSUDAEMON_PROVIDER` fresh (no
+prior value) leaked it into every test running after it in the same
+process, intermittently breaking unrelated suites (`test_v1_units.py`,
+`test_v1_round_loop.py`) depending on run order. `test_searxng_tool.py`
+(10) and the rewritten `test_v4_mcp_research.py` (2, was 7 — see the
+v4/pipeline sections above) cover the SearXNG web-search tool and its
+allowlist wiring.
+
+`tests/test_dashboard_state.py` (16) tests `dashboard/state.py`'s
+`RunState` directly (no server, no `urllib`, no port) — a straight rename
+of the file that lived at `tests/test_tui_state.py` while `RunState` lived
+at `tui/state.py`, no content changes beyond import paths and comments.
+Covers run listing, attach, snapshot reflecting tree/approvals, node
+detail + artifact (including tolerating a `None` artifact on an in-flight
+node), unknown-node/unknown-run handling, approval resolution, halt
+toggling, event tail, `subagents()` deriving distinct dispatched ids
+(including a `<node>~repair1` shape) from `events.jsonl`,
+`node_gptme_logdir` discovering a session from a forged
 `{"type": "logdir", ...}` trace line, `interject` appending to (and
 refusing to touch, when no logdir has been discovered yet, or the text is
-blank) that session's `prompt-queue.jsonl`, and `request_reopen`. There is
-no `control_enabled`/read-only-mode test class anymore — that concept
-doesn't exist post-web-view (see the v5 section's `tui/state.py` bullet).
-Deliberately does not import `kusudaemon.tui.app` (the one module with a
-`textual` import) — the same "test only the gptme-free half" rule
-`test_searxng_tool.py` already follows for `adapters/tools/
-searxng_search.py`'s gptme-importing half — so the suite stays runnable
-without `pip install "kusudaemon[tui]"`.
+blank) that session's `prompt-queue.jsonl`, and `request_reopen`.
+
+`tests/test_dashboard_server.py` (22, new 2026-08-09) is the HTTP-level
+suite over `dashboard/server.py` — a real `ThreadingHTTPServer` bound to
+127.0.0.1 on an OS-assigned ephemeral port, driven with `urllib` against a
+hand-built run directory (loopback-only traffic to a server this process
+itself owns, not a call to any external network). `DashboardServerTest`
+(11) covers static serving + path-traversal rejection, the same
+attach/snapshot/node-detail/approval-resolve/halt/events routes
+`test_dashboard_state.py` covers at the `RunState` layer, plus malformed
+JSON and unknown-route handling. `SubagentsInterjectDiffThinkingTest` (5)
+covers the routes that carry the TUI's additions over as JSON:
+`POST /api/node/<id>/interject` (409 with no live session, 200 and a
+written `prompt-queue.jsonl` once a forged logdir line makes one live),
+`GET /api/node/<id>/thinking` (a forged trace line round-trips to
+`{"role": "assistant", "text": "..."}`), and `GET /api/node/<id>/diff/
+<tag>` (a hand-written file under `out/.versions/<node>/` diffs against
+the live artifact; unknown tag 404s). `ReadOnlyDashboardServerTest` (6,
+`control_enabled=False`) asserts every mutating route 403s — `halt`,
+`start_run`, `amend`, `reopen`, `interject` — while `attach` still
+succeeds, since `RunState` itself has no opinion on read-only mode (see
+the v5 section's `dashboard/server.py` bullet: that gate lives on the
+HTTP handler, not the state class, precisely so this test class can
+exercise it without touching `RunState` at all).
 
 ### `tests/test_provider_config.py` (13 tests)
 
@@ -1079,22 +1170,23 @@ planner (v4's `research_loop.py` takes an explicit caller-supplied
 `plan` — deciding *which* nodes need *which* questions answered is not
 built, the same "hand- or script-authored" starting point v1's trees had
 before v2's planner existed). The view surface for the recursive harness
-(§11's "View surface") **is now built and mounted** (2026-08-09:
-`src/kusudaemon/tui/`, reachable via `kusudaemon tui` or bare
-`kusudaemon` — see the v5 section above) — earlier revisions of this file
-listed it here as unbuilt, first as a local web app
-(`dashboard/server.py` + `dashboard/static/`), which was itself built,
-then deleted and replaced by the TUI the same day (PLAN.md §11's
-2026-08-09 revision note explains why); it no longer belongs in this
-section either way. Still genuinely unbuilt: no auth or remote-access
-story of any kind — the TUI is a local terminal process over a local run
-directory, so this simply doesn't apply the way it did to a bindable HTTP
-server — and no multi-run concurrency limit (nothing stops the operator
-from starting enough runs from the "New run" form to hit local resource
-limits); also no gptme-native nested-subagent surfacing (the `subagent`
-tool gptme itself ships, letting *one* dispatched episode spawn further
-gptme-managed subagents of its own — distinct from this harness's own
-notion of "subagent" as one dispatched Writer/repair/research episode,
-which the TUI's Subagents tab and `interject` mechanism do cover; see the
-`tui/state.py` bullet in the v5 section above). `PLAN.md` §13's build
-ladder ends at v4; none of this is scoped in `PLAN.md` yet.
+(§11's "View surface") **is now built and mounted** (`src/kusudaemon/
+dashboard/`, reachable via `kusudaemon serve` or bare `kusudaemon` — see
+the v5 section above for its full three-act history: web app, then a
+Textual TUI, then a rebuilt web app carrying the TUI's additions
+forward); earlier revisions of this file listed it here as unbuilt or
+described whichever of the three it was at the time, and none of that
+belongs in this section anymore either way. Still genuinely unbuilt: no
+auth of any kind on the dashboard server — `--host`/`--port` default to
+127.0.0.1 only, so this is a real gap the moment anyone binds it wider
+than loopback, unlike when this surface was briefly a local terminal
+process with no network exposure at all — and no multi-run concurrency
+limit (nothing stops the operator from starting enough runs from the
+"+ New Run" form to hit local resource limits); also no gptme-native
+nested-subagent surfacing (the `subagent` tool gptme itself ships,
+letting *one* dispatched episode spawn further gptme-managed subagents of
+its own — distinct from this harness's own notion of "subagent" as one
+dispatched Writer/repair/research episode, which the dashboard's
+Subagents tab and interject mechanism do cover; see the
+`dashboard/state.py` bullet in the v5 section above). `PLAN.md` §13's
+build ladder ends at v4; none of this is scoped in `PLAN.md` yet.

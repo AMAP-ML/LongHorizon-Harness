@@ -1,20 +1,23 @@
-"""Run-directory state for the TUI (PLAN.md §11) — the terminal
-replacement for the deleted web view.
+"""Run-directory state for the web dashboard (PLAN.md §11).
 
-Adapted from the former ``dashboard/recursive.py`` (removed 2026-08-09
-when the web app was replaced by this TUI): the same "read everything
-fresh from disk on every call" design, minus every HTTP-only concept
-(``control_enabled``/403s — the TUI *is* the operator's own terminal, so
-it always has full control) and plus the "subagents" view and live
-mid-episode messaging this TUI adds on top of what the web view had.
+Formerly ``tui/state.py`` (2026-08-09: the Textual TUI was itself replaced
+by this web app the same day it was deleted — see CLAUDE.md's v5 section
+for the full back-and-forth). Moved here unchanged in spirit: still the
+same "read everything fresh from disk on every call" design, still no
+``control_enabled``/403 concept on *this* class — that gate now lives one
+layer up, in ``dashboard/server.py``'s HTTP handler, since a web server
+(unlike a TUI or a bound terminal) may be reachable from more than just
+the operator's own machine. The "subagents" view and live mid-episode
+messaging the TUI added over the original dashboard state are kept as-is.
 
-Bridges three worlds without coupling them, same as before:
+Bridges three worlds without coupling them:
 
 * the pipeline driver (hosted in a background thread by this same process,
   or running in a detached ``kusudaemon run`` process — this state never
   tells the difference, because the only contract is the run directory),
-* the TUI's own render loop (snapshots on a timer),
-* the operator (approve/amend/reopen/halt/interject actions).
+* the dashboard server's render loop (snapshots on every request, or every
+  SSE tick),
+* the operator (approve/amend/reopen/halt/interject actions, over HTTP).
 
 The approval protocol is still ``pipeline/approvals.py``'s: the driver
 creates ``pending`` records in ``approvals.jsonl`` and polls until a
@@ -64,8 +67,9 @@ def _now() -> float:
 
 
 class RunState:
-    """Per-process store for the TUI. Thread-safe: the driver, job workers,
-    and the TUI's own event loop all touch this concurrently."""
+    """Per-process store for the dashboard server. Thread-safe: the driver,
+    job workers, and the server's own request/SSE handlers all touch this
+    concurrently."""
 
     def __init__(self, runs_root: str | Path | None = None) -> None:
         self.runs_root = Path(runs_root) if runs_root else None
@@ -227,7 +231,7 @@ class RunState:
         """Send a live message into a currently-running subagent's gptme
         session — appends to that session's ``prompt-queue.jsonl``, which
         gptme's own chat loop drains between turns (see
-        ``tui/gptme_queue.py``). Returns False if no live session has been
+        ``dashboard/gptme_queue.py``). Returns False if no live session has been
         discovered for this node yet (nothing running, or too early)."""
         text = (text or "").strip()
         if not text:
@@ -272,7 +276,7 @@ class RunState:
         if driver is None:
             driver = self._default_driver(run_dir, options)
         thread = threading.Thread(
-            target=_host_driver, args=(run_dir, driver), name=f"kusudaemon-tui-{run_id}", daemon=True
+            target=_host_driver, args=(run_dir, driver), name=f"kusudaemon-dashboard-{run_id}", daemon=True
         )
         with self._lock:
             self._hosts[run_id] = thread
@@ -351,7 +355,7 @@ class RunState:
     # ------------------------------------------------------------------
     # Operator actions that *create* approvals (never run jobs directly)
     # ------------------------------------------------------------------
-    def request_amend(self, text: str, reason: str = "TUI amendment") -> dict[str, Any] | None:
+    def request_amend(self, text: str, reason: str = "web amendment") -> dict[str, Any] | None:
         """§10: show the re-validation cost estimate *before* running it.
         Creates an approval whose apply half runs amend + re-validation."""
         run_dir = self._attached_dir()
@@ -555,7 +559,7 @@ def _run_amend_job(run_dir: Path, approval_id: str) -> None:
     context = approval.context or {}
     try:
         options, provider, env, factory = _runtime_for(run_dir)
-        result = asyncio_run(amend_and_revalidate(run_dir, rule_text=context.get("text", ""), reason=context.get("reason", "TUI amendment"), provider=provider))
+        result = asyncio_run(amend_and_revalidate(run_dir, rule_text=context.get("text", ""), reason=context.get("reason", "web amendment"), provider=provider))
         counts = result["counts"]
         lines = ["Re-validation of the amended contract:", "", f"clean: {counts['clean']}   patchable: {counts['patchable']}   regenerate: {counts['regenerate']}", "", "Non-clean nodes:", ""]
         for node_id, record in result["triage"].items():

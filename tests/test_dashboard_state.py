@@ -1,16 +1,14 @@
-"""Tests for kusudaemon.tui.state.RunState -- the run-directory state layer
-behind the TUI (replaces the deleted dashboard/server.py + dashboard/
-recursive.py web view; see tests/test_dashboard_server.py in history for
-the HTTP-level tests this supersedes).
+"""Tests for kusudaemon.dashboard.state.RunState -- the run-directory state
+layer behind the web dashboard. Formerly tests/test_tui_state.py, when this
+same class lived at kusudaemon.tui.state (2026-08-09: the Textual TUI that
+briefly replaced the web view was itself replaced back by a web app the
+same day -- see CLAUDE.md's v5 section). See tests/test_dashboard_server.py
+for the HTTP-level tests layered on top of this state.
 
-Deliberately does not import kusudaemon.tui.app: that module imports
-``textual`` (an optional extra, ``pip install "kusudaemon[tui]"``), and
-this suite -- like the rest of the project -- stays extra-free so
-``python3 -m unittest discover`` works without it installed. RunState
-itself has no textual/gptme import (see its module docstring), so it's
-exercised directly here, the same way test_searxng_tool.py only tests the
-pure-Python surface of the gptme-adapter tool file and never its
-gptme-importing half.
+RunState has no http.server/textual/gptme import (see its module
+docstring), so it's exercised directly here, the same way
+test_searxng_tool.py only tests the pure-Python surface of the
+gptme-adapter tool file and never its gptme-importing half.
 """
 
 from __future__ import annotations
@@ -27,8 +25,8 @@ sys.path.insert(0, str(_REPO_ROOT / "src"))
 
 from kusudaemon.pipeline import approvals as approval_store  # noqa: E402
 from kusudaemon.pipeline.run_dir import run_spec_path  # noqa: E402
-from kusudaemon.tui import gptme_queue  # noqa: E402
-from kusudaemon.tui.state import RunState  # noqa: E402
+from kusudaemon.dashboard import gptme_queue  # noqa: E402
+from kusudaemon.dashboard.state import RunState  # noqa: E402
 from kusudaemon.v0.events import EventLog  # noqa: E402
 from kusudaemon.v0.run_dir import create_run_dir, events_path, node_artifact_path, node_scratch_dir  # noqa: E402
 from kusudaemon.v1.run_dir import tree_path  # noqa: E402

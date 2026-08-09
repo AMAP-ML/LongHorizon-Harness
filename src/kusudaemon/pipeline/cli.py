@@ -1,13 +1,13 @@
 """Command handlers for the ``kusudaemon pipeline`` group (PLAN.md §11's
-control surface: run / status / approve / amend / resume / tui).
+control surface: run / status / approve / amend / resume / serve).
 
 The run command drives :class:`RecursiveDriver` in the foreground by
 default, or detaches a background subprocess for pure ``status`` /
-``approve`` / ``tui``-attach workflows. Approve and amend operate purely
+``approve`` / ``serve``-attach workflows. Approve and amend operate purely
 on the run directory's ``approvals.jsonl`` and ``contract.md`` — which is
 exactly what makes them safe to run from a second terminal while the
-driver (or the TUI) is still attached to the same run (§11: the view "can
-be attached from anywhere").
+driver (or the dashboard server) is still attached to the same run (§11:
+the view "can be attached from anywhere").
 """
 
 from __future__ import annotations
@@ -81,9 +81,12 @@ def build_pipeline_parser() -> argparse.ArgumentParser:
     amend_parser.add_argument("--yes", action="store_true", help="Apply the triage without prompting.")
     amend_parser.add_argument("--max-attempts", type=int, default=3)
 
-    tui_parser = sub.add_parser("tui", help="Launch the interactive terminal UI (PLAN.md §11 control surface).")
-    tui_parser.add_argument("--runs-root", default=_RUNS_ROOT_DEFAULT)
-    tui_parser.add_argument("--run-id", default=None, help="Attach to this run on startup.")
+    serve_parser = sub.add_parser("serve", help="Serve the web dashboard (PLAN.md §11 control surface) over a runs directory.")
+    serve_parser.add_argument("--runs-root", default=_RUNS_ROOT_DEFAULT)
+    serve_parser.add_argument("--host", default="127.0.0.1")
+    serve_parser.add_argument("--port", type=int, default=8765)
+    serve_parser.add_argument("--run-id", default=None, help="Attach to this run on startup.")
+    serve_parser.add_argument("--no-control", action="store_true", help="Read-only view: disable start/attach/halt/approve/amend/reopen/interject.")
     return parser
 
 
@@ -99,11 +102,16 @@ def cmd_run(argv: argparse.Namespace) -> int:
     return run_from_args(_run_argv(argv, run_id=argv.run_id))
 
 
-def cmd_tui(argv: argparse.Namespace) -> int:
-    from ..tui.app import KusudaemonApp
+def cmd_serve(argv: argparse.Namespace) -> int:
+    from ..dashboard.server import run_forever
 
-    app = KusudaemonApp(runs_root=argv.runs_root, attach_run_id=argv.run_id)
-    app.run()
+    run_forever(
+        argv.runs_root,
+        argv.host,
+        argv.port,
+        attach_run_id=argv.run_id,
+        control_enabled=not argv.no_control,
+    )
     return 0
 
 
@@ -236,8 +244,8 @@ def dispatch(args: argparse.Namespace) -> int:
         return cmd_approve(args)
     if command == "amend":
         return cmd_amend(args)
-    if command == "tui":
-        return cmd_tui(args)
+    if command == "serve":
+        return cmd_serve(args)
     raise ValueError(f"unknown pipeline command: {command!r}")
 
 

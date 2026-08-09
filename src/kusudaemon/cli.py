@@ -1,13 +1,12 @@
 """The ``kusudaemon`` entry point: PLAN.md §11's control surface.
 
 This is a thin shim over ``pipeline/cli.py``'s command handlers — the
-pipeline group (run / status / approve / amend / resume / tui) *is* the
+pipeline group (run / status / approve / amend / resume / serve) *is* the
 CLI now, since the classic role-based harness (manager/executor/auditor
 plus the claude/codex backends) was removed. Run ``kusudaemon --help``
 from a terminal for the full command list. Bare ``kusudaemon`` (no
-subcommand) launches the interactive TUI directly — the same "just run
-the thing" ergonomics as other modern agent CLIs — rather than printing
-help.
+subcommand) launches the web dashboard directly — the same "just run the
+thing" ergonomics as other modern agent CLIs — rather than printing help.
 """
 
 from __future__ import annotations
@@ -46,9 +45,12 @@ def main(argv: list[str] | None = None) -> int:
         if raw_argv:
             parser.print_help()
             return 2
-        args.pipeline_command = "tui"
+        args.pipeline_command = "serve"
         args.runs_root = "./.kusudaemon/runs"
+        args.host = "127.0.0.1"
+        args.port = 8765
         args.run_id = None
+        args.no_control = False
     if written is not None:
         print(f"Created provider config: {written} (edit it to change your provider)")
     return dispatch(args)

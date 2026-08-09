@@ -7,9 +7,11 @@ own loop (``gptme/chat.py``'s ``_drain_external_prompt_queue``) already
 polls that file between turns and injects each queued line as the next user
 message. That mechanism, already shipped in gptme, is the entire "talk to a
 running subagent mid-episode" feature — this module just needs to write the
-same file in the same shape, from the long-lived TUI process, without
-importing gptme itself (only ``adapters/_gptme_worker.py`` does that; see
-its module docstring and ``pyproject.toml``'s ``tui``/``gptme`` extras).
+same file in the same shape, from the long-lived dashboard server process,
+without importing gptme itself (only ``adapters/_gptme_worker.py`` does
+that; see its module docstring and ``pyproject.toml``'s ``gptme`` extra —
+the dashboard package has no optional-dependency extra of its own, it's
+stdlib ``http.server`` all the way down).
 
 The record shape (``{"content": str, "queued_at": iso8601}``) and the
 ``fcntl.flock``-guarded append are copied from gptme's own
@@ -37,7 +39,7 @@ _LOCK_FILENAME = ".prompt-queue.lock"
 def queue_prompt(logdir: str | Path, content: str) -> None:
     """Append one operator message to a running gptme session's prompt
     queue. Safe to call at any point after the session's logdir has been
-    discovered (see ``tui/state.py``'s ``node_gptme_logdir``) — if the
+    discovered (see ``dashboard/state.py``'s ``node_gptme_logdir``) — if the
     worker process has already exited, the file is simply never drained,
     same as queuing to any conversation that isn't actively running."""
     logdir = Path(logdir)
