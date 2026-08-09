@@ -714,6 +714,35 @@ carries the TUI's additions forward.
   on. `control_enabled` (stitched into `/api/snapshot`'s payload by the
   server, since `RunState` itself doesn't carry it) greys out every
   mutating control when the dashboard is served with `--no-control`.
+  **Live-update re-render, fixed 2026-08-09 (two real bug reports, two
+  separate root causes):** `render()` has no diffing — every call tears
+  down `#app` (`root.innerHTML = ""`) and rebuilds the whole tree, and it's
+  called on every live update (`/api/stream` ticks every `_STREAM_INTERVAL`
+  = 1.5s server-side, or the `/api/snapshot` poll fallback every 2s).
+  First bug: every text `<input>`/`<textarea>` was a plain uncontrolled DOM
+  node, so a rebuild while the operator was mid-typing silently discarded
+  whatever they'd typed. Second bug, found only after the first fix: the
+  fix initially just diffed incoming snapshots (`applySnapshot` skips
+  `render()` when the new snapshot is unchanged) and restored the
+  *focused* field's value/selection across a rebuild that did fire
+  (`captureFocusState`/`restoreFocusState`, keyed by a `data-key` attribute
+  on each field) — good enough for the single-field prompt bar, but a
+  multi-field form (New Run's 5 inputs) still lost whatever the operator
+  had typed into any field *other* than the one currently focused, since
+  that field's content lived only in its own DOM node. Fixed by moving
+  every free-text field's value into `state` as the actual source of truth
+  (`state.promptText`, `state.newRun`, `state.interjectDrafts`/
+  `reopenDrafts`/`approvalDrafts`, the latter three keyed by node/approval
+  id) with an `input` listener keeping it in sync; every field's DOM node
+  is re-initialized from that state on every rebuild regardless of which
+  one has focus, and the focus/selection restoration from the first pass
+  stays on top for cursor continuity. Third fix, same day: `applySnapshot`'s
+  unchanged-snapshot check was comparing full `JSON.stringify` including
+  `RunState.snapshot()`'s own `server_time: _now()` field — stamped fresh
+  on literally every call whether or not anything else changed — so the
+  diff never actually matched and every 1.5s tick still forced a full
+  rebuild regardless of the first fix. `snapshotFingerprint()` now strips
+  `server_time` before comparing.
 ## Adapters (gptme-only)
 
 The Claude Code and Codex adapters, the classic role adapters
@@ -812,12 +841,28 @@ location:
   and `api_key_env`, the name of the env var holding *that* provider's
   key — never the key itself). Repo-local by design
   (`DEFAULT_CONFIG_PATH = Path("provider.json")`, resolved against the
-  cwd the CLI is run from — not `$HOME`; `KUSUDAEMON_PROVIDER_CONFIG`
-  overrides the path). A sample sits at the repo root
-  (`provider.example.json`); the CLI also writes this file from the same
-  sample on first invocation if it's missing (`ensure_user_config`), so
-  "customize the default" works whether the user copies the example by
-  hand or just runs the CLI once.
+  cwd the CLI is run from — not `$HOME`). `config_file_path()` search
+  order (2026-08-09, widened after a real report of an edited
+  `provider.json` being silently ignored — same bug class `.env` hit
+  first, below, and `provider.json` had never gotten the matching fix):
+  `KUSUDAEMON_PROVIDER_CONFIG` wins outright if set; otherwise cwd, then
+  each ancestor directory, then — last resort — the installed package's
+  own project root (`_installed_repo_root()`, the same helper `.env`'s
+  search uses); if none of those has a `provider.json` yet, falls back to
+  the plain cwd-relative path. Before this fix, running `kusudaemon` from
+  any cwd other than wherever `provider.json` actually lived meant the
+  edit was never read and `resolve()` silently fell back to the built-in
+  opencode default — which is easy to mistake for "my edit didn't take
+  effect" precisely because the built-in default model
+  (`opencode/deepseek-v4-flash-free`) is what most users' `provider.json`
+  already contains from `ensure_user_config`'s sample, so the fallback
+  value and the pre-edit value are byte-identical. A sample sits at the
+  repo root (`provider.example.json`); the CLI also writes this file from
+  the same sample on first invocation if it's missing
+  (`ensure_user_config`, which now also benefits from the same search —
+  it won't write a redundant cwd copy if an ancestor or the installed
+  repo root already has one), so "customize the default" works whether
+  the user copies the example by hand or just runs the CLI once.
 - **`.env`** — secret: the actual API key(s), one per `api_key_env` name
   used in `provider.json` (e.g. `OPENAI_API_KEY=...`). Loaded automatically
   at CLI startup (`load_env_file`) into `os.environ`, never overwriting a
@@ -897,7 +942,7 @@ that worktree's *test files* against the original checkout's (unmodified)
 guards against exactly this — copy the guard into any new test file
 rather than assuming a bare `import kusudaemon` is safe.
 
-~19s, 193 tests, all passing. `test_provider_config.py`'s
+~19s, 198 tests, all passing. `test_provider_config.py`'s
 `_EnvIsolatedTest` snapshots and restores the *entire* `os.environ` around
 each test — the previous partial-restore logic only put back keys that
 had a prior value, so a test setting e.g. `KUSUDAEMON_PROVIDER` fresh (no
@@ -945,12 +990,20 @@ the v5 section's `dashboard/server.py` bullet: that gate lives on the
 HTTP handler, not the state class, precisely so this test class can
 exercise it without touching `RunState` at all).
 
-### `tests/test_provider_config.py` (13 tests)
+### `tests/test_provider_config.py` (34 tests)
 
 `resolve()`'s precedence chain frozen (built-in opencode default; each
 higher level wins; unknown config keys ignored; malformed/non-object
 config raises), `require()` passing/raising, and `ensure_user_config`
 writing the sample once and never overwriting an existing file.
+`EnvFileLoaderTest` covers `load_env_file`'s cwd/ancestor/installed-repo-root
+search (see the Provider configuration section's `.env` bullet).
+`ConfigFilePathTest` (5, new 2026-08-09) mirrors it one-for-one for
+`config_file_path()`'s matching search over `provider.json` — cwd, then
+ancestors, then the installed repo root via a mocked `_installed_repo_root`,
+plus an end-to-end `resolve()` call proving an edited model value in a
+cwd-discovered `provider.json` actually takes effect (the regression this
+was added for: it silently didn't, before the fix in the same section).
 
 ### v0 (`tests/test_v0_resume.py`, 4 tests)
 

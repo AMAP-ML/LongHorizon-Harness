@@ -359,5 +359,90 @@ class EnvFileLoaderTest(_EnvIsolatedTest):
                 os.chdir(old)
 
 
+class ConfigFilePathTest(_EnvIsolatedTest):
+    """config_file_path()'s cwd/ancestor/installed-repo-root search --
+    mirrors EnvFileLoaderTest above one-for-one. Added after a real report
+    of an edited provider.json being silently ignored: the CLI was invoked
+    from a cwd that wasn't the repo root, config_file_path() only ever
+    looked at cwd-relative "provider.json", found nothing, and resolve()
+    fell all the way back to the built-in opencode default -- which
+    happened to be byte-identical to the user's *previous* model value, so
+    it looked like the edit had no effect rather than "file not found"."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        # Every other test in this file wants the config_file_path()
+        # override on so writes are isolated; these tests are specifically
+        # about what happens when that override is absent.
+        os.environ.pop("KUSUDAEMON_PROVIDER_CONFIG", None)
+
+    def test_config_file_path_finds_provider_json_in_cwd(self) -> None:
+        old = Path.cwd()
+        try:
+            os.chdir(self._tmp.name)
+            self._write_config(self._multi_provider_config())
+            self.assertEqual(config_file_path(), Path.cwd() / "provider.json")
+        finally:
+            os.chdir(old)
+
+    def test_config_file_path_finds_provider_json_in_ancestor(self) -> None:
+        self._write_config(self._multi_provider_config())
+        child = Path(self._tmp.name, "nested", "deeper")
+        child.mkdir(parents=True)
+        old = Path.cwd()
+        try:
+            os.chdir(child)
+            # Path.cwd() (not self._tmp.name) on the right-hand side: macOS
+            # resolves /tmp through a /var -> /private/var symlink, and
+            # os.chdir + Path.cwd() round-trips through the same resolution
+            # config_file_path()'s cwd.parents walk does, so comparing
+            # against it (rather than the pre-chdir tempdir name) avoids a
+            # spurious mismatch between equivalent paths.
+            self.assertEqual(config_file_path(), Path.cwd().parent.parent / "provider.json")
+        finally:
+            os.chdir(old)
+
+    def test_config_file_path_falls_back_to_installed_repo_root(self) -> None:
+        self._write_config(self._multi_provider_config())
+        with tempfile.TemporaryDirectory() as elsewhere:
+            old = Path.cwd()
+            try:
+                os.chdir(elsewhere)
+                with mock.patch(
+                    "kusudaemon.provider_config._installed_repo_root",
+                    return_value=Path(self._tmp.name),
+                ):
+                    self.assertEqual(config_file_path(), Path(self._tmp.name) / "provider.json")
+            finally:
+                os.chdir(old)
+
+    def test_config_file_path_no_fallback_returns_cwd_relative_default(self) -> None:
+        with tempfile.TemporaryDirectory() as elsewhere:
+            old = Path.cwd()
+            try:
+                os.chdir(elsewhere)
+                with mock.patch(
+                    "kusudaemon.provider_config._installed_repo_root",
+                    return_value=None,
+                ):
+                    self.assertEqual(config_file_path(), Path("provider.json"))
+            finally:
+                os.chdir(old)
+
+    def test_resolve_picks_up_edited_model_via_cwd_discovery(self) -> None:
+        # The exact reported scenario: an edited provider.json model only
+        # takes effect if config_file_path() actually finds that file.
+        config = self._multi_provider_config()
+        config["providers"]["opencode"]["model"] = "deepseek-v4-flash-free"
+        self._write_config(config)
+        old = Path.cwd()
+        try:
+            os.chdir(self._tmp.name)
+            settings = resolve()
+        finally:
+            os.chdir(old)
+        self.assertEqual(settings.model, "deepseek-v4-flash-free")
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -103,8 +103,35 @@ class ProviderSettings:
 
 
 def config_file_path() -> Path:
+    """Resolve the provider config file to actually read.
+
+    ``KUSUDAEMON_PROVIDER_CONFIG`` is an explicit override and wins
+    outright. Otherwise this mirrors ``load_env_file``'s search (that one
+    was widened after a real report of a frozen/401 run caused by invoking
+    ``kusudaemon`` from a cwd outside the project tree; ``provider.json``
+    had the same narrow cwd-only lookup and never got the same fix): cwd,
+    then each ancestor directory, then — as a last resort — the installed
+    package's own project root (``_installed_repo_root()``), so an
+    edited repo-root ``provider.json`` is found with zero shell
+    configuration regardless of where the CLI is invoked from. Falls back
+    to the plain cwd-relative path (matching the pre-fix behavior, and
+    where ``ensure_user_config`` writes a fresh sample) when none of those
+    exist yet.
+    """
     raw = os.getenv("KUSUDAEMON_PROVIDER_CONFIG")
-    return Path(raw).expanduser() if raw else DEFAULT_CONFIG_PATH
+    if raw:
+        return Path(raw).expanduser()
+    cwd = Path.cwd()
+    for candidate in (cwd, *cwd.parents):
+        candidate_path = candidate / CONFIG_FILE_NAME
+        if candidate_path.is_file():
+            return candidate_path
+    repo_root = _installed_repo_root()
+    if repo_root is not None:
+        candidate_path = repo_root / CONFIG_FILE_NAME
+        if candidate_path.is_file():
+            return candidate_path
+    return DEFAULT_CONFIG_PATH
 
 
 def read_config_file(path: Path | None = None) -> dict[str, object]:
