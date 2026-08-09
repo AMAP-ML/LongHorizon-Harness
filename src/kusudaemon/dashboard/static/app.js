@@ -28,6 +28,14 @@ const state = {
   assembly: null,
   promptText: "",
   promptMode: "auto", // 'auto' | 'amend' | 'reopen'
+  // Draft text for every other free-text field, keyed so a periodic
+  // snapshot re-render (SSE/poll) can safely rebuild the field's DOM node
+  // from scratch without losing what's typed in it — see render()'s
+  // comment for why that rebuild happens on every live update.
+  newRun: { runId: "", goal: "", source: "", model: "", compile: "" },
+  interjectDrafts: {}, // nodeId -> text
+  reopenDrafts: {},    // nodeId -> text
+  approvalDrafts: {},  // approvalId -> text
 };
 
 const root = document.getElementById("app");
@@ -350,10 +358,14 @@ function renderCenterStream() {
         }
         if (a.allow_input) {
           const inputEl = el("input", { type: "text", "data-key": `approval-input-${a.approval_id}`, placeholder: a.input_label || "Provide response details...", style: "margin-top:8px;" });
+          inputEl.value = state.approvalDrafts[a.approval_id] || "";
+          inputEl.addEventListener("input", () => { state.approvalDrafts[a.approval_id] = inputEl.value; });
           parts.push(inputEl);
           actionBtns.push(
             el("button", { class: "primary", disabled: state.busy ? "" : null, onclick: () => guarded(async () => {
-              await apiPost(`/api/approvals/${encodeURIComponent(a.approval_id)}/resolve`, { action: "answer", user_input: inputEl.value });
+              const val = state.approvalDrafts[a.approval_id] || "";
+              await apiPost(`/api/approvals/${encodeURIComponent(a.approval_id)}/resolve`, { action: "answer", user_input: val });
+              delete state.approvalDrafts[a.approval_id];
               showToast("Submitted answer");
             }) }, "Submit Input")
           );
@@ -410,13 +422,15 @@ function renderPromptBar() {
     rows: 1,
     disabled: disabled ? "" : null,
   });
+  ta.value = state.promptText;
+  ta.addEventListener("input", () => { state.promptText = ta.value; });
 
-  const sendBtn = el("button", { class: "primary", disabled: disabled ? "" : null, onclick: () => guarded(() => handlePromptSubmit(ta.value)) }, "Send ↵");
+  const sendBtn = el("button", { class: "primary", disabled: disabled ? "" : null, onclick: () => guarded(() => handlePromptSubmit()) }, "Send ↵");
 
   ta.addEventListener("keydown", (e) => {
     if (e.key === "Enter" && !e.shiftKey) {
       e.preventDefault();
-      handlePromptSubmit(ta.value);
+      handlePromptSubmit();
     }
   });
 
@@ -429,12 +443,13 @@ function renderPromptBar() {
   ]);
 }
 
-async function handlePromptSubmit(text) {
-  text = text.trim();
+async function handlePromptSubmit() {
+  const text = state.promptText.trim();
   if (!text) return;
 
   if (state.promptMode === "amend") {
     await apiPost("/api/amend", { text, reason: "web amendment" });
+    state.promptText = "";
     showToast("Contract amendment queued");
     fetchWorkbenchData("contract");
   } else if (state.promptMode === "reopen") {
@@ -442,9 +457,11 @@ async function handlePromptSubmit(text) {
     const nodeId = parts[0];
     const defect = parts.slice(1).join(" ") || "Defect requested via prompt";
     await apiPost("/api/reopen", { node_id: nodeId, defect });
+    state.promptText = "";
     showToast(`Reopen requested for node ${nodeId}`);
   } else {
     const res = await apiPost("/api/runs", { goal: text });
+    state.promptText = "";
     showToast(`Started run ${res.run_id}`);
   }
 }
@@ -700,21 +717,25 @@ function renderNodeDrawer() {
 
   const live = isLive(id);
   const interjectInput = el("input", { type: "text", "data-key": `interject-${id}`, placeholder: live ? "Message the running agent…" : "(not currently running)", disabled: live ? null : "" });
+  interjectInput.value = state.interjectDrafts[id] || "";
+  interjectInput.addEventListener("input", () => { state.interjectDrafts[id] = interjectInput.value; });
   const interjectBtn = el("button", { class: "primary", disabled: live && !state.busy ? null : "", onclick: () => guarded(async () => {
-    const text = interjectInput.value.trim();
+    const text = (state.interjectDrafts[id] || "").trim();
     if (!text) return;
     const ok = await apiPost(`/api/node/${encodeURIComponent(id)}/interject`, { text }).then(() => true).catch((e) => { showToast(String(e.message || e), true); return false; });
-    if (ok) { interjectInput.value = ""; showToast(`queued for ${id}`); }
+    if (ok) { state.interjectDrafts[id] = ""; showToast(`queued for ${id}`); }
   }) }, "Send");
   interjectInput.addEventListener("keydown", (e) => { if (e.key === "Enter") interjectBtn.click(); });
 
   const reopenable = !!(state.nodeDetail && state.nodeDetail.status === "passed");
   const reopenInput = el("input", { type: "text", "data-key": `reopen-${id}`, placeholder: reopenable ? "describe what's wrong…" : "(only for passed nodes)", disabled: reopenable ? null : "" });
+  reopenInput.value = state.reopenDrafts[id] || "";
+  reopenInput.addEventListener("input", () => { state.reopenDrafts[id] = reopenInput.value; });
   const reopenBtn = el("button", { disabled: reopenable && !state.busy ? null : "", onclick: () => guarded(async () => {
-    const text = reopenInput.value.trim();
+    const text = (state.reopenDrafts[id] || "").trim();
     if (!text) return;
     await apiPost("/api/reopen", { node_id: id, defect: text });
-    reopenInput.value = "";
+    state.reopenDrafts[id] = "";
     showToast("reopen queued — approve it in the run stream");
   }) }, "Reopen");
   reopenInput.addEventListener("keydown", (e) => { if (e.key === "Enter") reopenBtn.click(); });
@@ -738,32 +759,53 @@ function renderNodeDrawer() {
 // ---------------------------------------------------------------------
 // New Run Modal
 // ---------------------------------------------------------------------
+function resetNewRunDraft() {
+  state.newRun = { runId: "", goal: "", source: "", model: "", compile: "" };
+}
+
 function renderNewRunModal() {
   if (!state.newRunOpen) return null;
+  const nr = state.newRun;
+
   const runIdInput = el("input", { type: "text", "data-key": "new-run-run-id", placeholder: "leave blank to generate" });
+  runIdInput.value = nr.runId;
+  runIdInput.addEventListener("input", () => { nr.runId = runIdInput.value; });
+
   const goalInput = el("textarea", { "data-key": "new-run-goal", placeholder: "Goal (or @path/to/file)...", rows: 3 });
+  goalInput.value = nr.goal;
+  goalInput.addEventListener("input", () => { nr.goal = goalInput.value; });
+
   const sourceInput = el("textarea", { "data-key": "new-run-source", placeholder: "Source: text, @path, or blank", rows: 2 });
+  sourceInput.value = nr.source;
+  sourceInput.addEventListener("input", () => { nr.source = sourceInput.value; });
+
   const modelInput = el("input", { type: "text", "data-key": "new-run-model", placeholder: "Model (blank = provider default)" });
+  modelInput.value = nr.model;
+  modelInput.addEventListener("input", () => { nr.model = modelInput.value; });
+
   const compileInput = el("input", { type: "text", "data-key": "new-run-compile", placeholder: "Compile command (optional)" });
+  compileInput.value = nr.compile;
+  compileInput.addEventListener("input", () => { nr.compile = compileInput.value; });
 
   const submit = el("button", { class: "primary", disabled: state.busy ? "" : null, onclick: () => guarded(async () => {
-    const goal = goalInput.value.trim();
+    const goal = nr.goal.trim();
     if (!goal) return;
     const res = await apiPost("/api/runs", {
-      run_id: runIdInput.value.trim(),
+      run_id: nr.runId.trim(),
       goal,
-      source: sourceInput.value.trim(),
-      model: modelInput.value.trim() || null,
-      compile_command: compileInput.value.trim() || null,
+      source: nr.source.trim(),
+      model: nr.model.trim() || null,
+      compile_command: nr.compile.trim() || null,
     });
     state.newRunOpen = false;
+    resetNewRunDraft();
     showToast(`Started run ${res.run_id}`);
   }) }, "Start Run");
 
-  const cancel = el("button", { onclick: () => { state.newRunOpen = false; render(); } }, "Cancel");
+  const cancel = el("button", { onclick: () => { state.newRunOpen = false; resetNewRunDraft(); render(); } }, "Cancel");
 
   const panel = el("div", { class: "panel" }, [
-    el("div", { class: "panel-hdr" }, [el("h2", null, "New run (or resume: reuse an existing run id)"), el("button", { onclick: () => { state.newRunOpen = false; render(); } }, "Close")]),
+    el("div", { class: "panel-hdr" }, [el("h2", null, "New run (or resume: reuse an existing run id)"), el("button", { onclick: () => { state.newRunOpen = false; resetNewRunDraft(); render(); } }, "Close")]),
     el("div", { class: "form-grid" }, [
       el("label", null, "Run id"), runIdInput,
       el("label", null, "Goal"), goalInput,
@@ -774,7 +816,7 @@ function renderNewRunModal() {
     el("div", { style: "padding:16px; display:flex; gap:8px;" }, [submit, cancel]),
   ]);
 
-  return el("div", { class: "overlay", onclick: (e) => { if (e.target.classList.contains("overlay")) { state.newRunOpen = false; render(); } } }, panel);
+  return el("div", { class: "overlay", onclick: (e) => { if (e.target.classList.contains("overlay")) { state.newRunOpen = false; resetNewRunDraft(); render(); } } }, panel);
 }
 
 // ---------------------------------------------------------------------
