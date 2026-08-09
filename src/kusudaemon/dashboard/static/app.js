@@ -88,8 +88,17 @@ async function guarded(fn) {
 // ---------------------------------------------------------------------
 // Live SSE Stream / Polling
 // ---------------------------------------------------------------------
+function snapshotFingerprint(snap) {
+  // server_time is stamped fresh on every /api/snapshot call and /api/stream
+  // tick regardless of whether anything actually changed; comparing it along
+  // with the rest of the payload would make every tick look "changed" and
+  // defeat the whole point of this comparison.
+  const { server_time, ...rest } = snap || {};
+  return JSON.stringify(rest);
+}
+
 function applySnapshot(snap) {
-  const unchanged = JSON.stringify(snap) === JSON.stringify(state.snapshot);
+  const unchanged = snapshotFingerprint(snap) === snapshotFingerprint(state.snapshot);
   state.snapshot = snap;
   if (!unchanged) render();
 }
