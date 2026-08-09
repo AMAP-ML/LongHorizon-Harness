@@ -3,13 +3,15 @@
 The harness talks to OpenAI-compatible ``/chat/completions`` endpoints only.
 The **default** is OpenCode Zen (``https://opencode.ai/zen/v1`` with model
 ``opencode/deepseek-v4-flash-free``) so a fresh install works out of the
-box — but the default is **user-customizable** with two pieces:
+box — but the default is **user-customizable** with exactly two files, both
+at the repo root, both gitignored, both shipped as ``*.example`` templates
+the user copies and edits:
 
-- **Which providers exist and their endpoints**: ``~/.lh-harness/provider.json``
-  (or ``$LH_HARNESS_PROVIDER_CONFIG``) holds *named* providers. Each entry
-  carries its ``base_url`` and ``model`` plus ``api_key_env`` — the name of
-  the environment variable that holds that provider's key. Keys themselves
-  never live in this file:
+- **Which providers exist and their endpoints**: ``provider.json`` (or
+  ``$LH_HARNESS_PROVIDER_CONFIG`` to point elsewhere) holds *named*
+  providers. Each entry carries its ``base_url`` and ``model`` plus
+  ``api_key_env`` — the name of the environment variable that holds that
+  provider's key. Keys themselves never live in this file:
 
       {
         "default": "opencode",
@@ -54,7 +56,12 @@ from dataclasses import dataclass
 from pathlib import Path
 
 CONFIG_FILE_NAME = "provider.json"
-DEFAULT_CONFIG_PATH = Path.home() / ".lh-harness" / CONFIG_FILE_NAME
+# Repo-root-relative (i.e. resolved against the current working directory),
+# not a dotfile under $HOME: the harness's config lives entirely inside the
+# project folder, next to provider.example.json, the same way .env sits
+# next to .env.example. Run the CLI from the repo root (or set
+# $LH_HARNESS_PROVIDER_CONFIG) so this resolves to the right file.
+DEFAULT_CONFIG_PATH = Path(CONFIG_FILE_NAME)
 
 DEFAULT_PROVIDER = "opencode"
 DEFAULT_API_KEY_ENV = "OPENAI_API_KEY"
@@ -151,10 +158,10 @@ def ensure_user_config(path: Path | None = None) -> Path | None:
     """Create the user's provider config from the sample if it doesn't exist.
 
     Called from the CLI entry points, not from library code: materializing
-    ``~/.lh-harness/provider.json`` (the sample's named opencode provider)
-    is what makes "customize the default" concrete — the user edits that
-    file instead of the harness assuming anything. Returns the path
-    written, or None if the file already existed.
+    ``./provider.json`` (the sample's named opencode provider) is what
+    makes "customize the default" concrete — the user edits that file
+    instead of the harness assuming anything. Returns the path written, or
+    None if the file already existed.
     """
     target = path or config_file_path()
     if target.is_file():

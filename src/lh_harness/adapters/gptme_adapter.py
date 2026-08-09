@@ -1,10 +1,10 @@
 """GptmeAdapter — the only Writer backend: a tool-use loop, no agent CLI.
 
-Drives gptme (github.com/gptme/gptme, MIT, ``pip install gptme``) — a small
-tool-use loop (shell/read/save/patch) that talks to any OpenAI-compatible
+Drives gptme (github.com/gptme/gptme, MIT, ``pip install "lh-harness[gptme]"``)
+— a small tool-use loop (shell/read/save/patch) that talks to any OpenAI-compatible
 endpoint — so the user's configured provider (see
 ``..provider_config``; default OpenCode Zen, customizable via
-``~/.lh-harness/provider.json`` / ``LH_HARNESS_PROVIDER_*`` /
+``./provider.json`` / ``LH_HARNESS_PROVIDER_*`` /
 ``OPENAI_*``) acts as the Writer itself. The same settings
 ``v1/provider.py`` already resolves for the Orchestrator/Reviewer feeds
 this adapter's ``OPENAI_BASE_URL``/``OPENAI_API_KEY``.

@@ -8,10 +8,16 @@ tiny — this harness has exactly one backend:
   loop against the user's configured OpenAI-compatible provider, see
   ``..provider_config``). This is the only Writer backend.
 
-Research queries (v4) are refused loudly for now: gptme has no built-in
-web search, and the WebSearch/WebFetch tools that used to serve them were
-claude_code built-ins. Any existing research_plan therefore raises at
-dispatch time instead of silently degrading to full tool access.
+Research queries (v4): ``web_search`` is served by a ``GptmeAdapter``
+scoped to exactly one tool — ``adapters/tools/searxng_search.py``, a
+self-hosted SearXNG metasearch query, loaded via gptme's own
+file-path-allowlist mechanism (see that module's docstring). This keeps
+v4's "pay the search-result token cost once, in an isolated episode, not
+on every Writer turn" design intact — the tool is never in a plain
+Writer's ``DEFAULT_TOOL_ALLOWLIST``, only in a research query's adapter.
+``doc_retrieval`` (Context7) has no gptme equivalent wired up yet — it
+needed Claude Code's MCP integration, which was removed along with that
+adapter — so it still raises loudly rather than silently degrading.
 
 The workspace is always the run directory itself: the writer sees
 ``source.txt``, ``contract.md``, ``out/``, ``scratch/``, and its own
@@ -27,10 +33,11 @@ from typing import Any
 from ..adapters.base import AgentAdapter
 from ..adapters.gptme_adapter import GptmeAdapter
 from ..v1.tree import TaskNode
+from ..v4.mcp_research import allowed_tools_for
 from ..v4.research import ResearchQuery
 
 WRITER_BACKENDS = ("gptme",)
-_RESEARCH_CAPABLE: tuple[str, ...] = ()
+_RESEARCH_CAPABLE: tuple[str, ...] = ("gptme",)
 
 
 def build_writer_adapter(
@@ -66,19 +73,27 @@ def build_research_adapter(
 ) -> AgentAdapter:
     """Adapter for one v4 research query.
 
-    No backend can serve research queries in this gptme-only harness —
-    gptme has no web search tool, and the WebSearch/WebFetch built-ins
-    were claude_code-only. Raise instead of silently giving a query full
-    tool access: a research_plan that can't be honored should fail the run
-    loudly rather than degrade it.
+    ``web_search`` gets a ``GptmeAdapter`` narrowed to exactly the SearXNG
+    tool (``v4/mcp_research.py``'s ``allowed_tools_for``) — nothing else, so
+    the episode can't drift into shell/file access it has no reason to
+    need. ``doc_retrieval`` still raises there: it needed Claude Code's
+    Context7 MCP wiring, which no longer exists in this gptme-only harness.
+    Raise instead of silently giving a query full tool access: a
+    research_plan that can't be honored should fail the run loudly rather
+    than degrade it.
     """
     if backend not in _RESEARCH_CAPABLE:
         raise ValueError(
-            f"research queries need a backend with a built-in web search "
-            f"(WebSearch/WebFetch); backend {backend!r} cannot serve them. "
-            "Remove the research_plan or implement a search tool for gptme."
+            f"research queries need a backend that can serve them; "
+            f"backend {backend!r} cannot. Remove the research_plan or add "
+            f"support for this backend."
         )
-    raise ValueError(f"unknown research backend: {backend!r}")
+    return GptmeAdapter(
+        model=model,
+        workspace_path=str(workspace_path),
+        prompt_dir=str(prompt_dir),
+        tool_allowlist=allowed_tools_for(query.kind),
+    )
 
 
 def parse_research_plan(raw: Any) -> dict[str, list[ResearchQuery]]:

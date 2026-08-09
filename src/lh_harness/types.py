@@ -23,7 +23,10 @@ def _launch_directory() -> str:
 
 
 DEFAULT_WORKSPACE_PATH = _launch_directory()
-DEFAULT_TMP_DIR = f"{Path.home() / '.lh-harness'}/tmp"
+# Repo-local, not $HOME: everything this harness writes lives inside the
+# project folder it was launched from (matches provider_config.py's
+# DEFAULT_CONFIG_PATH and pipeline/run.py's ./.lh-harness/runs default).
+DEFAULT_TMP_DIR = f"{Path(DEFAULT_WORKSPACE_PATH) / '.lh-harness'}/tmp"
 
 
 @dataclass

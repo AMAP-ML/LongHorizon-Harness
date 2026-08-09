@@ -36,7 +36,8 @@ LongHorizon-Harness is an execution, state-management, and result-verification s
 
 ## ✨ News
 
-- **[2026-08-08]** The harness is now gptme-only: the classic role-based manager/executor/auditor loop and the Claude Code/Codex backends are gone. The pipeline CLI (`run` / `status` / `approve` / `amend` / `resume`) is the control surface, and the provider is user-configurable through `~/.lh-harness/provider.json` (default: OpenCode Zen).
+- **[2026-08-09]** A local web-search tool (backed by a self-hosted [SearXNG](https://docs.searxng.org/) instance via Docker) is now wired into the research phase — see [Web search (optional)](#web-search-optional).
+- **[2026-08-08]** The harness is now gptme-only: the classic role-based manager/executor/auditor loop and the Claude Code/Codex backends are gone. The pipeline CLI (`run` / `status` / `approve` / `amend` / `resume`) is the control surface, and the provider is user-configurable through `provider.json` and `.env` at the repo root (default: OpenCode Zen).
 - **[2026-08-07]** A new, more user-friendly Dashboard is in the works. Stay tuned.
 - **[2026-08-06]** LongHorizon-Harness reaches **#1** on the [Hugging Face Daily Papers weekly ranking](https://huggingface.co/papers/week/2026-W32).
 - **[2026-08-06]** The WeChat group is open. Scan the QR code below to join.
@@ -84,12 +85,12 @@ One task can begin in a browser, move to the command line for data processing, c
 
 ## Any model. Any OpenAI-compatible provider.
 
-LongHorizon-Harness is not tied to a specific model. The provider is configured in `~/.lh-harness/provider.json` (any OpenAI-compatible endpoint); the default is OpenCode Zen.
+LongHorizon-Harness is not tied to a specific model. The provider is configured in `provider.json` at the repo root (any OpenAI-compatible endpoint); the default is OpenCode Zen.
 
 | | Layer | Supported choices |
 |---|---|---|
-| 🧠 | **Provider** | Any OpenAI-compatible endpoint, configured per user in `~/.lh-harness/provider.json` (default: OpenCode Zen) |
-| 🤖 | **Agent backend** | gptme's tool-use loop (shell/read/save/patch) against the configured provider |
+| 🧠 | **Provider** | Any OpenAI-compatible endpoint, configured per project in `provider.json` (default: OpenCode Zen) |
+| 🤖 | **Agent backend** | gptme's tool-use loop (shell/read/save/patch, plus a web-search tool for research nodes) against the configured provider |
 | 🎛️ | **Decomposition** | Recursive intake → survey → planning → pilot/contract → execute → assemble, with per-node tool narrowing |
 | 🖥️ | **Execution environment** | Local, with a pluggable `Environment` protocol |
 
@@ -171,8 +172,9 @@ Steps 1–2 are once per machine; steps 3–4 are once per project.
 |---|---|
 | [uv](https://docs.astral.sh/uv/getting-started/installation/) | The recommended isolated install. Skip it if you prefer pip. |
 | Python 3.10 or later | Running the harness. `uv tool install` brings its own; a pip install uses yours. |
-| A provider API key | Any OpenAI-compatible endpoint. The default (OpenCode Zen) reads `OPENCODE_API_KEY`; set it in `~/.lh-harness/provider.json` or the environment. |
+| A provider API key | Any OpenAI-compatible endpoint. The default (OpenCode Zen) reads `OPENCODE_API_KEY` from `.env`. |
 | gptme (`pip install "lh-harness[gptme]"`) | The Writer backend: gptme's tool-use loop. The core package and tests stay gptme-free. |
+| [Docker](https://docs.docker.com/get-docker/) *(optional)* | Running a local [SearXNG](https://docs.searxng.org/) instance so research nodes can search the web. Skip it if you don't need web search. |
 
 > **Platform status:** Currently tested on macOS. Windows support is included but has not yet been thoroughly tested.
 
@@ -186,23 +188,112 @@ Upgrade later with `uv tool upgrade lh-harness` or `pip install --upgrade lh-har
 
 #### 2. Configure your provider
 
-The first `lh-harness` run creates `~/.lh-harness/provider.json` from the
-sample (also at the repo root as `provider.example.json`) with the default
-opencode settings:
+Configuration lives in exactly two files, both at the repo root, both
+gitignored, both shipped as `.example` templates: copy each one and edit
+the copy.
+
+```bash
+cp provider.example.json provider.json   # non-secret: which providers exist, base_url, model
+cp .env.example .env                     # secret: the actual API key(s)
+```
+
+`provider.json` names one or more providers and, for each, which env var
+holds its key — it never holds the key itself:
 
 ```json
 {
-  "api_key": "",
-  "base_url": "https://opencode.ai/zen/v1",
-  "model": "opencode/deepseek-v4-flash-free"
+  "default": "opencode",
+  "providers": {
+    "opencode": {
+      "base_url": "https://opencode.ai/zen/v1",
+      "model": "opencode/deepseek-v4-flash-free",
+      "api_key_env": "OPENAI_API_KEY"
+    }
+  }
 }
 ```
 
-Edit it to point at any OpenAI-compatible endpoint, or set
+Then open `.env` and set the key it points at:
+
+```bash
+OPENAI_API_KEY=sk-...
+```
+
+The CLI loads `.env` automatically at startup (a variable already exported
+in your shell wins over the file). To add another provider, add an entry
+to `provider.json` with its own `api_key_env` (e.g. `DEEPSEEK_API_KEY`)
+and a matching line in `.env`; select it with `LH_HARNESS_PROVIDER=<name>`
+or `provider.json`'s `"default"` field.
+
+Precedence per field, highest first: explicit CLI/constructor arguments >
 `LH_HARNESS_PROVIDER_API_KEY` / `LH_HARNESS_PROVIDER_BASE_URL` /
-`LH_HARNESS_PROVIDER_MODEL` (or the generic `OPENAI_*` equivalents)
-instead. Precedence: explicit flags/arguments > `LH_HARNESS_PROVIDER_*`
-env > config file > `OPENAI_*` env > built-in opencode default.
+`LH_HARNESS_PROVIDER_MODEL` env vars > the selected provider's entry in
+`provider.json` > generic `OPENAI_API_KEY` / `OPENAI_BASE_URL` /
+`OPENAI_MODEL` env vars > the built-in OpenCode Zen default.
+
+If you skip this step, `lh-harness run` creates a default `provider.json`
+for you on first launch (pointing at OpenCode Zen) — you still need to put
+a key in `.env` for it to actually authenticate.
+
+#### Web search (optional)
+
+Research nodes (the harness's `web_search` phase) use a `websearch` gptme
+tool backed by a **local [SearXNG](https://docs.searxng.org/)** instance —
+no third-party search API key, no results leaving your machine. This step
+is optional: skip it and any `--research-plan` step just gets marked
+`skipped` instead of failing the run.
+
+1. **Run SearXNG via Docker.** The official docker-compose setup is the
+   easiest path — see [SearXNG's own installation
+   docs](https://docs.searxng.org/admin/installation-docker.html) for the
+   full compose file. The short version, for a single-container instance
+   on the default port:
+
+   ```bash
+   mkdir -p searxng
+   docker run -d --name searxng -p 8080:8080 \
+     -v "$(pwd)/searxng:/etc/searxng" \
+     searxng/searxng
+   ```
+
+   The first run writes a default `settings.yml` into `./searxng/`.
+
+2. **Enable JSON output.** SearXNG ships with JSON output *disabled* by
+   default (it's how this tool queries results). Edit
+   `./searxng/settings.yml` and make sure `json` is listed under
+   `search.formats`:
+
+   ```yaml
+   search:
+     formats:
+       - html
+       - json
+   ```
+
+   Then restart the container: `docker restart searxng`.
+
+3. **Point the harness at it.** The default URL (`http://localhost:8080`)
+   matches the command above, so most setups need no further config. If
+   your instance runs elsewhere, set it in `.env`:
+
+   ```bash
+   LH_HARNESS_SEARXNG_URL=http://localhost:8080
+   ```
+
+4. **Verify it works:**
+
+   ```bash
+   curl "http://localhost:8080/search?q=test&format=json" | head -c 200
+   ```
+
+   A JSON blob (not an HTML page or a 403) means it's ready. A 403 usually
+   means step 2 didn't take — double check `settings.yml` and that the
+   container actually restarted.
+
+Once running, pass a `--research-plan` to `lh-harness run` naming the
+nodes that need a search (see the CLI reference below); the harness
+dispatches a scoped, single-tool gptme episode per query and folds the
+capped finding into that node's inputs.
 
 #### 3. Run a task
 
@@ -216,6 +307,20 @@ tool narrowing, gates and reviews every artifact, and assembles the
 verified result. Phases that are already done are skipped on resume;
 `lh-harness pipeline resume <run-id>` picks up a halted run exactly where
 it stopped.
+
+To give a specific node a scoped web search (see [Web search
+(optional)](#web-search-optional) above), pass `--research-plan`:
+
+```bash
+lh-harness run --goal "..." --source @source.md \
+  --research-plan '[{"node_id": "2.1", "kind": "web_search", "question": "current stable Python release"}]'
+```
+
+Each entry dispatches its own single-tool gptme episode (the `websearch`
+tool, nothing else) against your local SearXNG instance; the capped
+finding is folded into that node's inputs before its own Writer episode
+runs. Omit `--research-plan` (or don't set up SearXNG) and the phase is
+simply skipped.
 
 Control surface (all operate on the run directory, safe from a second
 terminal while a run is in flight):
@@ -248,14 +353,15 @@ Provider settings resolve per field, highest first:
 1. Explicit constructor/CLI arguments
 2. `LH_HARNESS_PROVIDER_API_KEY` / `LH_HARNESS_PROVIDER_BASE_URL` /
    `LH_HARNESS_PROVIDER_MODEL` environment variables
-3. `~/.lh-harness/provider.json` (or `$LH_HARNESS_PROVIDER_CONFIG`)
+3. `provider.json` at the repo root (or `$LH_HARNESS_PROVIDER_CONFIG`)
 4. `OPENAI_API_KEY` / `OPENAI_BASE_URL` / `OPENAI_MODEL` environment variables
 5. Built-in default: OpenCode Zen (api key via `OPENCODE_API_KEY`)
 
 Every run is stored in an isolated `runs/<run-id>/` directory under
-`~/.lh-harness/` or `--runs-root`. The complete task state and audit trail —
-`tree.json`, the fsync'd `events.jsonl`, per-node traces and versions — make
-the agent's progress inspectable, recoverable, and reproducible.
+`./.lh-harness/runs/` (or `--runs-root`) in the project folder. The
+complete task state and audit trail — `tree.json`, the fsync'd
+`events.jsonl`, per-node traces and versions — make the agent's progress
+inspectable, recoverable, and reproducible.
 
 ## Evaluation Reproduction
 

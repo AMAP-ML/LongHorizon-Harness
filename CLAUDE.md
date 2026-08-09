@@ -402,20 +402,23 @@ modifications to v0/v1/v2/v3.
   post-processing); `research_finding_path` is the harness-written capped
   canonical finding, and its mere existence is what makes a repeated call
   a no-op.
-- `v4/mcp_research.py` (§15.2, §15.7) — the MCP seam §15.2 insists on
-  ("Do not write web search or fetch. Use MCP servers") rather than a
-  search implementation. `web_search` needs no MCP server at all — Claude
-  Code already ships `WebSearch`/`WebFetch` as built-in tools, narrowed in
-  via the same per-node `allowed_tools` mechanism v1 already uses for
-  everything else. `doc_retrieval` wires in Context7, §15.7's one
-  concretely-named donor for version-specific library docs, via the
-  existing `ClaudeCodeAdapter(mcp_config=...)` seam; `context7_server()`
-  is env-overridable (`LH_HARNESS_CONTEXT7_MCP_COMMAND`/`_MCP_ARGS`,
-  `CONTEXT7_API_KEY`) the same way `adapters/claude_code.py` already reads
-  `LH_HARNESS_CLAUDECODE_MCP_CONFIG` instead of hardcoding a path.
-  `RESEARCH_TOOL_ALLOWLIST` is the `allowed_tools` value per kind;
-  `write_mcp_config` writes nothing (returns `None`) for an all-`web_search`
-  plan, since those tools need no MCP config at all.
+- `v4/mcp_research.py` (§15.2) — per-research-kind tool allowlists.
+  **Post gptme-only rewrite** (2026-08-09): this originally targeted Claude
+  Code's built-in `WebSearch`/`WebFetch` tools plus a Context7 MCP server
+  for `doc_retrieval` (`ClaudeCodeAdapter(mcp_config=...)`); that adapter
+  no longer exists, so the module was rewritten around what's actually
+  wired up now. `web_search` resolves to `SEARXNG_TOOL_PATH` — a
+  self-hosted [SearXNG](https://docs.searxng.org/) query, implemented as a
+  gptme tool file (`adapters/tools/searxng_search.py`) and loaded by
+  *path* rather than by name, since gptme's own `init_tools()` accepts
+  `.py` file paths as allowlist entries for exactly this kind of
+  non-built-in tool (`gptme.tools.base.load_from_file`). `allowed_tools_for`
+  raises for `doc_retrieval`: it has no gptme equivalent yet (gptme does
+  have native MCP tool support — `gptme.tools.mcp` — so wiring Context7
+  through *that* instead of Claude Code's config format is a real gap to
+  fill later, not a dead end, but it's unbuilt). `pipeline/backends.py`'s
+  `build_research_adapter` imports `allowed_tools_for` directly rather than
+  keeping its own copy of the mapping.
 - `v4/research.py` — `run_research_query(run_dir, node_id, query, adapter,
   env, budget)` dispatches one `ResearchQuery` under a derived id
   (`research_node_id`: `"<node>~research~<slug>"`, same reasoning as
@@ -500,12 +503,16 @@ state is a small v5 path set layered on the existing run-directory layout.
   are not `"passed"`).
 - `pipeline/backends.py` — one module deciding which agent backend a run's
   writers and research queries use, so the driver never constructs an
-  adapter: `build_writer_adapter` (claude_code with per-node `allowed_tools`
-  when the node declares them; codex; gptme), `build_research_adapter`
-  (claude_code only — WebSearch/WebFetch are Claude Code built-ins and
-  Context7 is the one wired MCP server; **any other backend raises** rather
-  than silently granting full tool access to a research query), and
-  `parse_research_plan` (the loose web/CLI JSON — a list of
+  adapter: `build_writer_adapter` (gptme is the only entry in
+  `WRITER_BACKENDS`; passes `node.tools` through as `tool_allowlist` when
+  the node declares them, same per-node narrowing v1's round loop already
+  does), `build_research_adapter` (also gptme, narrowed via
+  `v4/mcp_research.py`'s `allowed_tools_for(query.kind)` — currently just
+  the SearXNG `websearch` tool for `web_search`; **any other backend, or a
+  kind with no tool wired up, raises** rather than silently granting full
+  tool access to a research query — `driver.py`'s `_phase_research` catches
+  that `ValueError` and marks the phase "skipped" instead of failing the
+  run), and `parse_research_plan` (the loose web/CLI JSON — a list of
   `{node_id, slug, kind, question}` objects or a dict by node_id — into
   v4's typed plan dict).
 - `pipeline/prompts.py` — `build_node_prompt(node, run_dir)` assembles a
@@ -590,29 +597,71 @@ classic harness. What remains is the gptme-only surface:
   custom-endpoint mechanism, the `--output-format json` line shape
   `gptme_visible_output` parses) was confirmed against a real installed
   `gptme` package via `inspect`, not guessed from documentation.
+- `adapters/tools/searxng_search.py` (new, 2026-08-09) — a `websearch`
+  gptme tool, self-contained and stdlib-only (`urllib`), querying a local
+  [SearXNG](https://docs.searxng.org/) instance's JSON API
+  (`GET {base_url}/search?q=...&format=json`; base URL from
+  `LH_HARNESS_SEARXNG_URL`, default `http://localhost:8080`). Loaded by
+  *file path*, not by name — gptme's `init_tools()` accepts `.py` file
+  paths as allowlist entries and imports them via
+  `gptme.tools.base.load_from_file`
+  (`importlib.util.spec_from_file_location`, independent of the
+  `lh_harness` package), which is why this module avoids relative imports
+  and only reaches for `gptme.message`/`gptme.tools.base` inside function
+  bodies — never at module import time — so it stays importable (and its
+  pure-Python helpers unit-testable) without gptme installed; `tool =
+  _build_tool()` at module end is wrapped in a `try/except ImportError`
+  for the same reason. `pipeline/backends.py`'s `build_research_adapter`
+  passes `SEARXNG_TOOL_PATH` (via `v4/mcp_research.py`'s
+  `allowed_tools_for("web_search")`) as a `GptmeAdapter`'s
+  `tool_allowlist` — scoped to *only* this tool, never added to a plain
+  Writer's `DEFAULT_TOOL_ALLOWLIST`, preserving v4's "pay the search-result
+  token cost once, in an isolated research episode" design.
 
 ## Provider configuration (`provider_config.py`)
 
 Provider defaults and customization live in exactly one module, `src/
 lh_harness/provider_config.py`, so the endpoint the agents and planner
-talk to is never scattered across adapters. There **is** a built-in
-default — OpenCode Zen (`https://opencode.ai/zen/v1`, model
-`opencode/deepseek-v4-flash-free`, api key read from `OPENCODE_API_KEY`)
-— and the user replaces it in `~/.lh-harness/provider.json`
-(`LH_HARNESS_PROVIDER_CONFIG` overrides the path). A sample with those
-opencode values sits at the repo root (`provider.example.json`); the CLI
-writes it to `~/.lh-harness/provider.json` on first invocation
-(`ensure_user_config`) so "customize the default" is a file edit, not a
-code change.
+talk to is never scattered across adapters. Configuration is split across
+**exactly two files, both at the repo root, both gitignored, both shipped
+as `.example` templates** the user copies and edits — never a third
+location:
+
+- **`provider.json`** — non-secret: named providers (`base_url`, `model`,
+  and `api_key_env`, the name of the env var holding *that* provider's
+  key — never the key itself). Repo-local by design
+  (`DEFAULT_CONFIG_PATH = Path("provider.json")`, resolved against the
+  cwd the CLI is run from — not `$HOME`; `LH_HARNESS_PROVIDER_CONFIG`
+  overrides the path). A sample sits at the repo root
+  (`provider.example.json`); the CLI also writes this file from the same
+  sample on first invocation if it's missing (`ensure_user_config`), so
+  "customize the default" works whether the user copies the example by
+  hand or just runs the CLI once.
+- **`.env`** — secret: the actual API key(s), one per `api_key_env` name
+  used in `provider.json` (e.g. `OPENAI_API_KEY=...`). Loaded automatically
+  at CLI startup (`load_env_file`, searches the cwd then each parent
+  directory for a `.env`) into `os.environ`, never overwriting a value the
+  real shell environment already set. A sample sits at the repo root
+  (`.env.example`).
+
+There **is** a built-in default if neither file exists — OpenCode Zen
+(`https://opencode.ai/zen/v1`, model `opencode/deepseek-v4-flash-free`,
+api key read from `OPENCODE_API_KEY`) — so a fresh clone with just a key
+in the environment still works.
 
 Per-field precedence (highest first):
 
 1. explicit constructor argument (`api_key=`/`base_url=`/`model=`)
 2. `LH_HARNESS_PROVIDER_API_KEY` / `LH_HARNESS_PROVIDER_BASE_URL` /
    `LH_HARNESS_PROVIDER_MODEL` env vars
-3. the config file (`~/.lh-harness/provider.json` / `$LH_HARNESS_PROVIDER_CONFIG`)
+3. the selected provider's entry in `provider.json` (its key comes from
+   the env var its `api_key_env` names, itself normally set via `.env`)
 4. `OPENAI_API_KEY` / `OPENAI_BASE_URL` / `OPENAI_MODEL` env vars
 5. built-in default (opencode; key from `OPENCODE_API_KEY`)
+
+`types.py`'s `DEFAULT_TMP_DIR` follows the same repo-local rule
+(`<cwd>/.lh-harness/tmp`, not `~/.lh-harness/tmp`) — nothing this harness
+writes by default lives outside the project folder it was launched from.
 
 `resolve()` always returns populated `base_url`/`model`; only `api_key`
 may be empty and only `require()` (called by callers that must not
@@ -632,9 +681,16 @@ no API key. Run everything:
 python3 -m unittest discover -s tests -p "test_*.py" -v
 ```
 
-~7s, 132 tests, all passing (118 as of the v4 build, plus 15 for
-`GptmeAdapter` and its allowlist/no-codex rework + 13 new
-`test_provider_config.py` tests).
+~7s, 148 tests, all passing. `test_provider_config.py`'s `_EnvIsolatedTest`
+snapshots and restores the *entire* `os.environ` around each test now
+(2026-08-09 fix) — the previous partial-restore logic only put back keys
+that had a prior value, so a test setting e.g. `LH_HARNESS_PROVIDER`
+fresh (no prior value) leaked it into every test running after it in the
+same process, intermittently breaking unrelated suites
+(`test_v1_units.py`, `test_v1_round_loop.py`) depending on run order.
+`test_searxng_tool.py` (10, new) and the rewritten `test_v4_mcp_research.py`
+(2, was 7 — see the v4/pipeline sections above) cover the SearXNG web-search
+tool and its allowlist wiring.
 
 ### `tests/test_provider_config.py` (13 tests)
 
@@ -783,7 +839,7 @@ toolchain needed since the compile gate is a generic injected command).
   `"stale"`; `apply_revalidation_triage` leaves clean nodes untouched and
   routes patchable through `repair.run_repair`.
 
-### v4 (`tests/test_v4_*.py`, 14 tests)
+### v4 (`tests/test_v4_*.py`, 9 tests)
 
 Same fakes as v0-v3, no new fixtures — `FakeStreamAgentAdapter`/
 `fake_stream_agent.py` for research-query dispatch. Since the fake CLI
@@ -793,13 +849,12 @@ own visible output" path documented in `research.py`, the same fallback
 `v1/writer.py`'s promotion mechanism already relies on for the same
 reason.
 
-- `test_v4_mcp_research.py` (7) — `web_search`'s allowlist contains no
-  `mcp__*` tools; `doc_retrieval`'s contains exactly the two Context7 tool
-  names; `context7_server()`'s default command/args and its env-var
-  overrides (`LH_HARNESS_CONTEXT7_MCP_COMMAND`/`_MCP_ARGS`,
-  `CONTEXT7_API_KEY`); `write_mcp_config` writes nothing for an
-  all-`web_search` plan and writes exactly one `context7` entry for a plan
-  containing `doc_retrieval` (mixed or not).
+- `test_v4_mcp_research.py` (2) — `allowed_tools_for("web_search")` returns
+  exactly `(str(SEARXNG_TOOL_PATH),)`; `allowed_tools_for("doc_retrieval")`
+  raises (no gptme tool wired up for it yet). Rewritten 2026-08-09 for the
+  gptme/SearXNG-only module (see the v4 section above) — the prior version
+  covered the removed Claude-Code-era `WebSearch`/`WebFetch`/Context7
+  allowlists and `write_mcp_config`.
 - `test_v4_research.py` (2) — a fresh query dispatches a genuinely new
   episode under `research_node_id`'s derived id and caps a 2,000-word fake
   result down to the token budget (asserted via the truncation marker); a
@@ -814,6 +869,23 @@ reason.
   lands in `node.inputs` and that mutation survives a `TaskTree.load`
   round trip from disk; an unknown node id in the plan raises `KeyError`
   rather than silently no-oping.
+
+### SearXNG web-search tool (`tests/test_searxng_tool.py`, 10 tests, new)
+
+Only the pure-Python surface of `adapters/tools/searxng_search.py` is
+tested — `search()`/`_format_results()`/`searxng_base_url()` — never
+`execute_websearch()`, which imports `gptme.message` internally and only
+ever runs inside the gptme worker subprocess; testing it would break the
+"core package and test suite stay gptme-free" rule the rest of the suite
+holds to. `urllib.request.urlopen` is monkeypatched (`unittest.mock.patch`)
+with a fake response object rather than hitting a real SearXNG instance —
+no network, no Docker dependency for `python3 -m unittest discover`.
+Covers: default/env-overridden `LH_HARNESS_SEARXNG_URL`; a successful
+query parses and caps `results` to `MAX_NUM_RESULTS`; connection-refused
+and non-JSON/HTTP-error responses raise `SearxngSearchError` with a
+message pointing at the actual fix (`docker ps`, enabling `json` in
+`search.formats`); `_format_results`'s title/url/snippet formatting, the
+no-results case, and surfaced `answers`.
 
 Fixtures (`tests/fixtures/`):
 - `fake_stream_agent.py` — standalone script mimicking Claude Code's

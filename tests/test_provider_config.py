@@ -60,17 +60,24 @@ _ENV_KEYS = (
 
 class _EnvIsolatedTest(unittest.TestCase):
     def setUp(self) -> None:
-        self._backup = {key: os.environ.pop(key, None) for key in _ENV_KEYS}
+        # Snapshot the *whole* environment, not just _ENV_KEYS: individual
+        # tests set ad-hoc provider-specific vars (DEEPSEEK_API_KEY,
+        # LEGACY_KEY, ...) that aren't in that fixed list, and a partial
+        # snapshot silently leaks them into every test that runs after —
+        # e.g. a test setting LH_HARNESS_PROVIDER=deepseek with no prior
+        # value would never be unset, breaking unrelated tests elsewhere in
+        # the suite that share this process.
+        self._env_backup = dict(os.environ)
+        for key in _ENV_KEYS:
+            os.environ.pop(key, None)
         self._tmp = tempfile.TemporaryDirectory()
         os.environ["LH_HARNESS_PROVIDER_CONFIG"] = (
             str(Path(self._tmp.name) / "provider.json")
         )
 
     def tearDown(self) -> None:
-        os.environ.pop("LH_HARNESS_PROVIDER_CONFIG", None)
-        for key, value in self._backup.items():
-            if value is not None:
-                os.environ[key] = value
+        os.environ.clear()
+        os.environ.update(self._env_backup)
         self._tmp.cleanup()
 
     def _write_config(self, data: dict[str, object]) -> None:
