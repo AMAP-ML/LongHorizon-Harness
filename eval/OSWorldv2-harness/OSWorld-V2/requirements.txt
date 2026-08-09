@@ -1,3 +1,0 @@
-# pyproject.toml is the dependency source of truth.
-# This file remains only for tools that still expect requirements.txt.
--e .

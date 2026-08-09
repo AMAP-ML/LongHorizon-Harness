@@ -1,6 +1,0 @@
-interface:
-  display_name: "WeaveBench CUA Reproduce"
-  short_description: "Reproduce WeaveBench CUA-Harness runs"
-  default_prompt: "Use $weavebench-cua-reproduce to set up, check, smoke-test, and launch a WeaveBench CUA-Harness evaluation."
-policy:
-  allow_implicit_invocation: true

@@ -1,3 +1,0 @@
-[submodule "desktop_env/server"]
-	path = desktop_env/server
-	url = https://github.com/xlang-ai/osworld-server.git
