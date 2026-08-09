@@ -1,25 +1,26 @@
-"""Server-side state for the recursive-decomposition view (PLAN.md §11).
+"""Run-directory state for the TUI (PLAN.md §11) — the terminal
+replacement for the deleted web view.
 
-Bridges three worlds without coupling them:
+Adapted from the former ``dashboard/recursive.py`` (removed 2026-08-09
+when the web app was replaced by this TUI): the same "read everything
+fresh from disk on every call" design, minus every HTTP-only concept
+(``control_enabled``/403s — the TUI *is* the operator's own terminal, so
+it always has full control) and plus the "subagents" view and live
+mid-episode messaging this TUI adds on top of what the web view had.
 
-* the pipeline driver (possibly running in this process, possibly in a
-  detached ``kusudaemon run`` process — the state never tells the
-  difference, because the only contract is the run directory),
-* an HTTP server thread (snapshots for a web UI, SSE pushes) if one is
-  ever mounted,
-* the operator (approve/amend/reopen/halt actions).
+Bridges three worlds without coupling them, same as before:
 
-Everything durable is read fresh from disk on every call — the same
-"on-disk logs are always read fresh" rule the shipped dashboard state
-already follows. The only in-process bookkeeping is the map of hosted
-driver threads and the attached-run pointer.
+* the pipeline driver (hosted in a background thread by this same process,
+  or running in a detached ``kusudaemon run`` process — this state never
+  tells the difference, because the only contract is the run directory),
+* the TUI's own render loop (snapshots on a timer),
+* the operator (approve/amend/reopen/halt/interject actions).
 
-The approval protocol is ``pipeline/approvals.py``'s: the driver creates
-``pending`` records in ``approvals.jsonl`` and polls until a ``resolved``
-record lands; this state resolves by appending that record (and, for
-state-created approvals like amend/triage/reopen, dispatches the follow-up
-job in a worker thread). Any other surface — a second browser, the CLI
-``approve`` command — resolves the same file, so no surface owns a run.
+The approval protocol is still ``pipeline/approvals.py``'s: the driver
+creates ``pending`` records in ``approvals.jsonl`` and polls until a
+``resolved`` record lands; this state resolves by appending that record.
+Any other surface — a second terminal running ``kusudaemon approve`` —
+resolves the same file, so no surface owns a run.
 """
 
 from __future__ import annotations
@@ -32,7 +33,7 @@ from pathlib import Path
 from typing import Any
 
 from ..v0.events import EventLog
-from ..v0.run_dir import events_path, manifest_path, node_artifact_path, node_scratch_dir, spec_path
+from ..v0.run_dir import events_path, manifest_path, node_artifact_path, node_scratch_dir, node_trace_path, spec_path
 from ..v1.gates import estimate_tokens
 from ..v1.tree import TaskTree
 from ..v2.contract import load_contract
@@ -53,6 +54,7 @@ from ..pipeline.driver import (
     reopen_node,
 )
 from ..pipeline.run_dir import halt_path, jobs_path, phase_path, run_spec_path
+from . import gptme_queue
 
 _DEFAULT_RUN_ID_PREFIX = "rec"
 
@@ -61,12 +63,12 @@ def _now() -> float:
     return time.time()
 
 
-class RecursiveRunState:
-    """Thread-safe per-server store for the recursive decomposition view."""
+class RunState:
+    """Per-process store for the TUI. Thread-safe: the driver, job workers,
+    and the TUI's own event loop all touch this concurrently."""
 
-    def __init__(self, runs_root: str | Path | None = None, *, control_enabled: bool = True) -> None:
+    def __init__(self, runs_root: str | Path | None = None) -> None:
         self.runs_root = Path(runs_root) if runs_root else None
-        self.control_enabled = control_enabled
         self._lock = threading.Lock()
         self._attached: str | None = None
         self._hosts: dict[str, threading.Thread] = {}
@@ -95,6 +97,7 @@ class RecursiveRunState:
                     "detail": str(phase.get("detail", "")),
                     "mtime": _dir_mtime(entry),
                     "attached": entry.name == self._attached,
+                    "hosted": self.is_hosted(entry.name),
                 }
             )
         runs.sort(key=lambda item: item["mtime"], reverse=True)
@@ -138,7 +141,6 @@ class RecursiveRunState:
             return {
                 "attached": False,
                 "runs": self.list_runs(),
-                "control_enabled": self.control_enabled,
                 "server_time": _now(),
             }
         spec = _read_json(run_spec_path(run_dir)) or {}
@@ -150,7 +152,6 @@ class RecursiveRunState:
             "attached": True,
             "run_id": self.attached_run_id,
             "runs": self.list_runs(),
-            "control_enabled": self.control_enabled,
             "goal": str(spec.get("goal", "")),
             "backend": str(spec.get("backend", "")),
             "phase": str(phase.get("phase", "")),
@@ -161,10 +162,12 @@ class RecursiveRunState:
             "tree_counts": _count_statuses(tree),
             "approvals": [item.to_dict() for item in approvals],
             "pending_approvals": [item.to_dict() for item in approvals if item.status == "pending"],
-            "events": [e for e in events[-50:]],
+            "events": [e for e in events[-200:]],
             "events_count": len(events),
+            "subagents": self.subagents(events=events),
             "jobs": _read_jobs(run_dir),
             "halted": halt_path(run_dir).exists(),
+            "hosted": self.is_hosted(),
             "has_spec": _has_content(spec_path(run_dir)),
             "has_contract": contract_path(run_dir).exists(),
             "has_assembly": assembly_output_path(run_dir).exists(),
@@ -179,6 +182,63 @@ class RecursiveRunState:
         return [e for e in events[after:]]
 
     # ------------------------------------------------------------------
+    # Subagents: every distinct dispatched episode (tree Writer nodes,
+    # repairs, research queries, pilot drafts) seen in events.jsonl -- the
+    # harness's own vocabulary for "subagent" (see PLAN.md/CLAUDE.md's v4
+    # section). Each one funnels through the same GptmeAdapter/
+    # _gptme_worker.py, so the same live-trace/interject mechanism covers
+    # all of them uniformly.
+    # ------------------------------------------------------------------
+    def subagents(self, *, events: list[dict[str, Any]] | None = None) -> list[dict[str, Any]]:
+        run_dir = self._attached_dir()
+        if run_dir is None:
+            return []
+        if events is None:
+            events = EventLog(events_path(run_dir)).read_all()
+        by_node: dict[str, list[dict[str, Any]]] = {}
+        order: list[str] = []
+        for event in events:
+            node_id = event.get("node_id")
+            if not node_id or node_id == "-":
+                continue
+            if node_id not in by_node:
+                order.append(node_id)
+                by_node[node_id] = []
+            by_node[node_id].append(event)
+        result: list[dict[str, Any]] = []
+        for node_id in order:
+            node_events = by_node[node_id]
+            result.append(_summarize_subagent(run_dir, node_id, node_events))
+        return result
+
+    def node_gptme_logdir(self, node_id: str) -> Path | None:
+        """Scan a node's trace.jsonl for the ``{"type": "logdir", ...}``
+        line ``_gptme_worker.py`` prints before ``gptme.chat()`` starts —
+        the same "watch the live tee for a marker line" trick
+        ``v0/runner.py``'s ``_watch_for_session_id`` already uses for
+        ``session_id``. Returns the *last* one seen, so a redispatched
+        (retried) attempt's logdir wins over a stale earlier one."""
+        run_dir = self._attached_dir()
+        if run_dir is None or not _safe_node_id(node_id):
+            return None
+        return _last_logdir(node_trace_path(run_dir, node_id))
+
+    def interject(self, node_id: str, text: str) -> bool:
+        """Send a live message into a currently-running subagent's gptme
+        session — appends to that session's ``prompt-queue.jsonl``, which
+        gptme's own chat loop drains between turns (see
+        ``tui/gptme_queue.py``). Returns False if no live session has been
+        discovered for this node yet (nothing running, or too early)."""
+        text = (text or "").strip()
+        if not text:
+            return False
+        logdir = self.node_gptme_logdir(node_id)
+        if logdir is None:
+            return False
+        gptme_queue.queue_prompt(logdir, text)
+        return True
+
+    # ------------------------------------------------------------------
     # Hosted runs (hosted state drives the driver in a background thread)
     # ------------------------------------------------------------------
     def start_run(self, body: dict[str, Any], *, driver=None) -> tuple[str | None, str]:
@@ -189,8 +249,6 @@ class RecursiveRunState:
         authoritative for goal/source/backend/etc, the same rule
         ``pipeline/run.py``'s ``run_from_args`` already applies for the CLI
         path. Only ``run_id`` from the body is used for a resume."""
-        if not self.control_enabled:
-            return None, "control is disabled"
         if self.runs_root is None:
             return None, "no runs_root configured"
         run_id = str(body.get("run_id") or "").strip()
@@ -214,7 +272,7 @@ class RecursiveRunState:
         if driver is None:
             driver = self._default_driver(run_dir, options)
         thread = threading.Thread(
-            target=_host_driver, args=(run_dir, driver), name=f"recursive-{run_id}", daemon=True
+            target=_host_driver, args=(run_dir, driver), name=f"kusudaemon-tui-{run_id}", daemon=True
         )
         with self._lock:
             self._hosts[run_id] = thread
@@ -265,8 +323,6 @@ class RecursiveRunState:
         run_dir = self._attached_dir()
         if run_dir is None:
             return False
-        if not self.control_enabled:
-            return False
         record = _find_approval(run_dir, approval_id)
         if record is None or record.status == "resolved":
             return False
@@ -295,7 +351,7 @@ class RecursiveRunState:
     # ------------------------------------------------------------------
     # Operator actions that *create* approvals (never run jobs directly)
     # ------------------------------------------------------------------
-    def request_amend(self, text: str, reason: str = "web amendment") -> dict[str, Any] | None:
+    def request_amend(self, text: str, reason: str = "TUI amendment") -> dict[str, Any] | None:
         """§10: show the re-validation cost estimate *before* running it.
         Creates an approval whose apply half runs amend + re-validation."""
         run_dir = self._attached_dir()
@@ -360,7 +416,7 @@ class RecursiveRunState:
         node = tree.nodes.get(node_id)
         if node is None:
             return None
-        artifact = _read_text(node_artifact_path(run_dir, node_id))
+        artifact = _read_text(node_artifact_path(run_dir, node_id)) or ""
         from ..v1.gates import evaluate_gates
 
         gate_results = [
@@ -423,7 +479,7 @@ class RecursiveRunState:
         run_dir = self._attached_dir()
         if run_dir is None or not _safe_node_id(node_id):
             return None
-        return _read_text(run_dir / "scratch" / node_id / "trace.jsonl")
+        return _read_text(node_trace_path(run_dir, node_id))
 
     def spec_text(self) -> str:
         run_dir = self._attached_dir()
@@ -492,8 +548,6 @@ def _set_phase(run_dir: Path, phase: str, status: str, detail: str = "") -> None
 
 
 def _run_amend_job(run_dir: Path, approval_id: str) -> None:
-    from ..v1.provider import OpenAICompatibleProvider
-
     approval = _find_approval(run_dir, approval_id)
     if approval is None:
         _finish_job(run_dir, approval_id, "amend", "failed", "approval record missing")
@@ -501,7 +555,7 @@ def _run_amend_job(run_dir: Path, approval_id: str) -> None:
     context = approval.context or {}
     try:
         options, provider, env, factory = _runtime_for(run_dir)
-        result = asyncio_run(amend_and_revalidate(run_dir, rule_text=context.get("text", ""), reason=context.get("reason", "web amendment"), provider=provider))
+        result = asyncio_run(amend_and_revalidate(run_dir, rule_text=context.get("text", ""), reason=context.get("reason", "TUI amendment"), provider=provider))
         counts = result["counts"]
         lines = ["Re-validation of the amended contract:", "", f"clean: {counts['clean']}   patchable: {counts['patchable']}   regenerate: {counts['regenerate']}", "", "Non-clean nodes:", ""]
         for node_id, record in result["triage"].items():
@@ -693,6 +747,67 @@ def _list_versions(run_dir: Path, node_id: str) -> list[str]:
     if not directory.is_dir():
         return []
     return sorted(p.name for p in directory.iterdir() if p.is_file())
+
+
+def _kind_of(node_id: str) -> str:
+    if "~repair" in node_id:
+        return "repair"
+    if "~research~" in node_id:
+        return "research"
+    return "writer"
+
+
+def _summarize_subagent(run_dir: Path, node_id: str, events: list[dict[str, Any]]) -> dict[str, Any]:
+    role = "writer"
+    status = "pending"
+    duration_ms = 0
+    error: str | None = None
+    attempts = 0
+    completed = False
+    for event in events:
+        etype = event.get("type")
+        role = event.get("role", role)
+        if etype in ("node_dispatched", "node_redispatched"):
+            attempts += 1
+            status = "running"
+        elif etype == "session_captured":
+            status = "running"
+        elif etype == "episode_completed":
+            completed = True
+            status = str(event.get("status", "done"))
+            duration_ms = int(event.get("duration_ms") or 0)
+            error = event.get("error")
+    logdir = _last_logdir(node_trace_path(run_dir, node_id))
+    live = bool(logdir) and not completed
+    return {
+        "id": node_id,
+        "kind": _kind_of(node_id),
+        "role": role,
+        "status": status,
+        "attempts": attempts,
+        "duration_ms": duration_ms,
+        "error": error,
+        "live": live,
+        "has_logdir": logdir is not None,
+    }
+
+
+def _last_logdir(trace_path: Path) -> Path | None:
+    raw = _read_text(trace_path)
+    if not raw:
+        return None
+    found: str | None = None
+    for line in raw.splitlines():
+        line = line.strip()
+        if not line.startswith("{"):
+            continue
+        try:
+            record = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if record.get("type") == "logdir" and record.get("logdir"):
+            found = str(record["logdir"])
+    return Path(found) if found else None
 
 
 def _read_text(path: Path) -> str | None:

@@ -1,14 +1,13 @@
 """Command handlers for the ``kusudaemon pipeline`` group (PLAN.md §11's
-control surface: run / status / approve / amend / resume).
+control surface: run / status / approve / amend / resume / tui).
 
 The run command drives :class:`RecursiveDriver` in the foreground by
-default (with the web view optionally served alongside it), or detaches a
-background subprocess for pure ``status`` / ``approve`` / web-attach
-workflows. Approve and amend operate purely on the run directory's
-``approvals.jsonl`` and ``contract.md`` — which is exactly what makes
-them safe to run from a second terminal while the driver (or a web view)
-is still attached to the same run (§11: the view "can be attached from
-anywhere").
+default, or detaches a background subprocess for pure ``status`` /
+``approve`` / ``tui``-attach workflows. Approve and amend operate purely
+on the run directory's ``approvals.jsonl`` and ``contract.md`` — which is
+exactly what makes them safe to run from a second terminal while the
+driver (or the TUI) is still attached to the same run (§11: the view "can
+be attached from anywhere").
 """
 
 from __future__ import annotations
@@ -17,7 +16,6 @@ import argparse
 import asyncio
 import subprocess
 import sys
-import threading
 import time
 import uuid
 from pathlib import Path
@@ -59,9 +57,6 @@ def build_pipeline_parser() -> argparse.ArgumentParser:
     run_parser.add_argument("--max-rounds", type=int, default=100)
     run_parser.add_argument("--max-attempts", type=int, default=3)
     run_parser.add_argument("--detach", action="store_true", help="Run in a background subprocess and return immediately.")
-    run_parser.add_argument("--dashboard", action="store_true", help="Also serve the web view (PLAN.md §11) alongside this run, on a background thread.")
-    run_parser.add_argument("--dashboard-host", default="127.0.0.1")
-    run_parser.add_argument("--dashboard-port", type=int, default=8765)
 
     resume_parser = sub.add_parser("resume", help="Resume a run after a halt or crash.")
     resume_parser.add_argument("run_id")
@@ -86,12 +81,9 @@ def build_pipeline_parser() -> argparse.ArgumentParser:
     amend_parser.add_argument("--yes", action="store_true", help="Apply the triage without prompting.")
     amend_parser.add_argument("--max-attempts", type=int, default=3)
 
-    serve_parser = sub.add_parser("serve", help="Serve the web view (PLAN.md §11) over a runs directory.")
-    serve_parser.add_argument("--runs-root", default=_RUNS_ROOT_DEFAULT)
-    serve_parser.add_argument("--host", default="127.0.0.1")
-    serve_parser.add_argument("--port", type=int, default=8765)
-    serve_parser.add_argument("--run-id", default=None, help="Attach to this run on startup.")
-    serve_parser.add_argument("--no-control", action="store_true", help="Read-only view: disable start/attach/approve/amend/halt/reopen.")
+    tui_parser = sub.add_parser("tui", help="Launch the interactive terminal UI (PLAN.md §11 control surface).")
+    tui_parser.add_argument("--runs-root", default=_RUNS_ROOT_DEFAULT)
+    tui_parser.add_argument("--run-id", default=None, help="Attach to this run on startup.")
     return parser
 
 
@@ -104,54 +96,14 @@ def cmd_run(argv: argparse.Namespace) -> int:
         return cmd_run_detach(argv)
     from .run import run_from_args
 
-    run_id = argv.run_id
-    httpd = None
-    if getattr(argv, "dashboard", False):
-        run_id = run_id or _default_run_id()
-        httpd = _start_dashboard(argv, run_id)
-    try:
-        return run_from_args(_run_argv(argv, run_id=run_id))
-    finally:
-        if httpd is not None:
-            httpd.shutdown()
-            httpd.server_close()
+    return run_from_args(_run_argv(argv, run_id=argv.run_id))
 
 
-def _start_dashboard(argv: argparse.Namespace, run_id: str):
-    """Start the web view (PLAN.md §11) on a background thread alongside a
-    foreground ``run``, auto-attaching to ``run_id`` as soon as its run
-    directory exists (the driver touches ``events.jsonl`` at the very start
-    of ``RecursiveDriver.run()``, so this is a short wait, not a race the
-    operator would notice)."""
-    from ..dashboard.recursive import RecursiveRunState
-    from ..dashboard.server import make_server
+def cmd_tui(argv: argparse.Namespace) -> int:
+    from ..tui.app import KusudaemonApp
 
-    state = RecursiveRunState(argv.runs_root, control_enabled=True)
-    httpd = make_server(state, argv.dashboard_host, argv.dashboard_port)
-    thread = threading.Thread(target=httpd.serve_forever, name="kusudaemon-dashboard", daemon=True)
-    thread.start()
-    print(f"dashboard: http://{argv.dashboard_host}:{argv.dashboard_port}/  (watching {argv.runs_root})")
-
-    def _auto_attach() -> None:
-        for _ in range(200):
-            if state.attach(run_id):
-                return
-            time.sleep(0.25)
-
-    threading.Thread(target=_auto_attach, name="kusudaemon-dashboard-attach", daemon=True).start()
-    return httpd
-
-
-def cmd_serve(argv: argparse.Namespace) -> int:
-    from ..dashboard.server import run_forever
-
-    run_forever(
-        argv.runs_root,
-        argv.host,
-        argv.port,
-        attach_run_id=argv.run_id,
-        control_enabled=not argv.no_control,
-    )
+    app = KusudaemonApp(runs_root=argv.runs_root, attach_run_id=argv.run_id)
+    app.run()
     return 0
 
 
@@ -284,8 +236,8 @@ def dispatch(args: argparse.Namespace) -> int:
         return cmd_approve(args)
     if command == "amend":
         return cmd_amend(args)
-    if command == "serve":
-        return cmd_serve(args)
+    if command == "tui":
+        return cmd_tui(args)
     raise ValueError(f"unknown pipeline command: {command!r}")
 
 

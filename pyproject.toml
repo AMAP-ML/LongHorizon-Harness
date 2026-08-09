@@ -20,8 +20,14 @@ dependencies = [
 # gptme -- the core package, every other adapter, and the test suite stay
 # gptme-free. Install with `pip install "kusudaemon[gptme]"` to actually run
 # GptmeAdapter as a Writer backend.
+#
+# Only src/kusudaemon/tui/ imports textual -- the core package, every other
+# module, and the test suite stay textual-free (tests exercise tui/state.py
+# directly, never the widget tree). Install with `pip install
+# "kusudaemon[tui]"` to actually run `kusudaemon tui` / bare `kusudaemon`.
 [project.optional-dependencies]
 gptme = ["gptme"]
+tui = ["textual>=0.60"]
 
 # Points at this fork's actual GitHub location, which has not itself been
 # renamed (only the package/CLI/docs have) -- update if/when it is.

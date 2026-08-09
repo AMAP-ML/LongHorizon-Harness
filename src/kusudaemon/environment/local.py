@@ -53,9 +53,9 @@ class LocalEnvironment:
                 limit=64 * 1024 * 1024,
             )
             track_process_group(proc.pid)
-            # Always drain incrementally. Besides powering the live dashboard,
-            # this leaves the bytes already received available if a timeout or
-            # cancellation happens before the child exits normally.
+            # Always drain incrementally. Besides powering the live TUI trace
+            # view, this leaves the bytes already received available if a
+            # timeout or cancellation happens before the child exits normally.
             io_task = asyncio.create_task(
                 self._communicate_streaming(
                     proc,
@@ -129,9 +129,10 @@ class LocalEnvironment:
         """Drain both streams while optionally teeing stdout to a live file.
 
         stdout is written incrementally (one line at a time) so an external
-        reader (the dashboard) sees the agent's stream-json trajectory grow
-        live. The caller owns the chunk lists, so partial output survives even
-        when the wait is interrupted by timeout or cancellation.
+        reader (the TUI's Thinking tab) sees the agent's stream-json
+        trajectory grow live. The caller owns the chunk lists, so partial
+        output survives even when the wait is interrupted by timeout or
+        cancellation.
         """
         path = Path(tee_path) if tee_path else None
         if path is not None:

@@ -44,11 +44,26 @@ gptme's own documented line-delimited structured-output mode (the same
 mode its own ``--output-format json`` CLI flag selects), not something
 this script invents. ``gptme_adapter.py``'s ``gptme_visible_output``
 parses that stream back out.
+
+Also emits one ``{"type": "logdir", "logdir": "..."}`` line, first, before
+``gptme.chat()`` starts. ``gptme_visible_output`` already ignores any line
+whose ``type`` isn't ``"message"``, so this is invisible to it. It exists
+so a live surface (the TUI) watching this line tee'd to the node's
+``trace.jsonl`` (the same mechanism ``v0/runner.py``'s
+``_watch_for_session_id`` already uses to watch for ``session_id``) can
+discover *this attempt's* logdir while the episode is still running, and
+append to ``<logdir>/prompt-queue.jsonl`` — gptme's own durable
+mid-conversation prompt queue (``gptme/prompt_queue.py``), which
+``gptme.chat()``'s loop already drains between turns. That's the whole
+mechanism behind "talk to a running Writer/repair/research subagent
+mid-episode": no fork of gptme's chat loop, just its own already-shipped
+external-queue file, discovered via a path this script prints once.
 """
 
 from __future__ import annotations
 
 import argparse
+import json
 import sys
 import tempfile
 from pathlib import Path
@@ -69,6 +84,7 @@ def main() -> int:
     allowlist = [tool for tool in args.tool_allowlist.split(",") if tool]
     workspace = Path.cwd()
     logdir = Path(tempfile.mkdtemp(prefix="kusudaemon-gptme-"))
+    print(json.dumps({"type": "logdir", "logdir": str(logdir)}), flush=True)
 
     try:
         import gptme

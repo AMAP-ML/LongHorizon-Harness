@@ -87,7 +87,7 @@ class CommandAgentAdapter:
             command_body = command_body.replace(placeholder, value)
         command = f"cd {shlex.quote(self.workspace_path)} && {command_body}"
         # When a live path is given (local runs), the environment mirrors stdout
-        # to that file line-by-line so the dashboard shows the trajectory live.
+        # to that file line-by-line so the TUI shows the trajectory live.
         result = await env.exec(
             command,
             timeout=budget.max_duration_seconds,

@@ -1,15 +1,15 @@
 """Human-in-the-loop approval records, cross-process (PLAN.md §10, §11).
 
-The driver and its human surfaces (web app, CLI ``approve``) never share a
+The driver and its human surfaces (the TUI, CLI ``approve``) never share a
 lock or a pipe: every approval is a record in the run directory's
 ``approvals.jsonl``, append-only, latest record per ``approval_id`` wins.
 The driver creates a ``pending`` record and then *polls the file* until a
-resolved record for the same id shows up; the web app and the CLI resolve
+resolved record for the same id shows up; the TUI and the CLI resolve
 by appending that resolved record. Any surface can therefore answer what
 any other surface asked, and a crashed driver waits on nothing — resolution
 is a durable fact on disk, not a pipe buffer. There is no in-memory
-authority: the file IS the authority (the dashboard keeps an in-memory
-mirror only so its own HTTP replies are instant).
+authority: the file IS the authority (``tui/state.py`` reads it fresh on
+every poll rather than keeping its own mirror).
 
 Record shape (flat dict, JSON-serializable):
 

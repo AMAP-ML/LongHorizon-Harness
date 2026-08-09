@@ -560,6 +560,22 @@ editing plus PDF preview, which terminals are bad at.
 **Build neither first.** Structured logs + `tail`/`jq` gets a working harness. The
 web view is additive.
 
+**2026-08-09 revision: the view surface shipped as a TUI, not a web app.**
+Kusudaemon's actual implementation (`kusudaemon tui`, `src/kusudaemon/tui/`)
+replaced the local web app described above with a terminal UI
+([Textual](https://github.com/Textualize/textual)) attached to the same run
+directory — same "separate process, can crash without touching the run, can
+attach from anywhere" property, just rendered in the terminal instead of a
+browser. The pilot-editing/PDF-preview rationale above for *why a browser*
+turned out not to outweigh, in practice, "the operator is already living in a
+terminal for the CLI half of this control surface" — so the TUI became the
+whole view+control surface (approve/amend/reopen/halt included) rather than a
+separate read-mostly view next to a CLI doing the writing. It also picked up
+something a web view didn't have: a running Writer/repair/research episode's
+gptme session drains an external prompt-queue file between turns (gptme's own
+mechanism), so the TUI can append to it live — the operator can message a
+subagent *while it's still running*, not just watch its trace after the fact.
+
 **Default node view** — raw JSONL is unusable; nobody will read it. Show: brief
 given, gate results (pass/fail per item), reviewer verdict lines, artifact diff,
 **input tokens by segment**. Raw trace one keypress away. In practice correction
