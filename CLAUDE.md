@@ -511,15 +511,20 @@ state is a small v5 path set layered on the existing run-directory layout.
   adapter: `build_writer_adapter` (gptme is the only entry in
   `WRITER_BACKENDS`; passes `node.tools` through as `tool_allowlist` when
   the node declares them, same per-node narrowing v1's round loop already
-  does), `build_research_adapter` (also gptme, narrowed via
-  `v4/mcp_research.py`'s `allowed_tools_for(query.kind)` — currently just
-  the SearXNG `websearch` tool for `web_search`; **any other backend, or a
-  kind with no tool wired up, raises** rather than silently granting full
-  tool access to a research query — `driver.py`'s `_phase_research` catches
-  that `ValueError` and marks the phase "skipped" instead of failing the
-  run), and `parse_research_plan` (the loose web/CLI JSON — a list of
-  `{node_id, slug, kind, question}` objects or a dict by node_id — into
-  v4's typed plan dict).
+  does — **and, 2026-08-09, always adds the SearXNG `websearch` tool on
+  top of that narrowed-or-default set**, deduped against whatever's
+  already there, so every Writer can search mid-episode at will rather
+  than only through a pre-planned `research_plan` entry),
+  `build_research_adapter` (also gptme, narrowed via `v4/mcp_research.py`'s
+  `allowed_tools_for(query.kind)` — currently just the SearXNG `websearch`
+  tool for `web_search`, and *only* that tool, unlike the writer path
+  above — a research episode still has no reason to touch shell/file
+  tools; **any other backend, or a kind with no tool wired up, raises**
+  rather than silently granting full tool access to a research query —
+  `driver.py`'s `_phase_research` catches that `ValueError` and marks the
+  phase "skipped" instead of failing the run), and `parse_research_plan`
+  (the loose web/CLI JSON — a list of `{node_id, slug, kind, question}`
+  objects or a dict by node_id — into v4's typed plan dict).
 - `pipeline/prompts.py` — `build_node_prompt(node, run_dir)` assembles a
   writer's whole prompt before its bounded episode starts (brief, frozen
   contract, inputs list — spine unit ids and v4 finding paths the agent
@@ -677,9 +682,14 @@ classic harness. What remains is the gptme-only surface:
   for the same reason. `pipeline/backends.py`'s `build_research_adapter`
   passes `SEARXNG_TOOL_PATH` (via `v4/mcp_research.py`'s
   `allowed_tools_for("web_search")`) as a `GptmeAdapter`'s
-  `tool_allowlist` — scoped to *only* this tool, never added to a plain
-  Writer's `DEFAULT_TOOL_ALLOWLIST`, preserving v4's "pay the search-result
-  token cost once, in an isolated research episode" design.
+  `tool_allowlist` — scoped to *only* this tool, for the isolated v4
+  research episode. **`build_writer_adapter` now also adds it to every
+  plain Writer's tool set** (2026-08-09 — see the pipeline/backends.py
+  bullet in the v5 section above), on top of `DEFAULT_TOOL_ALLOWLIST` or
+  `node.tools`; the "pay the search-result cost once, in an isolated
+  episode" rule this file used to describe here no longer holds — search
+  is now available on every Writer turn, not only a pre-planned research
+  query's own turn.
 
 ## Provider configuration (`provider_config.py`)
 
@@ -744,20 +754,23 @@ no API key. Run everything:
 python3 -m unittest discover -s tests -p "test_*.py" -v
 ```
 
-**From a worktree (or any checkout other than the one this machine's
-`kusudaemon`/`lh_harness`/`waypoint` was last `pip install -e`'d from),
-prefix that with `PYTHONPATH=./src`.** Found 2026-08-09 while testing the
-dashboard server: this machine's conda base env still carries leftover
-`_editable_impl_lh_harness.pth` / `_editable_impl_waypoint.pth` files from
-earlier (pre-rename) editable installs of this same project, and — because
-`.pth` files add a bare directory to `sys.path`, not a specific
-package — they make `.../LongHorizon-Harness/src` (the *original*
-checkout, not whichever worktree you're actually in) importable as
-`kusudaemon` regardless of `cwd`. Bare `python3 -m unittest discover -s
-tests` from a worktree will happily run that worktree's *test files*
-against the original checkout's (unmodified) *package code* and report a
-false green. `PYTHONPATH=./src` puts the worktree's own `src/` first on
-`sys.path`, which wins.
+**Every test file starts with `sys.path.insert(0, str(_REPO_ROOT /
+"src"))` — this is load-bearing, not boilerplate.** Found 2026-08-09
+while testing the dashboard server: this machine's conda base env still
+carries leftover `_editable_impl_lh_harness.pth` /
+`_editable_impl_waypoint.pth` files from earlier (pre-rename) editable
+installs of this same project, and — because `.pth` files add a bare
+directory to `sys.path`, not a specific package — they make
+`.../LongHorizon-Harness/src` (the *original* checkout, not whichever
+worktree you're actually in) importable as `kusudaemon` regardless of
+`cwd`. Without the per-file `sys.path.insert` at position 0, running
+`python3 -m unittest discover -s tests` from a worktree would happily run
+that worktree's *test files* against the original checkout's (unmodified)
+*package code* and report a false green; every existing test file already
+guards against exactly this. `tests/test_dashboard_server.py` (new,
+below) initially skipped the guard and was fixed to match once this was
+understood — copy the guard into any new test file rather than assuming a
+bare `import kusudaemon` is safe.
 
 ~16s, 164 tests, all passing. `test_provider_config.py`'s `_EnvIsolatedTest`
 snapshots and restores the *entire* `os.environ` around each test now

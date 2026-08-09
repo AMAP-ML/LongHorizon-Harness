@@ -9,19 +9,23 @@ from __future__ import annotations
 
 import json
 import shutil
+import sys
 import tempfile
 import unittest
 import urllib.error
 import urllib.request
 from pathlib import Path
 
-from kusudaemon.dashboard.recursive import RecursiveRunState
-from kusudaemon.dashboard.server import make_server
-from kusudaemon.pipeline import approvals as approval_store
-from kusudaemon.pipeline.run_dir import run_spec_path
-from kusudaemon.v0.run_dir import create_run_dir, node_artifact_path
-from kusudaemon.v1.tree import TaskNode, TaskTree
-from kusudaemon.v1.run_dir import tree_path
+_REPO_ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(_REPO_ROOT / "src"))
+
+from kusudaemon.dashboard.recursive import RecursiveRunState  # noqa: E402
+from kusudaemon.dashboard.server import make_server  # noqa: E402
+from kusudaemon.pipeline import approvals as approval_store  # noqa: E402
+from kusudaemon.pipeline.run_dir import run_spec_path  # noqa: E402
+from kusudaemon.v0.run_dir import create_run_dir, node_artifact_path  # noqa: E402
+from kusudaemon.v1.tree import TaskNode, TaskTree  # noqa: E402
+from kusudaemon.v1.run_dir import tree_path  # noqa: E402
 
 
 def _write_scripted_run(runs_root: Path, run_id: str) -> Path:
