@@ -28,6 +28,9 @@ test = [
     "httpx2",
 ]
 
+[project.optional-dependencies]
+dev = ["pytest>=8"]
+
 [project.urls]
 Homepage = "https://github.com/AMAP-ML/LongHorizon-Harness"
 Issues = "https://github.com/AMAP-ML/LongHorizon-Harness/issues"
@@ -58,4 +61,6 @@ artifacts = [
 ]
 
 [tool.pytest.ini_options]
+# The package is not installed in a plain checkout, so tests import it from src.
+pythonpath = ["src"]
 testpaths = ["tests"]

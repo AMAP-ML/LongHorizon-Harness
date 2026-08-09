@@ -431,6 +431,9 @@ class DashboardState:
         return {
             "round_index": index,
             "next_step": _infer_next_step(plan_text),
+            # Written by the loop before the executor starts, so a round still in
+            # progress already shows which tier is running.
+            "executor_tier": _text("executor_tier.txt").strip(),
             "plan_text": plan_text,
             "task_state": _text("task_state.txt"),
             "task_contract": _text("task_contract.txt"),

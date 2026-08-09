@@ -41,6 +41,23 @@ DEFAULT_MAX_ROUNDS = 25
 RoleNextStep = Literal["gui", "cli", "done", "blocked", "invalid", "ask"]
 PromptLanguage = Literal["en", "zh"]
 
+# The executor tier is orthogonal to the GUI/CLI executor type: the type says
+# what kind of work the subtask is, the tier says how much model capability it
+# is worth. Both GUI and CLI executors exist in both tiers.
+ExecutorTier = Literal["cheap", "strong"]
+EXECUTOR_TIERS: tuple[ExecutorTier, ...] = ("cheap", "strong")
+DEFAULT_EXECUTOR_TIER: ExecutorTier = "cheap"
+DEFAULT_ESCALATION_TIER: ExecutorTier = "strong"
+# Escalate on the first genuinely failed audit. A retry on the same tier is not
+# briefed on what just failed (only the escalated executor is), so a second cheap
+# attempt would mostly repeat the first. Raise this to trade latency for cost, but
+# see `escalation_briefing` — an unbriefed retry round is largely wasted.
+DEFAULT_ESCALATE_AFTER_FAILURES = 1
+# A merely-incomplete audit is normal mid-run progress, not a failure, so it does
+# not count above. Instead, escalate once this many rounds in a row report the
+# same outstanding gap, which is what a cheap executor spinning looks like.
+DEFAULT_ESCALATE_AFTER_STALLED_ROUNDS = 3
+
 
 @dataclass
 class ExecResult:
@@ -87,10 +104,56 @@ class AuditReport:
 
 
 @dataclass
+class ExecutorRouting:
+    """Which executor tier runs a subtask, and when the harness escalates.
+
+    The default tier keeps routine work on the cheaper backend. Escalation is
+    the harness's own correction for a manager that misjudged difficulty, and it
+    reads two different signals:
+
+    * ``escalate_after_failures`` counts audits that report an actual problem —
+      blocked, suspect/violated integrity, a contract needing revision, or an
+      executor episode that errored. An audit that is merely ``incomplete`` with
+      clean integrity and an aligned contract is ordinary progress toward a
+      multi-round task and is deliberately **not** counted; treating it as a
+      failure would escalate on the first round of nearly every run.
+    * ``escalate_after_stalled_rounds`` catches the other shape of trouble: the
+      cheap tier producing clean-looking rounds that never close the same gap.
+
+    Either counter reaching 0 disables that signal.
+    """
+
+    default_tier: ExecutorTier = DEFAULT_EXECUTOR_TIER
+    escalate_after_failures: int = DEFAULT_ESCALATE_AFTER_FAILURES
+    escalate_after_stalled_rounds: int = DEFAULT_ESCALATE_AFTER_STALLED_ROUNDS
+    escalation_tier: ExecutorTier = DEFAULT_ESCALATION_TIER
+    # An escalated executor is a fresh session on a different backend, so
+    # without a briefing it would rediscover the dead ends the cheap tier
+    # already hit. See `format_executor_escalation_briefing`.
+    escalation_briefing: bool = True
+
+    def __post_init__(self) -> None:
+        for name in ("default_tier", "escalation_tier"):
+            value = getattr(self, name)
+            if value not in EXECUTOR_TIERS:
+                raise ValueError(
+                    f"{name} must be one of: {', '.join(EXECUTOR_TIERS)}; got {value!r}"
+                )
+        for name in ("escalate_after_failures", "escalate_after_stalled_rounds"):
+            value = getattr(self, name)
+            if isinstance(value, bool) or not isinstance(value, int):
+                raise ValueError(f"{name} must be an integer")
+            if value < 0:
+                raise ValueError(f"{name} must be 0 or more")
+
+
+@dataclass
 class ManagedRound:
     round_index: int
     next_step: RoleNextStep
     plan_text: str
+    # Empty on rounds that never reached an executor (done/blocked/ask/invalid).
+    executor_tier: str = ""
     executor_output: str = ""
     auditor_report: str = ""
     harness_feedback: str = ""
@@ -113,12 +176,14 @@ class HarnessConfig:
     auditor_budget: EpisodeBudget = field(
         default_factory=lambda: EpisodeBudget(max_duration_seconds=300)
     )
+    executor_routing: ExecutorRouting = field(default_factory=ExecutorRouting)
     workspace_path: str = DEFAULT_WORKSPACE_PATH
     harness_dir: str = DEFAULT_HARNESS_DIR
     log_dir: str = DEFAULT_LOG_DIR
     auditor_output_chars: int = 24_000
     role_verified_context_chars: int = 60_000
     role_history_chars: int = 100_000
+    escalation_briefing_chars: int = 12_000
     # English is the production default; Chinese remains available for
     # OSWorldv2-compatible role prompts and operator-facing control headers.
     prompt_language: PromptLanguage = "en"
