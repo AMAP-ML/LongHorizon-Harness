@@ -116,7 +116,7 @@ Before generating the DAG, you MUST:
     "nodes": [
       {
         "name": "Task Cannot Be Completed",
-        "info": "This task cannot Be Completed, worker can directly output Done to enable Final Check. Worker success quality check can output gate_done to enable Final Check. Final Check should outout gate_fail.",
+        "info": "This task cannot Be Completed, worker can directly output Done to enable Final Check. Worker success quality check can output gate_done to enable Final Check. Final Check should output gate_fail.",
         "assignee_role": "operator"
       }
     ],
