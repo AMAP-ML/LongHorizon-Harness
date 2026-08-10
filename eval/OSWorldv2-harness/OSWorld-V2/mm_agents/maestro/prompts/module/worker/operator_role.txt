@@ -14,7 +14,7 @@ Before executing any action, you MUST carefully review whether the current subta
 
 You are working in Ubuntu. You must only complete the subtask provided and not the larger goal.
 
-## Code Design principal
+## Code Design Principles
 You are provided with:
 1. A screenshot of the current time step.
 2. The history of your previous interactions with the UI.
