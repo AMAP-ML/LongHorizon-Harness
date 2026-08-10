@@ -23,6 +23,7 @@ sys.path.insert(0, str(_REPO_ROOT / "src"))
 
 from kusudaemon.adapters.tools.searxng_search import (  # noqa: E402
     DEFAULT_SEARXNG_URL,
+    DEFAULT_NUM_RESULTS,
     SearxngSearchError,
     _format_results,
     search,
@@ -130,6 +131,23 @@ class FormatResultsTest(unittest.TestCase):
     def test_answers_surfaced(self) -> None:
         text = _format_results("q", {"results": [], "answers": ["42"]})
         self.assertIn("Answer: 42", text)
+
+    def test_default_num_results_is_three(self) -> None:
+        # PLAN-zeromem.md §5.2b: the default dropped from 5 to 3 — the model
+        # still declares num_results when it wants more.
+        self.assertEqual(DEFAULT_NUM_RESULTS, 3)
+
+    def test_format_results_truncates_long_snippet(self) -> None:
+        # PLAN-zeromem.md §5.2a: MAX_SNIPPET_CHARS=300 — a snippet exists to
+        # tell the model whether to fetch the page, not to replace fetching it.
+        text = _format_results(
+            "q",
+            {"results": [{"title": "T", "url": "https://e.com", "content": "x" * 900}]},
+        )
+        self.assertNotIn("x" * 301, text)
+        self.assertIn("x" * 300, text)
+        self.assertIn("…", text)
+        self.assertLess(len(text), 500)
 
 
 if __name__ == "__main__":

@@ -268,6 +268,76 @@ pattern v0/v1 followed). Nothing in v0/v1 was modified beyond the one
   clean/patchable/regenerate re-validation triage over already-passed
   nodes (§10) is v3 scope (§13: "re-validation pass for contract
   amendments" is listed under v3, not v2).
+- `v2/embeddings.py` (new 2026-08-09, PLAN-zeromem.md §3) — the optional
+  embedding extra's front door: `DEFAULT_EMBED_MODEL = "BAAI/bge-m3"`,
+  `embeddings_available()` (import check, never raises), `embed_texts(texts,
+  model_name=..., batch_size=32)` (L2-normalized rows, module-level
+  `_model_cache`, lazy `sentence-transformers` import so the core package
+  and test suite stay extra-free), and a pure-stdlib `cosine`. Backs both
+  the deterministic survey below and `v2/retrieval.py`'s dense view.
+- `v2/survey.py`'s deterministic survey (`survey_chunks_deterministic`,
+  PLAN-zeromem.md §3; new 2026-08-09) — the model-free alternative to
+  `survey_chunks`: embedding dissimilarity `1 - cos(v_i, v_{i+1})`,
+  smoothed with a centered moving average (`DEFAULT_SMOOTHING_WINDOW=2`,
+  edges clamped — smoothing sets corpus-level contrast, never candidate
+  selection), `HEADING_BOOST=0.25` added at indices whose following chunk
+  starts with an author heading, threshold at the `boundary_percentile`
+  (0.75) quantile of the smoothed+boosted series. **Implemented variant
+  from the plan's literal algorithm, and why:** the plan's
+  "every index at/above the quantile fires" rule makes a lone odd chunk
+  (two-index dissimilarity plateau) always fire — contradicting §3.8 test
+  8's requirement that it not. So candidates are **strict local maxima of
+  the unsmoothed series** (sentinel `-1.0` at the edges, so corpus-end
+  peaks count) that clear the threshold — with author headings as
+  candidates regardless of peaks, since a heading outranks any embedding
+  gap. Confidence = min-max of the smoothed value; "at or above" accepts
+  the raw value too, so a genuine peak never loses to its own smoothing.
+  `_label_for_chunk` = first heading line stripped of `#` /
+  `Chapter|Section|Part N` / numbered-list markers, else the first 8
+  words, 120-char cap matching `SURVEY_SCHEMA`'s `maxLength`.
+- `v2/retrieval.py` (new 2026-08-09, PLAN-zeromem.md §4) — span retrieval
+  over the run's own chunked source, Zero-Mem's read path narrowed to the
+  node's own spine slice ("the planner already decided scope; retrieval is
+  not re-deciding it"). `build_chunk_index(run_dir, chunks, units)` writes
+  `chunks.jsonl` — one provenance-bearing line per chunk
+  `{index, unit_id, tokens, text}` — plus `chunks.emb.npy` /
+  `chunks.emb.meta.json` (embedding model name, so the query embeds with
+  the same model the index was built with) when `kusudaemon[retrieval]` is
+  installed; **idempotent**: a complete index (line count == chunk count)
+  is not rewritten. Called from `_phase_survey` while chunks are still in
+  memory (new 2026-08-09). `retrieve_spans(run_dir, node, query, *,
+  top_k=8, rho=0.6, neighbor_radius=1, dense=None)` — candidates are
+  chunks whose `unit_id` resolves from `node.inputs` via `_resolve_unit_ids`
+  (accepts bare ids *and* materialized `spine/<id>.md` paths; v4 finding
+  paths pass through as non-units); BM25 is in-module stdlib (~40 lines,
+  k1=1.5, b=0.75, IDF over the run's full chunk set — a ubiquitous term
+  can't dominate); dense cosine over candidates when the `.npy` exists,
+  fused Zero-Mem-style as `rho*dense + (1-rho)*bm25` after min-max
+  normalizing each view, with `dense` as an injectable seam (fake vectors
+  in tests; BM25 alone is degradation, not failure); closure pulls in
+  +/-`neighbor_radius` adjacent chunks of each winner, clamped to the
+  winner's own unit range ("a retrieved paragraph whose antecedent
+  sentence is in the previous chunk is worse than useless"); deduped and
+  returned in **ascending chunk order**, not score order. The query is
+  `node.brief` plus the node's rubric text — both already on the node, no
+  model call.
+- `pipeline/prompts.py`'s inline-spans mode (`build_node_prompt(node,
+  run_dir, *, inline_spans=False, top_k=DEFAULT_TOP_K)`, PLAN-zeromem.md
+  §4.4; new 2026-08-09) — opt-in replacement of the bare input-path list
+  with retrieved spans rendered under provenance headers
+  (`[unit-03 · chunk 41]`), so a Writer never has to open `source.txt`.
+  v4 finding paths (non-unit `node.inputs` entries, detected by
+  `_non_unit_inputs` against the loaded spine) stay in the "Inputs (read
+  them...)" section unchanged; the contract and rubric blocks are
+  untouched. Fallback to today's path-list rendering is **silent and
+  per-node** — unlike §3's phase-level fallback, which logs a loud
+  `survey_fallback` event — since a missing index here would spam the
+  event log once per node. `RunOptions.inline_spans` is persisted and
+  **defaults off** until §4.7's real-corpus A/B clears; `--inline-spans`
+  on both the CLI and `pipeline run` parsers. The byte-for-byte default
+  prompt is pinned by `test_pipeline_prompts.py`'s
+  `test_default_prompt_unchanged` — the regression guard for the whole
+  workstream.
 
 ## v3 — assembly and repair (`src/kusudaemon/v3/`)
 
@@ -382,6 +452,36 @@ touch to v1 (see below).
   for patchable and `mode="regenerate"` for regenerate, with the defect
   text derived straight from the triage verdict's own `id`/`defect`
   fields; clean nodes are left untouched.
+
+  **§2 lexical pre-filter (PLAN-zeromem.md)**: `run_revalidation_pass` and
+  `estimate_revalidation_cost` take optional keyword-only `amendment_text`
+  and `prefilter=True` args; `v3/prefilter.py`'s `artifact_may_be_affected`
+  is the deterministic pre-filter that decides before any Reviewer call
+  whether the amendment can possibly bear on a node. `prefilter` also
+  accepts a callable visitor `prefilter(amendment, node) -> bool` for
+  callers who want a node-type-aware classifier (the node-type template
+  system, still unbuilt) — driver and CLI both pass the plain-text default;
+  the `driver.py` `amend_and_revalidate` signature (text, names,
+  `prefilter` node-visitor) is the stable surface contract. `_triage_json`
+  records the skip in the audit file (`prefiltered: true` + `reason`), and
+  the node is labeled `"clean"` without marking it `"stale"` — its `"passed"`
+  status is untouched, so nothing ships "clean" on a false negative being
+  treated as a regression. ~Tests: `test_v3_prefilter.py`'s §2.7 unit set.
+- `v3/prefilter.py` — deterministic lexical pre-filter for
+  `revalidate.py`'s re-validation pass, per PLAN-zeromem.md §2. A node is
+  skipped (returns `(False, reason)`) only when *all* of: the amendment's
+  `distinguishing_terms` (tokens of len >= 4 minus a ~180-word STOPWORDS
+  frozenset) are non-empty; none of those terms (with singular/plural
+  variants, word-boundary-matched via regex `\b…\b`, case-folded) appears
+  in the artifact or the node's rubric text; and if both `shape` and
+  `amendment_shape` are given, they differ. Shape-match forces review
+  (a rule scoped to the node's own shape can never be skipped on shape
+  grounds). Any condition it cannot decide returns `(True, reason)` — it
+  can only produce "clean", so a false skip is the failure mode it is
+  engineered against, and the matching leans wide on purpose: variants
+  count as hits, boundaries are word-level not substring, and an amendment
+  with no distinguishing terms disables the filter entirely (review
+  everything).
 
 One additive touch to v1: `TaskNode.status` (`v1/tree.py`) gained
 `"stale"` (§10: "Amend contract... completed nodes now stale"). A passed
@@ -538,7 +638,13 @@ carries the TUI's additions forward.
   `repair.run_repair` per non-clean node, patch or regenerate per its
   classification), `reopen_node` (mark one passed node stale and dispatch
   a single scoped repair from operator defect text; refuses nodes that
-  are not `"passed"`).
+  are not `"passed"`). `RunOptions.survey_mode` ("model"/"embedding") and
+  `RunOptions.inline_spans` (PLAN-zeromem.md §3/§4) both round-trip
+  through `to_spec`/`from_spec`; `_phase_survey` switches on survey_mode
+  (with a loud `survey_fallback` event if the embedding extra is missing)
+  and calls `build_chunk_index` while chunks are still in memory;
+  `_phase_execute`'s `prompt_for_node` lambda threads `inline_spans`
+  through.
 - `pipeline/backends.py` — one module deciding which agent backend a run's
   writers and research queries use, so the driver never constructs an
   adapter: `build_writer_adapter` (gptme is the only entry in
@@ -558,15 +664,20 @@ carries the TUI's additions forward.
   phase "skipped" instead of failing the run), and `parse_research_plan`
   (the loose web/CLI JSON — a list of `{node_id, slug, kind, question}`
   objects or a dict by node_id — into v4's typed plan dict).
-- `pipeline/prompts.py` — `build_node_prompt(node, run_dir)` assembles a
-  writer's whole prompt before its bounded episode starts (brief, frozen
-  contract, inputs list — spine unit ids and v4 finding paths the agent
-  reads with its own tools — and judgment rubric). No model calls.
+- `pipeline/prompts.py` — `build_node_prompt(node, run_dir, *,
+  inline_spans=False, top_k=DEFAULT_TOP_K)` assembles a writer's whole
+  prompt before its bounded episode starts (brief, frozen contract, inputs
+  list — spine unit ids and v4 finding paths the agent reads with its own
+  tools — and judgment rubric; see the v2 section's inline-spans bullet
+  for the opt-in PLAN-zeromem.md §4 mode that replaces that list with
+  retrieved spans under provenance headers). No model calls.
 - `pipeline/run.py` — the standalone entrypoint (`python -m
   kusudaemon.pipeline.run`) that both `kusudaemon pipeline run` and its
   `--detach` mode spawn, so one argument parser stays in sync with one run
   loop. A run id whose `run.spec.json` already exists *resumes*: the disk
-  is authoritative, argv contributes nothing but the id.
+  is authoritative, argv contributes nothing but the id. Mirror of the CLI
+  flag set: `--survey-mode` (model/embedding) and `--inline-spans` land
+  here from `RunOptions`' persisted `to_spec`/`from_spec` round trip.
 - `pipeline/cli.py` — builds the `kusudaemon` CLI itself (§11's control
   surface; note it is a *flat* set of subcommands — `kusudaemon run`,
   `kusudaemon status <id>`, etc. — not a `kusudaemon pipeline <cmd>`
@@ -957,7 +1068,7 @@ that worktree's *test files* against the original checkout's (unmodified)
 guards against exactly this — copy the guard into any new test file
 rather than assuming a bare `import kusudaemon` is safe.
 
-~19s, 198 tests, all passing. `test_provider_config.py`'s
+~19s, 299 tests, all passing. `test_provider_config.py`'s
 `_EnvIsolatedTest` snapshots and restores the *entire* `os.environ` around
 each test — the previous partial-restore logic only put back keys that
 had a prior value, so a test setting e.g. `KUSUDAEMON_PROVIDER` fresh (no
@@ -1085,11 +1196,14 @@ fails loudly instead of `round_loop.py` silently misbehaving.
    puts `--allowedTools` and the given tool names on the built command
    line; omitting it omits the flag.
 
-### v2 (`tests/test_v2_*.py`, 36 tests)
+### v2 (`tests/test_v2_*.py`, 58 tests)
 
 All against fakes — `FakeProvider` for every `complete_json` call,
 `FakeStreamAgentAdapter`/`fake_stream_agent.py` for the one real-subprocess
-Writer episode in the pilot tests. No new fixtures were needed.
+Writer episode in the pilot tests. No new fixtures were needed. The
+deterministic-survey and retrieval suites (PLAN-zeromem.md §3.8/§4.6) never
+import `sentence-transformers` — vectors are injected — so the core suite
+stays free of the `retrieval` extra.
 
 - `test_v2_intake.py` (4) — the 7-question-then-finalize call count; an
   unanswered dimension shows up in `assumptions`; `render_spec_md`
@@ -1118,6 +1232,33 @@ Writer episode in the pilot tests. No new fixtures were needed.
   zero rules and zero provider calls; `freeze_contract`/`amend_contract`
   cover the round trip, the token-ceiling rejection leaving no partial
   write, and amendment appending without erasing prior rules.
+- `test_v2_survey_deterministic.py` (12, PLAN-zeromem.md §3.8) — all of
+  it against hand-built vectors injected through `embed_fn`, so the core
+  suite stays free of the `retrieval` extra: a clean topic shift emits
+  exactly one vote at the boundary (a `[0,0,1,0,0]` dissimilarity series
+  fires only index 2); a uniform corpus emits no high-confidence votes and
+  `assemble_spine` folds to one unit; the lone odd chunk's plateau
+  (`[0,0,1,1,0,0]`) fires nothing at `smoothing_window=2` — the §3.8 test
+  8 requirement that forced the implemented-variant algorithm in
+  `survey_chunks_deterministic`; a purely uniform corpus still emits a
+  vote when an author heading (boost) arms the candidate; confidence is
+  min-max-normalized into [0,1]; `_label_for_chunk` covers the heading,
+  first-8-words fallback, and 120-char cap; `embeddings_available()`
+  returns False without the extra and `embed_texts` raises
+  `EmbeddingsUnavailable`; an end-to-end spine assembly stays contiguous
+  and covers every chunk.
+- `test_v2_retrieval.py` (10, PLAN-zeromem.md §4.6) — BM25 ranks the
+  exact-term-match chunk first and IDF downweights a term that appears in
+  every chunk; candidates are restricted to the node's own units (a
+  higher-scoring chunk in another unit is never returned); closure pulls
+  in the winner's adjacent chunks (clamped to its unit); results come
+  back deduped in ascending document order; an injected fake `dense`
+  scorer flips the top rank vs BM25-only (fusion = `rho*dense +
+  (1-rho)*bm25` after min-max on each view); no embeddings degrades to
+  BM25 without error; `build_chunk_index` is idempotent (second call
+  rewrites nothing — mtime unchanged) and every line round-trips
+  `unit_id`/`index`/`tokens`/`text`; materialized `spine/<id>.md` input
+  paths resolve to units while v4 finding paths pass through.
 
 ### v3 (`tests/test_v3_*.py`, 28 tests)
 
@@ -1151,14 +1292,27 @@ toolchain needed since the compile gate is a generic injected command).
   literal marker string proving the repaired content actually flowed
   through); an unattributable compile failure escalates without dispatching
   any repair.
-- `test_v3_revalidate.py` (7) — `classify_verdict`'s four buckets (pass →
+- `test_v3_revalidate.py` (10) — `classify_verdict`'s four buckets (pass →
   clean; all-patchable failures → patchable; missing class → regenerate;
   mixed patchable+regenerate → regenerate); `estimate_revalidation_cost`
   counts only passed nodes and scales with contract/artifact size;
   `run_revalidation_pass` is read-only (asserted via `FakeProvider` call
   count matching exactly the passed-node count) and marks non-clean nodes
   `"stale"`; `apply_revalidation_triage` leaves clean nodes untouched and
-  routes patchable through `repair.run_repair`.
+  routes patchable through `repair.run_repair`. `PrefilterRevalidationTest`
+  (3, PLAN-zeromem.md §2.7) — with `amendment_text`+`prefilter=True`, nodes
+  the amendment provably can't bear on are skipped: zero provider calls
+  for them (FakeProvider's queue holds exactly one verdict), they stay
+  `"passed"`, and their audit file carries `prefiltered: true` + `reason`;
+  `prefilter=False` reviews every node; the estimate reports a nonzero
+  `skipped_count` with a lower token estimate than the unfiltered pass.
+- `test_v3_prefilter.py` (10, PLAN-zeromem.md §2.7's unit set) —
+  `artifact_may_be_affected`/`distinguishing_terms` directly: stopwords
+  dropped (incl. "every" from the harness list); an amendment with no
+  distinguishing terms disables the filter; absent terms skip with a
+  reason; a term present in the artifact *or* the rubric forces review;
+  plural/singular variants match; word-boundary matching (not substring);
+  shape mismatch skips when terms are absent, shape match forces review.
 
 ### v4 (`tests/test_v4_*.py`, 9 tests)
 
@@ -1222,39 +1376,3 @@ Fixtures (`tests/fixtures/`):
   off a list and asserts it validates against the schema it was called with.
 - `run_node_subprocess.py` — CLI wrapper so `run_node` can be launched as an
   independently-killable OS process.
-
-## Explicitly out of scope (do not build here)
-
-**Still open after v4** — the node-type template system (so leaves still
-carry only v1's generic gates — no `headers:std`/`terms_defined`/
-`problems>=N` — and no judgment/rubric items; `v1/gates.py`,
-`v2/planner.py`, and `v3/checks.py`'s docstrings all flag this same gap —
-it's also why `checks.py` can't check `refs_out` resolution or glossary
-terms, and why `glossary.json` from `PLAN.md` §5 is still unbuilt), Codex
-per-node tool restriction, concurrent/parallel dispatch (round loop and
-assembly loop are both sequential — `depends_on` is tracked so this is a
-config change later, not a redesign, per §4.5), an automatic research-query
-planner (v4's `research_loop.py` takes an explicit caller-supplied
-`plan` — deciding *which* nodes need *which* questions answered is not
-built, the same "hand- or script-authored" starting point v1's trees had
-before v2's planner existed). The view surface for the recursive harness
-(§11's "View surface") **is now built and mounted** (`src/kusudaemon/
-dashboard/`, reachable via `kusudaemon serve` or bare `kusudaemon` — see
-the v5 section above for its full three-act history: web app, then a
-Textual TUI, then a rebuilt web app carrying the TUI's additions
-forward); earlier revisions of this file listed it here as unbuilt or
-described whichever of the three it was at the time, and none of that
-belongs in this section anymore either way. Still genuinely unbuilt: no
-auth of any kind on the dashboard server — `--host`/`--port` default to
-127.0.0.1 only, so this is a real gap the moment anyone binds it wider
-than loopback, unlike when this surface was briefly a local terminal
-process with no network exposure at all — and no multi-run concurrency
-limit (nothing stops the operator from starting enough runs from the
-"+ New Run" form to hit local resource limits); also no gptme-native
-nested-subagent surfacing (the `subagent` tool gptme itself ships,
-letting *one* dispatched episode spawn further gptme-managed subagents of
-its own — distinct from this harness's own notion of "subagent" as one
-dispatched Writer/repair/research episode, which the dashboard's
-Subagents tab and interject mechanism do cover; see the
-`dashboard/state.py` bullet in the v5 section above). `PLAN.md` §13's
-build ladder ends at v4; none of this is scoped in `PLAN.md` yet.

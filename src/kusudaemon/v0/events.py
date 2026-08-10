@@ -56,15 +56,29 @@ class EventLog:
                     continue
         return events
 
+    @staticmethod
+    def scan(
+        events: list[dict[str, Any]], node_id: str, event_type: str
+    ) -> dict[str, Any] | None:
+        """Last matching event from an already-parsed list, in memory.
+
+        Internal hot-path helper: ``run_node`` reads the log exactly once
+        per dispatch and scans the parsed list for each event it needs,
+        instead of re-parsing the whole file once per ``last_event`` call
+        (PLAN-zeromem.md §10). ``last_event`` keeps its public signature so
+        every other caller is unaffected.
+        """
+        match: dict[str, Any] | None = None
+        for event in events:
+            if event.get("node_id") == node_id and event.get("type") == event_type:
+                match = event
+        return match
+
     def events_for(self, node_id: str) -> list[dict[str, Any]]:
         return [event for event in self.read_all() if event.get("node_id") == node_id]
 
     def last_event(self, node_id: str, event_type: str) -> dict[str, Any] | None:
-        match: dict[str, Any] | None = None
-        for event in self.read_all():
-            if event.get("node_id") == node_id and event.get("type") == event_type:
-                match = event
-        return match
+        return self.scan(self.read_all(), node_id, event_type)
 
     def has_terminal(self, node_id: str) -> bool:
         return self.last_event(node_id, "episode_completed") is not None

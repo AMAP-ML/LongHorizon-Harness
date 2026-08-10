@@ -45,6 +45,33 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--max-rounds", type=int, default=100, help="Maximum orchestrator rounds in the execute phase.")
     parser.add_argument("--max-attempts", type=int, default=3, help="Retry limit per node before it is blocked.")
+    parser.add_argument(
+        "--dispatch-policy",
+        choices=("model", "document_order"),
+        default="model",
+        help="document_order skips the per-round orchestrator LLM call and "
+        "dispatches the earliest ready node in document order (PLAN-zeromem.md §1)",
+    )
+    parser.add_argument(
+        "--document-review",
+        action="store_true",
+        help="Run PLAN-zeromem.md §8 document-level review passes after "
+        "assembly (approval-gated before repairs).",
+    )
+    parser.add_argument(
+        "--survey-mode",
+        choices=("model", "embedding"),
+        default="model",
+        help="embedding replaces the per-window model survey with "
+        "embedding-dissimilarity boundaries (PLAN-zeromem.md §3); "
+        "falls back to model when kusudaemon[retrieval] is not installed.",
+    )
+    parser.add_argument(
+        "--inline-spans",
+        action="store_true",
+        help="Inline top-k retrieved spans from the node's own spine slice "
+        "into its prompt instead of bare input paths (PLAN-zeromem.md §4).",
+    )
     return parser
 
 
@@ -103,6 +130,10 @@ def run_from_args(argv: list[str] | None = None, *, env: Environment | None = No
             research_plan=_parse_plan(args.research_plan),
             max_rounds=args.max_rounds,
             max_attempts=args.max_attempts,
+            dispatch_policy=args.dispatch_policy,
+            document_review=args.document_review,
+            survey_mode=args.survey_mode,
+            inline_spans=args.inline_spans,
         )
 
     driver = RecursiveDriver(

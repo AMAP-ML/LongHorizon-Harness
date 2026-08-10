@@ -477,5 +477,63 @@ class PerNodeToolRestrictionTest(unittest.TestCase):
         self.assertIn("shell,read,save,patch", adapter.command_template)
 
 
+class DeterministicDispatchRoundLoopTest(unittest.TestCase):
+    """PLAN-zeromem.md §1.6 item 8: the same two-node chain as
+    LinearChainRoundLoopTest rerun with ``dispatch_policy="document_order"``
+    — identical final tree, identical manifest line count, with the
+    ``FakeProvider`` queue holding *only* reviewer responses. Same outcome,
+    fewer calls."""
+
+    def test_chain_runs_identically_with_zero_orchestrator_calls(self) -> None:
+        with tempfile.TemporaryDirectory() as root_str:
+            root = Path(root_str)
+            run_dir = create_run_dir(root, "run-policy")
+            prompt_dir = root / "prompts"
+            prompt_dir.mkdir(parents=True, exist_ok=True)
+
+            _write_tree(
+                tree_path(run_dir),
+                [
+                    {"id": "a", "brief": "first", "artifact": "out/a.md", "gates": ["nonempty"]},
+                    {
+                        "id": "b",
+                        "brief": "second",
+                        "artifact": "out/b.md",
+                        "gates": ["nonempty"],
+                        "depends_on": ["a"],
+                    },
+                ],
+            )
+
+            # No orchestrator responses at all: the deterministic policy
+            # dispatches without popping anything. FakeProvider raises if
+            # anything tries to pop — the strictest zero-call assertion.
+            provider = FakeProvider([])
+
+            tree = asyncio.run(
+                run_round_loop(
+                    run_dir,
+                    tree_path(run_dir),
+                    writer_adapter_factory=_adapter_factory(root, run_dir, prompt_dir),
+                    env=LocalEnvironment(tmp_dir=str(prompt_dir)),
+                    provider=provider,
+                    prompt_for_node=lambda node: f"do {node.id}",
+                    writer_budget=EpisodeBudget(max_duration_seconds=30),
+                    dispatch_policy="document_order",
+                )
+            )
+
+            self.assertEqual(tree.nodes["a"].status, "passed")
+            self.assertEqual(tree.nodes["b"].status, "passed")
+            self.assertEqual(len(provider.calls), 0)
+            manifest_lines = manifest_path(run_dir).read_text(encoding="utf-8").splitlines()
+            self.assertEqual(len(manifest_lines), 2)
+            # The decision's dispatcher writes which policy produced each
+            # round into the trace, unchanged by design (§1.4).
+            reloaded = TaskTree.load(tree_path(run_dir))
+            self.assertEqual(reloaded.nodes["a"].status, "passed")
+            self.assertEqual(reloaded.nodes["b"].status, "passed")
+
+
 if __name__ == "__main__":
     unittest.main()

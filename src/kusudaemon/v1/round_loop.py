@@ -39,7 +39,11 @@ from ..types import EpisodeBudget
 from ..v0.events import EventLog
 from .gates import GateResult, all_passed, evaluate_gates, unmet
 from .manifest import append_manifest_line
-from .orchestrator import DispatchDecision, decide_next_action
+from .orchestrator import (
+    DispatchDecision,
+    DispatchPolicy,
+    decide_next_action_with_policy,
+)
 from .provider import OpenAICompatibleProvider
 from .reviewer import ReviewVerdict, review_node
 from .run_dir import audit_path, events_path, manifest_path, node_artifact_path, round_trace_path
@@ -59,17 +63,20 @@ async def run_round_loop(
     provider: OpenAICompatibleProvider,
     prompt_for_node: PromptBuilder,
     writer_budget: EpisodeBudget | None = None,
+    writer_budget_for: Callable[[TaskNode], EpisodeBudget] | None = None,
     max_rounds: int = 100,
     max_attempts: int = 3,
+    dispatch_policy: DispatchPolicy = "model",
 ) -> TaskTree:
     run_dir = Path(run_dir)
     tree = TaskTree.load(tree_path)
     log = EventLog(events_path(run_dir))
     manifest = manifest_path(run_dir)
-    budget = writer_budget or EpisodeBudget()
+    default_budget = writer_budget or EpisodeBudget()
 
     async def dispatch(node: TaskNode) -> None:
         adapter = writer_adapter_factory(node)
+        budget = writer_budget_for(node) if writer_budget_for is not None else default_budget
         result, promotion = await run_writer_node(
             run_dir, node, prompt_for_node(node), adapter, env, budget
         )
@@ -102,7 +109,13 @@ async def run_round_loop(
             await review(node)
 
     for round_index in range(max_rounds):
-        decision = decide_next_action(tree, str(manifest), provider, round_index=round_index)
+        decision = decide_next_action_with_policy(
+            tree,
+            str(manifest),
+            provider,
+            round_index=round_index,
+            policy=dispatch_policy,
+        )
         _write_round_trace(run_dir, round_index, tree, decision)
 
         if decision.action == "halt":

@@ -34,15 +34,20 @@ async def run_node(
     run_dir = Path(run_dir)
     log = EventLog(events_path(run_dir))
 
-    completed = log.last_event(node_id, "episode_completed")
+    # One parse of events.jsonl for the whole dispatch; every per-node query
+    # scans the parsed list in memory. events.jsonl is append-only and
+    # fsync'd per record (EventLog's contract), so a single read sees a
+    # consistent prefix of the durable log.
+    events = log.read_all()
+    completed = EventLog.scan(events, node_id, "episode_completed")
     if completed is not None:
         # Resume-after-complete is a pure no-op: replay the recorded result
         # instead of re-dispatching, so calling run_node twice never produces
         # two artifacts or two terminal events for the same node.
         return _result_from_completed_event(completed)
 
-    dispatched = log.last_event(node_id, "node_dispatched")
-    session = log.last_event(node_id, "session_captured")
+    dispatched = EventLog.scan(events, node_id, "node_dispatched")
+    session = EventLog.scan(events, node_id, "session_captured")
     supports_resume = bool(getattr(adapter, "supports_session_resume", False))
 
     resume_session_id: str | None = None

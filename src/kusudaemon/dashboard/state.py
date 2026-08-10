@@ -29,11 +29,12 @@ resolves the same file, so no surface owns a run.
 from __future__ import annotations
 
 import json
+import os
 import threading
 import time
 import uuid
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from ..v0.events import EventLog
 from ..v0.run_dir import events_path, manifest_path, node_artifact_path, node_scratch_dir, node_trace_path, spec_path
@@ -56,7 +57,7 @@ from ..pipeline.driver import (
     apply_triage,
     reopen_node,
 )
-from ..pipeline.run_dir import halt_path, jobs_path, phase_path, run_spec_path
+from ..pipeline.run_dir import approvals_path, halt_path, jobs_path, phase_path, run_spec_path
 from . import gptme_queue
 
 _DEFAULT_RUN_ID_PREFIX = "rec"
@@ -76,6 +77,48 @@ class RunState:
         self._lock = threading.Lock()
         self._attached: str | None = None
         self._hosts: dict[str, threading.Thread] = {}
+        # Parse-on-change cache for the per-snapshot file reads: keyed by
+        # path, value is (stat stamp, parsed result). Depends on the
+        # append-only invariant — see _cached_read.
+        self._file_cache: dict[str, tuple[Any, Any]] = {}
+
+    def _cached_read(self, path: Path, loader: Callable[[], Any]) -> Any:
+        """``loader()`` result cached until the file's (st_size, st_mtime_ns)
+        changes — the dashboard's hot path (a snapshot every _STREAM_INTERVAL
+        per client) stops re-parsing files that haven't moved
+        (PLAN-zeromem.md §10.2).
+
+        **Depends on the append-only invariant**: events.jsonl and
+        approvals.jsonl are append-only and fsync'd per record
+        (v0/events.py's whole contract), so a same-size same-nanosecond
+        rewrite can never occur and the cache cannot serve stale data for
+        them. tree.json *is* rewritten in place by ``TaskTree.save``; a
+        same-size same-nanosecond rewrite would be served stale for at most
+        one poll, accepted per §10.2's stated caveat. If anything ever
+        rewrites an append-only log in place, this breaks silently.
+        """
+        key = str(path)
+        try:
+            stat = os.stat(path)
+            stamp = (stat.st_size, stat.st_mtime_ns)
+        except OSError:
+            stamp = None
+        if self._file_cache.get(key, (None, None))[0] == stamp:
+            return self._file_cache[key][1]
+        value = loader()
+        self._file_cache[key] = (stamp, value)
+        return value
+
+    def _cached_events(self, run_dir: Path) -> list[dict[str, Any]]:
+        path = events_path(run_dir)
+        return self._cached_read(path, lambda: EventLog(path).read_all())
+
+    def _cached_tree(self, run_dir: Path) -> TaskTree:
+        return self._cached_read(run_dir / "tree.json", lambda: _load_tree(run_dir))
+
+    def _cached_approvals(self, run_dir: Path) -> list[Any]:
+        path = approvals_path(run_dir)
+        return self._cached_read(path, lambda: approval_store.read_all(run_dir))
 
     # ------------------------------------------------------------------
     # Run scanning / attachment (read-only browsing across runs_root)
@@ -149,9 +192,9 @@ class RunState:
             }
         spec = _read_json(run_spec_path(run_dir)) or {}
         phase = _read_json(phase_path(run_dir)) or {}
-        events = EventLog(events_path(run_dir)).read_all()
-        tree = _load_tree(run_dir)
-        approvals = approval_store.read_all(run_dir)
+        events = self._cached_events(run_dir)
+        tree = self._cached_tree(run_dir)
+        approvals = self._cached_approvals(run_dir)
         return {
             "attached": True,
             "run_id": self.attached_run_id,
@@ -182,7 +225,7 @@ class RunState:
         run_dir = self._attached_dir()
         if run_dir is None:
             return []
-        events = EventLog(events_path(run_dir)).read_all()
+        events = self._cached_events(run_dir)
         return [e for e in events[after:]]
 
     # ------------------------------------------------------------------

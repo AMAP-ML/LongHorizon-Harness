@@ -35,6 +35,7 @@ VERDICT_SCHEMA: dict[str, Any] = {
                     "pass": {"type": "boolean"},
                     "defect": {"type": "string", "maxLength": 300},
                     "class": {"type": "string", "enum": ["patchable", "regenerate"]},
+                    "node_ids": {"type": "array", "items": {"type": "string"}},
                 },
             },
         },

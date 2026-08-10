@@ -1,13 +1,15 @@
 """Run-directory path helpers layered on top of v0/v1 (PLAN.md §5).
 
 v0 owns ``spec.md``/``events.jsonl``/``manifest.jsonl``/``scratch``/``out``;
-v1 adds ``tree.json``/``audit/``/``orchestrator/``. v2 adds the two paths
-its own state needs: ``spine.json`` (discovered structure, §4.2) and
-``contract.md`` (frozen after pilot, §4.4). Both are plain accessors — the
-files are created by whichever v2 module actually writes them
-(``survey.save_spine``, ``contract.freeze_contract``), not pre-touched here,
-since unlike v0's single-node files they don't exist until survey/pilot
-actually run.
+v1 adds ``tree.json``/``audit/``/``orchestrator/``. v2 adds the paths its own
+state needs: ``spine.json`` (discovered structure, §4.2), ``contract.md``
+(frozen after pilot, §4.4), and the chunk-level retrieval index —
+``chunks.jsonl`` + optional ``chunks.emb.npy``/``chunks.emb.meta.json``
+(PLAN-zeromem.md §4). All are plain accessors — the files are created by
+whichever v2 module actually writes them (``survey.save_spine``,
+``contract.freeze_contract``, ``retrieval.build_chunk_index``), not
+pre-touched here, since unlike v0's single-node files they don't exist until
+survey/pilot/plan actually run.
 """
 
 from __future__ import annotations
@@ -51,3 +53,26 @@ def spine_units_dir(run_dir: str | Path) -> Path:
 
 def spine_unit_path(run_dir: str | Path, unit_id: str) -> Path:
     return spine_units_dir(run_dir) / f"{unit_id}.md"
+
+
+def chunk_index_path(run_dir: str | Path) -> Path:
+    """``chunks.jsonl`` — one provenance-bearing line per chunk
+    (PLAN-zeromem.md §4.3). Written by ``retrieval.build_chunk_index``
+    inside ``_phase_survey``, where chunks are still in memory."""
+
+    return Path(run_dir) / "chunks.jsonl"
+
+
+def chunk_embeddings_path(run_dir: str | Path) -> Path:
+    """``chunks.emb.npy`` — float32 rows per chunk, in chunk order. Written
+    only when ``kusudaemon[retrieval]`` is installed (PLAN-zeromem.md §4.3:
+    dense scoring is a degradation-safe upgrade over BM25 alone)."""
+
+    return Path(run_dir) / "chunks.emb.npy"
+
+
+def chunk_embeddings_meta_path(run_dir: str | Path) -> Path:
+    """``chunks.emb.meta.json`` — the embedding model name, so retrieval can
+    embed its query with the same model the index was built with."""
+
+    return Path(run_dir) / "chunks.emb.meta.json"

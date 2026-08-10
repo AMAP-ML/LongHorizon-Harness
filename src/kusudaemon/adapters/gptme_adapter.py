@@ -80,6 +80,7 @@ class GptmeAdapter(CommandAgentAdapter):
         workspace_path: str = DEFAULT_WORKSPACE_PATH,
         prompt_dir: str = f"{DEFAULT_TMP_DIR}/prompts",
         python_executable: str = sys.executable,
+        hidden_paths: tuple[str, ...] = (),
     ) -> None:
         resolved = resolve(api_key=api_key or "", base_url=base_url or "", model=model or "")
         if not resolved.api_key:
@@ -118,6 +119,7 @@ class GptmeAdapter(CommandAgentAdapter):
             prompt_dir=prompt_dir,
             workspace_path=workspace_path,
             visible_output_parser=gptme_visible_output,
+            hidden_paths=hidden_paths,
         )
 
 

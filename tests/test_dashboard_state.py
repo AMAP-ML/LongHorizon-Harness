@@ -19,6 +19,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 _REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(_REPO_ROOT / "src"))
@@ -117,6 +118,59 @@ class RunStateTest(unittest.TestCase):
     def test_events_tail(self) -> None:
         self.state.attach("run-a")
         self.assertIsInstance(self.state.events_tail(0), list)
+
+
+class SnapshotEventCacheTest(unittest.TestCase):
+    """PLAN-zeromem.md §10.3: snapshot() re-parses events.jsonl only when
+    the file's (st_size, st_mtime_ns) changes — the SSE loop calls
+    snapshot() every _STREAM_INTERVAL per client, and an unchanged log must
+    not be re-parsed on every tick."""
+
+    def setUp(self) -> None:
+        self.tmp = Path(tempfile.mkdtemp())
+        self.runs_root = self.tmp / "runs"
+        self.runs_root.mkdir()
+        self.run_dir = _write_scripted_run(self.runs_root, "run-a")
+        self.state = RunState(self.runs_root)
+        self.state.attach("run-a")
+
+    def tearDown(self) -> None:
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_snapshot_reuses_cached_events(self) -> None:
+        real_read_all = EventLog.read_all
+        calls = {"n": 0}
+
+        def counting_read_all(self_):
+            calls["n"] += 1
+            return real_read_all(self_)
+
+        with mock.patch.object(EventLog, "read_all", counting_read_all):
+            self.state.snapshot()
+            self.state.snapshot()
+        self.assertEqual(
+            calls["n"], 1, "unchanged log must not be re-parsed"
+        )
+
+    def test_snapshot_reparses_after_append(self) -> None:
+        real_read_all = EventLog.read_all
+        calls = {"n": 0}
+
+        def counting_read_all(self_):
+            calls["n"] += 1
+            return real_read_all(self_)
+
+        with mock.patch.object(EventLog, "read_all", counting_read_all):
+            self.state.snapshot()
+            EventLog(events_path(self.run_dir)).append(
+                {"node_id": "1", "role": "writer", "round": 0, "type": "node_redispatched", "reason": "resumed_session"}
+            )
+            self.state.snapshot()
+        self.assertEqual(
+            calls["n"], 2, "an appended line must invalidate the cache"
+        )
+        snap = self.state.snapshot()
+        self.assertEqual(snap["events_count"], 1)
 
 
 class SubagentsAndInterjectTest(unittest.TestCase):

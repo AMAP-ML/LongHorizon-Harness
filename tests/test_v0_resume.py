@@ -351,5 +351,45 @@ class EventLogFsyncTest(unittest.TestCase):
             self.assertEqual(len(lines), 2)
 
 
+class EventLogReadsOncePerDispatchTest(unittest.TestCase):
+    """PLAN-zeromem.md §10.3: run_node parses events.jsonl exactly once per
+    dispatch, however many per-node events it has to consult."""
+
+    def test_run_node_reads_event_log_once(self) -> None:
+        with tempfile.TemporaryDirectory() as root_str:
+            root = Path(root_str)
+            run_dir = create_run_dir(root, "run1read")
+            node_id = "writer_readonce"
+            prompt_dir = root / "prompts"
+            prompt_dir.mkdir(parents=True, exist_ok=True)
+
+            adapter = FakeStreamAgentAdapter(
+                script_path=str(FAKE_CLI),
+                pidfile=str(root / "writer_readonce.pid"),
+                prompt_dir=str(prompt_dir),
+                workspace_path=str(run_dir),
+            )
+            env = LocalEnvironment(tmp_dir=str(prompt_dir))
+            budget = EpisodeBudget(max_duration_seconds=30)
+
+            log = EventLog(run_dir / "events.jsonl")
+            real_read_all = EventLog.read_all
+            calls = {"n": 0}
+
+            def counting_read_all(self_):
+                calls["n"] += 1
+                return real_read_all(self_)
+
+            with mock.patch.object(EventLog, "read_all", counting_read_all):
+                result = asyncio.run(
+                    run_node(run_dir, node_id, "do the task", adapter, env, budget)
+                )
+
+            self.assertEqual(result.status, "done")
+            # A fresh run consults episode_completed / node_dispatched /
+            # session_captured — three in-memory scans over one parse.
+            self.assertEqual(calls["n"], 1, "run_node must parse events.jsonl exactly once")
+
+
 if __name__ == "__main__":
     unittest.main()

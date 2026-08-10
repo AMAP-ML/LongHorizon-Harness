@@ -17,6 +17,7 @@ Coverage:
 from __future__ import annotations
 
 import asyncio
+import json
 import sys
 import tempfile
 import unittest
@@ -138,6 +139,101 @@ class RevalidationPassTest(unittest.TestCase):
 
             self.assertTrue(revalidation_audit_path(run_dir, "clean1").exists())
             self.assertTrue(revalidation_audit_path(run_dir, "patch1").exists())
+
+
+class PrefilterRevalidationTest(unittest.TestCase):
+    """PLAN-zeromem.md §2.7 items 10-12: the pre-filter skips nodes the
+    amendment provably cannot bear on, records the skip in the audit file,
+    and the estimate reflects skipped counts."""
+
+    def _run_dir_with_three_passed(self, root: Path, run_id: str = "run-prefil"):
+        run_dir = create_run_dir(root, run_id)
+        nodes = {
+            "a": _node("a"),
+            "b": _node("b"),
+            "c": _node("c"),
+        }
+        node_artifact_path(run_dir, "a").write_text(
+            "worked solutions are shown in full", encoding="utf-8"
+        )
+        node_artifact_path(run_dir, "b").write_text(
+            "photosynthesis converts light", encoding="utf-8"
+        )
+        node_artifact_path(run_dir, "c").write_text(
+            "enzymes catalyze reactions", encoding="utf-8"
+        )
+        tree = TaskTree(nodes=nodes)
+        tree_path = Path(root) / "tree.json"
+        tree.save(tree_path)
+        return run_dir, tree, tree_path
+
+    def test_prefilter_skips_unaffected_and_reviews_the_rest(self) -> None:
+        with tempfile.TemporaryDirectory() as root_str:
+            run_dir, tree, tree_path = self._run_dir_with_three_passed(Path(root_str))
+            # Exactly one verdict: node "a" holds the amendment's term. Nodes
+            # "b" and "c" must be skipped without consuming a response —
+            # FakeProvider raises if a third pop is attempted, so the queue
+            # holding exactly one verdict proves one call, no more.
+            provider = FakeProvider(
+                [{"items": [{"id": "C1", "pass": True}], "verdict": "pass"}]
+            )
+
+            triage = run_revalidation_pass(
+                run_dir, tree, tree_path,
+                "every worked solution becomes a hint", provider,
+                amendment_text="every worked solution becomes a hint",
+            )
+
+            self.assertEqual(len(provider.calls), 1)
+            self.assertEqual(triage["a"].classification, "clean")
+            self.assertEqual(triage["b"].classification, "clean")
+            self.assertEqual(triage["c"].classification, "clean")
+            # Untouched nodes stay "passed" — no stale marks from skips.
+            self.assertEqual(tree.nodes["b"].status, "passed")
+            self.assertEqual(tree.nodes["c"].status, "passed")
+            # Every passed node has an audit file; the skipped two carry the
+            # prefiltered flag and reason.
+            for node_id in ("a", "b", "c"):
+                audit = revalidation_audit_path(run_dir, node_id)
+                self.assertTrue(audit.exists())
+            skipped = json.loads(revalidation_audit_path(run_dir, "b").read_text(encoding="utf-8"))
+            self.assertTrue(skipped["prefiltered"])
+            self.assertIn("reason", skipped)
+            reviewed = json.loads(revalidation_audit_path(run_dir, "a").read_text(encoding="utf-8"))
+            self.assertNotIn("prefiltered", reviewed)
+
+    def test_prefilter_disabled_calls_every_node(self) -> None:
+        with tempfile.TemporaryDirectory() as root_str:
+            run_dir, tree, tree_path = self._run_dir_with_three_passed(Path(root_str))
+            provider = FakeProvider(
+                [
+                    {"items": [], "verdict": "pass"},
+                    {"items": [], "verdict": "pass"},
+                    {"items": [], "verdict": "pass"},
+                ]
+            )
+            run_revalidation_pass(
+                run_dir, tree, tree_path, "every worked solution becomes a hint",
+                provider, amendment_text="every worked solution becomes a hint",
+                prefilter=False,
+            )
+            self.assertEqual(len(provider.calls), 3)
+
+    def test_estimate_reports_skipped_count(self) -> None:
+        with tempfile.TemporaryDirectory() as root_str:
+            run_dir, tree, tree_path = self._run_dir_with_three_passed(Path(root_str))
+            full = estimate_revalidation_cost(
+                run_dir, tree, "every worked solution becomes a hint"
+            )
+            filtered = estimate_revalidation_cost(
+                run_dir, tree, "every worked solution becomes a hint",
+                amendment_text="every worked solution becomes a hint",
+            )
+            self.assertEqual(full.node_count, 3)
+            self.assertEqual(full.skipped_count, 0)
+            self.assertEqual(filtered.node_count, 3)
+            self.assertEqual(filtered.skipped_count, 2)
+            self.assertLess(filtered.estimated_tokens, full.estimated_tokens)
 
 
 class ApplyTriageTest(unittest.TestCase):

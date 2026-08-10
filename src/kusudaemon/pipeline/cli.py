@@ -56,6 +56,34 @@ def build_pipeline_parser() -> argparse.ArgumentParser:
     run_parser.add_argument("--research-plan", default=None)
     run_parser.add_argument("--max-rounds", type=int, default=100)
     run_parser.add_argument("--max-attempts", type=int, default=3)
+    run_parser.add_argument(
+        "--dispatch-policy",
+        choices=("model", "document_order"),
+        default="model",
+        help="document_order skips the per-round orchestrator LLM call and "
+        "dispatches the earliest ready node in document order (PLAN-zeromem.md §1)",
+    )
+    run_parser.add_argument(
+        "--document-review",
+        action="store_true",
+        help="Run PLAN-zeromem.md §8 document-level review passes after "
+        "assembly; surface triage counts for approval before any repair "
+        "dispatches.",
+    )
+    run_parser.add_argument(
+        "--survey-mode",
+        choices=("model", "embedding"),
+        default="model",
+        help="embedding replaces the per-window model survey with "
+        "embedding-dissimilarity boundaries (PLAN-zeromem.md §3); "
+        "falls back to model when kusudaemon[retrieval] is not installed.",
+    )
+    run_parser.add_argument(
+        "--inline-spans",
+        action="store_true",
+        help="Inline top-k retrieved spans from the node's own spine slice "
+        "into its prompt instead of bare input paths (PLAN-zeromem.md §4).",
+    )
     run_parser.add_argument("--detach", action="store_true", help="Run in a background subprocess and return immediately.")
 
     resume_parser = sub.add_parser("resume", help="Resume a run after a halt or crash.")
@@ -128,7 +156,14 @@ def cmd_run_detach(argv: argparse.Namespace) -> int:
         "--backend", argv.backend,
         "--max-rounds", str(argv.max_rounds),
         "--max-attempts", str(argv.max_attempts),
+        "--dispatch-policy", argv.dispatch_policy,
     ]
+    if argv.document_review:
+        command += ["--document-review"]
+    if argv.survey_mode != "model":
+        command += ["--survey-mode", argv.survey_mode]
+    if argv.inline_spans:
+        command += ["--inline-spans"]
     for flag, value in (
         ("--model", argv.model),
         ("--compile-command", argv.compile_command),
@@ -196,7 +231,13 @@ def cmd_amend(argv: argparse.Namespace) -> int:
         amend_and_revalidate(run_dir, rule_text=argv.text, reason=argv.reason, provider=provider)
     )
     counts = result["counts"]
-    print(f"revalidation: clean={counts['clean']} patchable={counts['patchable']} regenerate={counts['regenerate']}")
+    estimate = result.get("estimate", {})
+    print(
+        f"revalidation: clean={counts['clean']} patchable={counts['patchable']} "
+        f"regenerate={counts['regenerate']} "
+        f"({estimate.get('nodes', 0)} nodes, {estimate.get('skipped', 0)} "
+        f"pre-filtered, ~{estimate.get('tokens', 0)} tokens)"
+    )
     if not argv.yes:
         try:
             choice = input("apply repairs for non-clean nodes? [y/N] ").strip().lower()
@@ -279,9 +320,16 @@ def _run_argv(argv: argparse.Namespace, *, run_id: str | None) -> list[str]:
         "--backend", argv.backend,
         "--max-rounds", str(argv.max_rounds),
         "--max-attempts", str(argv.max_attempts),
+        "--dispatch-policy", argv.dispatch_policy,
     ]
     if run_id:
         parts += ["--run-id", run_id]
+    if getattr(argv, "document_review", False):
+        parts += ["--document-review"]
+    if getattr(argv, "survey_mode", "model") != "model":
+        parts += ["--survey-mode", argv.survey_mode]
+    if getattr(argv, "inline_spans", False):
+        parts += ["--inline-spans"]
     for flag, value in (
         ("--model", argv.model),
         ("--compile-command", argv.compile_command),

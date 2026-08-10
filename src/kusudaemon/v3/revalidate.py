@@ -44,6 +44,7 @@ from ..v1.gates import estimate_tokens
 from ..v1.provider import OpenAICompatibleProvider
 from ..v1.reviewer import VERDICT_SCHEMA, ReviewVerdict
 from ..v1.tree import TaskNode, TaskTree
+from .prefilter import artifact_may_be_affected
 from .repair import RepairOutcome, run_repair
 from .run_dir import revalidation_audit_path
 
@@ -67,22 +68,44 @@ _REVALIDATE_SYSTEM_PROMPT = (
 class RevalidationEstimate:
     node_count: int
     estimated_tokens: int
+    skipped_count: int = 0
+    """Nodes the lexical pre-filter (PLAN-zeromem.md §2) would skip — they
+    contribute 0 tokens and increment ``skipped_count``, so the operator's
+    cost preview reflects what will actually be spent."""
 
 
 def estimate_revalidation_cost(
-    run_dir: str | Path, tree: TaskTree, contract_text: str
+    run_dir: str | Path,
+    tree: TaskTree,
+    contract_text: str,
+    *,
+    amendment_text: str | None = None,
+    prefilter: bool = True,
 ) -> RevalidationEstimate:
     """§10: "Cost ≈ N × (contract + rubric + artifact). Show that estimate
-    before running." — a pure token count, no model call."""
+    before running." — a pure token count, no model call. When the §2
+    pre-filter is enabled and an ``amendment_text`` is supplied, nodes the
+    filter would skip contribute 0 tokens and count toward
+    ``skipped_count``."""
     run_dir = Path(run_dir)
     contract_tokens = estimate_tokens(contract_text)
     passed = [n for n in tree.nodes.values() if n.status == "passed"]
     total = 0
+    skipped = 0
     for node in passed:
         rubric_text = "\n".join(node.rubric.get(j, "") for j in node.judgment)
         artifact_text = _read_artifact(run_dir, node.id)
+        if prefilter and amendment_text:
+            needs_review, _ = artifact_may_be_affected(
+                amendment_text, artifact_text, rubric_text
+            )
+            if not needs_review:
+                skipped += 1
+                continue
         total += contract_tokens + estimate_tokens(rubric_text) + estimate_tokens(artifact_text)
-    return RevalidationEstimate(node_count=len(passed), estimated_tokens=total)
+    return RevalidationEstimate(
+        node_count=len(passed), estimated_tokens=total, skipped_count=skipped
+    )
 
 
 @dataclass
@@ -151,16 +174,41 @@ def run_revalidation_pass(
     provider: OpenAICompatibleProvider,
     *,
     node_ids: list[str] | None = None,
+    amendment_text: str | None = None,
+    prefilter: bool = True,
 ) -> dict[str, Triage]:
     """Read-only: no writer is dispatched here (§10: "no writers
     dispatched"). Marks anything not clean ``"stale"`` in the tree and
     returns the full triage map so the caller can present counts before
-    calling ``apply_revalidation_triage``."""
+    calling ``apply_revalidation_triage``.
+
+    ``amendment_text``/``prefilter`` (PLAN-zeromem.md §2): when both are
+    given, the lexical pre-filter runs first and skips nodes the amendment
+    provably cannot bear on — those come back ``"clean"`` without a model
+    call, recorded to the same audit file with a ``prefiltered`` flag so a
+    skip is auditable rather than invisible. The filter only ever produces
+    clean; patchable/regenerate still require the Reviewer."""
     run_dir = Path(run_dir)
     targets = node_ids or [n.id for n in tree.nodes.values() if n.status == "passed"]
     triage_by_node: dict[str, Triage] = {}
     for node_id in targets:
         node = tree.nodes[node_id]
+        if prefilter and amendment_text:
+            rubric_text = "\n".join(node.rubric.get(j, "") for j in node.judgment)
+            needs_review, reason = artifact_may_be_affected(
+                amendment_text, _read_artifact(run_dir, node_id), rubric_text
+            )
+            if not needs_review:
+                triage = Triage(
+                    node_id=node_id,
+                    classification="clean",
+                    verdict=ReviewVerdict(node_id=node_id, items=[], verdict="pass"),
+                )
+                triage_by_node[node_id] = triage
+                revalidation_audit_path(run_dir, node_id).write_text(
+                    _triage_json(triage, skipped_reason=reason), encoding="utf-8"
+                )
+                continue
         triage = revalidate_node(run_dir, node, contract_text, provider)
         triage_by_node[node_id] = triage
         revalidation_audit_path(run_dir, node_id).write_text(
@@ -224,11 +272,17 @@ async def apply_revalidation_triage(
     return outcomes
 
 
-def _triage_json(triage: Triage) -> str:
+def _triage_json(triage: Triage, skipped_reason: str | None = None) -> str:
     payload: dict[str, Any] = {
         "node": triage.node_id,
         "classification": triage.classification,
         "items": triage.verdict.items,
         "verdict": triage.verdict.verdict,
     }
+    if skipped_reason:
+        # PLAN-zeromem.md §2.5: a pre-filter skip is recorded to the same
+        # audit file a model verdict would write, but flagged so it cannot
+        # be mistaken for one.
+        payload["prefiltered"] = True
+        payload["reason"] = skipped_reason
     return json.dumps(payload, indent=2, sort_keys=True) + "\n"

@@ -50,6 +50,18 @@ from ..v4.research import ResearchQuery
 WRITER_BACKENDS = ("gptme",)
 _RESEARCH_CAPABLE: tuple[str, ...] = ("gptme",)
 
+# PLAN-zeromem.md §11.1: the run's own bookkeeping, off limits to every
+# Writer's prompt. Each entry minus the node's own paths — its artifact and
+# its scratch dir, both of which it is *supposed* to touch (writing
+# out/<node>.md is the entire point of the episode).
+_HIDDEN_RUN_PATHS: tuple[str, ...] = ("events.jsonl", "approvals.jsonl", "audit/", "scratch/", "out/")
+
+
+def _hidden_paths_for(node: TaskNode) -> tuple[str, ...]:
+    own_artifact = f"out/{node.id}.md"
+    own_scratch = f"scratch/{node.id}"
+    return tuple(path for path in _HIDDEN_RUN_PATHS if path not in (own_artifact, own_scratch))
+
 
 def build_writer_adapter(
     backend: str,
@@ -77,6 +89,14 @@ def build_writer_adapter(
         kwargs["tool_allowlist"] = base_tools + tuple(
             tool for tool in web_search_tools if tool not in base_tools
         )
+        if node is not None:
+            # PLAN-zeromem.md §5.2c: node.budget.tokens (set by the planner,
+            # validated by leaf_gate) becomes the episode's OpenAI-compatible
+            # context length instead of the adapter's own default.
+            kwargs["context_length"] = node.budget.tokens
+            # PLAN-zeromem.md §11.1: hide the run's own bookkeeping (minus
+            # the node's own artifact/scratch paths) in the episode prompt.
+            kwargs["hidden_paths"] = _hidden_paths_for(node)
         return GptmeAdapter(**kwargs)
     raise ValueError(f"unknown backend: {backend!r}")
 

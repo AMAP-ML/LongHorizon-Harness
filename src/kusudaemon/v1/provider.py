@@ -39,6 +39,19 @@ class ProviderError(RuntimeError):
     pass
 
 
+class ProviderHTTPError(ProviderError):
+    """HTTP-level rejection from the endpoint, carrying its status code.
+
+    lets callers react to specific statuses (e.g. `complete_json` retrying
+    a 400 without `response_format`) instead of string-matching messages
+    (PLAN-zeromem.md §11.3).
+    """
+
+    def __init__(self, status: int, message: str) -> None:
+        super().__init__(message)
+        self.status = status
+
+
 @dataclass
 class ProviderResponse:
     content: str
@@ -110,18 +123,34 @@ class OpenAICompatibleProvider:
             *messages,
         ]
         last_error = "empty response"
-        for _attempt in range(retries + 1):
+
+        def make_payload(with_format: bool) -> dict[str, Any]:
             payload = {
                 "model": self.model,
                 "messages": working_messages,
                 "temperature": temperature,
                 "stream": False,
-                "response_format": {
+            }
+            if with_format:
+                payload["response_format"] = {
                     "type": "json_schema",
                     "json_schema": {"name": "response", "schema": schema, "strict": True},
-                },
-            }
-            raw = self._call(payload)
+                }
+            return payload
+
+        for _attempt in range(retries + 1):
+            try:
+                raw = self._call(make_payload(with_format=True))
+            except ProviderHTTPError as exc:
+                # §12's fallback must be reachable when the *endpoint* (not
+                # the model) rejects structured output: some OpenAI-compatible
+                # hosts 400 on `response_format` / `strict`. The system prompt
+                # already describes the schema in prose, so retrying the same
+                # messages without the field is fully functional
+                # (PLAN-zeromem.md §11.3).
+                if exc.status != 400:
+                    raise
+                raw = self._call(make_payload(with_format=False))
             content = _first_choice_message(raw).get("content") or ""
             parsed, parse_error = _parse_json_object(content)
             if parsed is not None:
@@ -160,7 +189,9 @@ class OpenAICompatibleProvider:
                 return json.loads(response.read().decode("utf-8"))
         except urllib.error.HTTPError as exc:
             detail = exc.read().decode("utf-8", errors="replace")
-            raise ProviderError(f"HTTP {exc.code} from provider: {detail[:500]}") from exc
+            raise ProviderHTTPError(
+                exc.code, f"HTTP {exc.code} from provider: {detail[:500]}"
+            ) from exc
         except urllib.error.URLError as exc:
             raise ProviderError(f"provider request failed: {exc.reason}") from exc
 

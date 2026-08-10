@@ -26,6 +26,10 @@ dependencies = [
 # `kusudaemon`.
 [project.optional-dependencies]
 gptme = ["gptme"]
+# Non-generative retrieval (PLAN-zeromem.md §3, §4): embedding-based
+# boundary detection and span retrieval. Heavy (pulls torch) and strictly
+# optional — every consumer degrades to the model path when absent.
+retrieval = ["sentence-transformers>=3.0"]
 
 # Points at this fork's actual GitHub location, which has not itself been
 # renamed (only the package/CLI/docs have) -- update if/when it is.

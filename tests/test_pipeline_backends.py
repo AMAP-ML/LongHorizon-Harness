@@ -1,6 +1,7 @@
 """pipeline/backends.py: build_writer_adapter's tool-allowlist composition
 (2026-08-09: every Writer gets web search unconditionally, on top of
-whatever node.tools narrows shell/read/save/patch to)."""
+whatever node.tools narrows shell/read/save/patch to) and the per-node
+context-length wiring (PLAN-zeromem.md §5.2c)."""
 
 from __future__ import annotations
 
@@ -14,7 +15,7 @@ sys.path.insert(0, str(_REPO_ROOT / "src"))
 
 from kusudaemon.adapters.gptme_adapter import DEFAULT_TOOL_ALLOWLIST  # noqa: E402
 from kusudaemon.pipeline.backends import build_writer_adapter  # noqa: E402
-from kusudaemon.v1.tree import TaskNode  # noqa: E402
+from kusudaemon.v1.tree import NodeBudget, TaskNode  # noqa: E402
 from kusudaemon.v4.mcp_research import SEARXNG_TOOL_PATH  # noqa: E402
 
 _ENV_KEYS = (
@@ -68,6 +69,59 @@ class WriterAdapterToolAllowlistTest(unittest.TestCase):
             adapter = build_writer_adapter("gptme", workspace_path="/tmp/ws", prompt_dir="/tmp/prompts", node=node)
         self.assertEqual(adapter.tool_allowlist, ("read", str(SEARXNG_TOOL_PATH)))
         self.assertEqual(adapter.tool_allowlist.count(str(SEARXNG_TOOL_PATH)), 1)
+
+
+class WriterAdapterContextLengthTest(unittest.TestCase):
+    """PLAN-zeromem.md §5.2c: node.budget.tokens becomes the episode's
+    GPTME_CONTEXT_LENGTH, so a budget the planner set and leaf_gate
+    validated actually binds inside the episode."""
+
+    def test_writer_adapter_passes_node_context_length(self) -> None:
+        node = TaskNode(
+            id="n", brief="b", artifact="out/n.md", gates=["nonempty"],
+            budget=NodeBudget(tokens=12_000, calls=7),
+        )
+        with _EnvGuard():
+            adapter = build_writer_adapter(
+                "gptme", workspace_path="/tmp/ws", prompt_dir="/tmp/prompts", node=node
+            )
+        self.assertIn("GPTME_CONTEXT_LENGTH=12000", adapter.command_template)
+
+    def test_writer_adapter_without_node_omits_context_length(self) -> None:
+        with _EnvGuard():
+            adapter = build_writer_adapter(
+                "gptme", workspace_path="/tmp/ws", prompt_dir="/tmp/prompts"
+            )
+        self.assertNotIn("GPTME_CONTEXT_LENGTH", adapter.command_template)
+
+
+class WriterAdapterHiddenPathsTest(unittest.TestCase):
+    """PLAN-zeromem.md §11.1: the run's own bookkeeping is off limits in the
+    episode prompt, minus the node's own artifact and scratch paths."""
+
+    def test_node_hides_run_paths_but_keeps_its_own(self) -> None:
+        node = TaskNode(id="n", brief="b", artifact="out/n.md", gates=["nonempty"])
+        with _EnvGuard():
+            adapter = build_writer_adapter(
+                "gptme", workspace_path="/tmp/ws", prompt_dir="/tmp/prompts", node=node
+            )
+        self.assertIn("events.jsonl", adapter.hidden_paths)
+        self.assertIn("approvals.jsonl", adapter.hidden_paths)
+        self.assertIn("audit/", adapter.hidden_paths)
+        self.assertIn("scratch/", adapter.hidden_paths)
+        self.assertIn("out/", adapter.hidden_paths)
+        # The node's own artifact path (out/n.md) is not in the list — the
+        # node is supposed to write exactly there. The list is made of the
+        # directory prefixes, so the exact artifact filename simply isn't
+        # present; assert the prefixes are, and that nothing mentions "n.md".
+        self.assertFalse(any("n.md" in path for path in adapter.hidden_paths))
+
+    def test_without_node_no_hidden_paths(self) -> None:
+        with _EnvGuard():
+            adapter = build_writer_adapter(
+                "gptme", workspace_path="/tmp/ws", prompt_dir="/tmp/prompts"
+            )
+        self.assertEqual(adapter.hidden_paths, ())
 
 
 if __name__ == "__main__":

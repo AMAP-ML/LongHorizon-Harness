@@ -49,6 +49,7 @@ from ..v2.contract import ContractRule, freeze_contract
 from ..v2.intake import run_intake
 from ..v2.pilot import approve_pilot, run_pilot, select_pilot_nodes
 from ..v2.planner import build_tree
+from ..v2.retrieval import build_chunk_index
 from ..v2.run_dir import contract_path
 from ..v2.survey import (
     SpineUnit,
@@ -74,6 +75,34 @@ PHASES = ("intake", "survey", "plan", "pilot", "research", "execute", "assemble"
 _HALTED = "halted"
 _IN_PROGRESS = "in_progress"
 
+# PLAN-zeromem.md §5.2c': per-node episode durations scale with the node's
+# token budget instead of every node getting the same flat 30 minutes.
+# NodeBudget.tokens defaults to 24_000 and v2/planner.py sets it per leaf
+# (default via DEFAULT_TOKEN_BUDGET); those 24k tokens map to the harness's
+# historical flat EpisodeBudget default of 1800s. Floors and ceilings keep
+# a 400-token stub from getting a 30-second box and a generous chapter from
+# an unbounded one — the point is bounding pathology, not tight packing
+# (v1/gates.py's estimate_tokens feeds it: words/0.75, no tokenizer).
+_REFERENCE_BUDGET_TOKENS = 24_000
+_REFERENCE_DURATION_SECONDS = 1_800
+_MIN_EPISODE_SECONDS = 300  # 5 minutes: a slow-but-correct node must not
+# be converted into a hard max_attempts burn by a too-tight cap.
+_MAX_EPISODE_SECONDS = 7_200  # 2 hours: past this the budget is pathological
+
+
+def _budget_seconds(node: TaskNode) -> int:
+    """Wall-clock ceiling for one node's episode, proportional to
+    ``node.budget.tokens`` with a floor and a ceiling (PLAN-zeromem.md §5.2c').
+
+    ``NodeBudget.calls`` stays deliberately unwired: gptme has no lever that
+    would enforce a tool-call limit, so inventing one here would be fake
+    enforcement — the docs (and ``v2/planner.py``'s leaf_gate) already note
+    that calls is a plan-time estimate only.
+    """
+    tokens = node.budget.tokens or _REFERENCE_BUDGET_TOKENS
+    seconds = round(tokens / _REFERENCE_BUDGET_TOKENS * _REFERENCE_DURATION_SECONDS)
+    return max(_MIN_EPISODE_SECONDS, min(_MAX_EPISODE_SECONDS, seconds))
+
 
 @dataclass
 class RunOptions:
@@ -91,6 +120,10 @@ class RunOptions:
     research_plan: dict[str, list[ResearchQuery]] = field(default_factory=dict)
     max_rounds: int = 100
     max_attempts: int = 3
+    dispatch_policy: str = "model"
+    document_review: bool = False
+    survey_mode: str = "model"
+    inline_spans: bool = False
 
     def to_spec(self) -> dict[str, Any]:
         return {
@@ -106,6 +139,10 @@ class RunOptions:
             ],
             "max_rounds": self.max_rounds,
             "max_attempts": self.max_attempts,
+            "dispatch_policy": self.dispatch_policy,
+            "document_review": self.document_review,
+            "survey_mode": self.survey_mode,
+            "inline_spans": self.inline_spans,
         }
 
     @staticmethod
@@ -119,6 +156,10 @@ class RunOptions:
             research_plan=parse_research_plan(data.get("research_plan")),
             max_rounds=int(data.get("max_rounds", 100)),
             max_attempts=int(data.get("max_attempts", 3)),
+            dispatch_policy=str(data.get("dispatch_policy", "model")),
+            document_review=bool(data.get("document_review", False)),
+            survey_mode=str(data.get("survey_mode", "model")),
+            inline_spans=bool(data.get("inline_spans", False)),
         )
 
 
@@ -196,7 +237,12 @@ class RecursiveDriver:
             )
             return RunReport(status="error", phase=phase, detail=str(exc))
         status = "done" if outcome is not False else "escalated"
-        self._set_phase(phase, status)
+        # Preserve a detail the phase body already wrote (e.g.
+        # _phase_research's "skipped: ...") instead of clobbering it with a
+        # blank tail call (PLAN-zeromem.md §11.4).
+        existing = _read_phase(self.run_dir)
+        detail = existing.get("detail", "") if existing.get("phase") == phase else ""
+        self._set_phase(phase, status, detail=detail)
         self._log(
             {
                 "node_id": "-",
@@ -228,14 +274,41 @@ class RecursiveDriver:
         return approval.user_input.strip()
 
     async def _phase_survey(self) -> None:
+        from ..v2.embeddings import embeddings_available
+        from ..v2.survey import survey_chunks_deterministic
+
         source = source_path(self.run_dir).read_text(encoding="utf-8").strip()
         if not source:
             units = [SpineUnit(id="unit-01", label="The goal", start_chunk=0, end_chunk=0, tokens=0)]
         else:
             chunks = chunk_text(source)
-            votes = survey_chunks(chunks, self.provider)
+            if self.options.survey_mode == "embedding" and embeddings_available():
+                votes = survey_chunks_deterministic(chunks)
+            else:
+                if self.options.survey_mode == "embedding":
+                    # Loud but non-fatal (PLAN-zeromem.md §3.7): the operator
+                    # paid for 250 calls they meant to avoid, but a missing
+                    # optional extra is a config problem, not a corpus
+                    # problem. Logged to the append-only event log — never
+                    # phase.json, whose detail field is clobbered by
+                    # _run_phase's tail call.
+                    self._log(
+                        {
+                            "node_id": "-",
+                            "role": "harness",
+                            "round": 0,
+                            "type": "survey_fallback",
+                            "reason": (
+                                "embedding mode requested but "
+                                "kusudaemon[retrieval] is not installed; "
+                                "falling back to the model survey"
+                            ),
+                        }
+                    )
+                votes = survey_chunks(chunks, self.provider)
             units = assemble_spine(chunks, votes)
             materialize_units(self.run_dir, chunks, units)
+            build_chunk_index(self.run_dir, chunks, units)
         save_spine(self.run_dir, units)
 
     async def _phase_plan(self) -> None:
@@ -249,7 +322,6 @@ class RecursiveDriver:
     async def _phase_pilot(self) -> None:
         tree = self._load_tree()
         rules: list[ContractRule] = []
-        budget = EpisodeBudget()
         selected = select_pilot_nodes(tree)
         for node in sorted(selected.values(), key=lambda n: n.id):
             previous = self.log.last_event(node.id, "pilot_approved")
@@ -268,7 +340,7 @@ class RecursiveDriver:
                     build_node_prompt(node, self.run_dir),
                     self.writer_adapter_factory(node),
                     self.env,
-                    EpisodeBudget(),
+                    EpisodeBudget(max_duration_seconds=_budget_seconds(node)),
                     self.log,
                 )
             approval = self._ask(
@@ -309,15 +381,23 @@ class RecursiveDriver:
             writer_adapter_factory=self.writer_adapter_factory,
             env=self.env,
             provider=self.provider,
-            prompt_for_node=lambda node: build_node_prompt(node, self.run_dir),
-            writer_budget=EpisodeBudget(),
+            prompt_for_node=lambda node: build_node_prompt(
+                node, self.run_dir, inline_spans=self.options.inline_spans
+            ),
+            writer_budget_for=lambda node: EpisodeBudget(
+                max_duration_seconds=_budget_seconds(node)
+            ),
             max_rounds=self.options.max_rounds,
             max_attempts=self.options.max_attempts,
+            dispatch_policy=self.options.dispatch_policy,
         )
         tree = self._load_tree()
         return None if not tree.is_blocked() else False
 
     async def _phase_assemble(self) -> None:
+        from ..v3.document_review import serialize_triage
+        from ..v3.revalidate import summarize_triage
+
         result = await run_assembly_loop(
             self.run_dir,
             tree_path(self.run_dir),
@@ -329,7 +409,60 @@ class RecursiveDriver:
             writer_budget=EpisodeBudget(),
             max_repairs=3,
             max_attempts=self.options.max_attempts,
+            document_review=self.options.document_review,
         )
+        if result.escalated:
+            return False
+        if result.review is not None and result.review.triage:
+            counts = summarize_triage(result.review.triage)
+            summary = ", ".join(f"{kind}={count}" for kind, count in counts.items())
+            sample = "; ".join(
+                f"{node_id} ({triage.classification})"
+                for node_id, triage in sorted(result.review.triage.items())[:8]
+            )
+            approval = self._ask(
+                "document_review",
+                title="Document review triage — approve repairs?",
+                message=(
+                    f"Document-level review found: {summary}.\n\n"
+                    f"First entries: {sample}.\n\n"
+                    "Repairs dispatch through the same gates as §10 triage "
+                    "(snapshot, gates + review, only then overwrite). Reply "
+                    "'no' to leave defects in place."
+                ),
+                context={"phase": "assemble"},
+            )
+            if approval.user_input.strip().lower() in ("n", "no", "abort", "halt"):
+                return None
+            repaired = await apply_triage(
+                self.run_dir,
+                triage=serialize_triage(result.review.triage),
+                writer_adapter_factory=self.writer_adapter_factory,
+                env=self.env,
+                provider=self.provider,
+                max_attempts=self.options.max_attempts,
+            )
+            result = await run_assembly_loop(
+                self.run_dir,
+                tree_path(self.run_dir),
+                str(manifest_path(self.run_dir)),
+                writer_adapter_factory=self.writer_adapter_factory,
+                env=self.env,
+                provider=self.provider,
+                compile_command=self.options.compile_command,
+                writer_budget=EpisodeBudget(),
+                max_repairs=3,
+                max_attempts=self.options.max_attempts,
+            )
+            self._log(
+                {
+                    "node_id": "-",
+                    "role": "harness",
+                    "round": 0,
+                    "type": "document_review_repairs",
+                    "repaired": repaired,
+                }
+            )
         return None if not result.escalated else False
 
     # ------------------------------------------------------------------
@@ -456,6 +589,14 @@ def _read_artifact(run_dir: Path, node_id: str) -> str:
     return path.read_text(encoding="utf-8") if path.exists() else ""
 
 
+def _read_phase(run_dir: Path) -> dict[str, Any]:
+    try:
+        payload = json.loads(phase_path(run_dir).read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+    return payload if isinstance(payload, dict) else {}
+
+
 def _count_statuses(tree: TaskTree) -> dict[str, int]:
     counts: dict[str, int] = {}
     for node in tree.nodes.values():
@@ -473,23 +614,39 @@ async def amend_and_revalidate(
     rule_text: str,
     reason: str,
     provider: OpenAICompatibleProvider,
+    prefilter: bool = True,
 ) -> dict[str, Any]:
     """§10 contract amendment, first half: append the rule, run the
-    read-only re-validation pass, and return ``{contract, counts, triage}``
-    for the operator to review before any repair is dispatched (§10:
-    "Present counts, get approval, then execute"). No writer runs here."""
+    read-only re-validation pass, and return ``{contract, counts, estimate,
+    triage}`` for the operator to review before any repair is dispatched
+    (§10: "Present counts, get approval, then execute"). No writer runs
+    here.
+
+    ``prefilter`` (PLAN-zeromem.md §2): when enabled (default), the lexical
+    pre-filter skips nodes the amendment provably cannot bear on before the
+    Reviewer spends a call — ``estimate`` carries the skipped count so the
+    operator sees the real cost, not the unfiltered one."""
     from ..v2.contract import amend_contract
-    from ..v3.revalidate import summarize_triage
+    from ..v3.revalidate import estimate_revalidation_cost, summarize_triage
 
     run_dir = Path(run_dir)
     contract_text = amend_contract(run_dir, rule_text, reason=reason)
     tree = TaskTree.load(tree_path(run_dir))
+    estimate = estimate_revalidation_cost(
+        run_dir, tree, contract_text, amendment_text=rule_text, prefilter=prefilter
+    )
     triage_by_node = run_revalidation_pass(
-        run_dir, tree, tree_path(run_dir), contract_text, provider
+        run_dir, tree, tree_path(run_dir), contract_text, provider,
+        amendment_text=rule_text, prefilter=prefilter,
     )
     return {
         "contract": contract_text,
         "counts": summarize_triage(triage_by_node),
+        "estimate": {
+            "nodes": estimate.node_count,
+            "skipped": estimate.skipped_count,
+            "tokens": estimate.estimated_tokens,
+        },
         "triage": {
             node_id: {
                 "classification": triage.classification,

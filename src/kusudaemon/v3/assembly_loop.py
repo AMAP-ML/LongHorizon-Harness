@@ -22,6 +22,14 @@ any node, this stops and escalates rather than guessing (same "don't loop
 forever, don't guess" posture as v1's ``max_attempts`` and PLAN.md §10's
 "if the amendment was itself the mistake, you'll only realize it three
 chapters in" — better to ask than to thrash).
+
+**Document-level review** (PLAN-zeromem.md §8, opt-in via
+``document_review=True``): after assemble and before compile, run the
+read-only document review passes; the triage rides back on
+``AssemblyRunResult.review`` so the caller can present counts through an
+approval and dispatch repairs via the existing §10 path — repairs are
+never dispatched from inside this module. An unattributable review defect
+escalates exactly like an unattributable compile failure does.
 """
 
 from __future__ import annotations
@@ -40,6 +48,7 @@ from ..v1.tree import TaskNode, TaskTree
 from .assemble import AssemblyNotReadyError, AssemblyOutput, assemble
 from .checks import CheckResult, run_cross_cutting_checks, write_checks_json
 from .compile import CompileResult, run_compile
+from .document_review import DocumentReviewResult, run_document_review
 from .repair import RepairOutcome, run_repair
 
 AdapterFactory = Callable[[TaskNode], AgentAdapter]
@@ -55,6 +64,7 @@ class AssemblyRunResult:
     repairs: list[RepairOutcome] = field(default_factory=list)
     escalated: bool = False
     escalation_reason: str | None = None
+    review: DocumentReviewResult | None = None
 
 
 def find_offending_nodes(tree: TaskTree, log_text: str) -> list[str]:
@@ -85,6 +95,7 @@ async def run_assembly_loop(
     max_repairs: int = 3,
     max_attempts: int = 3,
     filename: str = "main.md",
+    document_review: bool = False,
 ) -> AssemblyRunResult:
     run_dir = Path(run_dir)
     tree = TaskTree.load(tree_path)
@@ -100,6 +111,19 @@ async def run_assembly_loop(
         assembly = assemble(run_dir, tree, filename=filename)
     except AssemblyNotReadyError as exc:
         return _escalate(log, checks, str(exc))
+
+    review: DocumentReviewResult | None = None
+    if document_review:
+        review = run_document_review(run_dir, tree, provider, log=log)
+        if review.escalated:
+            return AssemblyRunResult(
+                assembly=assembly,
+                checks=checks,
+                compile_result=None,
+                escalated=True,
+                escalation_reason=f"document review: {review.escalation_reason}",
+                review=review,
+            )
 
     compile_result = await run_compile(run_dir, env, compile_command)
     repairs: list[RepairOutcome] = []
@@ -144,6 +168,7 @@ async def run_assembly_loop(
         repairs=repairs,
         escalated=escalated,
         escalation_reason=reason,
+        review=review,
     )
 
 

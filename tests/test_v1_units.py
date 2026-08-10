@@ -15,7 +15,11 @@ sys.path.insert(0, str(_REPO_ROOT / "src"))
 
 from kusudaemon.v1.gates import estimate_tokens, evaluate_gates  # noqa: E402
 from kusudaemon.v1.manifest import cap_promotion  # noqa: E402
-from kusudaemon.v1.provider import OpenAICompatibleProvider, ProviderError  # noqa: E402
+from kusudaemon.v1.provider import (  # noqa: E402
+    OpenAICompatibleProvider,
+    ProviderError,
+    ProviderHTTPError,
+)
 from kusudaemon.v1.tree import TaskTree, TreeValidationError  # noqa: E402
 from kusudaemon.v1.writer import writer_prompt  # noqa: E402
 
@@ -206,6 +210,36 @@ class ProviderStructuredOutputTest(unittest.TestCase):
         provider = OpenAICompatibleProvider(transport=transport, api_key="unused")
         result = provider.complete_json([{"role": "user", "content": "hi"}], self.SCHEMA)
         self.assertEqual(result, {"action": "go"})
+
+    def test_http_400_retries_without_response_format(self) -> None:
+        # PLAN-zeromem.md §11.3: an endpoint that 400s on response_format /
+        # strict must still reach the plain-messages fallback instead of
+        # failing on the first attempt.
+        calls = []
+
+        def transport(url, payload, headers):
+            calls.append(payload)
+            if len(calls) == 1:
+                raise ProviderHTTPError(400, "HTTP 400 from provider: response_format not supported")
+            return {"choices": [{"message": {"content": '{"action": "go"}'}}]}
+
+        provider = OpenAICompatibleProvider(transport=transport, api_key="unused")
+        result = provider.complete_json([{"role": "user", "content": "hi"}], self.SCHEMA)
+        self.assertEqual(result, {"action": "go"})
+        self.assertEqual(len(calls), 2)
+        self.assertIn("response_format", calls[0])
+        self.assertNotIn("response_format", calls[1])
+
+    def test_non_400_http_error_is_not_retried_without_format(self) -> None:
+        # A 500 is a provider problem, not a response_format rejection —
+        # it must propagate, not silently retry without the schema guard.
+        def transport(url, payload, headers):
+            raise ProviderHTTPError(500, "HTTP 500 from provider: boom")
+
+        provider = OpenAICompatibleProvider(transport=transport, api_key="unused")
+        with self.assertRaises(ProviderHTTPError) as ctx:
+            provider.complete_json([{"role": "user", "content": "hi"}], self.SCHEMA)
+        self.assertEqual(ctx.exception.status, 500)
 
 
 if __name__ == "__main__":

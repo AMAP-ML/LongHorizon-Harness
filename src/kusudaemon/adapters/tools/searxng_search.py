@@ -41,8 +41,9 @@ from typing import Any
 SEARXNG_TOOL_PATH = Path(__file__).resolve()
 
 DEFAULT_SEARXNG_URL = "http://localhost:8080"
-DEFAULT_NUM_RESULTS = 5
+DEFAULT_NUM_RESULTS = 3  # PLAN-zeromem.md §5.2b: 5 -> 3, model can ask for more
 MAX_NUM_RESULTS = 10
+MAX_SNIPPET_CHARS = 300  # PLAN-zeromem.md §5.2a: a snippet exists to say whether to fetch the page
 REQUEST_TIMEOUT_SECONDS = 15
 
 
@@ -115,6 +116,8 @@ def _format_results(query: str, data: dict[str, Any]) -> str:
         title = r.get("title") or "(untitled)"
         link = r.get("url") or ""
         snippet = (r.get("content") or "").strip()
+        if len(snippet) > MAX_SNIPPET_CHARS:
+            snippet = snippet[:MAX_SNIPPET_CHARS] + "…"
         lines.append(f"\n{i}. {title}\n   {link}")
         if snippet:
             lines.append(f"   {snippet}")
