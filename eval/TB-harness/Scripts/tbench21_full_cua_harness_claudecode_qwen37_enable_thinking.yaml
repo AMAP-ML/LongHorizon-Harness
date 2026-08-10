@@ -1,0 +1,65 @@
+# Terminal-Bench 2.1 full run: CUA-Harness + Claude Code + Qwen3.7-Plus + enable_thinking.
+job_name: cua-harness-tb21-full-a3-c16-claudecode-qwen37-thinking
+jobs_dir: jobs
+
+# Run each task three times and report the average score.
+n_attempts: 3
+
+# Concurrency used by the reported full run.
+n_concurrent_trials: 16
+
+retry:
+  max_retries: 3
+
+environment:
+  type: docker
+
+agents:
+  - import_path: harbor_agent:CuaHarnessClaudeCodeAgent
+    model_name: qwen3.7-plus
+
+    # 5h Harbor-level agent/setup timeouts.
+    override_timeout_sec: 18000
+    override_setup_timeout_sec: 18000
+
+    include_logs:
+      - cua_harness_claudecode_harbor/**
+
+    env:
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY}
+      ANTHROPIC_BASE_URL: ${ANTHROPIC_BASE_URL}
+      CUA_HARNESS_CLAUDE_CODE_VERSION: ${CLAUDE_CODE_VERSION:-2.1.176}
+      CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: "1"
+
+    kwargs:
+      harness_model: qwen3.7-plus
+      verifier_model: qwen3.7-plus
+
+      # Terminal-Bench task containers normally use /app as the workspace.
+      workspace_path: /app
+
+      # Role-orchestration budget.
+      max_rounds: 25
+      episode_timeout_sec: 4200
+      cli_task_timeout_sec: 1800
+      orchestrator_timeout_sec: 600
+      verifier_timeout_sec: 600
+      max_turns: 200
+      orchestrator_max_turns: 200
+      verifier_max_turns: 200
+
+      # Request proxy settings injected into Claude Code's Anthropic-compatible calls.
+      max_tokens: 65536
+      temperature: 1.0
+      top_p: 0.95
+      top_k: 20
+      llm_call_kwargs:
+        extra_body:
+          enable_thinking: true
+      dashscope_wait_timeout_sec: 90
+
+verifier:
+  override_timeout_sec: 18000
+
+datasets:
+  - path: datasets/terminal-bench-2-1/tasks

@@ -1,0 +1,8 @@
+name: terminal-bench-2-1
+channels:
+  - conda-forge
+dependencies:
+  - python=3.12
+  - pip
+  - pip:
+      - harbor==0.18.0

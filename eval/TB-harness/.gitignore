@@ -1,0 +1,15 @@
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+logs/
+jobs/
+
+# Terminal-Bench task data can be very large. Keep it outside git, or add it as
+# a submodule / external download in your own release process.
+datasets/terminal-bench-2-1/tasks/
+
+# Local credentials and experiment overrides.
+.env
+*.local.yaml
+*.local.yml

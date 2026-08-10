@@ -441,14 +441,15 @@ Dashboard 会展示每一轮的任务规划、执行结果、审计证据和返�
 
 ## 评测复现
 
-`eval/` 提供两个固定版本的评测复现套件：
+`eval/` 提供三个固定版本的评测复现套件：
 
 | 目录 | 评测 | 说明 |
 |---|---|---|
 | [`eval/WeaveBench-harness/`](eval/WeaveBench-harness/) | WeaveBench（114 个任务） | GUI + CLI 混合任务及复现 Skill |
 | [`eval/OSWorldv2-harness/`](eval/OSWorldv2-harness/) | OSWorld-V2（108 个任务） | 与官方版本对齐的混合运行器 |
+| [`eval/TB-harness/`](eval/TB-harness/) | Terminal-Bench 2.1 | 纯 CLI 长时程任务 |
 
-环境配置、参数和启动命令请查看各目录中的 `README.md` 或 `README.zh-CN.md`。其中的 `cua_harness` 包是用于评测的固定兼容副本；新的集成应使用 `src/lh_harness/`。
+环境配置、参数和启动命令请查看各目录中的 `README.md` 或 `README.zh-CN.md`。其中内嵌的 `Harness` / `cua_harness` 代码是用于评测的固定兼容副本；新的集成应使用 `src/lh_harness/`。
 
 ## 引用
 
