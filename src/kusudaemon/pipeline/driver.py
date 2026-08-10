@@ -50,7 +50,16 @@ from ..v2.intake import run_intake
 from ..v2.pilot import approve_pilot, run_pilot, select_pilot_nodes
 from ..v2.planner import build_tree
 from ..v2.run_dir import contract_path
-from ..v2.survey import SpineUnit, assemble_spine, chunk_text, load_spine, save_spine, survey_chunks
+from ..v2.survey import (
+    SpineUnit,
+    assemble_spine,
+    chunk_text,
+    load_spine,
+    materialize_units,
+    save_spine,
+    survey_chunks,
+    unit_input_path,
+)
 from ..v3.assembly_loop import run_assembly_loop
 from ..v3.revalidate import Triage, apply_revalidation_triage, run_revalidation_pass
 from ..v4.research import ResearchQuery
@@ -226,10 +235,15 @@ class RecursiveDriver:
             chunks = chunk_text(source)
             votes = survey_chunks(chunks, self.provider)
             units = assemble_spine(chunks, votes)
+            materialize_units(self.run_dir, chunks, units)
         save_spine(self.run_dir, units)
 
     async def _phase_plan(self) -> None:
-        tree = build_tree(load_spine(self.run_dir), self.provider)
+        tree = build_tree(
+            load_spine(self.run_dir),
+            self.provider,
+            input_path_for=lambda unit: unit_input_path(self.run_dir, unit),
+        )
         tree.save(tree_path(self.run_dir))
 
     async def _phase_pilot(self) -> None:

@@ -22,6 +22,15 @@ regenerate is marked stale rather than reset to "pending" or left
 untouched work, and it isn't yet re-confirmed against the amendment.
 Purely additive: no v1/v2 code path that never amends a contract ever
 produces this status.
+
+``last_defect`` was added for PLAN-zeromem.md §9 (feedback-carrying
+retries): a retry's prompt is otherwise byte-identical to the first
+attempt's, making attempts 2 and 3 i.i.d. resamples rather than a
+correction loop. ``round_loop.py`` records the located gate/reviewer
+failure here on a failed attempt and clears it on success;
+``pipeline/prompts.py:build_node_prompt`` reads it to render a retry block.
+Purely additive and defaulted, like ``"stale"`` above — every existing
+``tree.json`` loads unchanged.
 """
 
 from __future__ import annotations
@@ -68,6 +77,7 @@ class TaskNode:
     depends_on: list[str] = field(default_factory=list)
     status: NodeStatus = "pending"
     attempts: int = 0
+    last_defect: str = ""
 
     def __post_init__(self) -> None:
         _validate_node(self)
@@ -98,6 +108,7 @@ class TaskNode:
             depends_on=list(data.get("depends_on") or []),
             status=data.get("status", "pending"),
             attempts=int(data.get("attempts", 0)),
+            last_defect=str(data.get("last_defect", "")),
         )
 
 

@@ -16,14 +16,17 @@ sys.path.insert(0, str(_REPO_ROOT / "tests" / "fixtures"))
 
 from fake_provider import FakeProvider  # noqa: E402
 from kusudaemon.v0.run_dir import create_run_dir  # noqa: E402
+from kusudaemon.v2.run_dir import spine_unit_path  # noqa: E402
 from kusudaemon.v2.survey import (  # noqa: E402
     BoundaryVote,
     Chunk,
     assemble_spine,
     chunk_text,
     load_spine,
+    materialize_units,
     save_spine,
     survey_chunks,
+    unit_input_path,
 )
 
 
@@ -160,6 +163,90 @@ class SpinePersistenceTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as root_str:
             run_dir = create_run_dir(Path(root_str), "run1")
             self.assertEqual(load_spine(run_dir), [])
+
+    def test_load_spine_tolerates_legacy_records(self) -> None:
+        # A spine.json written before materialization existed carries only
+        # the original SpineUnit fields. load_spine must still construct it.
+        with tempfile.TemporaryDirectory() as root_str:
+            run_dir = create_run_dir(Path(root_str), "run1")
+            legacy = [
+                {"id": "unit-01", "label": "Intro", "start_chunk": 0, "end_chunk": 1, "tokens": 900}
+            ]
+            spine_path_obj = run_dir / "spine.json"
+            import json as _json
+
+            spine_path_obj.write_text(_json.dumps(legacy), encoding="utf-8")
+            loaded = load_spine(run_dir)
+            self.assertEqual(len(loaded), 1)
+            self.assertEqual(loaded[0].id, "unit-01")
+
+
+class MaterializeUnitsTest(unittest.TestCase):
+    def _source_and_units(self) -> tuple[list[Chunk], list["object"]]:
+        text = "## Intro\n" + ("intro word " * 60) + "\n\n## Body\n" + ("body word " * 60)
+        chunks = chunk_text(text, min_chunk_tokens=5)
+        votes = [BoundaryVote(boundary_after=0, label="Body", confidence=0.9)]
+        units = assemble_spine(chunks, votes, min_unit_tokens=1)
+        return chunks, units
+
+    def test_materialize_units_writes_one_file_per_unit(self) -> None:
+        chunks, units = self._source_and_units()
+        with tempfile.TemporaryDirectory() as root_str:
+            run_dir = create_run_dir(Path(root_str), "run1")
+            materialize_units(run_dir, chunks, units)
+            for unit in units:
+                self.assertTrue(spine_unit_path(run_dir, unit.id).exists())
+
+    def test_materialized_unit_text_matches_its_chunk_range(self) -> None:
+        chunks, units = self._source_and_units()
+        with tempfile.TemporaryDirectory() as root_str:
+            run_dir = create_run_dir(Path(root_str), "run1")
+            materialize_units(run_dir, chunks, units)
+            for unit in units:
+                expected = "".join(c.text for c in chunks[unit.start_chunk : unit.end_chunk + 1])
+                actual = spine_unit_path(run_dir, unit.id).read_text(encoding="utf-8")
+                self.assertEqual(actual, expected)
+
+    def test_materialize_is_idempotent(self) -> None:
+        chunks, units = self._source_and_units()
+        with tempfile.TemporaryDirectory() as root_str:
+            run_dir = create_run_dir(Path(root_str), "run1")
+            materialize_units(run_dir, chunks, units)
+            path = spine_unit_path(run_dir, units[0].id)
+            first_mtime = path.stat().st_mtime_ns
+            materialize_units(run_dir, chunks, units)
+            self.assertEqual(path.stat().st_mtime_ns, first_mtime)
+
+    def test_units_partition_the_source(self) -> None:
+        chunks, units = self._source_and_units()
+        with tempfile.TemporaryDirectory() as root_str:
+            run_dir = create_run_dir(Path(root_str), "run1")
+            materialize_units(run_dir, chunks, units)
+            reconstructed = "".join(
+                spine_unit_path(run_dir, unit.id).read_text(encoding="utf-8") for unit in units
+            )
+            self.assertEqual(reconstructed, "".join(c.text for c in chunks))
+
+
+class UnitInputPathTest(unittest.TestCase):
+    def test_resolves_to_materialized_path_when_present(self) -> None:
+        chunks = [Chunk(index=0, text="hello", tokens=10)]
+        from kusudaemon.v2.survey import SpineUnit
+
+        unit = SpineUnit(id="unit-01", label="x", start_chunk=0, end_chunk=0, tokens=10)
+        with tempfile.TemporaryDirectory() as root_str:
+            run_dir = create_run_dir(Path(root_str), "run1")
+            materialize_units(run_dir, chunks, [unit])
+            resolved = unit_input_path(run_dir, unit)
+            self.assertEqual(resolved, str(spine_unit_path(run_dir, unit.id).relative_to(run_dir)))
+
+    def test_falls_back_to_unit_id_when_unmaterialized(self) -> None:
+        from kusudaemon.v2.survey import SpineUnit
+
+        unit = SpineUnit(id="unit-01", label="x", start_chunk=0, end_chunk=0, tokens=10)
+        with tempfile.TemporaryDirectory() as root_str:
+            run_dir = create_run_dir(Path(root_str), "run1")
+            self.assertEqual(unit_input_path(run_dir, unit), "unit-01")
 
 
 if __name__ == "__main__":

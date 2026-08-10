@@ -13,6 +13,11 @@ output regardless of input structure:
 3. **Spine assembly** (``assemble_spine``, harness, no model) — merge
    boundary votes across overlapping windows, apply a minimum-size floor,
    produce ``spine.json``.
+4. **Materialization** (``materialize_units``, no model, PLAN-zeromem.md
+   §7) — write each unit's verbatim chunk range to ``spine/<unit-id>.md``,
+   so a leaf's ``inputs`` entries (``unit_input_path``) resolve to a real
+   file a Writer's own tools can open, instead of an opaque id nothing on
+   disk answers to.
 """
 
 from __future__ import annotations
@@ -25,7 +30,7 @@ from typing import Any
 
 from ..v1.gates import estimate_tokens
 from ..v1.provider import OpenAICompatibleProvider
-from .run_dir import spine_path
+from .run_dir import spine_path, spine_unit_path
 
 DEFAULT_MIN_CHUNK_TOKENS = 50
 DEFAULT_WINDOW_SIZE = 12
@@ -251,4 +256,36 @@ def load_spine(run_dir: str | Path) -> list[SpineUnit]:
         return []
     raw_text = path.read_text(encoding="utf-8").strip()
     raw = json.loads(raw_text) if raw_text else []
+    # SpineUnit(**item) tolerates a legacy spine.json missing any field this
+    # module has added since it was written, as long as that field carries a
+    # default -- see materialize_units/unit_input_path below (PLAN-zeromem.md
+    # §7): a resumed pre-§7 run has a spine.json but no materialized units,
+    # and unit_input_path already falls back to the bare id in that case.
     return [SpineUnit(**item) for item in raw]
+
+
+def materialize_units(
+    run_dir: str | Path, chunks: list[Chunk], units: list[SpineUnit]
+) -> None:
+    """Write ``spine/<unit-id>.md`` per unit — the verbatim concatenation of
+    its chunk range (PLAN-zeromem.md §7) — so a leaf's ``inputs`` entries
+    resolve to a real file instead of an opaque id nothing on disk answers
+    to. Idempotent: a unit whose materialized file already holds the exact
+    same text is left untouched rather than rewritten."""
+    for unit in units:
+        text = "".join(chunk.text for chunk in chunks[unit.start_chunk : unit.end_chunk + 1])
+        path = spine_unit_path(run_dir, unit.id)
+        if path.exists() and path.read_text(encoding="utf-8") == text:
+            continue
+        path.write_text(text, encoding="utf-8")
+
+
+def unit_input_path(run_dir: str | Path, unit: SpineUnit) -> str:
+    """Resolve a unit to its materialized file, relative to ``run_dir``, when
+    ``materialize_units`` has actually written one for it; otherwise fall
+    back to the bare unit id, today's behavior — the resolver a legacy or
+    unmaterialized run degrades to (PLAN-zeromem.md §7)."""
+    path = spine_unit_path(run_dir, unit.id)
+    if path.exists() and path.stat().st_size > 0:
+        return str(path.relative_to(Path(run_dir)))
+    return unit.id

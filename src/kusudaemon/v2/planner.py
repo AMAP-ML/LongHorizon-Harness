@@ -26,7 +26,7 @@ rubrics derived from the frozen contract are future wiring.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Callable
 
 from ..v1.provider import OpenAICompatibleProvider
 from ..v1.tree import NodeBudget, TaskNode, TaskTree
@@ -181,12 +181,19 @@ def build_tree(
     token_budget: int = DEFAULT_TOKEN_BUDGET,
     tool_call_cap: int = DEFAULT_TOOL_CALL_CAP,
     default_gates: tuple[str, ...] = ("nonempty",),
+    input_path_for: Callable[[SpineUnit], str] | None = None,
 ) -> TaskTree:
     """Recurse level-at-a-time from the full spine to a flat set of leaf
     TaskNodes. Depth cap, node cap, and a size floor (a one-unit slice
     cannot be usefully split further) are all harness decisions that force
     a leaf regardless of what the leaf gate says — the model is never asked
-    whether it has hit a limit."""
+    whether it has hit a limit.
+
+    ``input_path_for`` resolves a unit to whatever a leaf's ``inputs`` entry
+    should actually be (PLAN-zeromem.md §7) — e.g. a materialized file path
+    under ``spine/`` — without this module ever knowing about run-directory
+    layout itself. Left ``None``, a leaf's inputs are bare unit ids, today's
+    behavior."""
     nodes: dict[str, TaskNode] = {}
     budget = _NodeBudget(node_cap)
 
@@ -203,13 +210,18 @@ def build_tree(
             return
         node_id = unique_id(node_id)
         gates = [*default_gates, f"max_tokens:{token_budget}"]
+        inputs = (
+            [input_path_for(unit) for unit in slice_units]
+            if input_path_for is not None
+            else [unit.id for unit in slice_units]
+        )
         nodes[node_id] = TaskNode(
             id=node_id,
             brief=candidate.brief,
             artifact=f"out/{node_id}.md",
             gates=gates,
             shape=candidate.shape,
-            inputs=[unit.id for unit in slice_units],
+            inputs=inputs,
             budget=NodeBudget(tokens=token_budget, calls=tool_call_cap),
             depends_on=[],
         )

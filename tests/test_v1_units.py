@@ -17,6 +17,7 @@ from kusudaemon.v1.gates import estimate_tokens, evaluate_gates  # noqa: E402
 from kusudaemon.v1.manifest import cap_promotion  # noqa: E402
 from kusudaemon.v1.provider import OpenAICompatibleProvider, ProviderError  # noqa: E402
 from kusudaemon.v1.tree import TaskTree, TreeValidationError  # noqa: E402
+from kusudaemon.v1.writer import writer_prompt  # noqa: E402
 
 
 class GatesTest(unittest.TestCase):
@@ -116,6 +117,19 @@ class TreeValidationTest(unittest.TestCase):
             tree.nodes["a"].status = "blocked"
             self.assertTrue(tree.is_blocked())
 
+    def test_defect_survives_tree_roundtrip(self) -> None:
+        with tempfile.TemporaryDirectory() as root_str:
+            root = Path(root_str)
+            path = self._write(
+                root, [{"id": "a", "brief": "x", "artifact": "out/a.md", "gates": ["nonempty"]}]
+            )
+            tree = TaskTree.load(path)
+            self.assertEqual(tree.nodes["a"].last_defect, "")
+            tree.nodes["a"].last_defect = "nonempty: artifact is empty"
+            tree.save(path)
+            reloaded = TaskTree.load(path)
+            self.assertEqual(reloaded.nodes["a"].last_defect, "nonempty: artifact is empty")
+
 
 class PromotionCapTest(unittest.TestCase):
     def test_short_text_is_untouched(self) -> None:
@@ -127,6 +141,19 @@ class PromotionCapTest(unittest.TestCase):
         capped = cap_promotion(text)
         self.assertLess(estimate_tokens(capped), estimate_tokens(text))
         self.assertIn("truncated", capped)
+
+
+class WriterPromptTest(unittest.TestCase):
+    def test_writer_prompt_states_artifact_contract(self) -> None:
+        prompt = writer_prompt("Write the intro.", Path("/tmp/run/scratch/a/promotion.json"))
+        self.assertIn("your last message", prompt.lower())
+        self.assertIn("Write the intro.", prompt)
+
+    def test_writer_prompt_still_requests_promotion(self) -> None:
+        promotion_path = Path("/tmp/run/scratch/a/promotion.json")
+        prompt = writer_prompt("Write the intro.", promotion_path)
+        self.assertIn(str(promotion_path), prompt)
+        self.assertIn("promotion", prompt)
 
 
 class ProviderStructuredOutputTest(unittest.TestCase):

@@ -17,6 +17,13 @@ Invariant enforced here, not by either role (PLAN.md §2 invariant 1): a
 node's status only ever becomes "passed" after both its gates (code) and
 its reviewer verdict (model, only consulted when the node declares
 judgment items) agree.
+
+``_transition_after_writer``/``_transition_after_review`` also record the
+located gate or reviewer failure onto ``node.last_defect`` on every failed
+attempt, and clear it on success (PLAN-zeromem.md §9) — a retry's prompt
+(``pipeline/prompts.py:build_node_prompt``) reads it back, so attempts 2
+and 3 carry forward what attempt 1 got wrong instead of resampling an
+identical prompt blind.
 """
 
 from __future__ import annotations
@@ -30,7 +37,7 @@ from ..adapters.base import AgentAdapter
 from ..environment.base import Environment
 from ..types import EpisodeBudget
 from ..v0.events import EventLog
-from .gates import GateResult, all_passed, evaluate_gates
+from .gates import GateResult, all_passed, evaluate_gates, unmet
 from .manifest import append_manifest_line
 from .orchestrator import DispatchDecision, decide_next_action
 from .provider import OpenAICompatibleProvider
@@ -147,9 +154,16 @@ def _transition_after_writer(
 ) -> None:
     if episode_ok and all_passed(gate_results):
         node.status = "awaiting_review"
+        node.last_defect = ""
     else:
         node.attempts += 1
         node.status = "blocked" if node.attempts >= max_attempts else "pending"
+        # PLAN-zeromem.md §9: carry the located failure forward so a retry's
+        # prompt differs from the first attempt's instead of resampling the
+        # same instructions blind.
+        node.last_defect = "; ".join(
+            f"{result.gate}: {result.detail}" for result in unmet(gate_results)
+        ) or "episode did not complete"
         log.append(
             {
                 "node_id": node.id,
@@ -177,9 +191,11 @@ def _transition_after_review(
         # after gates (checked in _transition_after_writer) and review
         # (checked here) both agree.
         node.status = "passed"
+        node.last_defect = ""
     else:
         node.attempts += 1
         node.status = "blocked" if node.attempts >= max_attempts else "pending"
+        node.last_defect = _defect_from_verdict(verdict)
         log.append(
             {
                 "node_id": node.id,
@@ -190,6 +206,18 @@ def _transition_after_review(
             }
         )
     tree.save(tree_path)
+
+
+def _defect_from_verdict(verdict: ReviewVerdict) -> str:
+    """Located, scoped feedback (PLAN-zeromem.md §9) rather than a bare
+    "fail" — the same join v3/revalidate.py already does for repair
+    prompts, applied one layer earlier so an ordinary retry gets it too."""
+    lines = [
+        f"{item.get('id', '?')}: {item.get('defect', '')}".rstrip(": ")
+        for item in verdict.items
+        if not item.get("pass", True)
+    ]
+    return "\n".join(lines) if lines else "reviewer verdict: fail"
 
 
 def _write_audit(run_dir: Path, node: TaskNode, verdict: ReviewVerdict) -> None:

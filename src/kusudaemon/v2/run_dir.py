@@ -38,3 +38,16 @@ def spine_path(run_dir: str | Path) -> Path:
 
 def contract_path(run_dir: str | Path) -> Path:
     return Path(run_dir) / "contract.md"
+
+
+def spine_units_dir(run_dir: str | Path) -> Path:
+    """Materialized spine units (PLAN-zeromem.md §7) — verbatim slices of
+    the source a leaf's ``inputs`` entries resolve to, so a Writer's ``read``
+    tool has something real to open instead of an opaque ``unit-03`` id."""
+    path = Path(run_dir) / "spine"
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+def spine_unit_path(run_dir: str | Path, unit_id: str) -> Path:
+    return spine_units_dir(run_dir) / f"{unit_id}.md"

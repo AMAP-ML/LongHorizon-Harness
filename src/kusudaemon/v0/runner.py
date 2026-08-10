@@ -74,7 +74,12 @@ async def run_node(
             )
     elif dispatched is not None:
         # Crashed before any output ever hit disk: nothing to continue from,
-        # so redispatch fresh from the original prompt.
+        # so redispatch fresh. "The original prompt" is the caller's
+        # framing, not this module's: run_node has no memory of what it was
+        # given before and just dispatches whatever prompt it's handed this
+        # call — a caller may legitimately supply a different one on a
+        # redispatch (PLAN-zeromem.md §9: a retry's prompt carries the prior
+        # attempt's located defect forward, so it differs from the first).
         log.append(
             {
                 "node_id": node_id,

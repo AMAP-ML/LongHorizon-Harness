@@ -171,6 +171,55 @@ class BuildTreeTest(unittest.TestCase):
         tree = build_tree(units, provider, depth_cap=4, node_cap=2)
         self.assertLessEqual(len(tree.nodes), 2)
 
+    def test_planner_emits_unit_ids_by_default(self) -> None:
+        units = _units(2, tokens=1000)
+        provider = FakeProvider(
+            [
+                {
+                    "children": [
+                        {
+                            "id": f"c{i}",
+                            "brief": f"write unit {i}",
+                            "unit_start": i,
+                            "unit_end": i,
+                            "estimated_calls": 3,
+                            "shape": "prose-dominant",
+                        }
+                        for i in range(2)
+                    ]
+                }
+            ]
+        )
+        tree = build_tree(units, provider, depth_cap=4, node_cap=100)
+        self.assertEqual(tree.nodes["c0"].inputs, ["unit-01"])
+        self.assertEqual(tree.nodes["c1"].inputs, ["unit-02"])
+
+    def test_planner_emits_paths_when_resolver_given(self) -> None:
+        units = _units(2, tokens=1000)
+        provider = FakeProvider(
+            [
+                {
+                    "children": [
+                        {
+                            "id": f"c{i}",
+                            "brief": f"write unit {i}",
+                            "unit_start": i,
+                            "unit_end": i,
+                            "estimated_calls": 3,
+                            "shape": "prose-dominant",
+                        }
+                        for i in range(2)
+                    ]
+                }
+            ]
+        )
+        tree = build_tree(
+            units, provider, depth_cap=4, node_cap=100,
+            input_path_for=lambda unit: f"spine/{unit.id}.md",
+        )
+        self.assertEqual(tree.nodes["c0"].inputs, ["spine/unit-01.md"])
+        self.assertEqual(tree.nodes["c1"].inputs, ["spine/unit-02.md"])
+
     def test_resulting_tree_is_a_valid_taskree_round_trip(self) -> None:
         import json
         import tempfile

@@ -35,16 +35,30 @@ from ..v0.runner import run_node
 from .manifest import cap_promotion
 from .tree import TaskNode
 
+_ARTIFACT_INSTRUCTION = (
+    "\n\nProduce the full artifact text as your final answer — your last message in "
+    "this conversation becomes the artifact file verbatim. Do not close with a "
+    "status update, a summary of what you wrote, or an offer to make changes: write "
+    "the finished section itself, in full, as your last message."
+)
+
 _PROMOTION_INSTRUCTION_TEMPLATE = (
     "\n\nWhen you are finished, also write a short handoff note to {promotion_path} "
     'as a JSON object: {{"promotion": "<=400 tokens summarizing what you produced, '
-    'key decisions, and anything a downstream node should know"}}. This is the only '
-    "part of your work another node will ever see."
+    'key decisions, and anything a downstream node should know"}}. A document-level '
+    "reviewer sees only this summary, never your artifact's full text, when it later "
+    "checks the whole document for coverage gaps, duplication, and contract "
+    "compliance — so state what this section actually covers and asserts, not just "
+    "that it's done."
 )
 
 
 def writer_prompt(brief_prompt: str, promotion_path: Path) -> str:
-    return brief_prompt + _PROMOTION_INSTRUCTION_TEMPLATE.format(promotion_path=promotion_path)
+    return (
+        brief_prompt
+        + _ARTIFACT_INSTRUCTION
+        + _PROMOTION_INSTRUCTION_TEMPLATE.format(promotion_path=promotion_path)
+    )
 
 
 async def run_writer_node(

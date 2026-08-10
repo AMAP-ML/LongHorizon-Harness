@@ -328,6 +328,142 @@ class ResumeInFlightWriterNodeTest(unittest.TestCase):
             self.assertIn("forged-session-1", artifact_text)
 
 
+class FeedbackCarryingRetryTest(unittest.TestCase):
+    def test_gate_failure_records_defect_on_node(self) -> None:
+        with tempfile.TemporaryDirectory() as root_str:
+            root = Path(root_str)
+            run_dir = create_run_dir(root, "run5")
+            prompt_dir = root / "prompts"
+            prompt_dir.mkdir(parents=True, exist_ok=True)
+
+            _write_tree(
+                tree_path(run_dir),
+                [
+                    {
+                        "id": "a",
+                        "brief": "impossible",
+                        "artifact": "out/a.md",
+                        "gates": ["len:9999-99999"],
+                    }
+                ],
+            )
+            provider = FakeProvider(
+                [
+                    {"action": "dispatch", "node_id": "a", "reason": "attempt 1"},
+                    {"action": "dispatch", "node_id": "a", "reason": "attempt 2"},
+                ]
+            )
+            tree = asyncio.run(
+                run_round_loop(
+                    run_dir,
+                    tree_path(run_dir),
+                    writer_adapter_factory=_adapter_factory(root, run_dir, prompt_dir),
+                    env=LocalEnvironment(tmp_dir=str(prompt_dir)),
+                    provider=provider,
+                    prompt_for_node=lambda node: f"do {node.id}",
+                    writer_budget=EpisodeBudget(max_duration_seconds=30),
+                    max_attempts=2,
+                )
+            )
+            self.assertEqual(tree.nodes["a"].status, "blocked")
+            self.assertIn("len:9999-99999", tree.nodes["a"].last_defect)
+
+    def test_review_failure_records_located_defects(self) -> None:
+        with tempfile.TemporaryDirectory() as root_str:
+            root = Path(root_str)
+            run_dir = create_run_dir(root, "run6")
+            prompt_dir = root / "prompts"
+            prompt_dir.mkdir(parents=True, exist_ok=True)
+
+            _write_tree(
+                tree_path(run_dir),
+                [
+                    {
+                        "id": "a",
+                        "brief": "first",
+                        "artifact": "out/a.md",
+                        "gates": ["nonempty"],
+                        "judgment": ["R1"],
+                        "rubric": {"R1": "must mention widgets"},
+                    }
+                ],
+            )
+            provider = FakeProvider(
+                [
+                    {"action": "dispatch", "node_id": "a", "reason": "attempt 1"},
+                    {
+                        "items": [
+                            {"id": "R1", "pass": False, "defect": "no mention of widgets"}
+                        ],
+                        "verdict": "fail",
+                    },
+                ]
+            )
+            tree = asyncio.run(
+                run_round_loop(
+                    run_dir,
+                    tree_path(run_dir),
+                    writer_adapter_factory=_adapter_factory(root, run_dir, prompt_dir),
+                    env=LocalEnvironment(tmp_dir=str(prompt_dir)),
+                    provider=provider,
+                    prompt_for_node=lambda node: f"do {node.id}",
+                    writer_budget=EpisodeBudget(max_duration_seconds=30),
+                    max_attempts=1,
+                )
+            )
+            self.assertEqual(tree.nodes["a"].status, "blocked")
+            self.assertIn("no mention of widgets", tree.nodes["a"].last_defect)
+            self.assertIn("R1", tree.nodes["a"].last_defect)
+
+    def test_success_clears_defect(self) -> None:
+        with tempfile.TemporaryDirectory() as root_str:
+            root = Path(root_str)
+            run_dir = create_run_dir(root, "run7")
+            prompt_dir = root / "prompts"
+            prompt_dir.mkdir(parents=True, exist_ok=True)
+
+            _write_tree(
+                tree_path(run_dir),
+                [
+                    {
+                        "id": "a",
+                        "brief": "first",
+                        "artifact": "out/a.md",
+                        "gates": ["nonempty"],
+                        "judgment": ["R1"],
+                        "rubric": {"R1": "must mention widgets"},
+                    }
+                ],
+            )
+            provider = FakeProvider(
+                [
+                    {"action": "dispatch", "node_id": "a", "reason": "attempt 1"},
+                    {
+                        "items": [
+                            {"id": "R1", "pass": False, "defect": "no mention of widgets"}
+                        ],
+                        "verdict": "fail",
+                    },
+                    {"action": "dispatch", "node_id": "a", "reason": "attempt 2"},
+                    {"items": [{"id": "R1", "pass": True}], "verdict": "pass"},
+                ]
+            )
+            tree = asyncio.run(
+                run_round_loop(
+                    run_dir,
+                    tree_path(run_dir),
+                    writer_adapter_factory=_adapter_factory(root, run_dir, prompt_dir),
+                    env=LocalEnvironment(tmp_dir=str(prompt_dir)),
+                    provider=provider,
+                    prompt_for_node=lambda node: f"do {node.id}",
+                    writer_budget=EpisodeBudget(max_duration_seconds=30),
+                    max_attempts=3,
+                )
+            )
+            self.assertEqual(tree.nodes["a"].status, "passed")
+            self.assertEqual(tree.nodes["a"].last_defect, "")
+
+
 class PerNodeToolRestrictionTest(unittest.TestCase):
     def test_tool_allowlist_reaches_the_command_line(self) -> None:
         adapter = GptmeAdapter(api_key="k", tool_allowlist=("shell", "read"))
