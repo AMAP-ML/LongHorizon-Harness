@@ -36,6 +36,7 @@ LongHorizon-Harness is an execution, state-management, and result-verification s
 
 ## ✨ News
 
+- **[2026-08-10]** Added the Terminal-Bench 2.1 evaluation.
 - **[2026-08-07]** A new, more user-friendly Dashboard is in the works. Stay tuned.
 - **[v0.1.3 · 2026-08-07]** Every run now ends with a plain-language reply that answers your task from the verified state alone. Tasks act on the directory you launched from by default, and the console reports each round as it happens.
 - **[2026-08-06]** LongHorizon-Harness reaches **#1** on the [Hugging Face Daily Papers weekly ranking](https://huggingface.co/papers/week/2026-W32).

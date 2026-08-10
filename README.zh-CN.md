@@ -36,6 +36,7 @@ LongHorizon-Harness 是一套面向长程任务的执行、状态管理和结果
 
 ## ✨ News
 
+- **[2026-08-10]** 补充了 Terminal-Bench 2.1 评测。
 - **[2026-08-07]** 我们正在开发新版 Dashboard，交互会更友好，敬请期待。
 - **[v0.1.3 · 2026-08-07]** 每次运行结束都会输出一份自然语言回复，只依据已验证状态回答你的任务；任务默认作用于你启动命令的目录，控制台也会实时打印每一轮进展。
 - **[2026-08-06]** LongHorizon-Harness 登上 [Hugging Face Daily Papers 周榜](https://huggingface.co/papers/week/2026-W32)**第 1 名**。
