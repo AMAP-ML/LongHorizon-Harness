@@ -441,14 +441,15 @@ Every run is stored in an isolated `runs/<run-id>/` directory. The complete task
 
 ## Evaluation Reproduction
 
-`eval/` provides frozen reproduction suites for two benchmarks:
+`eval/` provides frozen reproduction suites for three benchmarks:
 
 | Directory | Benchmark | Description |
 |---|---|---|
 | [`eval/WeaveBench-harness/`](eval/WeaveBench-harness/) | WeaveBench (114 tasks) | Hybrid GUI+CLI tasks and a reproduction skill |
 | [`eval/OSWorldv2-harness/`](eval/OSWorldv2-harness/) | OSWorld-V2 (108 tasks) | Hybrid runner aligned with the official release |
+| [`eval/TB-harness/`](eval/TB-harness/) | Terminal-Bench 2.1 | CLI-only long-horizon tasks |
 
-See each directory's `README.md` or `README.zh-CN.md` for environment setup, parameters, and launch commands. The nested `cua_harness` packages are frozen compatibility copies used for evaluation; new integrations should use `src/lh_harness/`.
+See each directory's `README.md` or `README.zh-CN.md` for environment setup, parameters, and launch commands. The nested `Harness` / `cua_harness` code is a frozen compatibility copy used for evaluation; new integrations should use `src/lh_harness/`.
 
 ## Citation
 

@@ -1,0 +1,16 @@
+from __future__ import annotations
+
+from typing import Protocol, runtime_checkable
+
+from harness_types import ExecResult
+
+
+@runtime_checkable
+class Environment(Protocol):
+    async def exec(self, command: str, timeout: int = 30) -> ExecResult: ...
+
+    async def screenshot(self) -> bytes: ...
+
+    async def upload(self, local_path: str, remote_path: str) -> None: ...
+
+    async def download(self, remote_path: str, local_path: str) -> None: ...
