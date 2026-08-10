@@ -17,7 +17,7 @@
 
 </div>
 
-> Models often produce incomplete work, or start to forget critical details as they go. Kusudaemon is built to fix that. It is built with delegation and verification in mind.
+> Models often produce incomplete work, or start to forget critical details as they go. Kusudaemon is built to fix that. It is made with delegation and verification in mind.
 
 Kusudaemon is an agent harness designed for long-horizon tasks. It decomposes long tasks into a tree of subtasks (each a node) that are executed and verified independently. Each task has criteria that can be verified by static code, rather than an LLM.
 

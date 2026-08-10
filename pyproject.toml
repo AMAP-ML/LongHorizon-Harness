@@ -26,7 +26,7 @@ dependencies = [
 # `kusudaemon`.
 [project.optional-dependencies]
 gptme = ["gptme"]
-# Non-generative retrieval (PLAN-zeromem.md §3, §4): embedding-based
+# Non-generative retrieval (CLAUDE.md, v2/embeddings.py + v2/retrieval.py):
 # boundary detection and span retrieval. Heavy (pulls torch) and strictly
 # optional — every consumer degrades to the model path when absent.
 retrieval = ["sentence-transformers>=3.0"]

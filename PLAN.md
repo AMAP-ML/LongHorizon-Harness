@@ -1,815 +1,502 @@
-# PLAN.md — Recursive Decomposition Harness
+# PLAN.md — what is not built yet
 
-**Status:** v0 (resumability), v1 (round loop), v2 (intake, survey,
-recursive planning, pilot + contract derivation), v3 (assembly and
-repair), and v4 (research tools) implemented and tested. See Progress
-below.
-**Scope:** general-purpose long-horizon task executor. Not a coding harness.
+`CLAUDE.md` is the design document and the record of what exists. **This file
+contains only work that has not shipped.** Anything described here is
+aspirational until it moves into `CLAUDE.md` Part II with tests behind it.
 
-## Progress
-
-- **v0 — prove resumability (§13): done.** `src/kusudaemon/v0/` — fsync'd
-  append-only `EventLog`, idempotent `run_node()` that converges to exactly
-  one artifact/terminal event no matter when a `kill -9` lands, and session
-  continuation for `ClaudeCodeAdapter` via `claude --resume <id>` (Codex has
-  no equivalent, falls back to fresh redispatch). Proven by
-  `tests/test_v0_resume.py`, which SIGKILLs real OS subprocesses (not
-  in-process mocks) — 4/4 passing. Existing role files
-  (`manager.py`/`auditor_agent.py`/`cli.py`/`role_prompts.py`) untouched;
-  this is additive scaffolding. Decision on file placement: build directly
-  inside `src/kusudaemon/`, eventually replacing Manager→Orchestrator,
-  Executor→Writer, Auditor→Reviewer in place (not a separate package).
-  See `CLAUDE.md` for the file-by-file breakdown.
-- **v1 — the round loop (§13): done.** `src/kusudaemon/v1/` —
-  OpenAI-compatible provider module (§12, stdlib-only), stateless-per-round
-  Orchestrator, Reviewer, and a Writer wrapper over v0's `run_node`, all
-  tied together by `round_loop.run_round_loop`. Task state lives in
-  `tree.json` (§6 Node schema); a node cannot be constructed without
-  machine-checkable gates (§2 invariant 1/2). Schema-constrained JSON
-  returns for Orchestrator/Reviewer, with a validate-and-reprompt fallback
-  since `response_format: json_schema` support varies by endpoint (§12).
-  Per-node tool restriction via `ClaudeCodeAdapter(allowed_tools=...)`
-  (additive, §5). Writer handoff capped at ~400 tokens (§13 v1 scope).
-  Round-loop-level resumability composes with v0 rather than reimplementing
-  it — see `CLAUDE.md` for how in-flight nodes are resumed before the
-  orchestrator is asked anything new. 25/25 tests passing
-  (`tests/test_v0_resume.py`, `tests/test_v1_units.py`,
-  `tests/test_v1_round_loop.py`), all against fakes — no network, no real
-  provider/agent-CLI credentials needed to run the suite.
-- **v2 — intake, survey, recursive planning (§13): done.**
-  `src/kusudaemon/v2/` — bounded assumptions-list intake (one question call
-  per rubric dimension, one finalize call, freezes `spec.md`); mechanical
-  chunking + windowed-survey + harness-merged `spine.json` (§4.2, three
-  stages, one file); a recursive level-at-a-time planner (§4.3) whose leaf
-  gate, depth cap (4), and node cap (400) are all harness code, never model
-  judgment, producing a v1 `TaskTree` of independent leaves
-  (`depends_on=[]`, per §4.5); pilot-per-shape + diff-derived contract
-  rules frozen into `contract.md` under a hard token ceiling (§4.4), with
-  `amend_contract` as the only other allowed writer. Four composable
-  library modules, not a pipeline driver — nothing chains
-  intake→survey→plan→pilot→execute yet, and the node-type template system
-  (richer gates/rubrics) still doesn't exist, so leaves carry only v1's
-  generic gates. 61/61 tests passing (`tests/test_v0_resume.py`,
-  `tests/test_v1_units.py`, `tests/test_v1_round_loop.py`,
-  `tests/test_v2_intake.py`, `tests/test_v2_survey.py`,
-  `tests/test_v2_planner.py`, `tests/test_v2_pilot.py`), all against fakes.
-  See `CLAUDE.md` for the file-by-file breakdown and what's explicitly
-  still out of scope.
-- **v3 — assembly and repair (§13): done.** `src/kusudaemon/v3/` —
-  deterministic concatenation + index ordered straight from `tree.json`'s
-  own array order (`assemble.py`, zero model tokens); cross-cutting
-  checks over what's actually derivable pre-node-type-templates: missing/
-  empty artifacts, gate drift, manifest desync (`checks.py`, emits
-  `assembly/checks.json`); a compile gate that's a plain injected shell
-  command run through the existing `Environment.exec` abstraction, not a
-  LaTeX-specific assumption — exit code + log are the gate, and it's a
-  trivial pass when no command is configured (`compile.py`). The harder
-  piece is `repair.py`: a scoped repair dispatches under a derived node id
-  (`"<id>~repair<attempt>"`) because v0's `run_node` would otherwise no-op-
-  replay an already-completed node id, then copies the result over the
-  real artifact only after it re-clears gates and review — snapshotting to
-  `out/.versions/` first. `assembly_loop.py` is the v3 entrypoint: on a
-  compile failure it attributes the log to a node by artifact filename and
-  dispatches a scoped repair, looping (bounded by `max_repairs`) until
-  clean or escalating rather than guessing when nothing can be attributed.
-  `revalidate.py` builds the §10 contract-amendment triage on top of the
-  same repair primitive: a read-only re-run of the existing Reviewer
-  against the amended contract (no writers dispatched), classified
-  clean/patchable/regenerate via the verdict schema's own `class` field
-  (already shipped in v1's `reviewer.py`), with a token-count cost
-  estimate and a triage-counts summary meant to sit either side of a user
-  approval gate before `apply_revalidation_triage` executes anything. One
-  additive touch to v1: `TaskNode.status` gained `"stale"` (§10:
-  "completed nodes now stale") — nothing that doesn't amend a contract
-  ever produces it. 89/89 tests passing (adds
-  `tests/test_v3_assemble.py`, `test_v3_checks.py`, `test_v3_compile.py`,
-  `test_v3_repair.py`, `test_v3_assembly_loop.py`,
-  `test_v3_revalidate.py`), all against fakes — no network, no real
-  provider/agent-CLI credentials. Glossary tracking (`glossary.json`) and
-  refs/terms-based checks remain unbuilt: they need the node-type template
-  system, still open (see below).
-- **v4 — research tools (§13): done.** `src/kusudaemon/v4/` — a scoped,
-  budget-capped research subagent, run as its own phase before the round
-  loop dispatches any Writer, not wired into a Writer's own tool loop
-  (§8: raw search transcripts are exactly the "raw tool results" waste §8
-  ranks second-worst). `mcp_research.py` supplies the MCP seam §15.2
-  insists on rather than reimplementing search: `web_search` needs no MCP
-  server at all (Claude Code's built-in `WebSearch`/`WebFetch`, narrowed
-  in via the existing per-node `allowed_tools` mechanism); `doc_retrieval`
-  wires in Context7 (§15.7's one concrete named donor) via the existing
-  `ClaudeCodeAdapter(mcp_config=...)` seam, env-overridable the same way
-  `KUSUDAEMON_CLAUDECODE_MCP_CONFIG` already is. `research.py` dispatches
-  each query under a derived id (`"<node>~research~<slug>"`, same
-  reasoning as `v3/repair.py`'s `"<id>~repair<n>"`: a query isn't the
-  node's own dispatch, so it can't collide with that node's own
-  `episode_completed` event) through v0's `run_node`, caps the result to
-  300 tokens, and layers its own idempotency on top of v0's per-episode
-  idempotency — a second call for an already-answered query is a pure
-  cache read, no redispatch. `research_loop.py` is the v4 entrypoint:
-  folds each finding's path straight into the target node's existing
-  `inputs` list (§6 — a finding is just another input, no new `tree.json`
-  field), skipping only findings that failed their own `nonempty` gate
-  (a missing citation degrades gracefully rather than blocking a run, per
-  §13's "lowest priority: these are retrieval fixes"). Composable library
-  module, not pipeline wiring — same posture v2/v3 already took; nothing
-  here is called from `cli.py`. Zero modifications to v0/v1/v2/v3. 103/103
-  tests passing (adds `tests/test_v4_mcp_research.py`,
-  `tests/test_v4_research.py`, `tests/test_v4_research_loop.py`), all
-  against fakes — no network, no real MCP server, no provider/agent-CLI
-  credentials. The node-type template system v2's planner and v1's gates
-  both flag as missing is still open — see `v2/planner.py`'s and
-  `v1/gates.py`'s docstrings. Per §13, v4 was the last item on the build
-  ladder; anything past this is v5+ and not yet scoped in this file.
+Supersedes the old `PLAN.md` (design doc — folded into `CLAUDE.md` §§1–15) and
+`PLAN-zeromem.md` (Zero-Mem workstreams — all eleven shipped 2026-08-09; their
+outstanding *measurements* are carried forward here as §6).
 
 ---
 
-## 1. Problem
+## §0 Status
 
-LLMs fail at long-horizon tasks for three reasons: context windows fill, provider
-limits interrupt, and no one verifies that "done" means done. Existing harnesses
-mostly address the first two. This one is built around the third, and around a
-harder constraint: **no task may be attempted at a size the model can't reliably
-handle.**
+Built and tested: v0–v5 plus Zero-Mem §§1–11. 299 tests, ~19s, green.
 
-The framework is corpus-agnostic. It must work on a textbook with a table of
-contents, a folder of unstructured personal lecture notes, a codebase, or a
-research corpus, without special-casing any of them.
+The harness can take a corpus and a goal, elicit a rubric, discover structure,
+decompose recursively, pilot and freeze a contract, research, execute, review,
+repair, assemble, and be driven from a CLI or a web dashboard — with crash
+resume at every point.
 
----
+What it cannot yet do, in the order that matters:
 
-## 2. Invariants
-
-These are the non-negotiable properties. Every design decision below exists to
-serve one of them.
-
-1. **Nothing declares itself done.** Only the harness writes `status: passed`,
-   and only after gates evaluate.
-2. **Decomposition is unconditional and gated by code**, not by model judgment
-   about whether a task "feels" too big.
-3. **Every context is bounded and constant-size.** No context grows with corpus
-   size or run length — including the orchestrator's.
-4. **The filesystem is the state.** Model contexts are scratch space, rebuilt
-   from disk. Any context can be destroyed and reconstructed.
-5. **Anything a script can compute, a script computes.** Model tokens are spent
-   only on judgment.
-6. **Cross-agent isolation.** No agent sees another agent's reasoning, scratch,
-   or raw tool output.
-7. **Small outputs everywhere.** Every model call — including planning calls —
-   emits a small artifact. Large generations are the observed failure mode.
-
----
-
-## 3. Roles
-
-Four roles. Three are pure text-in / JSON-out and are called via the API
-directly. Only the Writer needs a full agent loop with file editing.
-
-| Role | Reads | Writes | Loop? |
-|---|---|---|---|
-| **Orchestrator** | `tree.json`, `manifest.jsonl` tail, open gates | dispatch decisions | no — stateless per round |
-| **Planner** | `spine.json`, global rubric, node templates | flat list of child nodes | no |
-| **Writer** | its node brief, declared inputs, contract | one artifact | yes — agent CLI |
-| **Reviewer** | artifact, contract, rubric | structured verdict | no |
-
-**Orchestrator is stateless per round.** Fresh context every round, rebuilt from
-disk: read compact tree, read manifest tail, decide next node, dispatch, discard.
-~2–3K tokens per round regardless of whether the run has 40 nodes or 400.
-
-**Planner never sees source content.** Its context is the spine (unit labels +
-token counts), the global rubric, and node-type templates. Constant size for a
-900-page corpus.
-
-**Reviewer never sees the Writer's reasoning or scratch.** Artifact + contract +
-rubric only. A reviewer that can see the writer's justification talks itself into
-accepting.
-
-**Reviewer cannot write.** Verdicts and scoped defects only. Repairs are separate
-Writer nodes.
-
----
-
-## 4. Pipeline
-
-```
-intake → survey → plan → pilot → [execute → review → repair]* → assemble
-           ↑                ↑
-      (spine.json)   (user approval → contract.md frozen)
-```
-
-### 4.1 Intake
-
-Elicits the **global rubric** once, through questioning — not assumption.
-Roughly: audience and level; purpose (exam prep / reference / first pass); what
-makes something important here; what to exclude outright; required components per
-unit; target length; fidelity to source wording.
-
-Anything intake can't resolve becomes an explicit **assumption line** in the
-global rubric, surfaced for user review before execution begins. This is how we
-get "no unstated assumptions" without an unbounded interview.
-
-Per-node rubrics are **derived** from the global rubric plus node type via
-templates. Never re-elicited per node.
-
-### 4.2 Survey — structure discovery
-
-Three stages, uniform output regardless of input structure.
-
-1. **Mechanical chunking** (no model). Split on whatever boundaries exist:
-   headings, page breaks, dates, file boundaries, blank-line runs. Compute
-   per-chunk token counts.
-2. **Windowed survey** (model, tiny outputs). Walk chunks in overlapping windows.
-   Each call emits only candidate boundaries:
-   `{"boundary_after": 11, "label": "shift to Lagrangian formulation", "confidence": 0.8}`.
-   Never a summary. Never content. No call ever sees the whole corpus.
-3. **Spine assembly** (harness). Merge boundary votes, apply a minimum-size floor,
-   emit `spine.json`.
-
-A textbook's TOC makes stage 2 nearly free. Lecture notes make it do real work.
-Downstream is identical.
-
-### 4.3 Plan — recursive, one level at a time
-
-The planner is subject to the same small-output rule as everything else.
-
-1. Planner call #1 sees the spine, emits a top-level partition (8–12 children,
-   **flat list**, parent implied by the call — never nested JSON).
-2. Harness runs the leaf gate on each child.
-3. Each child failing the gate gets **its own separate planner call** for its
-   children.
-4. Recurse to depth cap (4) with a node-count cap.
-
-**Leaf gate.** A node may be a leaf only if *all* hold — checked by the harness,
-not asserted by the model:
-
-- produces exactly one named artifact
-- required inputs fit under the node token budget
-- done-condition expressible as one checkable sentence
-- estimated tool calls ≤ K (start K=15)
-
-Fail any → harness rejects the leaf and forces another split.
-
-### 4.4 Pilot — the consistency mechanism
-
-Sizing classifies nodes by **shape** (prose-dominant, derivation-dominant,
-problem-set-dominant, etc.). Run **one pilot per shape**, usually two or three
-total. Not "the first node" — the first chapter of anything is atypical.
-
-For each pilot:
-
-1. Writer produces the artifact.
-2. Run enters `awaiting_approval` (a durable event-log state, not a blocking
-   prompt — the user can return the next morning).
-3. User edits the file **directly on disk** in their own editor.
-4. `harness approve` diffs original vs. edited.
-5. **Contract derivation** reads that diff. The diff is the highest-signal input
-   in the whole system — "user deleted every historical aside," "user cut examples
-   to three lines" — rules that could never be elicited by asking.
-6. `contract.md` is frozen.
-
-Only two things may write to the contract: pilot derivation, and explicit user
-amendment. **Reviewer suggestions must never reach it** — otherwise requirements
-inflate monotonically and node 30 is held to a stricter bar than node 2.
-
-Reviewers get the **contract plus a short excerpt**, with `read_exemplar(section)`
-available as a tool. Always-loading the full exemplar costs its token count on
-every review turn for the rest of the run.
-
-### 4.5 Execute / review / repair
-
-Sequential by default (one node at a time). Nodes carry `depends_on` anyway —
-costs nothing now, unlocks parallelism later. Freezing the contract after the
-pilot makes the remaining leaves genuinely independent, so parallelism is a
-config change rather than a redesign.
-
-A leaf has **no `finish()` tool**. Its terminal action is `submit(artifact_path)`.
-The harness runs gates and either passes the node or returns unmet item IDs with
-one-line reasons. Three failed submits → escalate to the user, don't loop.
-
-Defects are **scoped and located** ("§Worked Examples, example 2 omits the
-intermediate step"). Repair writers are instructed to make the minimal change.
-Freeform prose suggestions get over-applied and drift the artifact away from the
-exemplar in the name of fixing it.
-
-### 4.6 Assemble
-
-Three things, two of which need no model:
-
-1. **Concatenation + index** — script. Generate `main.tex` (or equivalent) with
-   `\input{}` lines ordered from `tree.json`. Zero tokens.
-2. **Cross-cutting checks** — script. Do all `refs_out` resolve? Is every used
-   term in `glossary.json`? Duplicate definitions? Continuous numbering? Empty
-   sections? Emit `assembly/checks.json`.
-3. **Compile + repair** — model. Run `latexmk`; **exit code and log are the gate.**
-
-**Critical guardrail:** the assembler's file tools are **read-only over `out/`**.
-A compile error becomes a repair node scoped to the offending file, which goes
-back through review. Otherwise the assembler "helpfully" edits content to make the
-build green and you ship a passing compile over corrupted content that already
-passed review.
-
-Parse warnings too, not just errors — undefined references, overfull boxes past a
-threshold, missing citations. Free structural checks that catch cross-unit
-breakage per-unit review can't see.
-
-**Holistic gap (accepted deliberately):** because the orchestrator never reads
-content, nobody ever looks at the whole thing. Add an explicit **sampling node**
-near the end — read units 1, 14, 27, check against `spec.md`, report — budgeted
-like any other leaf.
-
----
-
-## 5. Run directory
-
-Harness-owned. **Code creates it, code enforces it.** If agents choose their own
-paths, the orchestrator can no longer navigate by path without reading.
-
-```
-.harness/runs/<run-id>/
-  spec.md              frozen: goal, global rubric, approved assumptions
-  contract.md          frozen after pilot; hard token ceiling
-  spine.json           discovered structure
-  tree.json            nodes, deps, gates, status
-  manifest.jsonl       one machine-written line per completed leaf
-  events.jsonl         append-only, fsync'd — the resume log
-  glossary.json        append-only, term → defining location
-  orchestrator/
-    round-NN.jsonl     per-round trace (naturally chunked — stateless rounds)
-  scratch/
-    <node>/
-      notes.md         working notes
-      raw/             tool dumps; nothing else ever reads these
-      trace.jsonl      streamed reasoning — write-once, never re-read by any agent
-      promotion.json   ≤300 tokens, the only thing that escapes
-  out/
-    <node>.md          artifacts
-    .versions/         pre-repair snapshots
-  audit/
-    <node>.json        gate results + reviewer verdict
-  assembly/
-    index.md, checks.json, main.tex
-```
-
-**Enforcement, not instruction:** each leaf's file tools are chrooted to its own
-`scratch/<node>/`, its declared inputs, and its artifact path. Not a prompt rule —
-an actual restriction in the tool implementation. That's what guarantees no leaf
-can pull another leaf's raw dumps into context.
-
-`scratch/<node>/` is deletable once the node passes. Keep it for debugging; it's
-never in anyone's context again.
-
----
-
-## 6. Schemas
-
-### Node (`tree.json`)
-
-```json
-{
-  "id": "ch07",
-  "type": "chapter-summary",
-  "shape": "derivation-dominant",
-  "brief": "…what and why, ~2 sentences…",
-  "inputs": ["source.pdf#pp.184-211"],
-  "artifact": "out/ch07.md",
-  "tools": ["read_span", "write", "glossary_lookup"],
-  "budget": {"tokens": 24000, "calls": 15},
-  "gates": ["headers:std", "problems>=5", "terms_defined", "len:1200-2000"],
-  "judgment": ["R1", "R2", "R3"],
-  "depends_on": ["contract:frozen"],
-  "status": "pending"
-}
-```
-
-`tools` is **per-node**. This is the single biggest token lever and it also
-improves reliability — a surveyor with three read-only tools is both cheaper and
-better than one with fifteen.
-
-### Manifest line (`manifest.jsonl`)
-
-Everything except `promotion` is **derived by the harness from the artifact** —
-no model involvement, no hallucination surface.
-
-```json
-{"node":"ch07","artifact":"out/ch07.md","tokens":1640,
- "headers":["Overview","Key Terms","Worked Examples","Practice"],
- "terms_defined":["flux","divergence"],"terms_used_undefined":[],
- "refs_out":["ch05#gauss"],"problems":6,"gates":"pass",
- "promotion":"used vector-field notation from ch05; deferred Stokes to ch09"}
-```
-
-This is enough for the orchestrator to plan repairs, order assembly, and answer
-"what's left" without opening a single artifact.
-
-### Reviewer verdict (`audit/<node>.json`)
-
-```json
-{"node":"ch07","contract_version":3,
- "items":[{"id":"R1","pass":true},
-          {"id":"R2","pass":false,
-           "defect":"§Worked Examples, ex.2 omits intermediate step",
-           "class":"patchable"}],
- "verdict":"fail"}
-```
-
----
-
-## 7. Rubrics: gates vs. judgment
-
-Split by checkability. This is how "no room to say I'm done" costs almost no
-context.
-
-**Gates** — machine-checkable, live in the harness, **never enter model context**.
-File exists, required headers present, ≥N practice problems, formulas in LaTeX, no
-undefined glossary terms, length in band, every source section referenced. The
-writer doesn't read "must have ≥5 problems"; it fails the gate and gets
-`unmet: R3 (4 problems, need 5)`.
-
-**Judgment** — terse imperatives in the brief, 3–6 lines max:
-
-```
-R1 define every bolded term from source span
-R2 worked example for each procedure, not each theorem
-R3 exclude historical/biographical material
-```
-
-Twelve invisible gate items + four visible judgment items = full enforcement at
-near-zero prompt cost.
-
-**Calibration risk:** gates too strict → leaves fail three times and escalate on
-trivia → you babysit. Start with gates that are structural and unambiguous; keep
-judgment items genuinely soft. Tighten after seeing where real failures cluster.
-
----
-
-## 8. Context discipline
-
-Where input tokens actually go, in rough order of waste, for a 15-turn leaf:
-
-1. **Tool schemas** — 15 verbose tools ≈ 3–4K tokens resent every turn ≈ 50K
-   wasted on one leaf. Fixed by per-node `tools`.
-2. **Raw tool results** — `read_file` dumping 800 lines when three functions were
-   needed pollutes every subsequent turn. Use `read_span`, symbol-level reads,
-   grep-with-context. Never cat the whole source.
-3. **Turn history** — grows quadratically in turns. This is the real argument for
-   small leaves: a 6-turn leaf costs far less than a third of an 18-turn leaf.
-   Enforce `budget.calls` as a hard stop that triggers **re-split**, not a warning.
-4. **Restatement** — rubric in system prompt, again in brief, again in a reminder.
-   Say everything once; let position do the work.
-
-**Excluded from every leaf context:** the full task tree (it gets its node plus a
-one-line parent), any other leaf's output, the raw source document, history from
-prior leaves, schemas for tools it can't call.
-
-**Prompt ordering** — most-stable to least-stable, for prefix caching:
-system → tool schemas → frozen contract → node brief → inputs → turn history.
-Never interleave volatile state into the system prompt. If the contract is still
-mutating, place it *after* the tool schemas.
-
-**Instrument it.** Log per-turn input tokens broken down by segment (system /
-tools / contract / brief / inputs / history). Put *mean input tokens per leaf* in
-the eval suite next to correctness — otherwise a prompt tweak that doubles the
-bill looks identical to one that doesn't.
-
----
-
-## 9. Reasoning traces
-
-**Policy:** thinking is streamed to the user, written once to
-`scratch/<node>/trace.jsonl`, and **never read by any agent.** Not in promotions,
-not in manifest lines, not in reviewer context.
-
-Enforce structurally: put traces in a store the prompt assembler physically cannot
-read from. Discipline fails at 2am; a type error doesn't.
-
-**Within-agent carve-out:** the *current* turn's reasoning must accompany the tool
-result back to the model on the next call, or multi-step reasoning degrades —
-silently. Note that Anthropic's API already strips earlier turns' thinking
-automatically, so effective behavior closely matches the intended policy. Verify
-against current docs for whichever endpoint is in use.
-
-**Retry after failure:**
-- Failure before generation (429, connect error) → nothing produced, plain retry.
-- Stream dies mid-generation → cannot resume; must re-query. Partial reasoning
-  **cannot** be re-sent as a signed reasoning block (truncated → signature fails).
-  Re-inject as labeled plain text with explicit permission to discard:
-  *"Your previous attempt was interrupted. Partial reasoning (unverified, may end
-  mid-thought): … Continue from here or restart if it looks wrong."*
-- Only re-inject above a floor (~1000 tokens of partial reasoning). Below that,
-  regenerating is cheaper than paying to re-read it.
-
-Traces will be large and completely inert. Rotate or compress per node; the viewer
-streams from the tail rather than loading whole files.
-
----
-
-## 10. Failure, resume, intervention
-
-**Resume.** `events.jsonl` is append-only and fsync'd. Every event carries `ts`,
-`node_id`, `role`, `round`, `type`. Resume replays to the exact tool call. This is
-the load-bearing property — build and test it first.
-
-**Never interrupt mid-turn.** Queue interventions; apply at the next node
-boundary. Killing mid-turn loses the turn's work and can leave a half-written
-artifact.
-
-**Three intervention types, by blast radius:**
-
-| Type | Effect | Radius |
+| # | Gap | Why it's ranked here |
 |---|---|---|
-| **Reopen node** | mark failed with a user-written defect; re-enters queue as repair | one node |
-| **Amend contract** | new rules downstream; completed nodes now `stale` | whole run |
-| **Halt** | stop after current node | — |
+| §2 | **Node-type template system** | The semantic bar is missing entirely. Every leaf ships `nonempty` + `max_tokens` and an empty `judgment`, so `review_node` auto-passes without a model call. Gate pass rate and reviewer pass rate are both pinned at 1.0 and cannot move — which also means three of §6's ship gates have no instrument. |
+| §3 | **Parallel dispatch** | Pure throughput, no correctness change. `depends_on` is already tracked, so this is a config change, not a redesign (`CLAUDE.md` §4.5). |
+| §4 | **Automatic research-query planner** | v4 executes a plan; nothing decides *which* nodes need *which* questions. Same "hand-authored starting point" v1's trees had before v2's planner. |
+| §5 | **Dashboard hardening** | No auth of any kind; no cap on concurrent runs; gptme-native nested subagents invisible. Only §5.1 is a real exposure, and only once someone binds off loopback. |
+| §6 | **Ship-gate measurements** | Not code. Seven real-corpus checks the unit suite structurally cannot satisfy. |
+| §7 | **Eval harness** | `CLAUDE.md` §14 was never built. Without it §2's calibration and §6's measurements are one-off manual exercises. |
 
-**Contract amendment → re-validation pass.** Do *not* blanket-regenerate. Re-run
-the existing **Reviewer** (read-only, stateless, no writers dispatched) against
-the amended contract as review-only nodes. Cost ≈ N × (contract + rubric +
-artifact). Show that estimate before running.
+**Ordering is not arbitrary.** §2 before §6, because §6's gates are stated in
+terms of artifact quality and there is currently no instrument that can read
+it. §2 before §7, because an eval suite measuring pass rates pinned at 1.0
+measures nothing. §3, §4, and §5 are independent of all of that and of each
+other.
 
-Triage each completed node into three buckets:
+## §1 Rules that apply to every workstream
 
-- **Clean** — already satisfies the amendment. No action.
-- **Patchable** — small scoped edit. Additive amendments usually land here
-  ("every unit needs a summary box" → append a box).
-- **Regenerate** — the amendment contradicts what was written
-  ("worked solutions → hints-only"). Full re-run.
+Carried from the Zero-Mem plan; they held up across eleven workstreams.
 
-Present counts, get approval, then execute. Snapshot to `out/.versions/` before
-any repair — if the amendment was itself the mistake, you'll only realize it three
-chapters in.
-
-**Approval-rate tracking, segmented by shape.** A global drop from 90%→60% says
-something is wrong. A rate that's fine for prose units and collapsing on
-derivation-heavy ones says *which exemplar to re-pilot*. Below threshold → halt
-and offer re-pilot rather than grinding out thirty more units that all need
-repair.
-
----
-
-## 11. Interfaces
-
-**Control surface: CLI.** `harness run`, `status`, `approve`, `amend`, `resume`.
-
-**View surface: local web app.** `harness serve` → localhost, SSE streaming,
-separate process watching the run directory. It can crash without touching the
-run; it can be attached from anywhere.
-
-Rationale for the split: liking the terminal and wanting to review a 2,000-word
-document in it are different preferences. The pilot-approval step is document
-editing plus PDF preview, which terminals are bad at.
-
-**Build neither first.** Structured logs + `tail`/`jq` gets a working harness. The
-web view is additive.
-
-**2026-08-09 revision: the view surface shipped as a TUI, not a web app.**
-Kusudaemon's actual implementation (`kusudaemon tui`, `src/kusudaemon/tui/`)
-replaced the local web app described above with a terminal UI
-([Textual](https://github.com/Textualize/textual)) attached to the same run
-directory — same "separate process, can crash without touching the run, can
-attach from anywhere" property, just rendered in the terminal instead of a
-browser. The pilot-editing/PDF-preview rationale above for *why a browser*
-turned out not to outweigh, in practice, "the operator is already living in a
-terminal for the CLI half of this control surface" — so the TUI became the
-whole view+control surface (approve/amend/reopen/halt included) rather than a
-separate read-mostly view next to a CLI doing the writing. It also picked up
-something a web view didn't have: a running Writer/repair/research episode's
-gptme session drains an external prompt-queue file between turns (gptme's own
-mechanism), so the TUI can append to it live — the operator can message a
-subagent *while it's still running*, not just watch its trace after the fact.
-
-**Default node view** — raw JSONL is unusable; nobody will read it. Show: brief
-given, gate results (pass/fail per item), reviewer verdict lines, artifact diff,
-**input tokens by segment**. Raw trace one keypress away. In practice correction
-happens from the verdict; the trace is for debugging the harness, not the content.
-
-Streaming-reasoning rendering is commodity — lift it from existing work. Writer
-leaves shelled out to an agent CLI get its rendering free; direct-API roles render
-from `trace.jsonl`. Don't build stream rendering twice.
+1. **No behavior change in v0–v5 without a fallback.** Every new path is
+   opt-in via an explicit argument or flag, and every consumer degrades to
+   today's behavior when it's off or its optional dependency is missing.
+2. **The core package and test suite stay dependency-free.** `pyproject.toml`
+   is `packaging` + `tomli`, with `gptme` and `retrieval` as extras. Anything
+   heavier is imported inside a function body, never at module import time.
+3. **Every new test file starts with
+   `sys.path.insert(0, str(_REPO_ROOT / "src"))`** — see `CLAUDE.md` Part III
+   for why this is load-bearing rather than boilerplate.
+4. **Run the whole suite after each workstream**, not just the new file.
+5. **A new default is a separate decision from a new mechanism.** Ship
+   default-off, measure, then flip. Every Zero-Mem workstream that skipped
+   this step is one of §6's open gates.
 
 ---
 
-## 12. Provider layer
+## §2 Node-type template system  (v6 — the load-bearing one)
 
-**Scope for v1: OpenAI-compatible only.** Test model: DeepSeek V4 Flash Free via
-OpenCode Zen.
+### 2.1 The gap, precisely
 
-Testing on a weak free model is the correct development target. A frontier model
-compensates for harness defects and everything looks like it works; then you swap
-models and can't tell which of forty design choices was load-bearing. Free-tier
-rate limits also exercise backoff and resume paths continuously, for free.
+Four places in the source already flag this against each other:
 
-**Do not build a provider abstraction now.** Keep everything provider-specific in
-**one module** (~200 lines): stream parsing, reasoning extraction, structured
-output, tool-call format. Later portability costs one file instead of a refactor.
+- `v1/gates.py` ships `exists`/`nonempty`/`len`/`max_tokens`/`contains`. The
+  §6 and §7 examples — `headers:std`, `terms_defined`, `problems>=5` — need
+  per-type knowledge that doesn't exist.
+- `v2/planner.py:add_leaf` sets `gates=[*default_gates, max_tokens:N]`,
+  `judgment=[]`, `rubric={}`. It knows each candidate's `shape` and throws it
+  away for rubric purposes.
+- `v1/reviewer.py:review_node` auto-passes on an empty `judgment`. Correct
+  behavior — there is nothing to ask — but it means **no leaf is ever
+  semantically reviewed**.
+- `v3/checks.py` can't check `refs_out` resolution, glossary coverage, or
+  duplicate definitions, because the manifest line carries none of that.
+- `glossary.json` (`CLAUDE.md` §5) has never existed.
 
-Notes for OpenAI-compatible endpoints:
-- Reasoning arrives as `reasoning_content` alongside `content` in the delta.
-- `response_format: json_schema` support varies. **Build the fallback regardless:**
-  schema in prompt → parse → validate → re-prompt with validator error. Catches
-  semantically-invalid-but-syntactically-valid output too.
-- Prefix caching is usually automatic; no explicit breakpoints. Stable-first
-  prompt ordering still pays off, implicitly.
+`TaskNode.type` exists and defaults to `"generic"`. Nothing reads it.
 
-**Role/model routing:** orchestrator, planner, and reviewer are cheap
-structured-output calls and should run on the cheapest capable model. Only the
-writer needs the strong one. This is a config table, not code.
+### 2.2 Design decision: registry now, Skills loader later
 
----
+The old plan's §15.4 argued node templates *are* Agent Skills folders
+(`SKILL.md` + `scripts/` + `references/`) and that adopting the standard beats
+inventing a format. That's right for the **model-facing** half and wrong for
+the **gate** half:
 
-## 13. Build ladder
+- Gates must be cheap, in-process, and deterministic (`CLAUDE.md` §2.5, §7).
+  Shelling out to `scripts/` per gate per attempt adds a subprocess and a
+  trust boundary to the one part of the system that must never be either.
+- Judgment text, exemplars, and briefing rationale are exactly progressive
+  disclosure, and belong in a folder format.
 
-**v0 — prove resumability.** Shell out to an agent CLI headless on a single task.
-Append-only fsync'd event log, run directory. Then `kill -9` mid-task and resume.
-If this isn't perfect, nothing above it works. Everything else is downstream.
+**Therefore:** an in-repo Python registry defines gate implementations and
+template metadata; an *optional* loader reads Skills-format folders for
+user-defined types and maps their frontmatter onto the same dataclass. Ship
+the registry first; the loader is §2.8 and is not on the critical path.
 
-**v1 — the round loop.** Orchestrator/Writer/Reviewer with schema-constrained JSON
-returns and per-node tool restriction. Task state in JSON; markdown only as a
-rendered view. No node enters the tree without a machine-checkable exit condition.
-Writer returns capped at ~400 tokens.
+### 2.3 New module: `src/kusudaemon/v6/templates.py`
 
-**v2 — intake, survey, recursive planning.** Assumptions-list protocol. Mechanical
-chunking + windowed survey → `spine.json`. Level-at-a-time planner with flat child
-lists. Pilot + contract derivation from the user's diff.
+```python
+@dataclass(frozen=True)
+class NodeTemplate:
+    type: str                      # "chapter-summary", "problem-set", ...
+    shapes: tuple[str, ...]        # which v2 shapes this type applies to
+    gates: tuple[str, ...]         # gate strings, may contain {token_budget}
+    judgment_ids: tuple[str, ...]  # R1..Rn, stable ids
+    judgment_text: dict[str, str]  # id -> imperative, contract-substitutable
+    required_headers: tuple[str, ...] = ()
+    briefing: str = ""             # the "why this matters" rationale (§15.3)
 
-**v3 — assembly and repair.** Deterministic concatenation, cross-cutting checks,
-compile gate, scoped repair nodes. Re-validation pass for contract amendments.
-
-**v4 — research tools.** Web search subagent, current-docs retrieval. Lowest
-priority: these are retrieval fixes; everything above is a correctness fix.
-
----
-
-## 14. Eval
-
-Start at **v1**, not at the end. Five fixed tasks, three runs each. Measure:
-
-- resume correctness after `kill -9` at randomized points
-- does the reviewer catch a deliberately broken node
-- does the orchestrator's context stay bounded as node count grows
-- mean input tokens per leaf
-- planner schema-validity rate and leaf/split gate sanity
-- approval rate by shape
-
-Without this, prompt tuning is vibes, and weak models are noisy enough that vibes
-mislead.
-
-### Pre-implementation spikes (cheap, do first)
-
-1. **Planner conformance.** Synthetic spine of 40 units with sizes → valid
-   top-level partition, 20 runs. Measure schema validity, dependency-edge sanity,
-   and how often it returns `leaf` for something obviously oversized.
-2. **Survey quality on real unstructured input.** Run the windowed survey over
-   actual lecture notes. Do the proposed boundaries match where you'd have drawn
-   them? This is the one that tells you whether the general-purpose ambition holds.
-
----
-
-## 15. Reuse inventory
-
-### 15.1 Base — clone LongHorizon-Harness and start there
-
-`github.com/AMAP-ML/LongHorizon-Harness` — MIT, Python ≥3.10, `uv tool install
-lh-harness`. **This is the starting point. Clone it, don't reimplement it.**
-
-What it already gives us, matching §3–§5 almost directly:
-
-- Manager / Executor / Auditor role separation with per-role model assignment
-- Fresh-context execution per round (our §3 stateless orchestrator)
-- Only independently-verified results enter persistent task state (our §2.1)
-- Isolated `runs/<run-id>/` with task state, event stream, audit reports, role
-  trajectories, workspace, final report (our §5, nearly one-to-one)
-- Dashboard with human gates on complete / blocked / needs-input / repeated-fail
-  (our §10 intervention model)
-- `AgentAdapter` abstraction preserving each backend's native loop
-- Execution environments: local, `ssh://`, `docker://`
-- `eval/` with frozen reproduction suites — a template for our §14
-
-**First concrete task:** it ships adapters for `claude_code`, `codex`, and
-`openclaw` only. Write an `AgentAdapter` for OpenCode. That single file is the
-whole "orchestration layer on top of existing CLIs" decision made real.
-
-**Our deltas on top** (nothing below exists in it): recursive level-at-a-time
-planner, survey/spine discovery, the leaf gate, gates-vs-judgment rubric split,
-pilot + contract derivation from user diff, per-node tool restriction, the
-derived manifest, deterministic assembly with a read-only assembler.
-
-### 15.2 Tools — commodity, lift wholesale
-
-The set is identical across every harness: `glob`, `grep`, `read`, `edit`,
-`write`, `bash`. Nobody should write these again.
-
-Ranked by ease of extraction into Python:
-
-- **gptme** (MIT, Python, ~4k stars) — deliberately small: shell, Python
-  execution, file editing. Cleanest small donor, scriptable, works with weak
-  models. Probably the first place to look.
-- **Mini-Kode** — explicitly an educational reference implementation. Written to
-  be read, which is exactly what we want from a donor.
-- **Pi / pi-mono** (~83k stars) — minimal adaptable harness with unified LLM API,
-  tools, skills, and MCP. Heavier but the abstractions are good.
-- **OpenHands** (~83k stars) — most battle-tested sandboxed execution if we ever
-  need real isolation. Heavy; take the sandbox, not the framework.
-
-**Do not write web search or fetch.** Use MCP servers. Same for browser work
-(`playwright-mcp` uses accessibility-tree snapshots rather than screenshots,
-which is dramatically cheaper in tokens). §12's rule about keeping
-provider-specific code in one module applies here too — MCP is the seam.
-
-**Expect one modification everywhere:** every harness ships whole-file `read`.
-We need `read_span` (§8.2). Budget time for that; it's the difference between a
-leaf costing 3K and 30K input tokens.
-
-### 15.3 Subagents and delegation
-
-- **LongHorizon-Harness** role split is the base — see 15.1.
-- **statewright** — state-machine guardrails constraining which tools an agent may
-  call per workflow phase. This *is* our per-node `tools` field, already built and
-  benchmarked. Reported result: local models went from 2/10 to 10/10 on a
-  SWE-bench subset purely by shrinking the tool space. Read this before
-  implementing §6's `tools` restriction.
-- **Briefing pattern** — brief each subagent with the *rationale* (why this
-  subtask matters, how it fits the goal), not just the task description.
-  Documented to reduce redundant exploration. Already reflected in our node
-  `brief` field; make sure the template enforces it.
-- **subtask** (zippoxer) — subagents in git worktrees. Only relevant if we ever
-  turn on the parallelism that §4.5 leaves the door open for.
-- Reference datapoint for the architecture: subagents process ~67% fewer tokens
-  than skills in multi-domain scenarios, because context isolation prevents
-  cross-domain bloat.
-
-### 15.4 Skills — adopt the open standard instead of inventing node templates
-
-**This is the biggest find of the reuse pass.** Agent Skills is an open standard
-(`agentskills.io`), released by Anthropic in December 2025, now supported by 26+
-platforms including OpenCode, Codex, Cursor, Gemini CLI, and Copilot.
-
-A skill is a folder:
-
-```
-my-skill/
-  SKILL.md      required — YAML frontmatter (name, description) + markdown body
-  scripts/      optional — executable code
-  references/   optional — docs loaded on demand
-  assets/       optional — templates, examples
+REGISTRY: dict[str, NodeTemplate]
+def template_for(node_type: str, shape: str) -> NodeTemplate
+def apply_template(node: TaskNode, template: NodeTemplate,
+                   contract_rules: Sequence[ContractRule]) -> TaskNode
 ```
 
-Three-tier progressive disclosure, which is precisely our §8 goal:
+`apply_template` is pure: it returns a new node with `gates` extended and
+`judgment`/`rubric` populated. It never removes a gate the planner set —
+`max_tokens:N` came from the leaf gate and is not the template's to override.
 
-1. **Advertise** — name + description injected at startup, ~80–100 tokens per
-   skill. Dozens of skills cost less than one activated skill.
-2. **Load** — full `SKILL.md` body on activation, recommended under 5,000 tokens.
-3. **Reference** — bundled files pulled only when actually needed.
+Seed the registry with one template per existing `_SHAPES` entry plus
+`generic` (today's behavior exactly, so `type="generic"` is a no-op and every
+existing `tree.json` is unaffected).
 
-**The insight: our node-type templates and per-shape rubrics ARE skills.**
-`chapter-summary`, `derivation-dominant`, `problem-set`, `assembly` — each becomes
-a skill folder whose `SKILL.md` holds the rubric skeleton and judgment items,
-whose `scripts/` holds the gate implementations, and whose `references/` holds the
-approved exemplar. We get progressive disclosure for free, we stop inventing a
-bespoke template format, and the templates stay portable across whatever executor
-we shell out to.
+### 2.4 New gates in `v1/gates.py`
 
-There is a reference Python library (Apache-2.0) that validates skills, reads
-properties, and emits `<available_skills>` prompt blocks. Use it for validation in
-CI; it's documented as demonstration-quality, not production.
+Additive, but **the dispatcher needs one change first.** `_evaluate_one` does
+`name, _, arg = gate.partition(":")` and looks `name` up in `_HANDLERS`, so
+`problems>=5` — the spelling `CLAUDE.md` §6 uses — parses as a handler named
+`"problems>=5"` and fails as unknown. Extend the split to take the first of
+`:`, `>=`, `<=`, `>` , `<`, keeping the operator in `arg`. Either that or
+respell the gate `problems:>=5`; prefer extending the split, because the §6
+spelling is what the design doc and any future template author will write.
 
-Related: **SkillOpt** (Microsoft) treats skills as optimizable parameters improved
-by execution feedback rather than static prompts — relevant much later, once we
-have approval-rate data per shape (§10).
+| Gate | Semantics | Notes |
+|---|---|---|
+| `headers:std` | every header in the template's `required_headers` is present as a markdown heading | order-insensitive; the failure message names the missing ones |
+| `headers:a,b,c` | same, with an inline list | avoids needing the template to be in scope |
+| `problems>=N` | ≥ N items under a "Problems"/"Practice"/"Exercises" heading | counts `^\s*\d+[.)]` and `^\s*[-*]` list items in that section only |
+| `terms_defined` | every `**bolded**` term in the artifact appears in `glossary.json` with this node as a defining location | needs §2.6 |
+| `no_undefined_terms` | every `**bolded**` term *used* resolves to some node's definition | run at assembly, not per-node — a forward reference is legal mid-run |
+| `latex_balanced` | `$`/`$$`/`\begin{}`/`\end{}` balance | cheap, catches the most common compile failure before compile |
+| `refs_resolve` | every `[[node-id]]` / `[[node-id#anchor]]` names a node in the tree | assembly-time |
 
-### 15.5 Build ourselves — no good donor exists
+Everything here is a regex-and-count over the artifact text. Nothing calls a
+model. Nothing reads another node's artifact except the two assembly-time
+gates, which are given an index, not the artifacts.
 
-- Recursive level-at-a-time planner with flat child lists (§4.3)
-- Survey / spine discovery for unstructured corpora (§4.2)
-- The leaf gate as harness-enforced code (§4.3)
-- Gates-vs-judgment rubric split (§7)
-- Pilot approval → diff → contract derivation (§4.4)
-- Derived manifest (§6)
-- Re-validation triage: clean / patchable / regenerate (§10)
-- Per-segment input-token accounting (§8)
+**Calibration guard (`CLAUDE.md` §7):** ship every new gate as
+`warn`-severity first — recorded in the manifest and the audit file, not
+failing the node — and promote to `fail` per gate after one real run shows
+where failures actually cluster. Add a `severity` field to `GateResult` and a
+`warn:` prefix to the gate string; `all_passed` ignores warns.
 
-That's the actual project. Everything else is assembly.
+### 2.5 Manifest enrichment (`v1/manifest.py`)
 
-### 15.6 Licensing notes
+`check_no_duplicate_definitions`, `refs_resolve`, and `no_undefined_terms` all
+need data the manifest line doesn't carry. Add **harness-derived** fields
+only (`CLAUDE.md` §6: no hallucination surface):
 
-Permissive and safe: LongHorizon-Harness (MIT), OpenCode (MIT), gptme (MIT),
-Grinta (MIT), Agent Skills reference lib (Apache-2.0), OpenHands (MIT),
-playwright-mcp (Apache-2.0).
+```
+headers[]            markdown headings, in order
+terms_defined[]      bolded terms in a "Key Terms"/"Definitions" section
+terms_used[]         all bolded terms
+refs_out[]           [[...]] targets
+problems             int count
+gate_warnings[]      warn-severity gate results
+```
 
-Watch for: Loki Mode is BUSL-1.1, AgentsMesh is BSL-1.1 — usable to read, not to
-vendor.
+All optional with empty defaults, so `read_all_manifest_entries` and
+`v3/document_review.py:build_document_index` keep working unchanged.
 
-**Avoid entirely:** Claude Code is source-available, *not* open source — don't
-copy from it. More importantly, several popular repos (Claw Code, claw-code-agent,
-Free Code) are openly described as deriving from a March 2026 Claude Code source
-leak. Regardless of the license text they carry, that provenance is legally
-unsettled and they should not be a donor for anything intended to be published.
-Read them for ideas if you like; don't lift code.
+### 2.6 `glossary.json`
 
-### 15.7 Also worth reading before writing our own
+Append-only, one record per defining location:
+`{"term": "flux", "node": "ch05", "artifact": "out/ch05.md", "ts": ...}`.
+Written by the round loop **after** a node passes, derived from the same
+manifest extraction — never by a Writer, for the same reason a Writer doesn't
+write its own manifest line. New helpers in `v6/run_dir.py`:
+`glossary_path`, `append_glossary_entries`, `load_glossary`.
 
-- **Grinta** (Python, MIT) — event-stream ledger, checkpoint/revert, stuck
-  detection, completion-quality validation. Closest single-agent analogue to
-  what we want the leaf loop to feel like.
-- **Ralph Workflow / agx / AgentPlane** — resume and checkpoint patterns.
-- **Context7** — version-specific library docs via MCP, for the v4 research tools.
-- **headroom** — compresses bulky tool output before it enters context; relevant
-  if `read_span` proves insufficient.
+Duplicate-definition detection is then a pure read: two records for one term
+from different nodes. Whether that's a defect is a *judgment* call, so it
+becomes a `checks.py` finding, not a gate.
+
+### 2.7 Wiring
+
+- `v2/planner.py:build_tree(..., template_for=None)` — an injected resolver,
+  defaulting to `None` = today's behavior byte-for-byte. When supplied,
+  `add_leaf` calls it with `(candidate.shape)` and applies the result.
+  Mirrors how `input_path_for` was threaded in for materialized units.
+- `v2/contract.py` — `judgment_text` values may contain `{contract}`
+  placeholders filled from the frozen contract's rules for that shape. This
+  is the mechanism `v1/tree.py`'s docstring has been promising since v1: the
+  per-node rubric text finally comes *from* the contract instead of being
+  hand-carried on the node.
+- `v3/checks.py` — three new checks over the enriched manifest:
+  `check_refs_resolve`, `check_terms_defined`, `check_no_duplicate_definitions`.
+- `pipeline/driver.py` — `RunOptions.node_templates: bool = False`, persisted
+  through `to_spec`/`from_spec`, `--node-templates` in **both** `cli.py` and
+  `run.py`. Default off until §2.9 clears.
+
+### 2.8 Optional: Skills-format loader
+
+`v6/skills_loader.py` — read a directory of Agent Skills folders, parse
+`SKILL.md` frontmatter (`name`, `description`) plus a `kusudaemon:` block
+(gates, judgment ids/text, required headers), and register the result as a
+`NodeTemplate`. `references/exemplar.md` becomes the reviewer's excerpt,
+loaded on demand rather than pinned into every review turn (`CLAUDE.md`
+§4.4). Stdlib YAML is not available — parse the frontmatter with a ~30-line
+restricted key/value + list reader rather than adding a dependency, and fail
+loudly on anything it doesn't understand.
+
+### 2.9 Tests and ship gate
+
+`tests/test_v6_templates.py` — registry lookup and shape fallback;
+`apply_template` is pure and never drops a planner gate; `generic` is a
+byte-for-byte no-op against a hand-built node.
+`tests/test_v6_gates.py` — one true-positive and one true-negative per new
+gate, plus warn-severity not failing `all_passed`.
+`tests/test_v6_glossary.py` — append/load round trip, duplicate detection,
+append-only under a simulated crash (truncated trailing line tolerated, as
+`EventLog` does).
+Additions to `test_v2_planner.py` (resolver threading, default unchanged),
+`test_v1_units.py` (manifest fields default empty), `test_v3_checks.py`
+(the three new checks).
+
+**Ship gate:** on one real corpus, with templates on, (a) reviewer pass rate
+is no longer 1.0 and the failures are ones the operator agrees with, (b) no
+node exhausts `max_attempts` on a gate the operator considers trivia — if it
+does, that gate goes back to `warn`.
+
+---
+
+## §3 Parallel dispatch (v7)
+
+### 3.1 Scope
+
+`v1/round_loop.py` and `v3/assembly_loop.py` are both strictly sequential.
+`depends_on` is already tracked and the contract freeze already makes leaves
+genuinely independent, so the mechanism is a bounded fan-out over
+`tree.ready_nodes()`, not a redesign.
+
+### 3.2 What actually has to change
+
+- **`run_round_loop(..., max_parallel: int = 1)`** — gather up to N ready
+  nodes per round instead of one. `max_parallel=1` must be the same code path
+  as today, not a special case.
+- **Single-writer discipline for `tree.json`.** Today every transition does
+  read-modify-write on the whole file. Two concurrent writers lose one.
+  Serialize through an `asyncio.Lock` held only across mutate-and-save, and
+  keep the in-memory `TaskTree` as the single source with the file as its
+  mirror. Do **not** reach for file locks — one process owns the tree.
+- **`events.jsonl` / `manifest.jsonl` appends.** Both do open-write-fsync-close
+  per call. O_APPEND makes short writes near-atomic on POSIX but guarantees
+  nothing for an arbitrary-length line, so concurrent appends still need a
+  lock. Use a `threading.Lock` inside `EventLog`, not an `asyncio.Lock`:
+  `append` is synchronous and is already called from worker threads.
+- **Provider concurrency.** Reviewer calls now overlap. Add a semaphore in
+  `v1/provider.py` (bounded by a new `max_concurrent_requests`) and honor
+  `Retry-After` on 429 — free-tier endpoints are the stated test target
+  (`CLAUDE.md` §12) and will hit this immediately.
+- **Workspace isolation.** `GptmeAdapter` already runs each episode in its own
+  subprocess with a unique logdir and a unique prompt file, and gptme
+  `chdir`s inside that subprocess. Concurrent episodes sharing one workspace
+  path is therefore safe *for the harness*, but two Writers can still write
+  the same file if a template misdirects them. Keep `hidden_paths` as the
+  fence and add an assertion that no two in-flight nodes share an `artifact`.
+- **Resume.** The existing "resolve in-flight nodes before asking the
+  orchestrator anything" scan already handles N crashed nodes; it just does
+  them one at a time. Gather it too.
+- **Dispatch policy interaction.** With `dispatch_policy="model"` the
+  orchestrator picks one node per call; parallel dispatch wants a *set*.
+  Simplest correct answer: when `max_parallel > 1`, force the deterministic
+  policy for the fan-out and keep the model call only for the halt/escalate
+  arbitration it already owns. Document that in the flag's help text.
+
+### 3.3 Config and tests
+
+`RunOptions.max_parallel: int = 1`, persisted, `--max-parallel` in `cli.py`
+and `run.py`. Also `pipeline/backends.py` unchanged — adapters are already
+constructed per node.
+
+`tests/test_v1_parallel.py` — three ready nodes with `max_parallel=3` all
+dispatch before any completes (assert via pidfiles from
+`fake_stream_agent.py`, the same mechanism `test_v1_round_loop.py` already
+uses); a dependency chain still serializes; a crash with two nodes in flight
+resumes both; `max_parallel=1` produces a byte-identical event sequence to
+today's loop (the regression guard).
+
+**Ship gate:** wall-clock speedup on a ≥20-node run with no change in final
+`assembly/main.md` versus a sequential run of the same tree.
+
+---
+
+## §4 Automatic research-query planner (v8)
+
+### 4.1 Scope
+
+`v4/research_loop.py` takes `plan: dict[node_id, list[ResearchQuery]]` from
+the caller. Deciding which nodes need external information, and what to ask,
+is unbuilt.
+
+### 4.2 Design
+
+Two stages, mirroring the survey: a free deterministic filter, then a windowed
+model call. **Not one call per node** — that is the cost mistake §8 of the
+Zero-Mem plan already corrected once for document review.
+
+1. **`needs_research(node) -> bool`** — model-free. True when the node's brief
+   or rubric text contains recency/citation markers (a year later than the
+   corpus, "current", "latest", "as of", "cite", "source", "version",
+   "release", "standard", "spec") **or** the node's inputs resolve to fewer
+   than a floor of tokens (a thin slice is the case where the corpus doesn't
+   contain the answer). Conservative in the opposite direction from
+   `v3/prefilter.py`: this one can only *add* work, so a false positive costs
+   one capped episode and a false negative costs nothing but a weaker node.
+2. **`plan_research(nodes, provider, *, window=60, max_per_node=2,
+   max_total=...)`** — one `complete_json` call per window of candidate nodes,
+   seeing id + brief + rubric only (never artifacts, never source), returning
+   `{node_id, slug, kind, question}` objects against a schema. Harness-side:
+   drop unknown node ids (same rule as document review), enforce
+   `max_per_node` and a hard `max_total` cap, dedupe by `(node_id, slug)`, and
+   reject any `kind` that `v4/mcp_research.py:allowed_tools_for` would raise
+   on — better to drop a query than to fail the phase.
+
+New module `v4/research_planner.py`. `pipeline/driver.py:_phase_research`
+calls it when `RunOptions.research_plan` is empty **and**
+`RunOptions.auto_research` is set, so an explicit plan always wins.
+
+### 4.3 Tests and ship gate
+
+`tests/test_v4_research_planner.py` — marker and thin-slice detection;
+windowing keeps call count flat as node count grows; caps enforced; unknown
+ids dropped; an unwired `kind` dropped rather than raised; an explicit
+`research_plan` suppresses the planner entirely.
+
+**Ship gate:** on one real corpus, the planner selects a small minority of
+nodes (a planner that flags everything is a filter that isn't working), and
+the findings it produces are ones the operator would have asked for.
+
+---
+
+## §5 Dashboard hardening
+
+### 5.1 Authentication (the only real exposure)
+
+`--host`/`--port` default to loopback, so this is a gap the moment anyone
+binds wider — which the flags invite.
+
+- Generate a token at `serve` time if none is supplied, print it once with the
+  URL, and accept `--auth-token` / `KUSUDAEMON_DASHBOARD_TOKEN`.
+- Compare with `hmac.compare_digest`. Never log the token, never echo it in an
+  error body.
+- Transport: `Authorization: Bearer` for `fetch`; `EventSource` cannot set
+  headers, so `/api/stream` takes the token as a query parameter **and** the
+  server sets an `HttpOnly; SameSite=Strict` session cookie on first
+  successful auth so the frontend never has to hold it in JS.
+- **Refuse to start on a non-loopback `--host` with auth disabled.** An
+  explicit `--insecure-no-auth` is the escape hatch; a default that fails
+  closed is the point.
+- Keep the existing `control_enabled` gate orthogonal: auth answers "may you
+  talk to this server", `--no-control` answers "may you mutate a run".
+
+`tests/test_dashboard_auth.py` — 401 without a token on both API and static
+routes; 200 with; constant-time comparison used; SSE query-param path;
+non-loopback bind refused without `--insecure-no-auth`.
+
+### 5.2 Concurrent-run limit
+
+Nothing stops the "+ New Run" form from starting runs until the machine dies;
+each hosts a `RecursiveDriver` in a thread with gptme subprocesses under it.
+`RunState.start_run` should count live hosted threads plus non-terminal
+`jobs.json` records and reject past `max_concurrent_runs` (default 2) with a
+clear message and HTTP 429, surfaced in the form rather than swallowed.
+`--max-concurrent-runs` on `serve`. Queueing is explicitly *not* in scope —
+refusing is honest, a hidden queue is not.
+
+### 5.3 gptme-native nested subagents
+
+gptme ships a `subagent` tool: one dispatched episode can spawn its own
+gptme-managed children. The harness's own notion of "subagent" (a dispatched
+Writer/repair/research episode) is covered by the Subagents tab; these nested
+ones are invisible.
+
+They are discoverable from disk — a child runs under a logdir beneath the
+parent's, which `node_gptme_logdir` already finds. Extend `RunState.subagents`
+to walk one level of nested logdirs and report them as children of their
+parent id, and allow `interject` into a nested logdir by the same
+`prompt-queue.jsonl` mechanism. Frontend: indent under the parent row. No new
+transport, no gptme fork. Verify the nesting layout against a real installed
+gptme via `inspect` before writing the walker — the same rule that kept
+`gptme_adapter.py` correct.
+
+---
+
+## §6 Outstanding ship-gate measurements
+
+Carried from the Zero-Mem plan's checklist. **None is satisfiable by the unit
+suite** — each needs one real run over a real corpus. Several are blocked on
+§2 supplying an instrument.
+
+| # | Workstream | Measurement | Blocked on |
+|---|---|---|---|
+| 1 | §6 writer output contract | read one real `out/<node>.md`: prose, not a sign-off line | — |
+| 2 | §8 document review | operator agrees with most reported defects; post-repair artifacts still clear gates | — |
+| 3 | §1 dispatch policy | byte-identical `assembly/main.md` between `model` and `deterministic` on the same tree | measurement 1 |
+| 4 | §2 revalidation pre-filter | filtered and unfiltered triage agree on a real amendment | — |
+| 5 | §5 episode context discipline | `trace.jsonl` size before/after | — |
+| 6 | §3 embedding survey | boundary precision/recall vs. model mode against hand-drawn ground truth; only then consider flipping the default | — |
+| 7 | §4 retrieved spans | A/B: gate pass rate + document-review coverage-gap counts + three artifacts read side by side; stays default-off unless it clears | §2 (pass rates are pinned at 1.0 today) |
+
+Record results in a table at the bottom of this file as they land, and move
+the flag defaults in the same commit as the measurement that justifies them.
+
+---
+
+## §7 Eval harness (`CLAUDE.md` §14)
+
+Never built. Five fixed tasks, three runs each, in `eval/` with frozen inputs
+and a committed results file. Metrics: resume correctness after `kill -9` at
+randomized points (automatable today — `test_v0_resume.py` already has the
+machinery); reviewer catch rate on a deliberately broken node; orchestrator
+context size as node count grows; **mean input tokens per leaf, broken down by
+prompt segment** (system / tools / contract / brief / inputs / history — the
+instrumentation §8 asks for and nothing currently emits); planner
+schema-validity rate; approval rate by shape.
+
+The token-per-segment breakdown is the one worth building even if nothing else
+here is: without it, a prompt change that doubles the bill looks identical to
+one that doesn't.
+
+---
+
+## §8 Closed — will not build
+
+- **Codex per-node tool restriction.** The Codex adapter was deleted with the
+  classic harness. Not a gap; a removed feature.
+- **`doc_retrieval` via Claude Code MCP config.** Same reason. If
+  version-pinned docs are wanted, wire Context7 through gptme's own native
+  MCP support (`gptme.tools.mcp`) as a new `kind` in
+  `v4/mcp_research.py` — that is a §4-adjacent addition, not a restoration.
+- **Rewriting the Writer promotion into a non-generative extract.** Considered
+  and rejected: it is written at the tail of an episode already paid for, so
+  it costs output tokens only.
+- **A hidden run queue in the dashboard.** See §5.2.
+
+---
+
+## §9 Sequencing
+
+```
+[ ] v6 — node-type templates            (§2)   unblocks §6.7, §7
+    [ ] v6/templates.py registry + generic no-op
+    [ ] new gates, all shipped warn-severity
+    [ ] manifest enrichment (additive fields, empty defaults)
+    [ ] glossary.json + v6/run_dir.py
+    [ ] planner template_for resolver (default None = unchanged)
+    [ ] contract-substituted judgment text
+    [ ] 3 new checks.py checks
+    [ ] RunOptions.node_templates + flags in cli.py AND run.py
+    [ ] tests: test_v6_templates / _gates / _glossary + 3 existing files
+    [ ] full suite green
+    [ ] ship gate: reviewer pass rate moves; no trivia escalations
+    [ ] only then promote gates warn -> fail, one at a time
+
+[ ] §6 measurements 1, 2, 4, 5, 6            (unblocked today)
+[ ] §6 measurements 3, 7                     (after v6)
+
+[ ] v7 — parallel dispatch              (§3)
+    [ ] EventLog append lock; tree.json single-writer lock
+    [ ] provider semaphore + Retry-After
+    [ ] run_round_loop max_parallel; gather the resume scan too
+    [ ] force deterministic policy when max_parallel > 1
+    [ ] RunOptions.max_parallel + flags
+    [ ] tests incl. max_parallel=1 byte-identical event sequence
+    [ ] ship gate: speedup, identical assembly
+
+[ ] v8 — research planner               (§4)
+    [ ] needs_research deterministic filter
+    [ ] windowed plan_research + caps + unknown-id drop
+    [ ] driver wiring: explicit plan always wins
+    [ ] tests incl. flat call count
+    [ ] ship gate: selects a minority; findings are wanted
+
+[ ] dashboard hardening                 (§5)
+    [ ] auth: token, compare_digest, cookie for SSE, fail-closed off-loopback
+    [ ] max_concurrent_runs + 429 surfaced in the form
+    [ ] nested gptme subagents (verify layout via inspect first)
+    [ ] tests: test_dashboard_auth.py
+
+[ ] eval harness                        (§7)
+    [ ] per-segment token accounting first
+    [ ] five frozen tasks, committed results file
+```
+
+---
+
+## §10 Results log
+
+Nothing recorded yet. One row per completed workstream or measurement:
+date, item, and what the number actually was.

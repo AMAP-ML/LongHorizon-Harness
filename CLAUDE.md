@@ -1,1378 +1,713 @@
-# CLAUDE.md — Kusudaemon (this worktree)
+# CLAUDE.md — Kusudaemon
 
-## What this repo is
+Kusudaemon (`src/kusudaemon/`) is a **recursive-decomposition harness**: it
+takes one long-horizon, corpus-scale goal, decomposes it into leaves no
+larger than a model can reliably finish, and drives each leaf to verified
+completion by shelling out to one agent backend (**gptme**). It is not a
+coding harness — it must work on a textbook with a TOC, a folder of
+unstructured lecture notes, a codebase, or a research corpus, without
+special-casing any of them.
 
-Kusudaemon (`src/kusudaemon/`) is an execution/state-management harness that
-shells out to one agent backend (**gptme**) to carry long-horizon tasks to
-verified completion. Originally forked from LongHorizon-Harness
-(arXiv:2608.01964; see README.md's Credits section) and renamed
-2026-08-09 once it had diverged far enough (gptme-only backend, no more
-role-based Claude Code/Codex harness) to no longer be that project. The
-classic role-based harness (manager/executor/auditor over Claude Code/Codex
-CLIs) and its web dashboard were **removed** — this worktree is the
-recursive-decomposition harness only (`src/kusudaemon/v0`..`v5`/`pipeline/`).
-The `kusudaemon` CLI is now exactly the §11 control surface: `run` / `resume`
-/ `status` / `approve` / `amend` / `serve`. See README.md for the shipped
-product, and PLAN.md's Progress section for the v0-v5 build ladder detail.
+Forked from LongHorizon-Harness (arXiv:2608.01964; see README.md Credits),
+renamed 2026-08-09 once the gptme-only backend and the removal of the
+role-based Claude Code/Codex harness had made it a different project. The
+classic harness (manager/executor/auditor, `plugins/`, Codex + Claude Code
+adapters) is **deleted**; what remains is v0–v5 below.
 
-On top of this codebase, the repo is also building the **Recursive
-Decomposition Harness** described in `PLAN.md` (repo root). `PLAN.md` §13
-defines a build ladder: v0 (resumability), v1 (the round loop), v2
-(intake/survey/planning/pilot), v3 (assembly and repair), and v4 (research
-tools) are done and live in `src/kusudaemon/v0/`, `src/kusudaemon/v1/`,
-`src/kusudaemon/v2/`, `src/kusudaemon/v3/`, and `src/kusudaemon/v4/`; v4
-was the last item on the §13 build ladder, so anything past it is v5+ and
-not yet scoped in `PLAN.md`. v5 has been built here anyway as the pipeline
-driver and §11 control surface (`src/kusudaemon/pipeline/`) plus a web
-dashboard (`src/kusudaemon/dashboard/`, mounted via `kusudaemon serve` /
-bare `kusudaemon`) — see the v5 section below for the full history: this
-is the *second* build of the web view. The original PLAN.md §11 plan
-called for a local web app as the view surface, and that's what shipped
-first; it was then deleted and replaced by a Textual TUI the same day
-(2026-08-09) once it became clear the operator was already living in a
-terminal for the CLI half of this control surface anyway, and the TUI was
-in turn deleted and replaced by a rebuilt web dashboard — this one — later
-that same day, carrying forward every feature (Subagents view, live
-interject, diff history, reopen) the TUI had added over the original web
-view. See PLAN.md's Progress section for detail.
+**This file is now the only design document.** The old `PLAN.md` and
+`PLAN-zeromem.md` were folded into it; the current `PLAN.md` holds only work
+that has *not* shipped. Nothing in this file is aspirational.
 
-## v0 — resumability (`src/kusudaemon/v0/`)
+**Citation compatibility.** ~60 docstrings cite `PLAN.md §N` and ~36 cite
+`PLAN-zeromem.md §N`. Part I below preserves PLAN.md's §1–§15 numbering
+exactly, so those resolve here. Zero-Mem's §1–§11 are listed by number in
+§13; a docstring citing `PLAN-zeromem.md §8` means document-level review,
+`§7` means materialized spine units, and so on. **Do not renumber Part I.**
 
-The load-bearing property (`PLAN.md` §10): `events.jsonl` is append-only and
-fsync'd, and replaying it after a `kill -9` at any point converges to exactly
-one artifact and one terminal event per node — no double work, no lost work.
+---
 
-- `v0/events.py` — `EventLog`: `append()` fsyncs every write (not just
-  flush); `read_all()` silently drops a torn trailing line (kill -9 mid
-  `write()` can only corrupt the line being written, and fsync-per-append
-  means that's always the last line at kill time); `last_event()` /
-  `has_terminal()` for querying node state.
-- `v0/run_dir.py` — `create_run_dir(root, run_id)` (idempotent) plus path
-  helpers for `spec.md`, `events.jsonl`, `manifest.jsonl`,
-  `scratch/<node>/trace.jsonl`, `out/<node>.md`. A minimal slice of the full
-  `PLAN.md` §5 layout — no `tree.json` here (v1's), no `spine.json`/
-  `contract.md` here (v2's); both later layers re-export this module's
-  helpers rather than duplicating them. `spec_path()` was added alongside
-  the others once v2's intake needed to write to the file this module
-  already touches into existence (additive, no v0 behavior changed).
-- `v0/runner.py` — `run_node(run_dir, node_id, prompt, adapter, env, budget)`.
-  One idempotent entrypoint for both first-run and resume: it inspects
-  `events.jsonl` for the node's furthest-reached state (`episode_completed` →
-  no-op replay; `session_captured` → continuation via
-  `resume_session_id` if the adapter supports it, else fresh redispatch;
-  `node_dispatched` only → fresh redispatch; nothing → first dispatch) and
-  proceeds from there. While the episode runs, a concurrent task tails the
-  live trajectory file for the first `session_id` and durably records
-  `session_captured` *before* `run_episode()` returns, since a crash can
-  land any time after that line hits disk. `run`/`resume` are thin aliases
-  of the same function. **Does not write `manifest.jsonl`** — a lone Writer
-  node has no gates to evaluate and no way to derive the `PLAN.md` §6
-  manifest schema; that line is now written by whoever actually ran gates
-  (v1's `round_loop.py`), not by the episode runner. (Earlier v0 wrote a
-  placeholder `{node, artifact, status}` line here; removed once v1 needed
-  the real schema on the same file — nothing else read it.)
+# Part I — Design spec
 
-Event `type` vocabulary: `node_dispatched`, `session_captured` (carries
-`session_id`), `episode_completed` (carries `status`, `artifact_path`),
-`node_redispatched` (carries `reason`: `resumed_session` |
-`no_session_captured` | `resume_unsupported`).
+Section numbers are load-bearing: they are cited by docstrings throughout
+`src/`. Renumbering breaks those references.
 
-## v1 — the round loop (`src/kusudaemon/v1/`)
+## §1 Problem
 
-Orchestrator/Writer/Reviewer with schema-constrained JSON returns and
-per-node tool restriction, task state kept entirely in `tree.json`
-(`PLAN.md` §13 v1 scope). Built on v0 rather than modifying it — see the
-"Adapter changes" and v0 sections above for the two small v0-side touches
-this required.
+LLMs fail at long-horizon work for three reasons: context fills, provider
+limits interrupt, and nobody verifies "done" means done. This harness is
+built around the third, plus a harder constraint: **no task may be attempted
+at a size the model can't reliably handle.**
 
-- `v1/json_schema.py` — a minimal stdlib-only JSON Schema validator
-  (`type`/`enum`/`required`/`properties`/`items`/`min*`/`max*`). Not a
-  general implementation (no `$ref`, no `oneOf`) — just the subset v1's own
-  schemas use. No dependency added; the repo stays stdlib + packaging/tomli.
-- `v1/provider.py` — `OpenAICompatibleProvider` (`PLAN.md` §12): one
-  un-abstracted module for OpenAI-compatible chat completions.
-  `complete()` for plain calls (exposes `reasoning_content`).
-  `complete_json(messages, schema)` for the Orchestrator/Reviewer path:
-  requests `response_format: json_schema`, then **always** parses + validates
-  the response against `schema` and re-prompts with the validator's error on
-  failure (up to `retries`, default 2) — because `response_format` support
-  varies by endpoint, so the fallback path is the one actually exercised in
-  practice, not a rarely-hit backstop. HTTP via `urllib` (no new dependency);
-  the transport is an injectable callable so tests never need a real network
-  call or API key. Model/base-url/key all come from `provider_config.py`'s
-  `resolve()` (see the Provider configuration section below) — no
-  per-module default of its own; `resolve()` raises if nothing configures
-  a `base_url`/`model` rather than silently picking one.
-- `v1/tree.py` — `TaskNode`/`TaskTree`, the `PLAN.md` §6 Node schema as the
-  run's source of truth (§13: "task state in JSON; markdown only as a
-  rendered view"). `TaskNode.__post_init__` raises `TreeValidationError` if
-  `gates` is empty — the code-level enforcement of "no node enters the tree
-  without a machine-checkable exit condition." One field is a v1-only
-  extension not in the §6 example: `rubric: dict[judgment_id, str]`, the
-  per-node judgment text. In the full design that text comes from the frozen
-  contract (§4.4, v2+'s pilot mechanism); v1 has no contract yet, so `rubric`
-  carries it directly until contract derivation can generate it.
-  `TaskTree.ready_nodes()` / `is_complete()` / `is_blocked()` are pure
-  dependency-graph queries over node `status`, no I/O.
-- `v1/gates.py` — machine-checkable gates (§7), evaluated in code, never
-  sent to a model. v1 ships the generic, content-agnostic set that doesn't
-  need the node-type template system (v2's planner): `exists`, `nonempty`,
-  `len:MIN-MAX` (word count), `max_tokens:N` (whitespace-token estimate,
-  `words/0.75`), `contains:TEXT`. The richer §6/§7 examples
-  (`headers:std`, `terms_defined`, `problems>=5`) need a type-template
-  system that doesn't exist until v2.
-- `v1/manifest.py` — `manifest.jsonl` (§6): harness-derived fields
-  (`tokens`, `gates` pass/fail, `unmet_gates`) plus the writer's own
-  `promotion` text, capped to `PROMOTION_TOKEN_CAP = 400` tokens
-  (`cap_promotion`) — §13 v1 scope: "Writer returns capped at ~400 tokens."
-- `v1/run_dir.py` — re-exports v0's path helpers and adds `tree_path`,
-  `audit_path(run_dir, node_id)`, `round_trace_path(run_dir, round_index)`.
-- `v1/orchestrator.py` — `decide_next_action(tree, manifest_path, provider,
-  round_index=...)`. Stateless per round: rebuilds a compact text state
-  (node id/status/deps/one-line brief + a 5-line manifest tail) from disk
-  every call, one `complete_json` call, discard. When `tree.ready_nodes()`
-  is empty, the harness decides `halt`/`escalate` itself without spending a
-  call (invariant 2: decomposition/dispatch is code-gated, not model
-  judgment). When the model's `action: "dispatch"` names a node id outside
-  the ready set (hallucinated, stale), the harness silently falls back to
-  the first ready node rather than trusting it — this is what invariant 1
-  ("only the harness writes `passed`, and only after gates evaluate") means
-  in practice for dispatch, not just completion.
-- `v1/reviewer.py` — `review_node(node, artifact_text, provider)`. Sees the
-  artifact and rubric only, never scratch/reasoning (§3). Skips the model
-  call entirely and auto-passes when `node.judgment` is empty — gates
-  already ran in code by the time review is reached, so an empty judgment
-  list means there's nothing left to ask an opinion about.
-- `v1/writer.py` — `run_writer_node(...)` wraps v0's `run_node` unchanged
-  (crash resume, resume-after-complete no-op — all inherited for free) and
-  appends an instruction to the prompt asking the agent to write
-  `scratch/<node>/promotion.json` (`{"promotion": "..."}`) before finishing.
-  If that file is missing or unparseable, falls back to the episode's own
-  visible-output/log text — the ~400-token cap (`manifest.cap_promotion`)
-  is enforced either way, so a model that ignores the instruction doesn't
-  break the round loop, it just gets a worse promotion.
-- `v1/round_loop.py` — `run_round_loop(run_dir, tree_path,
-  writer_adapter_factory, env, provider, prompt_for_node, ...)`, the v1
-  entrypoint. Per-node tool restriction is the caller's responsibility via
-  `writer_adapter_factory: Callable[[TaskNode], AgentAdapter]` — the round
-  loop never touches adapter internals; a caller wanting Claude Code
-  built-in-tool restriction passes `lambda node:
-  ClaudeCodeAdapter(..., allowed_tools=tuple(node.tools))`. **Resumability**:
-  before ever asking the orchestrator anything, it scans `tree.json` for
-  nodes still `dispatched` (crashed mid-write) or `awaiting_review` (crashed
-  between gates passing and review running) from a prior process and
-  resolves those directly — `dispatched` nodes go through
-  `run_writer_node` again (idempotent via v0: this is a fresh call into the
-  same `run_node` a live process would have made, not special resume code);
-  `awaiting_review` nodes just re-read the artifact already on disk and
-  call the reviewer. Only once nothing is left in flight does the round
-  loop proper start asking the orchestrator for new dispatches. A node only
-  becomes `"passed"` after **both** its gates (checked right after the
-  writer episode) and its reviewer verdict (checked right after review, and
-  skipped-as-pass when there's no judgment) agree — enforced in
-  `_transition_after_writer`/`_transition_after_review`, never by either
-  role's own output. `max_attempts` (default 3) retries a node that fails
-  gates or review by putting it back to `"pending"`; exhausting it sets
-  `"blocked"`, which makes the tree `is_blocked()` and the orchestrator
-  `escalate` on the next round instead of looping forever (§4.5: "Three
-  failed submits → escalate to the user, don't loop").
+## §2 Invariants
 
-## v2 — intake, survey, recursive planning, pilot + contract (`src/kusudaemon/v2/`)
+Non-negotiable. Every design decision below serves one of these.
 
-Four library modules, composed by a future pipeline driver rather than
-wired into `cli.py` here (same "additive scaffolding, wiring is later"
-pattern v0/v1 followed). Nothing in v0/v1 was modified beyond the one
-`spec_path()` addition noted above.
+1. **Nothing declares itself done.** Only the harness writes
+   `status: passed`, and only after gates evaluate.
+2. **Decomposition is unconditional and gated by code**, never by model
+   judgment about whether a task "feels" too big.
+3. **Every context is bounded and constant-size** — including the
+   orchestrator's. No context grows with corpus size or run length.
+4. **The filesystem is the state.** Model contexts are scratch, rebuilt from
+   disk. Any context can be destroyed and reconstructed.
+5. **Anything a script can compute, a script computes.** Model tokens buy
+   judgment only.
+6. **Cross-agent isolation.** No agent sees another's reasoning, scratch, or
+   raw tool output.
+7. **Small outputs everywhere**, including planning calls. Large generations
+   are the observed failure mode.
 
-- `v2/run_dir.py` — re-exports v0's and v1's path helpers and adds
-  `spine_path`/`contract_path`. Unlike v0's single-node files, `spine.json`
-  and `contract.md` aren't pre-touched by any `create_run_dir` — they don't
-  exist until `survey.save_spine`/`contract.freeze_contract` actually write
-  them, so a partially-run intake/survey doesn't leave a misleading empty
-  file behind.
-- `v2/intake.py` (§4.1) — `elicit_global_rubric(goal, provider, answer_fn)`
-  runs exactly one small `complete_json` call per entry in
-  `RUBRIC_DIMENSIONS` (7: audience/level, purpose, importance criteria,
-  exclusions, required components, target length, fidelity), each asking
-  for a single clarifying question; `answer_fn` is the seam to a real user
-  (CLI prompt in production, a scripted function in tests). One final
-  `complete_json` call turns the accumulated Q&A transcript into the rubric
-  plus an `assumptions` list — **the model, not the harness, decides what a
-  reasonable default is** for any dimension the user left blank, and must
-  add a matching assumption line explaining it (§4.1: "no unstated
-  assumptions... without an unbounded interview"). `run_intake(...)` calls
-  this and freezes the result into `spec.md` via `render_spec_md`. No
-  per-node rubric derivation from node type yet — that needs the
-  node-type template system, still unbuilt (see "out of scope" below).
-- `v2/survey.py` (§4.2) — three stages in one file, matching how PLAN.md
-  groups them:
-  1. `chunk_text(text)` — model-free. Splits on markdown/numbered headings,
-     page breaks (`\f`), or 2+ blank-line runs found by regex; folds any
-     resulting fragment under `min_chunk_tokens` into its neighbor so stage
-     2 never sees a near-empty window entry.
-  2. `survey_chunks(chunks, provider)` — walks chunks in overlapping
-     windows (`DEFAULT_WINDOW_SIZE=12`, `DEFAULT_WINDOW_STRIDE=8`); each
-     call sees only that window, rendered as index + first-15-words
-     preview (never full chunk text — §8: never cat the whole source), and
-     returns only candidate boundaries (`boundary_after`, `label`,
-     `confidence`), converted from window-local back to global chunk
-     indices before being returned.
-  3. `assemble_spine(chunks, votes)` — harness-only merge, no model call.
-     Overlapping windows can vote on the same boundary more than once; this
-     keeps the highest-confidence vote per boundary, drops anything under
-     `confidence_floor` (default 0.5), then folds any resulting unit under
-     `min_unit_tokens` (default 800) into a neighbor. `save_spine`/
-     `load_spine` round-trip `SpineUnit` lists through `spine.json`.
-- `v2/planner.py` (§4.3) — `build_tree(units, provider)` recurses
-  level-at-a-time: `plan_level` shows the model only the current slice
-  (unit index/label/token-count, indices local to that call — never source
-  content, never the whole spine past the top-level call) and asks for a
-  flat `children` list (8-12 at the top level, fewer for smaller slices).
-  `leaf_gate(candidate)` is pure harness code checking §4.3's per-node
-  conditions that are actually data-dependent (nonempty done-condition,
-  inputs within `token_budget`, `estimated_calls` within `tool_call_cap`;
-  "exactly one artifact" holds by construction, every candidate gets
-  exactly one `out/<id>.md`). A child that fails the gate gets its own
-  recursive `plan_level` call over just its slice. `depth_cap` (default 4)
-  and `node_cap` (default 400) are enforced entirely in code — a slice
-  hitting either cap becomes a forced leaf without ever asking the model,
-  and a single-unit slice is always a forced leaf too (§2 invariant 2).
-  Leaves get `depends_on=[]`: per §4.5, freezing the contract after the
-  pilot makes leaves genuinely independent, so the planner never wires up
-  leaf-to-leaf ordering. Leaves carry v1's generic gates only
-  (`nonempty`, `max_tokens:N`) and no judgment items — the node-type
-  template system that would generate richer gates/rubrics doesn't exist
-  yet (same gap `v1/gates.py`'s docstring already flags).
-- `v2/pilot.py` + `v2/contract.py` (§4.4) — the consistency mechanism.
-  `select_pilot_nodes(tree)` picks one node per distinct `shape` present in
-  the tree: the id-sorted **median**, not the first ("the first chapter of
-  anything is atypical"). `run_pilot(...)` runs the Writer via v1's
-  `run_writer_node` unmodified, then appends a `pilot_awaiting_approval`
-  event to `events.jsonl` and returns — a durable state, not a blocking
-  prompt, so the user can come back whenever. `approve_pilot(run_dir, node,
-  edited_text, provider, log)` is the resume point: diffs the edit against
-  the original artifact with `difflib.unified_diff`, writes the edit back
-  as the canonical artifact, and — only if the diff is non-empty — makes
-  one `complete_json` call asking the model to infer *generalizable* rules
-  from the diff (e.g. "exclude historical/biographical material", not "the
-  user deleted paragraph 3"); an unedited pilot derives zero rules and
-  spends zero model calls. `contract.freeze_contract(run_dir, rules)`
-  renders every pilot's `ContractRule`s into `contract.md`, grouped by
-  shape, and raises `ContractCeilingExceeded` **before writing anything**
-  if the rendered text is over `token_ceiling` (default 1500) — call once,
-  after every shape's pilot is approved, not incrementally.
-  `amend_contract(run_dir, rule_text, reason=...)` is the *only* other
-  writer to `contract.md` (§4.4: "reviewer suggestions must never reach
-  it"); it appends and re-freezes, same ceiling check, same
-  write-only-on-success guarantee. It does not touch `tree.json` — the
-  clean/patchable/regenerate re-validation triage over already-passed
-  nodes (§10) is v3 scope (§13: "re-validation pass for contract
-  amendments" is listed under v3, not v2).
-- `v2/embeddings.py` (new 2026-08-09, PLAN-zeromem.md §3) — the optional
-  embedding extra's front door: `DEFAULT_EMBED_MODEL = "BAAI/bge-m3"`,
-  `embeddings_available()` (import check, never raises), `embed_texts(texts,
-  model_name=..., batch_size=32)` (L2-normalized rows, module-level
-  `_model_cache`, lazy `sentence-transformers` import so the core package
-  and test suite stay extra-free), and a pure-stdlib `cosine`. Backs both
-  the deterministic survey below and `v2/retrieval.py`'s dense view.
-- `v2/survey.py`'s deterministic survey (`survey_chunks_deterministic`,
-  PLAN-zeromem.md §3; new 2026-08-09) — the model-free alternative to
-  `survey_chunks`: embedding dissimilarity `1 - cos(v_i, v_{i+1})`,
-  smoothed with a centered moving average (`DEFAULT_SMOOTHING_WINDOW=2`,
-  edges clamped — smoothing sets corpus-level contrast, never candidate
-  selection), `HEADING_BOOST=0.25` added at indices whose following chunk
-  starts with an author heading, threshold at the `boundary_percentile`
-  (0.75) quantile of the smoothed+boosted series. **Implemented variant
-  from the plan's literal algorithm, and why:** the plan's
-  "every index at/above the quantile fires" rule makes a lone odd chunk
-  (two-index dissimilarity plateau) always fire — contradicting §3.8 test
-  8's requirement that it not. So candidates are **strict local maxima of
-  the unsmoothed series** (sentinel `-1.0` at the edges, so corpus-end
-  peaks count) that clear the threshold — with author headings as
-  candidates regardless of peaks, since a heading outranks any embedding
-  gap. Confidence = min-max of the smoothed value; "at or above" accepts
-  the raw value too, so a genuine peak never loses to its own smoothing.
-  `_label_for_chunk` = first heading line stripped of `#` /
-  `Chapter|Section|Part N` / numbered-list markers, else the first 8
-  words, 120-char cap matching `SURVEY_SCHEMA`'s `maxLength`.
-- `v2/retrieval.py` (new 2026-08-09, PLAN-zeromem.md §4) — span retrieval
-  over the run's own chunked source, Zero-Mem's read path narrowed to the
-  node's own spine slice ("the planner already decided scope; retrieval is
-  not re-deciding it"). `build_chunk_index(run_dir, chunks, units)` writes
-  `chunks.jsonl` — one provenance-bearing line per chunk
-  `{index, unit_id, tokens, text}` — plus `chunks.emb.npy` /
-  `chunks.emb.meta.json` (embedding model name, so the query embeds with
-  the same model the index was built with) when `kusudaemon[retrieval]` is
-  installed; **idempotent**: a complete index (line count == chunk count)
-  is not rewritten. Called from `_phase_survey` while chunks are still in
-  memory (new 2026-08-09). `retrieve_spans(run_dir, node, query, *,
-  top_k=8, rho=0.6, neighbor_radius=1, dense=None)` — candidates are
-  chunks whose `unit_id` resolves from `node.inputs` via `_resolve_unit_ids`
-  (accepts bare ids *and* materialized `spine/<id>.md` paths; v4 finding
-  paths pass through as non-units); BM25 is in-module stdlib (~40 lines,
-  k1=1.5, b=0.75, IDF over the run's full chunk set — a ubiquitous term
-  can't dominate); dense cosine over candidates when the `.npy` exists,
-  fused Zero-Mem-style as `rho*dense + (1-rho)*bm25` after min-max
-  normalizing each view, with `dense` as an injectable seam (fake vectors
-  in tests; BM25 alone is degradation, not failure); closure pulls in
-  +/-`neighbor_radius` adjacent chunks of each winner, clamped to the
-  winner's own unit range ("a retrieved paragraph whose antecedent
-  sentence is in the previous chunk is worse than useless"); deduped and
-  returned in **ascending chunk order**, not score order. The query is
-  `node.brief` plus the node's rubric text — both already on the node, no
-  model call.
-- `pipeline/prompts.py`'s inline-spans mode (`build_node_prompt(node,
-  run_dir, *, inline_spans=False, top_k=DEFAULT_TOP_K)`, PLAN-zeromem.md
-  §4.4; new 2026-08-09) — opt-in replacement of the bare input-path list
-  with retrieved spans rendered under provenance headers
-  (`[unit-03 · chunk 41]`), so a Writer never has to open `source.txt`.
-  v4 finding paths (non-unit `node.inputs` entries, detected by
-  `_non_unit_inputs` against the loaded spine) stay in the "Inputs (read
-  them...)" section unchanged; the contract and rubric blocks are
-  untouched. Fallback to today's path-list rendering is **silent and
-  per-node** — unlike §3's phase-level fallback, which logs a loud
-  `survey_fallback` event — since a missing index here would spam the
-  event log once per node. `RunOptions.inline_spans` is persisted and
-  **defaults off** until §4.7's real-corpus A/B clears; `--inline-spans`
-  on both the CLI and `pipeline run` parsers. The byte-for-byte default
-  prompt is pinned by `test_pipeline_prompts.py`'s
-  `test_default_prompt_unchanged` — the regression guard for the whole
-  workstream.
+## §3 Roles
 
-## v3 — assembly and repair (`src/kusudaemon/v3/`)
+| Role | Reads | Writes | Agent loop? |
+|---|---|---|---|
+| **Orchestrator** | `tree.json`, `manifest.jsonl` tail | dispatch decisions | no — stateless per round |
+| **Planner** | `spine.json`, global rubric | flat list of child nodes | no |
+| **Writer** | its brief, declared inputs, contract | one artifact | yes — gptme |
+| **Reviewer** | artifact, contract, rubric | structured verdict | no |
 
-Deterministic concatenation, cross-cutting checks, a compile gate, and
-scoped repair — the last piece being what makes the first three matter,
-since none of the checks are worth anything if there's no way to fix what
-they find. Built on v0/v1/v2 without modifying them, beyond one additive
-touch to v1 (see below).
+Three of the four are text-in/JSON-out API calls. Only the Writer needs a
+tool loop.
 
-- `v3/run_dir.py` — re-exports v0/v1/v2's path helpers and adds
-  `assembly_dir`/`assembly_index_path`/`assembly_checks_path`/
-  `assembly_output_path`/`compile_log_path` (all under `assembly/`),
-  `versions_dir`/`version_snapshot_path` (`out/.versions/<node>/`), and
-  `revalidation_dir`/`revalidation_audit_path` (`audit/revalidation/`,
-  kept separate from v1's `audit/<node>.json` so a re-validation pass never
-  overwrites the record of the review that originally passed a node).
-- `v3/assemble.py` (§4.6.1) — `assemble(run_dir, tree)` writes
-  `assembly/index.md` and a concatenated output file, zero model tokens.
-  Ordering comes straight from `tree.json`'s own array order
-  (`ordered_node_ids`) rather than a separate order field: `TaskTree.nodes`
-  is a dict, but `TaskTree.load` builds it via a comprehension over the
-  JSON array in file order, and `v2/planner.py` writes candidates into that
-  array left-to-right as it walks the spine — so dict iteration order
-  already *is* document order. `require_complete` raises
-  `AssemblyNotReadyError` listing every not-yet-`"passed"` node if called
-  before the tree is done. Output is generic markdown
-  (`assembly/main.md`), not LaTeX-specific — a caller needing `main.tex` (or
-  any other compiled format) passes its own `render` callable; nothing here
-  assumes a toolchain exists.
-- `v3/checks.py` (§4.6.2) — script only, no model call. PLAN.md's example
-  checklist (`refs_out` resolution, glossary terms, duplicate definitions)
-  needs the node-type template system for the underlying data, and that
-  system is still unbuilt (same gap `v1/gates.py`/`v2/planner.py` already
-  flag), so this ships what's actually derivable today:
-  `check_all_nodes_passed`, `check_artifacts_exist_and_nonempty`,
-  `check_no_gate_drift` (an artifact that passed its gates at dispatch time
-  but no longer would — the file changed under us since), and
-  `check_manifest_recorded` (a passed node with no matching
-  `manifest.jsonl` line). `run_cross_cutting_checks` + `write_checks_json`
-  emit `assembly/checks.json`. (A `check_no_duplicate_artifact_paths` was
-  cut during review: `node_artifact_path` derives the path purely from the
-  node id and `TaskTree.nodes` is a dict keyed by id, so that collision is
-  structurally unreachable, not just unlikely — dead code, not a check.)
-- `v3/compile.py` (§4.6.3) — "Run latexmk; exit code and log are the gate,"
-  generalized: `compile_command` is a plain injected shell string run
-  through the existing `Environment.exec` abstraction (the same one every
-  episode dispatch already uses), not an assumed LaTeX toolchain. No
-  command configured → trivial pass (`skipped=True`) — most corpora this
-  harness runs over don't compile anything, per §1's corpus-agnostic goal.
-  `run_compile` shells into `assembly_dir` by default (`cd {dir} &&
-  {command}`) and writes the combined stdout+stderr to
-  `assembly/compile.log`.
-- `v3/repair.py` (§4.5, §4.6) — the mechanism everything else in v3 leans
-  on. **Why it can't just call v0's `run_node` again under the node's own
-  id**: `run_node` is keyed by node id in `events.jsonl`, and every node
-  reaching this module already has an `episode_completed` event from its
-  original successful dispatch — calling `run_node` again on that id is
-  defined to be a no-op replay (v0's whole resumability contract), not a
-  fresh attempt. So `run_repair` dispatches under a derived id
-  (`repair_node_id`: `"<node id>~repair<attempt>"`, `attempt = node.attempts
-  + 1`, reusing the same counter v1's round loop already increments on
-  failed submits/reviews — which also makes the derived id deterministic
-  across a crash mid-repair, so v0's own resume machinery still covers the
-  repair dispatch itself), then copies the resulting text over the real
-  artifact path only after it re-clears **both** gates and review — same
-  invariant 1 v1's round loop enforces, applied to a second pass. Snapshots
-  the pre-repair artifact to `out/.versions/<node>/<repair_id>.md`
-  unconditionally, before dispatch (§4.6: "if the amendment was itself the
-  mistake, you'll only realize it three chapters in"). `RepairMode` is
-  `"patch"` (minimal scoped edit — §4.5: freeform suggestions get
-  over-applied) or `"regenerate"` (full rewrite; used by contract-amendment
-  regenerate triage), which only changes the prompt template
-  (`build_repair_prompt`), not the dispatch/gate/review mechanics. On
-  success the node returns to `"passed"`; on failure it becomes `"stale"`
-  (retryable) or `"blocked"` once `node.attempts >= max_attempts` (same
-  threshold v1 uses to escalate rather than loop forever). This is also the
-  guardrail behind §4.6's "the assembler's file tools are read-only over
-  `out/`": nothing in `assemble.py`/`checks.py`/`compile.py` ever writes
-  into `out/` — only a repair *writer*, dispatched here and gated the same
-  as any other writer node, is allowed to change a passed artifact.
-- `v3/assembly_loop.py` — the v3 entrypoint, mirroring how `v1/round_loop.py`
-  ties Orchestrator/Writer/Reviewer together. `run_assembly_loop(run_dir,
-  tree_path, manifest_path, writer_adapter_factory, env, provider,
-  compile_command=..., ...)` runs checks → assemble → compile, in that
-  order (cheapest, most structural gate first — a missing artifact should
-  surface as a checks failure, not a confusing compile error). On a compile
-  failure it calls `find_offending_nodes(tree, log_text)` — a plain
-  substring match of each passed node's artifact **filename** against the
-  log text, not a format-specific log parser — and dispatches a scoped
-  `repair.run_repair` (mode `"patch"`) for every match, then re-assembles
-  and recompiles, bounded by `max_repairs`. If the log can't be attributed
-  to any node, it stops and escalates immediately rather than guessing (an
-  `run_escalated` event, same posture as v1's `max_attempts` exhaustion).
-- `v3/revalidate.py` (§10, §15.5) — the contract-amendment re-validation
-  pass, built on `repair.py` rather than a parallel mechanism. Two-phase,
-  matching §10's "present counts, get approval, then execute": (1)
-  `run_revalidation_pass(run_dir, tree, tree_path, contract_text,
-  provider)` is **read-only** — no writer is dispatched — re-running the
-  existing Reviewer (a dedicated system prompt, same `VERDICT_SCHEMA` v1's
-  reviewer already defines) against the amended contract for every
-  currently-`"passed"` node, classifying each via `classify_verdict` into
-  clean/patchable/regenerate using the verdict schema's own per-item
-  `class` field (already shipped in `v1/reviewer.py`'s schema — a failing
-  item with a missing or mixed class defaults to the stricter
-  `"regenerate"`, never guesses patchable). Anything not clean is marked
-  `"stale"` in the tree. `estimate_revalidation_cost` is a pure token count
-  (contract + rubric + artifact per passed node, zero model calls) for
-  showing the estimate *before* running, and `summarize_triage` gives the
-  clean/patchable/regenerate counts for the approval step in between. (2)
-  `apply_revalidation_triage(...)` — call only after that approval —
-  dispatches `repair.run_repair` for every non-clean node, `mode="patch"`
-  for patchable and `mode="regenerate"` for regenerate, with the defect
-  text derived straight from the triage verdict's own `id`/`defect`
-  fields; clean nodes are left untouched.
+- **Orchestrator is stateless per round** — fresh context rebuilt from disk
+  each round, then discarded. Bounded by the *ready set*, not tree size.
+- **Planner never sees source content** — unit labels and token counts only.
+- **Reviewer never sees the Writer's reasoning or scratch.** A reviewer that
+  can read the writer's justification talks itself into accepting.
+- **Reviewer cannot write.** Verdicts and scoped defects only; repairs are
+  separate Writer dispatches.
 
-  **§2 lexical pre-filter (PLAN-zeromem.md)**: `run_revalidation_pass` and
-  `estimate_revalidation_cost` take optional keyword-only `amendment_text`
-  and `prefilter=True` args; `v3/prefilter.py`'s `artifact_may_be_affected`
-  is the deterministic pre-filter that decides before any Reviewer call
-  whether the amendment can possibly bear on a node. `prefilter` also
-  accepts a callable visitor `prefilter(amendment, node) -> bool` for
-  callers who want a node-type-aware classifier (the node-type template
-  system, still unbuilt) — driver and CLI both pass the plain-text default;
-  the `driver.py` `amend_and_revalidate` signature (text, names,
-  `prefilter` node-visitor) is the stable surface contract. `_triage_json`
-  records the skip in the audit file (`prefiltered: true` + `reason`), and
-  the node is labeled `"clean"` without marking it `"stale"` — its `"passed"`
-  status is untouched, so nothing ships "clean" on a false negative being
-  treated as a regression. ~Tests: `test_v3_prefilter.py`'s §2.7 unit set.
-- `v3/prefilter.py` — deterministic lexical pre-filter for
-  `revalidate.py`'s re-validation pass, per PLAN-zeromem.md §2. A node is
-  skipped (returns `(False, reason)`) only when *all* of: the amendment's
-  `distinguishing_terms` (tokens of len >= 4 minus a ~180-word STOPWORDS
-  frozenset) are non-empty; none of those terms (with singular/plural
-  variants, word-boundary-matched via regex `\b…\b`, case-folded) appears
-  in the artifact or the node's rubric text; and if both `shape` and
-  `amendment_shape` are given, they differ. Shape-match forces review
-  (a rule scoped to the node's own shape can never be skipped on shape
-  grounds). Any condition it cannot decide returns `(True, reason)` — it
-  can only produce "clean", so a false skip is the failure mode it is
-  engineered against, and the matching leans wide on purpose: variants
-  count as hits, boundaries are word-level not substring, and an amendment
-  with no distinguishing terms disables the filter entirely (review
-  everything).
+## §4 Pipeline
 
-One additive touch to v1: `TaskNode.status` (`v1/tree.py`) gained
-`"stale"` (§10: "Amend contract... completed nodes now stale"). A passed
-node whose re-validation triage comes back non-clean is neither untouched
-work (`"pending"`) nor still confirmed-good (`"passed"`), so neither
-existing status fit. Nothing that never amends a contract ever produces
-this value — every v1/v2 code path is unaffected.
+```
+intake → survey → plan → pilot → research → [execute → review → repair]* → assemble
+            ↑              ↑
+      (spine.json)  (user approval → contract.md frozen)
+```
 
-## v4 — research tools (`src/kusudaemon/v4/`)
+**§4.1 Intake.** Elicits the global rubric once by questioning, not
+assumption: audience/level, purpose, what makes something important here,
+what to exclude, required components, target length, source fidelity.
+Anything unresolved becomes an explicit **assumption line** in `spec.md`,
+surfaced before execution — that is how "no unstated assumptions" is bought
+without an unbounded interview. Per-node rubrics are *derived*, never
+re-elicited.
 
-A scoped, budget-capped research subagent (§13: "web search subagent,
-current-docs retrieval") — run as its own phase *before* the round loop
-dispatches any Writer, not offered as a tool inside a Writer's own loop.
-Reasoning: §8 ranks raw tool results (a search's result list, fetched
-pages) as the second-worst context-discipline offender after unrestricted
-tool schemas; a Writer that could call `WebSearch` itself would pay for
-every one of those tokens on every subsequent turn. A research subagent
-pays that cost once, in its own isolated episode, and hands back only a
-300-token capped finding — the same shape `v1/writer.py`'s promotion
-mechanism already uses, applied one step earlier in the pipeline. Zero
-modifications to v0/v1/v2/v3.
+**§4.2 Survey.** Three stages, uniform output regardless of input structure:
+mechanical chunking (no model) → windowed boundary voting (model, tiny
+outputs — `{"boundary_after": 11, "label": "...", "confidence": 0.8}`, never
+a summary, never content) → harness-merged `spine.json`. A TOC makes stage 2
+nearly free; lecture notes make it work. Downstream is identical.
 
-- `v4/run_dir.py` — re-exports v0-v3's path helpers and adds
-  `research_dir`/`research_finding_path`/`research_raw_finding_path`,
-  all under a node's existing `scratch/<node>/` (never `out/`, so
-  `v3/assemble.py`'s tree-order concatenation — which only walks node ids
-  actually present in `tree.json` — never mistakes a finding for document
-  content). Two paths per query rather than one: `research_raw_finding_path`
-  is written once, by the agent itself, during its own episode (durable
-  regardless of when a crash lands relative to this module's own
-  post-processing); `research_finding_path` is the harness-written capped
-  canonical finding, and its mere existence is what makes a repeated call
-  a no-op.
-- `v4/mcp_research.py` (§15.2) — per-research-kind tool allowlists.
-  **Post gptme-only rewrite** (2026-08-09): this originally targeted Claude
-  Code's built-in `WebSearch`/`WebFetch` tools plus a Context7 MCP server
-  for `doc_retrieval` (`ClaudeCodeAdapter(mcp_config=...)`); that adapter
-  no longer exists, so the module was rewritten around what's actually
-  wired up now. `web_search` resolves to `SEARXNG_TOOL_PATH` — a
-  self-hosted [SearXNG](https://docs.searxng.org/) query, implemented as a
-  gptme tool file (`adapters/tools/searxng_search.py`) and loaded by
-  *path* rather than by name, since gptme's own `init_tools()` accepts
-  `.py` file paths as allowlist entries for exactly this kind of
-  non-built-in tool (`gptme.tools.base.load_from_file`). `allowed_tools_for`
-  raises for `doc_retrieval`: it has no gptme equivalent yet (gptme does
-  have native MCP tool support — `gptme.tools.mcp` — so wiring Context7
-  through *that* instead of Claude Code's config format is a real gap to
-  fill later, not a dead end, but it's unbuilt). `pipeline/backends.py`'s
-  `build_research_adapter` imports `allowed_tools_for` directly rather than
-  keeping its own copy of the mapping.
-- `v4/research.py` — `run_research_query(run_dir, node_id, query, adapter,
-  env, budget)` dispatches one `ResearchQuery` under a derived id
-  (`research_node_id`: `"<node>~research~<slug>"`, same reasoning as
-  `v3/repair.py`'s `"<id>~repair<n>"` — a query isn't the node's own
-  dispatch, so it must not collide with that node's own
-  `episode_completed` event) through v0's unmodified `run_node`, so the
-  episode itself inherits full crash-resume for free. On top of that, this
-  module adds its own idempotency layer for its post-processing step:
-  before ever calling `run_node`, it checks whether
-  `research_finding_path` already holds nonempty text and returns a cached
-  read if so — "resume-after-complete is a pure no-op," one call frame up
-  from v0's own proof of the same property. The finding text itself is
-  read from `research_raw_finding_path` (the file the agent was instructed
-  to write, persisted on disk regardless of replay) rather than from the
-  episode result's metadata, which goes empty on a replayed completion —
-  falling back to the episode's own visible-output/log text only on a
-  genuinely fresh dispatch, mirroring `v1/writer.py`'s promotion fallback.
-  `RESEARCH_FINDING_TOKEN_CAP = 300` (smaller than writer.py's 400: a
-  finding is one prompt segment among several on some *other* node's turn,
-  not that node's own full handoff), enforced via `v1/manifest.py`'s
-  existing `cap_promotion`. The only gate is `nonempty` — a finding has no
-  rubric the way a chapter does, it either found something or it didn't.
-- `v4/research_loop.py` — the v4 entrypoint, composable like v2's four
-  modules and v3's `assembly_loop.py` (nothing here is called from
-  `cli.py`). `run_research_loop(run_dir, tree_path, plan, adapter_factory,
-  env, budget)` takes a `plan: dict[node_id, list[ResearchQuery]]`
-  supplied by the caller — not a new `tree.json`/`TaskNode` field, since
-  §6's `inputs` is already "what this node's prompt should include"
-  (`["source.pdf#pp.184-211"]` in the schema example), so a finding's path
-  folds straight into the target node's existing `inputs` list via
-  `attach_finding`. `attach_finding` skips a finding that failed its own
-  gate (§13: "lowest priority... retrieval fixes" — a missing citation
+**§4.3 Plan.** Recursive, one level at a time. Call #1 emits a flat 8–12
+child partition (parent implied by the call — never nested JSON); the harness
+runs the **leaf gate** on each child; each failing child gets its own planner
+call over just its slice; recurse to a depth cap with a node-count cap.
+
+Leaf gate — all must hold, checked by code, never asserted by the model:
+exactly one named artifact; inputs fit the node token budget; done-condition
+expressible as one checkable sentence; estimated tool calls ≤ K (K=15).
+
+**§4.4 Pilot — the consistency mechanism.** Nodes are classified by **shape**
+(prose-, derivation-, problem-set-, reference-dominant). Run one pilot per
+shape — the id-sorted **median**, not the first: the first chapter of
+anything is atypical. The Writer produces the artifact, the run enters a
+durable `awaiting_approval` state (not a blocking prompt — the operator can
+return the next morning), the operator edits the file on disk, and `approve`
+diffs original vs. edited. **That diff is the highest-signal input in the
+system** — "cut every historical aside," "examples to three lines" — rules
+nobody would think to state. `contract.md` is frozen from it, under a hard
+token ceiling.
+
+Only two writers to the contract: pilot derivation, and explicit user
+amendment. **Reviewer suggestions must never reach it**, or requirements
+inflate monotonically and node 30 is held to a stricter bar than node 2.
+
+**§4.5 Execute / review / repair.** Sequential by default; nodes carry
+`depends_on` anyway, so parallelism is a config change rather than a
+redesign. A leaf has no `finish()` — its terminal action is submitting the
+artifact, and the harness runs gates. Three failed submits → escalate, don't
+loop. Defects are **scoped and located** ("§Worked Examples, ex. 2 omits the
+intermediate step"); freeform prose suggestions get over-applied and drift
+the artifact away from the exemplar in the name of fixing it.
+
+**§4.6 Assemble.** (1) Concatenation + index — script, zero tokens, ordered
+from `tree.json`. (2) Cross-cutting checks — script, `assembly/checks.json`.
+(3) Compile + repair — exit code and log are the gate.
+
+**Critical guardrail: the assembler's file tools are read-only over `out/`.**
+A compile error becomes a scoped repair node that goes back through review.
+Otherwise the assembler "helpfully" edits content to make the build green and
+you ship a passing compile over corrupted content.
+
+## §5 Run directory
+
+Harness-owned. **Code creates it, code enforces it** — if agents choose their
+own paths, the orchestrator can no longer navigate by path without reading.
+
+```
+<runs-root>/<run-id>/
+  spec.md            frozen goal + global rubric + approved assumptions
+  contract.md        frozen after pilot; hard token ceiling
+  spine.json         discovered structure
+  spine/<unit>.md    materialized unit text (what a Writer actually opens)
+  chunks.jsonl       provenance-bearing chunk index (+ .emb.npy, optional)
+  tree.json          nodes, deps, gates, status — the source of truth
+  manifest.jsonl     one harness-derived line per completed leaf
+  events.jsonl       append-only, fsync'd — the resume log
+  source.txt         the corpus this run decomposes
+  phase.json         durable phase marker; approvals.jsonl, halt.flag,
+                     run.spec.json, jobs.json
+  orchestrator/round-NN.jsonl
+  scratch/<node>/    notes, trace.jsonl, promotion.json, research/
+  out/<node>.md      artifacts;  out/.versions/<node>/  pre-repair snapshots
+  audit/<node>.json  gate results + reviewer verdict
+                     audit/revalidation/<node>.json (kept separate)
+  assembly/          index.md, checks.json, main.md, compile.log
+```
+
+`scratch/<node>/` is deletable once a node passes; it is never in anyone's
+context again.
+
+## §6 Schemas
+
+**Node (`tree.json`)** — `id`, `brief`, `artifact`, `gates` (required, may
+not be empty), `type`, `shape`, `inputs`, `tools`, `budget{tokens,calls}`,
+`judgment[]`, `rubric{id→text}`, `depends_on`, `status`, `attempts`,
+`last_defect`.
+
+`tools` is **per-node**. Single biggest token lever, and it improves
+reliability: a surveyor with three read-only tools is both cheaper and better
+than one with fifteen.
+
+**Manifest line (`manifest.jsonl`)** — everything except `promotion` is
+derived by the harness from the artifact, so there is no hallucination
+surface: `{node, artifact, tokens, gates, unmet_gates, promotion}`. Enough
+for the orchestrator to plan repairs and answer "what's left" without opening
+an artifact.
+
+**Reviewer verdict (`audit/<node>.json`)** — `{node, items[{id, pass,
+defect, class, node_ids}], verdict}`. `class` is `patchable` | `regenerate`
+and drives re-validation triage; `node_ids` (added for §8 document review)
+attributes a cross-node defect without overloading `id`.
+
+## §7 Rubrics: gates vs. judgment
+
+Split by checkability — this is how "no room to say I'm done" costs almost no
+context.
+
+**Gates** are machine-checkable, live in the harness, and **never enter model
+context**. The writer doesn't read "must have ≥5 problems"; it fails and gets
+back `unmet: R3 (4 problems, need 5)`.
+
+**Judgment** is 3–6 terse imperatives in the brief. Twelve invisible gate
+items + four visible judgment items = full enforcement at near-zero prompt
+cost.
+
+**Calibration risk:** gates too strict → leaves fail three times and escalate
+on trivia → you babysit. Start structural and unambiguous; keep judgment
+genuinely soft; tighten once real failures cluster.
+
+## §8 Context discipline
+
+Where input tokens actually go, in order of waste, for a 15-turn leaf:
+
+1. **Tool schemas** — 15 verbose tools ≈ 3–4K tokens resent every turn ≈ 50K
+   wasted on one leaf. Fixed by per-node `tools`.
+2. **Raw tool results** — a whole-file read pollutes every subsequent turn.
+   Read spans, not documents. Never cat the source.
+3. **Turn history** — grows quadratically in turns. The real argument for
+   small leaves. `budget.calls` should be a hard stop triggering re-split.
+4. **Restatement** — say everything once; let position do the work.
+
+**Excluded from every leaf context:** the task tree, any other leaf's output,
+the raw source document, prior leaves' history, schemas for uncallable tools.
+
+**Prompt ordering, most-stable first** (prefix caching): system → tool
+schemas → frozen contract → node brief → inputs → turn history. Never
+interleave volatile state into the system prompt.
+
+## §9 Reasoning traces
+
+Streamed to the operator, written once to `scratch/<node>/trace.jsonl`, and
+**never read by any agent** — not in promotions, not in manifest lines, not
+in reviewer context. Enforce structurally, not by instruction: discipline
+fails at 2am, a type error doesn't.
+
+Carve-out: the *current* turn's reasoning must accompany the tool result back
+to the model, or multi-step reasoning degrades silently. On a mid-generation
+stream death, partial reasoning cannot be re-sent as a signed block
+(truncated → signature fails) — re-inject as labeled plain text with explicit
+permission to discard, and only above a ~1000-token floor. Below that,
+regenerating is cheaper than paying to re-read it.
+
+## §10 Failure, resume, intervention
+
+**Resume.** `events.jsonl` is append-only and fsync'd; replay converges to
+exactly one artifact and one terminal event per node. This is *the*
+load-bearing property — everything else is downstream of it.
+
+**Never interrupt mid-turn.** Queue interventions, apply at node boundaries.
+
+| Intervention | Effect | Blast radius |
+|---|---|---|
+| Reopen node | mark stale with an operator defect; re-enters as a repair | one node |
+| Amend contract | new rules downstream; completed nodes go `stale` | whole run |
+| Halt | stop after the current phase | — |
+
+**Contract amendment → re-validation, never blanket regeneration.** Re-run
+the existing Reviewer read-only against the amended contract, triage each
+passed node into **clean** (no action) / **patchable** (scoped edit —
+additive amendments usually land here) / **regenerate** (the amendment
+contradicts what was written). Show the cost estimate and the counts, get
+approval, *then* execute. Snapshot to `out/.versions/` before any repair — if
+the amendment was itself the mistake you'll only realize three chapters in.
+
+## §11 Interfaces
+
+**Control surface: CLI** (`run`/`resume`/`status`/`approve`/`amend`/`serve`).
+**View surface: a local web app** — a separate process watching the run
+directory, so it can crash without touching the run and can attach from
+anywhere. Default node view is brief + gate results + verdict lines + diff,
+with the raw trace one click away; raw JSONL is unusable and nobody reads it.
+
+## §12 Provider layer
+
+**OpenAI-compatible only, in exactly one module.** Do not build a provider
+abstraction — later portability then costs one file instead of a refactor.
+
+Testing against a weak free model is the correct development target: a
+frontier model compensates for harness defects, so everything looks fine
+until you swap models and can't tell which of forty design choices was
+load-bearing. Free-tier rate limits also exercise backoff and resume
+continuously, for free.
+
+Endpoint notes: reasoning arrives as `reasoning_content` alongside `content`;
+`response_format: json_schema` support varies, so **the validate-and-reprompt
+fallback is the path actually exercised**, not a backstop. Role/model routing
+(cheap model for orchestrator/planner/reviewer, strong one only for the
+writer) is a config table, not code.
+
+## §13 Build ladder (all shipped)
+
+v0 resumability → v1 round loop → v2 intake/survey/plan/pilot → v3 assembly
+and repair → v4 research tools → v5 pipeline driver + control surface. On top
+of that, the Zero-Mem workstreams (`PLAN-zeromem.md` §§1–11, cited in source
+docstrings) all shipped 2026-08-09: deterministic dispatch policy (§1),
+re-validation pre-filter (§2), embedding survey (§3), retrieved spans (§4),
+episode context discipline (§5), writer output contract (§6), materialized
+spine units (§7), document-level review (§8), feedback-carrying retries (§9),
+zero-token log I/O (§10), and the §11 corrections. **Their ship gates are
+measurements, not code, and three are still open** — see `PLAN.md`.
+
+## §14 Eval
+
+Five fixed tasks, three runs each, measuring: resume correctness after
+`kill -9` at randomized points; whether the reviewer catches a deliberately
+broken node; orchestrator context bounded as node count grows; mean input
+tokens per leaf; planner schema-validity and leaf-gate sanity; **approval
+rate segmented by shape** (a global 90%→60% drop says something is wrong; a
+rate fine for prose and collapsing on derivations says *which* exemplar to
+re-pilot). Without this, prompt tuning is vibes, and weak models are noisy
+enough that vibes mislead.
+
+## §15 Provenance and licensing constraints
+
+Safe donors, permissive: LongHorizon-Harness, gptme, OpenCode, OpenHands
+(all MIT), playwright-mcp and the Agent Skills reference lib (Apache-2.0).
+Read-only, do not vendor: BUSL/BSL projects (Loki Mode, AgentsMesh).
+
+**Avoid entirely as donors:** Claude Code is source-available, not open
+source — and several popular repos (Claw Code, claw-code-agent, Free Code)
+openly derive from a March 2026 Claude Code source leak. Whatever license
+text they carry, that provenance is legally unsettled. Read for ideas; don't
+lift code.
+
+---
+
+# Part II — What is built, and why it's built that way
+
+Only non-obvious rationale and live gotchas are recorded here. Anything the
+code plainly says is not repeated.
+
+## v0 — resumability (`v0/`)
+
+- `events.py` — `EventLog.append()` **fsyncs every write**, not just
+  flushes. `read_all()` silently drops a torn trailing line: fsync-per-append
+  means a `kill -9` can only corrupt the line being written, which is always
+  the last one. `scan()` runs in-memory over an already-parsed list so a
+  caller needs one parse per dispatch, not three.
+- `run_dir.py` — `create_run_dir` is idempotent; path helpers for
+  `spec.md`/`events.jsonl`/`manifest.jsonl`/`scratch/`/`out/`. Later layers
+  re-export these rather than duplicating them.
+- `runner.py` — `run_node(...)`, one idempotent entrypoint for both first run
+  and resume. It inspects the node's furthest-reached state
+  (`episode_completed` → no-op replay; `session_captured` → continuation if
+  the adapter supports it; `node_dispatched` → fresh redispatch) and proceeds
+  from there. A concurrent task tails the live trajectory for the first
+  `session_id` and records `session_captured` **before** `run_episode()`
+  returns, since a crash can land any time after that line hits disk.
+  Deliberately **does not** write `manifest.jsonl` — a lone Writer has no
+  gates to evaluate, so the manifest line is written by whoever ran gates
+  (v1's round loop).
+
+Event vocabulary: `node_dispatched`, `session_captured`, `episode_completed`,
+`node_redispatched` (`reason`: `resumed_session` | `no_session_captured` |
+`resume_unsupported`).
+
+## v1 — the round loop (`v1/`)
+
+- `json_schema.py` — a stdlib-only validator covering exactly the subset the
+  package's own schemas use (no `$ref`, no `oneOf`). No dependency added.
+- `provider.py` — `OpenAICompatibleProvider`. `complete_json` **always**
+  parses and validates, and re-prompts with the validator's error on failure;
+  on a 400 it retries without `response_format`. HTTP via `urllib`, with the
+  transport as an injectable callable so tests never need network or a key.
+- `tree.py` — `TaskNode`/`TaskTree`. Construction **raises on an empty
+  `gates` list** — this is invariant 2 enforced in code. `rubric` carries
+  per-node judgment text until contract derivation can generate it.
+  `"stale"` and `last_defect` are additive, defaulted fields; every existing
+  `tree.json` loads unchanged.
+- `gates.py` — evaluated in code, never sent to a model. Shipped set:
+  `exists`, `nonempty`, `len:MIN-MAX`, `max_tokens:N`, `contains:TEXT`. The
+  richer §6/§7 examples (`headers:std`, `terms_defined`, `problems>=5`) need
+  the node-type template system — unbuilt, see `PLAN.md`.
+- `orchestrator.py` — stateless per round: rebuild compact state from disk,
+  one `complete_json`, discard. State is bounded by the **ready set**, not
+  tree size. Two hard code-side rules: when `ready_nodes()` is empty the
+  harness decides halt/escalate itself without spending a call; when the
+  model names a node id outside the ready set, the harness silently falls
+  back to the first ready node rather than trusting it.
+  `DispatchPolicy` selects `model` (default) or `deterministic` — the latter
+  removes the per-round call entirely.
+- `reviewer.py` — sees the artifact and rubric only. Skips the model call and
+  auto-passes when `judgment` is empty: gates already ran in code, so there
+  is nothing left to ask an opinion about.
+- `writer.py` — wraps v0's `run_node` unchanged (crash resume inherited free)
+  and asks the agent to write `scratch/<node>/promotion.json`. Missing or
+  unparseable → fall back to the episode's visible output; the ~400-token cap
+  applies either way, so an agent ignoring the instruction gets a worse
+  promotion rather than breaking the loop. A separate instruction states that
+  **the artifact is the deliverable** — without it, `out/<node>.md` collects
+  the agent's last chat message, i.e. a sign-off line.
+- `round_loop.py` — the v1 entrypoint. Per-node tool restriction is the
+  caller's job via `writer_adapter_factory`, so the loop never touches
+  adapter internals. **Resumability:** before asking the orchestrator
+  anything it resolves nodes left `dispatched` or `awaiting_review` by a
+  dead process — the former through `run_writer_node` again (idempotent via
+  v0, not special-case resume code), the latter by re-reading the artifact
+  already on disk. A node reaches `"passed"` only when **both** gates and the
+  reviewer agree, never by either role's own say-so. `max_attempts` (3) puts
+  a failing node back to `pending`; exhausting it sets `blocked`, which makes
+  the orchestrator escalate instead of looping. A failed attempt records its
+  located defect in `last_defect` so the retry is a correction rather than an
+  i.i.d. resample.
+
+## v2 — intake, survey, planning, pilot, contract (`v2/`)
+
+- `intake.py` — one small call per rubric dimension (7), then one finalize
+  call. **The model, not the harness, decides what a reasonable default is**
+  for an unanswered dimension, and must emit a matching assumption line.
+  `answer_fn` is the seam to a real operator.
+- `survey.py` — chunking (model-free, folds undersized fragments into
+  neighbors), windowed `survey_chunks` (converts window-local boundary
+  indices back to global before returning), `assemble_spine` (harness-only
+  merge: highest-confidence vote per boundary, drop below the floor, fold
+  undersized units), and `materialize_units` (writes `spine/<id>.md`, so a
+  Writer's `inputs` resolve to real files it can open).
+  `survey_chunks_deterministic` is the model-free alternative: embedding
+  dissimilarity, smoothed, heading-boosted, thresholded at a quantile.
+  **Implemented variant, deliberately:** candidates are *strict local maxima
+  of the unsmoothed series* that also clear the threshold, because the literal
+  "everything at/above the quantile fires" rule makes a lone odd chunk always
+  fire. Smoothing sets corpus-level contrast; it never selects candidates.
+- `planner.py` — `plan_level` shows the model one slice, indices local to the
+  call, never source content. `leaf_gate` is pure harness code. `depth_cap`
+  (4) and `node_cap` (400) force a leaf **without asking the model**, as does
+  a single-unit slice. Leaves get `depends_on=[]` because freezing the
+  contract makes them genuinely independent. Leaves carry generic gates and
+  **no judgment items** — the gap the node-type template system closes.
+- `pilot.py` / `contract.py` — `select_pilot_nodes` picks the id-sorted
+  median per shape. `run_pilot` appends `pilot_awaiting_approval` and
+  returns: a durable state, not a blocking prompt. `approve_pilot` diffs the
+  operator's edit, writes it back as canonical, and — **only if the diff is
+  non-empty** — makes one call to infer *generalizable* rules ("exclude
+  historical material", not "the user deleted paragraph 3"). An unedited
+  pilot spends zero model calls. `freeze_contract` raises
+  `ContractCeilingExceeded` **before writing anything**; `amend_contract` is
+  the only other writer, with the same guarantee.
+- `embeddings.py` / `retrieval.py` — the optional `kusudaemon[retrieval]`
+  extra (`BAAI/bge-m3`), imported lazily inside function bodies so the core
+  package and test suite stay extra-free. `build_chunk_index` is idempotent.
+  `retrieve_spans` restricts candidates to the node's **own** spine units
+  ("the planner already decided scope; retrieval is not re-deciding it"),
+  fuses stdlib BM25 with dense cosine as `rho*dense + (1-rho)*bm25` after
+  min-max per view, pulls in ±1 adjacent chunks **clamped to the winner's own
+  unit** (a retrieved paragraph whose antecedent is in the previous chunk is
+  worse than useless), and returns deduped in **ascending document order**,
+  not score order. No embeddings is degradation to BM25, not failure.
+
+## v3 — assembly, repair, re-validation, document review (`v3/`)
+
+- `assemble.py` — ordering comes from `tree.json`'s own array order:
+  `TaskTree.load` builds its dict by comprehension over the JSON array, and
+  the planner writes candidates left-to-right, so dict order already *is*
+  document order. `require_complete` raises listing every unfinished node.
+  Output is generic markdown; a caller needing `main.tex` passes its own
+  `render` callable — nothing here assumes a toolchain.
+- `checks.py` — script only. Ships what is derivable today:
+  all-nodes-passed, artifacts exist and nonempty, **gate drift** (an artifact
+  that passed at dispatch time but no longer would), manifest desync. The
+  `refs_out`/glossary checks in §4.6 need the node-type template system.
+- `compile.py` — `compile_command` is a plain injected shell string run
+  through `Environment.exec`. No command configured → trivial pass; most
+  corpora compile nothing.
+- `repair.py` — **why it can't just call `run_node` again:** every node
+  reaching this module already has an `episode_completed` event, so `run_node`
+  under the same id is defined to be a no-op replay. Repairs dispatch under a
+  derived id `"<node>~repair<attempt>"` — deterministic across a crash, so
+  v0's resume still covers it. The repaired text is copied over the real
+  artifact **only after it re-clears both gates and review**; the pre-repair
+  artifact is snapshotted unconditionally, before dispatch. Mode is `patch`
+  or `regenerate`, which changes only the prompt, not the mechanics. This is
+  the guardrail behind §4.6's read-only assembler: nothing in
+  `assemble/checks/compile` writes into `out/`.
+- `assembly_loop.py` — checks → assemble → compile, cheapest and most
+  structural gate first. `find_offending_nodes` is a plain substring match of
+  each artifact **filename** against the log, not a format-specific parser;
+  an unattributable failure escalates immediately rather than guessing.
+- `revalidate.py` — two-phase, matching §10. Phase 1 is **read-only**: no
+  writer is dispatched, the existing Reviewer runs against the amended
+  contract, and `classify_verdict` reads the verdict's own `class` field —
+  a failing item with a missing or mixed class defaults to the stricter
+  `regenerate`, never guesses patchable. `estimate_revalidation_cost` is a
+  pure token count with zero model calls, for showing before running. Phase 2
+  dispatches repairs per classification.
+- `prefilter.py` — deterministic lexical pre-filter in front of that pass. A
+  node is skipped only when the amendment's distinguishing terms are
+  non-empty, *none* of them (with plural variants, word-boundary matched)
+  appears in the artifact or rubric, and the shapes differ. **It can only
+  produce "clean", so a false skip is the failure mode it is engineered
+  against** — matching leans wide on purpose, shape-match forces review, and
+  an amendment with no distinguishing terms disables the filter entirely.
+  Skips are recorded in the audit file (`prefiltered: true` + reason) and the
+  node's `passed` status is left untouched.
+- `document_review.py` — the defect class per-leaf review is structurally
+  incapable of seeing: duplicate coverage, boundary gaps, terminology drift,
+  cross-section contradiction. Passes 1–3 read **promotions + briefs only**,
+  never artifact prose, so the whole-document index is already on disk and
+  already paid for. Windowed at 120/100, so calls scale with *windows, not
+  nodes* (≤16 flat at N=400 vs. 400 per-leaf). Attribution uses the verdict's
+  `node_ids`; unknown ids are dropped and logged, never trusted, never
+  crash; unattributable defects escalate. Only pass 4 opens artifacts — the
+  ≤4 shape-median nodes, reusing `select_pilot_nodes` unmodified.
+
+## v4 — research tools (`v4/`)
+
+Runs as its own phase *before* the round loop, not as a tool inside a
+Writer's loop: §8 ranks raw tool results second-worst, and a Writer that
+searched inline would pay for every result token on every subsequent turn. An
+isolated research episode pays once and hands back a 300-token capped finding
+(smaller than the writer's 400 — a finding is one segment of *another* node's
+prompt, not that node's own handoff).
+
+- `mcp_research.py` — `web_search` resolves to the SearXNG tool **by file
+  path**, since gptme's `init_tools()` accepts `.py` paths for non-built-in
+  tools. `doc_retrieval` **raises**: no gptme equivalent is wired up yet
+  (gptme has native MCP support, so this is a gap to fill, not a dead end).
+- `research.py` — dispatches under `"<node>~research~<slug>"` (same collision
+  reasoning as repair ids). Layers its own idempotency on top of v0's: a
+  nonempty finding file short-circuits before `run_node` is called. The
+  finding text is read from the **raw file the agent wrote**, not the episode
+  result metadata, which goes empty on a replayed completion.
+- `research_loop.py` — takes a caller-supplied `plan`, not a new `tree.json`
+  field, because a finding path folds straight into the node's existing
+  `inputs`. Skips a finding that failed its own gate (a missing citation
   degrades gracefully rather than blocking a run) and never duplicates a
-  path already present (resume-safe: re-running the loop after a crash is
-  safe to do again). Raises `KeyError` loudly if the plan names a node id
-  outside the tree, rather than silently skipping it.
+  path. Raises `KeyError` loudly on a plan naming an unknown node.
 
-## v5 — the pipeline driver and PLAN.md §11 control surface (`src/kusudaemon/pipeline/`, `src/kusudaemon/dashboard/`)
+## v5 — pipeline driver and control surface (`pipeline/`, `dashboard/`)
 
-The thing v0-v4 deliberately didn't provide: a driver that chains intake →
-survey → plan → pilot → contract → research → execute → assemble into one
-run, plus the control surface (§11: run / status / approve / amend /
-resume) around it. v0-v4 are imported unmodified; the only new durable
-state is a small v5 path set layered on the existing run-directory layout.
+- `driver.py` — `RunOptions` (persisted via `to_spec`/`from_spec`:
+  `dispatch_policy`, `document_review`, `survey_mode`, `inline_spans`, …) and
+  `RecursiveDriver`, a phase machine over
+  `intake, survey, plan, pilot, research, execute, assemble`. Construction
+  never touches the network; only `async run()` does. **Phase skip on resume
+  is decided by artifact existence, not by `phase.json`'s word**
+  (`## Goal` in `spec.md`, `spine.json`, `tree.json`, `contract.md`);
+  research/execute/assemble always re-run, which is safe because v4's cache,
+  v1's round loop, and v3's assembly loop are each resume-idempotent.
+  `halt.flag` is honored at phase boundaries only. Post-run interventions
+  (`amend_and_revalidate`, `apply_triage`, `reopen_node`) keep §10's
+  read-only-then-approve-then-execute split.
+- `approvals.py` — the cross-process human gate. Append-only
+  `approvals.jsonl`, latest record per `approval_id` wins; resume **reuses**
+  the unanswered record instead of stacking duplicates.
+  `wait_for_resolution(timeout=None)` waits forever by default — the operator
+  is the one surface that must never be rushed. Every surface resolves the
+  same file, so no surface owns a run.
+- `backends.py` — the only module that constructs adapters. gptme is the only
+  backend. `build_writer_adapter` passes `node.tools` through as the
+  allowlist and **always layers the SearXNG tool on top** (deduped), so any
+  Writer can search mid-episode; it also passes `node.budget.tokens` as the
+  episode context length and `hidden_paths` (the run's bookkeeping minus the
+  node's own paths). `build_research_adapter` grants *only* the search tool
+  and **raises** for an unwired kind rather than silently granting full tool
+  access — the driver catches that and marks the phase skipped.
+- `prompts.py` — `build_node_prompt` assembles brief + contract + inputs +
+  rubric + `last_defect` retry block + `depends_on` promotions before the
+  episode starts. `inline_spans=True` replaces the input path list with
+  retrieved spans under provenance headers (`[unit-03 · chunk 41]`); the
+  fallback when no index exists is **silent and per-node**, unlike the survey
+  phase's loud `survey_fallback` event, because a missing index here would
+  spam the log once per node. The byte-for-byte default prompt is pinned by
+  `test_pipeline_prompts.py::test_default_prompt_unchanged` — the regression
+  guard for the whole prompt surface.
+- `run.py` / `cli.py` — one argument parser, one run loop:
+  `kusudaemon run|resume|status|approve|amend|serve` (a flat command set),
+  with `--detach` spawning `python -m kusudaemon.pipeline.run`. A run id whose
+  `run.spec.json` exists **resumes** — disk is authoritative and argv
+  contributes nothing but the id. Bare `kusudaemon` = `serve` with defaults.
+  Every handler operates purely on the run directory, so they work from a
+  second terminal while a driver is attached.
+- `dashboard/state.py` — `RunState`, which **reads fresh from disk on every
+  call** (with a parse-on-change cache keyed on `(st_size, st_mtime_ns)`,
+  valid only because the logs are append-only). Deliberately imports no
+  `http.server` and no `gptme`, so it is testable with nothing installed;
+  the `control_enabled` gate lives one layer up, on the HTTP handler.
+  `subagents()` derives every distinct dispatched id from `events.jsonl` —
+  tree nodes plus derived `~repair`/`~research` ids.
+  `node_gptme_logdir` + `interject` are live mid-episode messaging: the gptme
+  worker tees a `{"type":"logdir"}` line into `trace.jsonl`, and appending to
+  that logdir's `prompt-queue.jsonl` uses gptme's own between-turn queue
+  rather than forking its chat loop.
+- `dashboard/gptme_queue.py` — a from-scratch reimplementation of gptme's
+  queue file protocol (not an import), so the long-lived server process stays
+  independent of whether the gptme extra is installed.
+- `dashboard/server.py` — stdlib `ThreadingHTTPServer` (no new dependency);
+  one thread so the SSE `/api/stream` connection never blocks other requests.
+  Owns transport only: routing, JSON, traversal-safe static serving, and
+  `control_enabled` gating on every mutating route (`attach` stays ungated).
+  `goal`/`source` fields get server-side `@path` resolution, since a browser
+  can't read server files the way the old same-process UI could.
+- `dashboard/static/` — dependency-free vanilla JS, no build step, SSE with a
+  2s poll fallback. **`render()` has no diffing** — every update tears down
+  and rebuilds `#app`. Consequence, and the live constraint: **every
+  free-text field's value must live in `state`** (`promptText`, `newRun`,
+  `interjectDrafts`/`reopenDrafts`/`approvalDrafts` keyed by id), with focus
+  and selection restored on top for cursor continuity. A field whose value
+  lives only in its DOM node loses the operator's typing on the next tick.
+  `snapshotFingerprint()` strips `server_time` before comparing snapshots —
+  otherwise the freshly-stamped timestamp makes every tick look changed.
 
-**History, in full, because it's genuinely gone back and forth twice in
-one day (2026-08-09) and every earlier revision of this file told a
-different story:** the original PLAN.md §11 plan called for a local *web
-app* as the view surface. That shipped first (`dashboard/server.py` +
-`dashboard/static/`, a stdlib `http.server` + hand-rolled JS frontend).
-It was then **deleted and replaced by a Textual TUI** (`tui/app.py` +
-`tui/state.py`, `pip install "kusudaemon[tui]"`) the same day, once it
-became clear the operator was already living in a terminal for the CLI
-half of this control surface anyway. The TUI added real features the
-original web view never had — a "Subagents" view, live mid-episode
-interject, colored diff history against `out/.versions/`, per-node
-reopen — while it was the only control surface. Then the TUI was **itself
-deleted and replaced by a rebuilt web dashboard** (`src/kusudaemon/
-dashboard/`, this section) later the same day, this time carrying every
-one of those TUI-only features over rather than dropping them again.
-`dashboard/state.py`'s `RunState` is a straight line all the way back to
-the original `dashboard/recursive.py`'s `RecursiveRunState` — it moved
-files twice (`dashboard/recursive.py` → `tui/state.py` → `dashboard/
-state.py`) but the class itself, and its "read everything fresh from disk
-on every call" design, never got rewritten from scratch. Net effect: the
-package name and the transport (`http.server`, not a terminal) are back to
-where they started, but the feature set is not — this is not a revert, it
-carries the TUI's additions forward.
-
-- `pipeline/run_dir.py` — v5 path helpers: `source_path` (the corpus the
-  run decomposes), `phase_path` (`{phase, status, detail, ts}` durable
-  progress marker), `approvals_path`, `halt_path`, `run_spec_path`
-  (immutable `{goal, backend, model, source_text, compile_command,
-  research_plan, ...}` written by the driver at first dispatch so a
-  detached dashboard server or `pipeline resume` can rebuild the
-  environment from disk alone), `jobs_path` (background-job records for
-  the dashboard).
-- `pipeline/approvals.py` — the cross-process human-gate protocol. Every
-  checkpoint (intake answers, pilot edits, amend/triage/reopen gates) is a
-  record in `approvals.jsonl`, append-only, latest record per
-  `approval_id` wins; `append`/`read_all`/`pending`/
-  `find_pending` (resume **reuses** the unanswered record instead of
-  stacking a duplicate question), `wait_for_resolution` (the driver blocks
-  polling the file — the operator is the one surface that must never be
-  rushed, so `timeout=None` waits forever), and `Approver` (a thread that
-  answers every pending record as it lands, so a driver run can be
-  scripted end to end over the exact same disk protocol the dashboard
-  uses). Any surface — the dashboard, CLI `pipeline approve` — resolves
-  the same file, so no surface owns a run.
-- `pipeline/driver.py` — `RunOptions` (persisted via `to_spec`/
-  `from_spec`) and `RunReport`, then `RecursiveDriver`, the phase machine.
-  Construction never touches the network; only `async run()` does. Phase
-  *skip* on resume is decided by artifact existence (`_phase_done`: `## Goal`
-  in `spec.md` for intake, `spine.json` for survey, `tree.json` for plan,
-  `contract.md` for pilot), not by `phase.json`'s word; research/execute/
-  assemble are always re-run, safe because v4's finding cache, v1's round
-  loop, and v3's assembly loop are themselves resume-idempotent. Human
-  gates go through `_ask()` (approval records, `find_pending`-reusing);
-  `halt.flag` is honored at phase boundaries only. Post-run interventions,
-  §10's "present counts, get approval, then execute" with no writer ever
-  running in the read-only half: `amend_and_revalidate` (append the rule →
-  run the read-only re-validation pass → return `{contract, counts,
-  triage}` for operator review), `apply_triage` (dispatch one
-  `repair.run_repair` per non-clean node, patch or regenerate per its
-  classification), `reopen_node` (mark one passed node stale and dispatch
-  a single scoped repair from operator defect text; refuses nodes that
-  are not `"passed"`). `RunOptions.survey_mode` ("model"/"embedding") and
-  `RunOptions.inline_spans` (PLAN-zeromem.md §3/§4) both round-trip
-  through `to_spec`/`from_spec`; `_phase_survey` switches on survey_mode
-  (with a loud `survey_fallback` event if the embedding extra is missing)
-  and calls `build_chunk_index` while chunks are still in memory;
-  `_phase_execute`'s `prompt_for_node` lambda threads `inline_spans`
-  through.
-- `pipeline/backends.py` — one module deciding which agent backend a run's
-  writers and research queries use, so the driver never constructs an
-  adapter: `build_writer_adapter` (gptme is the only entry in
-  `WRITER_BACKENDS`; passes `node.tools` through as `tool_allowlist` when
-  the node declares them, same per-node narrowing v1's round loop already
-  does — **and, 2026-08-09, always adds the SearXNG `websearch` tool on
-  top of that narrowed-or-default set**, deduped against whatever's
-  already there, so every Writer can search mid-episode at will rather
-  than only through a pre-planned `research_plan` entry),
-  `build_research_adapter` (also gptme, narrowed via `v4/mcp_research.py`'s
-  `allowed_tools_for(query.kind)` — currently just the SearXNG `websearch`
-  tool for `web_search`, and *only* that tool, unlike the writer path
-  above — a research episode still has no reason to touch shell/file
-  tools; **any other backend, or a kind with no tool wired up, raises**
-  rather than silently granting full tool access to a research query —
-  `driver.py`'s `_phase_research` catches that `ValueError` and marks the
-  phase "skipped" instead of failing the run), and `parse_research_plan`
-  (the loose web/CLI JSON — a list of `{node_id, slug, kind, question}`
-  objects or a dict by node_id — into v4's typed plan dict).
-- `pipeline/prompts.py` — `build_node_prompt(node, run_dir, *,
-  inline_spans=False, top_k=DEFAULT_TOP_K)` assembles a writer's whole
-  prompt before its bounded episode starts (brief, frozen contract, inputs
-  list — spine unit ids and v4 finding paths the agent reads with its own
-  tools — and judgment rubric; see the v2 section's inline-spans bullet
-  for the opt-in PLAN-zeromem.md §4 mode that replaces that list with
-  retrieved spans under provenance headers). No model calls.
-- `pipeline/run.py` — the standalone entrypoint (`python -m
-  kusudaemon.pipeline.run`) that both `kusudaemon pipeline run` and its
-  `--detach` mode spawn, so one argument parser stays in sync with one run
-  loop. A run id whose `run.spec.json` already exists *resumes*: the disk
-  is authoritative, argv contributes nothing but the id. Mirror of the CLI
-  flag set: `--survey-mode` (model/embedding) and `--inline-spans` land
-  here from `RunOptions`' persisted `to_spec`/`from_spec` round trip.
-- `pipeline/cli.py` — builds the `kusudaemon` CLI itself (§11's control
-  surface; note it is a *flat* set of subcommands — `kusudaemon run`,
-  `kusudaemon status <id>`, etc. — not a `kusudaemon pipeline <cmd>`
-  group, despite this module's own docstring/§11 phrasing suggesting
-  otherwise): run (foreground, or `--detach` in a background subprocess),
-  resume (= run with an existing id), status (phase/tree/approval
-  status/events lengths straight from disk), approve (resolve the oldest
-  pending approval, with `--answer`/`--file`/`--action`), amend (append a
-  rule, print the re-validation counts, ask before applying the triage —
-  or `--yes`), and **serve** (2026-08-09, replacing the since-deleted
-  `tui` command: `--runs-root`/`--host`/`--port`/`--run-id`/`--no-control`,
-  launches `dashboard.server.run_forever` in the foreground — the
-  standalone view+control surface, PLAN.md §11's "separate process
-  watching the run directory... can be attached from anywhere," back to
-  being a browser rather than a terminal). Bare `kusudaemon` (no
-  subcommand, `src/kusudaemon/cli.py`) is shorthand for `serve` with
-  default `--runs-root`/`--host`/`--port` — "just run the thing"
-  ergonomics matching other modern agent CLIs, replacing the old
-  bare-invocation behavior of printing `--help`. Every handler operates
-  purely on the run directory, so they work from a second terminal while a
-  driver (or the dashboard) is still attached.
-- `dashboard/state.py` — `RunState`, unchanged in spirit across both of
-  its moves (`dashboard/recursive.py` → `tui/state.py` → here): same
-  "read everything fresh from disk on every call" design. No
-  `control_enabled`/403 concept lives on this class — that gate is back
-  one layer up in `dashboard/server.py` now (see below), same place the
-  very first web view kept it, since a web server (unlike a TUI or a
-  bound terminal) may be reachable from more than just the operator's own
-  machine. Deliberately has **no `http.server`, `textual`, or `gptme`
-  import** (mirrors the "core package stays gptme-free" rule the rest of
-  the codebase already follows for its own optional extra), so
-  `tests/test_dashboard_state.py` exercises it directly without any extra
-  installed. Every method the very first web state had is still here —
-  `list_runs`/`attach`/`snapshot`/`events_tail`/`start_run` (hosts a
-  `RecursiveDriver` in a background thread)/`halt`/`resolve_approval`/
-  `request_amend`/`request_reopen`/`node_detail`/`artifact`/
-  `version_snapshot`/`trace`/`spec_text`/`contract_text`/`spine_text`/
-  `manifest_lines`/`assembly` — plus two the TUI added and this rebuild
-  kept:
-  - `subagents(events=...)` — every distinct dispatched id seen in
-    `events.jsonl` (tree Writer nodes, and derived ids like
-    `v3/repair.py`'s `<node>~repair<n>` and `v4/research.py`'s
-    `<node>~research~<slug>`), each summarized with kind/role/status/
-    attempts/duration/`live`. This is "subagents" in the harness's own
-    vocabulary — the same word `v4`'s module docstrings already use for a
-    research query — surfaced as a first-class view rather than only
-    reachable by knowing a tree node id. `dashboard/server.py` folds this
-    straight into `/api/snapshot`'s payload rather than giving it its own
-    route, since the frontend needs the whole list on every refresh
-    anyway (to compute per-id "live" status for both the Tree and
-    Subagents tabs).
-  - `node_gptme_logdir(node_id)` / `interject(node_id, text)` — live
-    mid-episode messaging. `_gptme_worker.py` (see Adapters below) tees a
-    `{"type": "logdir", "logdir": ...}` line to the node's `trace.jsonl`
-    before `gptme.chat()` starts; `node_gptme_logdir` scans for it the
-    same way `v0/runner.py`'s `_watch_for_session_id` already scans the
-    same file for `session_id`. `interject` then appends to
-    `<logdir>/prompt-queue.jsonl` via `dashboard/gptme_queue.py` (below) —
-    gptme's own chat loop (`gptme/chat.py`'s
-    `_drain_external_prompt_queue`) already polls that exact file between
-    turns and injects each line as the next user message, so this is
-    "talk to a running subagent mid-episode" using a mechanism gptme
-    already ships, not a fork of its chat loop. `dashboard/server.py`
-    exposes it as `POST /api/node/<id>/interject`.
-  A bug fixed while this lived at `tui/state.py` and still relevant here:
-  `node_detail` used to pass a possibly-`None` artifact straight into
-  `evaluate_gates`, which crashed inside `_gate_nonempty`'s `.strip()` —
-  unreachable from the original web tests (which only ever inspected
-  already-`"passed"` nodes with a real artifact on disk) but routine once
-  a caller inspects in-flight (`"dispatched"`) nodes too; now defaults to
-  `""`.
-- `dashboard/gptme_queue.py` — `queue_prompt(logdir, content)`, a
-  from-scratch reimplementation of gptme's own `gptme/prompt_queue.py`
-  file protocol (`{"content", "queued_at"}` JSON lines,
-  `fcntl.flock`-guarded append) — not an import of it, so the long-lived
-  dashboard server process stays independent of whether the `gptme`
-  optional extra is installed (only `adapters/_gptme_worker.py` imports
-  gptme itself; see that module's docstring and `pyproject.toml`'s
-  `gptme` extra — the dashboard package has no optional extra of its
-  own).
-- `dashboard/rendering.py` — pure string/data-rendering helpers, no
-  `http.server` import either (tested indirectly through
-  `dashboard/server.py`'s routes): `diff_lines` (a `difflib.unified_diff`
-  wrapper pre-classified into add/remove/context/header/hunk so a caller
-  styles without re-parsing `+`/`-`/`@@` markers itself — backs the Diff
-  tab's colored history against `out/.versions/`), and `parse_trace`
-  (turns `trace.jsonl` — the tee'd raw stdout of the agent subprocess,
-  either `{"type": "logdir", ...}` or gptme's own `--output-format json`
-  `{"type": "message", "role", "content"}` — into role-tagged entries for
-  the Thinking tab; unparsable lines are shown verbatim rather than
-  dropped). Also carries `STATUS_STYLE`/`STATUS_GLYPH`/`phase_strip_text`
-  (rich-text-style helpers left over from the TUI; unused by the web
-  frontend, which keys its own CSS off the raw status string via
-  `[data-status]` selectors instead — harmless to keep, nothing imports
-  `rich` to use them).
-- `dashboard/server.py` — the stdlib `http.server` transport (no new
-  dependency: `http.server`/`urllib`/`json`, matching the rest of the
-  harness's "stdlib + packaging/tomli" rule). One `ThreadingHTTPServer` so
-  the long-lived `/api/stream` SSE connection never blocks any other
-  request. Owns *transport* only — routing, JSON encoding,
-  path-traversal-safe static serving, and `control_enabled` gating for
-  every mutating route (`start_run`/`halt`/`resolve_approval`/
-  `request_amend`/`request_reopen`/`interject`; `attach` is deliberately
-  ungated, same as the original web view). Routes mirror `RunState`
-  one-to-one (`/api/snapshot`, `/api/runs`, `/api/attach`, `/api/halt`,
-  `/api/approvals/<id>/resolve`, `/api/amend`, `/api/reopen`,
-  `/api/node/<id>`, `/api/node/<id>/artifact`, `/api/node/<id>/trace`,
-  `/api/node/<id>/version/<tag>`, `/api/spec`, `/api/contract`,
-  `/api/spine`, `/api/manifest`, `/api/assembly`) plus what the TUI added
-  and this rebuild carries forward as JSON endpoints instead of widget
-  state: `/api/node/<id>/thinking` (`rendering.parse_trace`, JSON-ified),
-  `/api/node/<id>/diff/<tag>` (`rendering.diff_lines` against one prior
-  version, JSON-ified — the frontend calls this once per entry in
-  `node_detail().versions`), and `POST /api/node/<id>/interject`.
-  `POST /api/runs`'s `goal`/`source` fields get server-side `@path`
-  resolution (`_read_text_field`, mirroring `pipeline/run.py`'s
-  `_read_text_arg`) before reaching `RunState.start_run` — a browser can't
-  read arbitrary server files the way the old TUI's same-process New-run
-  form could, so this has to happen in the handler instead of the
-  frontend. `make_server`/`serve_in_background`/`run_forever` are the
-  three entrypoints (`kusudaemon serve`, bare `kusudaemon`, and
-  `python -m kusudaemon.dashboard.server` respectively all end up at
-  `run_forever`).
-- `dashboard/static/{index.html,app.js,style.css}` — the frontend: a
-  dependency-free vanilla-JS single-page app (`el()` helper builds DOM
-  nodes directly, no framework, no build step) polling `/api/snapshot`
-  every 2s as a fallback and preferring `/api/stream` (SSE) when
-  available. Three-pane layout — a left `Sidebar` (Runs/Task Tree/
-  Subagents/Phases tabs), a center `Run Stream` (goal, phase card,
-  pending approvals rendered generically from each approval's own
-  `options`/`allow_input` shape, a live event tail, and a bottom prompt
-  bar that starts new runs / amends the contract / reopens a node by
-  typing its id), and a right `Workbench` (Code & Artifacts / Contract /
-  Spec / Spine / Assembly / Events Log tabs) — plus a node/subagent
-  **drawer** (`openNode(id)`, shared by clicks from the Tree tab, the
-  Subagents tab, and any event's node-id link) with four sub-tabs mirroring
-  the TUI's `NodeDetail` widget: Overview (gates/judgment/rubric/reviewer
-  verdict/inputs/depends_on/budget), Artifact (raw text), Diff (one block
-  per prior version, fetched from `/api/node/<id>/diff/<tag>` and
-  colored via CSS classes matching `rendering.DiffLine.kind`), and
-  Thinking (role-colored trace entries from `/api/node/<id>/thinking`).
-  The drawer also carries the interject bar (enabled only when the node's
-  entry in `snapshot().subagents` has `live: true`) and the reopen bar
-  (enabled only when `node_detail().status === "passed"`) — the same two
-  conditions the TUI's `NodeDetail._send_interject`/`_send_reopen` gated
-  on. `control_enabled` (stitched into `/api/snapshot`'s payload by the
-  server, since `RunState` itself doesn't carry it) greys out every
-  mutating control when the dashboard is served with `--no-control`.
-  **Live-update re-render, fixed 2026-08-09 (two real bug reports, two
-  separate root causes):** `render()` has no diffing — every call tears
-  down `#app` (`root.innerHTML = ""`) and rebuilds the whole tree, and it's
-  called on every live update (`/api/stream` ticks every `_STREAM_INTERVAL`
-  = 1.5s server-side, or the `/api/snapshot` poll fallback every 2s).
-  First bug: every text `<input>`/`<textarea>` was a plain uncontrolled DOM
-  node, so a rebuild while the operator was mid-typing silently discarded
-  whatever they'd typed. Second bug, found only after the first fix: the
-  fix initially just diffed incoming snapshots (`applySnapshot` skips
-  `render()` when the new snapshot is unchanged) and restored the
-  *focused* field's value/selection across a rebuild that did fire
-  (`captureFocusState`/`restoreFocusState`, keyed by a `data-key` attribute
-  on each field) — good enough for the single-field prompt bar, but a
-  multi-field form (New Run's 5 inputs) still lost whatever the operator
-  had typed into any field *other* than the one currently focused, since
-  that field's content lived only in its own DOM node. Fixed by moving
-  every free-text field's value into `state` as the actual source of truth
-  (`state.promptText`, `state.newRun`, `state.interjectDrafts`/
-  `reopenDrafts`/`approvalDrafts`, the latter three keyed by node/approval
-  id) with an `input` listener keeping it in sync; every field's DOM node
-  is re-initialized from that state on every rebuild regardless of which
-  one has focus, and the focus/selection restoration from the first pass
-  stays on top for cursor continuity. Third fix, same day: `applySnapshot`'s
-  unchanged-snapshot check was comparing full `JSON.stringify` including
-  `RunState.snapshot()`'s own `server_time: _now()` field — stamped fresh
-  on literally every call whether or not anything else changed — so the
-  diff never actually matched and every 1.5s tick still forced a full
-  rebuild regardless of the first fix. `snapshotFingerprint()` now strips
-  `server_time` before comparing.
 ## Adapters (gptme-only)
 
-The Claude Code and Codex adapters, the classic role adapters
-(`manager.py`, `auditor_agent.py`, `plugins/`, `role_prompts.py`,
-`prompt_texts.py`, `config.py`, `agent_logs.py`), and their `utils/`
-helpers (`agent_cli.py`, `update_check.py`) were **deleted** along with the
-classic harness. What remains is the gptme-only surface:
-
-- `adapters/cli_agent.py` — `CommandAgentAdapter`, the shared base for the
-  one remaining adapter. `run_episode` builds the shell command from a
-  `command_template`, writes the prompt to a unique file under
-  `prompt_dir`, tees stdout to `live_trajectory_path` via the environment,
-  and produces an `EpisodeResult` (timeout → `"timeout"`, non-zero exit →
-  `"error"`, else `"done"`). `supports_session_resume = False` /
-  `supports_tool_restriction = False` class attributes, `command_override`
-  keyword for one-call command swaps.
-- `adapters/gptme_adapter.py` + `adapters/_gptme_worker.py` — the **only**
-  Writer backend: `GptmeAdapter`, an `AgentAdapter` with no agent CLI
-  anywhere in the chain. It drives gptme (github.com/gptme/gptme, MIT,
-  `pip install "kusudaemon[gptme]"` — an optional extra, so the core
-  package and the test suite stay gptme-free) — a small
-  shell/read/save/patch tool-use loop that talks to the user's configured
-  OpenAI-compatible endpoint (see `provider_config.py` below — a fresh
-  install's sample `provider.json` points at DeepSeek V4 Flash Free via
-  OpenCode Zen, but that's starter content in an editable file, not a
-  runtime fallback; `resolve()` raises if it's missing). Model id gets the
-  `local/` provider prefix (`_gptme_model`), because gptme routes
-  `local/<name>` through whatever `OPENAI_BASE_URL` points at. Still
-  subclasses `CommandAgentAdapter` and still shells a subprocess — of
-  `_gptme_worker.py`, a few lines of code in *this* repo that call one
-  gptme library function (`gptme.chat(...)`), not of a product this repo
-  doesn't control. That subprocess boundary is deliberate, not a
-  compromise: gptme's own `chat()` calls `os.chdir(workspace)` itself (a
-  process-global mutation two concurrent in-process episodes would race)
-  and, being a synchronous call, can't be forcibly cancelled once wrapped
-  in `asyncio.to_thread`. A subprocess gets both for free from machinery
-  (`environment/local.py`'s real timeout+killpg, `utils/process_group.py`
- 's tracked process groups). `supports_session_resume = False` — gptme's
-  own continuity model (re-point `chat()` at the same `logdir`) has no
-  fresh-vs-corrupted-log distinction the way `--resume <session_id>`
-  does; every `run_episode` call gets a fresh, never-reused `logdir`, so
-  a redispatch can never collide with a crashed attempt's partial log.
-  `supports_tool_restriction = True` via the `tool_allowlist` constructor
-  arg (per-node narrowing flows from `node.tools` through
-  `pipeline/backends.py`). Every exact API detail here (the `chat()`
-  signature, the `"local/<name>"` + `OPENAI_BASE_URL`/`OPENAI_API_KEY`
-  custom-endpoint mechanism, the `--output-format json` line shape
-  `gptme_visible_output` parses) was confirmed against a real installed
-  `gptme` package via `inspect`, not guessed from documentation.
-  `_gptme_worker.py` also emits one `{"type": "logdir", "logdir": ...}`
-  line (2026-08-09, added for the TUI and unchanged since) before
-  `gptme.chat()` starts — `gptme_visible_output` already ignores any line
-  whose `type` isn't `"message"`, so this is invisible to it; it exists
-  purely so `dashboard/state.py`'s `node_gptme_logdir` (watching the same
-  tee'd `trace.jsonl` this bullet's `live_trajectory_path` already writes)
-  can find *this attempt's* logdir while the episode is still running, and
-  append to its `prompt-queue.jsonl` — gptme's own already-shipped
-  mid-conversation message queue — to let the operator talk to a running
-  Writer/repair/research episode mid-task. See the `dashboard/state.py`
-  and `dashboard/gptme_queue.py` bullets in the v5 section above for the
-  other half of this mechanism.
-- `adapters/tools/searxng_search.py` (new, 2026-08-09) — a `websearch`
-  gptme tool, self-contained and stdlib-only (`urllib`), querying a local
-  [SearXNG](https://docs.searxng.org/) instance's JSON API
-  (`GET {base_url}/search?q=...&format=json`; base URL from
-  `KUSUDAEMON_SEARXNG_URL`, default `http://localhost:8080`). Loaded by
-  *file path*, not by name — gptme's `init_tools()` accepts `.py` file
-  paths as allowlist entries and imports them via
-  `gptme.tools.base.load_from_file`
-  (`importlib.util.spec_from_file_location`, independent of the
-  `kusudaemon` package), which is why this module avoids relative imports
-  and only reaches for `gptme.message`/`gptme.tools.base` inside function
-  bodies — never at module import time — so it stays importable (and its
-  pure-Python helpers unit-testable) without gptme installed; `tool =
-  _build_tool()` at module end is wrapped in a `try/except ImportError`
-  for the same reason. `pipeline/backends.py`'s `build_research_adapter`
-  passes `SEARXNG_TOOL_PATH` (via `v4/mcp_research.py`'s
-  `allowed_tools_for("web_search")`) as a `GptmeAdapter`'s
-  `tool_allowlist` — scoped to *only* this tool, for the isolated v4
-  research episode. **`build_writer_adapter` now also adds it to every
-  plain Writer's tool set** (2026-08-09 — see the pipeline/backends.py
-  bullet in the v5 section above), on top of `DEFAULT_TOOL_ALLOWLIST` or
-  `node.tools`; the "pay the search-result cost once, in an isolated
-  episode" rule this file used to describe here no longer holds — search
-  is now available on every Writer turn, not only a pre-planned research
-  query's own turn.
+- `cli_agent.py` — `CommandAgentAdapter`, the shared base: builds a command
+  from a template, writes the prompt to a unique file, tees stdout to the
+  live trajectory path, maps timeout → `"timeout"` and non-zero exit →
+  `"error"`.
+- `gptme_adapter.py` + `_gptme_worker.py` — the only Writer backend. Drives
+  gptme (MIT; `pip install "kusudaemon[gptme]"`, an optional extra so the
+  core package and tests stay gptme-free) against the configured
+  OpenAI-compatible endpoint; the model id gets a `local/` prefix, because
+  gptme routes `local/<name>` through `OPENAI_BASE_URL`. **The subprocess
+  boundary is deliberate, not a compromise:** gptme's `chat()` calls
+  `os.chdir()` itself (a process-global two concurrent episodes would race)
+  and, being synchronous, can't be cancelled once wrapped in
+  `asyncio.to_thread`. A subprocess gets both from existing machinery.
+  `supports_session_resume = False` — gptme's continuity model (re-point at
+  the same logdir) has no fresh-vs-corrupted distinction, so every episode
+  gets a fresh never-reused logdir and a redispatch can't collide with a
+  crashed attempt's partial log. Every API detail here was confirmed against
+  a real installed `gptme` via `inspect`, not from documentation.
+- `tools/searxng_search.py` — a stdlib-only `websearch` gptme tool over a
+  local SearXNG JSON API (`KUSUDAEMON_SEARXNG_URL`, default
+  `http://localhost:8080`). Loaded **by file path**, so it must avoid
+  relative imports and only touch `gptme.*` inside function bodies —
+  `tool = _build_tool()` is wrapped in `try/except ImportError` for the same
+  reason. Snippets are truncated and results capped, per §8.
 
 ## Provider configuration (`provider_config.py`)
 
-Provider defaults and customization live in exactly one module, `src/
-kusudaemon/provider_config.py`, so the endpoint the agents and planner
-talk to is never scattered across adapters. Configuration is split across
-**exactly two files, both at the repo root, both gitignored, both shipped
-as `.example` templates** the user copies and edits — never a third
-location:
+Exactly **two files, both repo-root, both gitignored, both shipped as
+`.example` templates**:
 
 - **`provider.json`** — non-secret: named providers (`base_url`, `model`,
-  and `api_key_env`, the name of the env var holding *that* provider's
-  key — never the key itself). Repo-local by design
-  (`DEFAULT_CONFIG_PATH = Path("provider.json")`, resolved against the
-  cwd the CLI is run from — not `$HOME`). `config_file_path()` search
-  order (2026-08-09, widened after a real report of an edited
-  `provider.json` being silently ignored — same bug class `.env` hit
-  first, below, and `provider.json` had never gotten the matching fix):
-  `KUSUDAEMON_PROVIDER_CONFIG` wins outright if set; otherwise cwd, then
-  each ancestor directory, then — last resort — the installed package's
-  own project root (`_installed_repo_root()`, the same helper `.env`'s
-  search uses); if none of those has a `provider.json` yet, falls back to
-  the plain cwd-relative path. Before this fix, running `kusudaemon` from
-  any cwd other than wherever `provider.json` actually lived meant the
-  edit was never read and `resolve()` silently fell back to the built-in
-  opencode default — which is easy to mistake for "my edit didn't take
-  effect" precisely because the built-in default model
-  (`opencode/deepseek-v4-flash-free`) is what most users' `provider.json`
-  already contains from `ensure_user_config`'s sample, so the fallback
-  value and the pre-edit value are byte-identical. A sample sits at the
-  repo root (`provider.example.json`); the CLI also writes this file from
-  the same sample on first invocation if it's missing
-  (`ensure_user_config`, which now also benefits from the same search —
-  it won't write a redundant cwd copy if an ancestor or the installed
-  repo root already has one), so "customize the default" works whether
-  the user copies the example by hand or just runs the CLI once.
-- **`.env`** — secret: the actual API key(s), one per `api_key_env` name
-  used in `provider.json` (e.g. `OPENAI_API_KEY=...`). Loaded automatically
-  at CLI startup (`load_env_file`) into `os.environ`, never overwriting a
-  value the real shell environment already set. A sample sits at the repo
-  root (`.env.example`). Search order (2026-08-09, widened after a real
-  freeze/401 report): cwd, then each parent directory — but a cwd *outside*
-  the project tree entirely (e.g. `~/Downloads`, a sibling of `~/kusudaemon`
-  rather than an ancestor) makes that walk find nothing, and a missing key
-  fails silent-ish at `require()` time (a plain 401 from the provider, not
-  a loud "no .env found") rather than at load time, since an empty api key
-  was always a legitimate `resolve()` outcome. So as a last resort,
-  `load_env_file` now also checks the *installed package's own* project
-  root (`_installed_repo_root()`: walks up from `provider_config.py`'s own
-  `__file__` for a `pyproject.toml`) — for the normal editable/dev install
-  this is the actual checkout regardless of cwd, so `.env` is found with
-  **zero shell configuration** no matter which directory `kusudaemon` is
-  invoked from. `KUSUDAEMON_ENV_FILE` (added the same day, kept as a
-  narrower escape hatch) forces an exact path instead, for the one case
-  the automatic fallback can't cover: a non-editable/wheel install with no
-  `pyproject.toml` on disk next to the installed code.
+  `api_key_env` — the *name* of the env var, never the key).
+- **`.env`** — the actual keys, loaded at CLI startup, never overwriting the
+  real shell environment.
 
-**No built-in fallback endpoint** (changed 2026-08-09, in response to a
-real report that an edited `provider.json` appeared to be silently
-ignored — see the `ConfigFilePathTest` docstring in
-`tests/test_provider_config.py`): if neither the config file nor any env
-var yields a `base_url`/`model`, `resolve()` raises `ProviderConfigError`
-naming the missing field(s), the exact config path it checked, and what
-to set — rather than quietly substituting OpenCode Zen's endpoint. The
-one place OpenCode Zen's values (`https://opencode.ai/zen/v1`, model
-`opencode/deepseek-v4-flash-free`) still appear in code is
-`SAMPLE_SETTINGS`, the **starter content** `ensure_user_config()` writes
-into a fresh `provider.json` at CLI startup if none exists yet (printed
-to the user, not hidden) — a fresh clone still works out of the box by
-getting a real, editable file, not by `resolve()` falling back to a
-constant at call time. Its api key is read from the generic
-`OPENAI_API_KEY` env var like every other provider, **not**
-`OPENCODE_API_KEY` — there is no code path in `provider_config.py` that
-reads `OPENCODE_API_KEY` (`DEFAULT_API_KEY_ENV = "OPENAI_API_KEY"`); a
-fresh clone with just `OPENAI_API_KEY` set in the environment or `.env`
-works, but `OPENCODE_API_KEY` alone silently does not.
+Both are searched: cwd → each ancestor → **the installed package's own
+project root** (walk up from `provider_config.py.__file__` for a
+`pyproject.toml`). That last fallback exists because of a real report: for a
+normal editable install it finds the actual checkout regardless of cwd.
+`KUSUDAEMON_PROVIDER_CONFIG` / `KUSUDAEMON_ENV_FILE` force exact paths, for
+wheel installs with no `pyproject.toml` on disk.
 
-Per-field precedence (highest first):
+**There is no built-in fallback endpoint.** If nothing yields a
+`base_url`/`model`, `resolve()` raises `ProviderConfigError` naming the
+missing field, the exact path it checked, and what to set. This replaced a
+silent fallback to OpenCode Zen — which was indistinguishable from "my edit
+didn't take effect", because the fallback value was byte-identical to what
+`ensure_user_config` writes into a fresh `provider.json`. That sample is
+starter content in an editable file, printed to the user; it is not a runtime
+default. Its key is read from the generic `OPENAI_API_KEY` —
+`OPENCODE_API_KEY` is read nowhere.
 
-1. explicit constructor argument (`api_key=`/`base_url=`/`model=`)
-2. `KUSUDAEMON_PROVIDER_API_KEY` / `KUSUDAEMON_PROVIDER_BASE_URL` /
-   `KUSUDAEMON_PROVIDER_MODEL` env vars
-3. the selected provider's entry in `provider.json` (its key comes from
-   the env var its `api_key_env` names, itself normally set via `.env`)
-4. `OPENAI_API_KEY` / `OPENAI_BASE_URL` / `OPENAI_MODEL` env vars
-
-No step 5: `resolve()` raises `ProviderConfigError` for `base_url`/`model`
-if nothing above yields a value.
+Per-field precedence: constructor arg → `KUSUDAEMON_PROVIDER_*` →
+`provider.json`'s selected entry → `OPENAI_*`. No step 5. Only `api_key` may
+come back empty, and only `require()` errors on that.
 
 `types.py`'s `DEFAULT_TMP_DIR` follows the same repo-local rule
-(`<cwd>/.kusudaemon/tmp`, not `~/.kusudaemon/tmp`) — nothing this harness
-writes by default lives outside the project folder it was launched from.
+(`<cwd>/.kusudaemon/tmp`): nothing this harness writes by default lives
+outside the project folder it was launched from.
 
-`resolve()` either returns a fully-populated `base_url`/`model`, or
-raises — only `api_key` may come back empty, and only `require()` (called
-by callers that must not proceed without credentials, and by
-`GptmeAdapter.__init__`) errors on that, with a message naming exactly
-which knob to set. `v1/provider.py`'s and the adapter's own model/key
-defaults were folded into this module; both now call `resolve()` with the
-same lookup chain and let it raise rather than catching and substituting
-anything themselves.
+---
 
-## Tests
+# Part III — Tests
 
-Stdlib `unittest`, no pytest, no network, no real `claude`/`codex` binary,
-no API key. Run everything:
+Stdlib `unittest`. No pytest, no network, no agent binary, no API key.
 
 ```
 python3 -m unittest discover -s tests -p "test_*.py" -v
 ```
 
-**Every test file starts with `sys.path.insert(0, str(_REPO_ROOT /
-"src"))` — this is load-bearing, not boilerplate.** Found 2026-08-09
-while testing the (now-deleted) dashboard server: this machine's conda
-base env still carries leftover `_editable_impl_lh_harness.pth` /
-`_editable_impl_waypoint.pth` files from earlier (pre-rename) editable
-installs of this same project, and — because `.pth` files add a bare
-directory to `sys.path`, not a specific package — they make
-`.../LongHorizon-Harness/src` (the *original* checkout, not whichever
-worktree you're actually in) importable as `kusudaemon` regardless of
-`cwd`. Without the per-file `sys.path.insert` at position 0, running
-`python3 -m unittest discover -s tests` from a worktree would happily run
-that worktree's *test files* against the original checkout's (unmodified)
-*package code* and report a false green; every existing test file already
-guards against exactly this — copy the guard into any new test file
-rather than assuming a bare `import kusudaemon` is safe.
+**299 tests, ~19s, all passing** (2026-08-09).
 
-~19s, 299 tests, all passing. `test_provider_config.py`'s
-`_EnvIsolatedTest` snapshots and restores the *entire* `os.environ` around
-each test — the previous partial-restore logic only put back keys that
-had a prior value, so a test setting e.g. `KUSUDAEMON_PROVIDER` fresh (no
-prior value) leaked it into every test running after it in the same
-process, intermittently breaking unrelated suites (`test_v1_units.py`,
-`test_v1_round_loop.py`) depending on run order. `test_searxng_tool.py`
-(10) and the rewritten `test_v4_mcp_research.py` (2, was 7 — see the
-v4/pipeline sections above) cover the SearXNG web-search tool and its
-allowlist wiring.
+**Every test file starts with `sys.path.insert(0, str(_REPO_ROOT / "src"))`.
+This is load-bearing, not boilerplate.** Stale `_editable_impl_*.pth` files
+from pre-rename editable installs put a bare *other* checkout's `src` on
+`sys.path`, so without the insert a worktree runs its own test files against
+the original checkout's package code and reports a false green. Copy the
+guard into any new test file.
 
-`tests/test_dashboard_state.py` (16) tests `dashboard/state.py`'s
-`RunState` directly (no server, no `urllib`, no port) — a straight rename
-of the file that lived at `tests/test_tui_state.py` while `RunState` lived
-at `tui/state.py`, no content changes beyond import paths and comments.
-Covers run listing, attach, snapshot reflecting tree/approvals, node
-detail + artifact (including tolerating a `None` artifact on an in-flight
-node), unknown-node/unknown-run handling, approval resolution, halt
-toggling, event tail, `subagents()` deriving distinct dispatched ids
-(including a `<node>~repair1` shape) from `events.jsonl`,
-`node_gptme_logdir` discovering a session from a forged
-`{"type": "logdir", ...}` trace line, `interject` appending to (and
-refusing to touch, when no logdir has been discovered yet, or the text is
-blank) that session's `prompt-queue.jsonl`, and `request_reopen`.
+| File | n | Covers |
+|---|---|---|
+| `test_provider_config.py` | 35 | precedence chain, `require()`, `.env` and `provider.json` cwd/ancestor/installed-root search |
+| `test_v0_resume.py` | 5 | real-subprocess `SIGKILL` resume (both windows), no-op replay, fsync-per-append, single-parse dispatch |
+| `test_v1_units.py` | 20 | gates, tree validation, promotion cap, `complete_json` retry paths, artifact instruction |
+| `test_v1_round_loop.py` | 10 | dependency order, gate-failure escalation, resume of passed and in-flight nodes, tool restriction, deterministic dispatch |
+| `test_v1_orchestrator_policy.py` | 9 | `DispatchPolicy`, ready-set-bounded state |
+| `test_v2_intake.py` / `_survey.py` / `_planner.py` / `_pilot.py` | 4/22/12/7 | call counts, window→global index conversion, spine merge and folding, leaf gate, caps forcing leaves with zero calls, median pilot, contract ceiling |
+| `test_v2_survey_deterministic.py` | 12 | injected vectors only — clean shift fires once, uniform corpus silent, the lone-odd-chunk plateau that forced the implemented variant |
+| `test_v2_retrieval.py` | 10 | BM25/IDF, unit-restricted candidates, clamped closure, fusion flipping rank, idempotent index |
+| `test_v3_assemble/checks/compile/repair/assembly_loop.py` | 3/5/4/4/5 | tree order, each check's true positive, injected compile command, derived-id repair + snapshot + rollback, attribute→repair→recompile |
+| `test_v3_revalidate.py` / `_prefilter.py` | 10/10 | four triage buckets, read-only phase 1, pre-filter skip/force rules |
+| `test_v3_document_review.py` | 14 | windowed call count flat in node count, id attribution and dropping |
+| `test_v4_*.py` | 2/2/5 | allowlist, derived-id dispatch + cache hit, finding attachment |
+| `test_dashboard_state.py` / `_server.py` | 18/22 | `RunState` directly (no port), then HTTP over a real loopback `ThreadingHTTPServer` incl. traversal rejection and `--no-control` 403s |
+| `test_pipeline_prompts.py` / `_backends.py` / `test_driver_phases.py` | 13/7/2 | byte-identical default prompt, adapter wiring, phase detail preservation |
+| `test_gptme_adapter.py` / `test_searxng_tool.py` | 15/12 | command construction and output parsing; monkeypatched `urlopen`, never `execute_websearch` (it imports gptme) |
 
-`tests/test_dashboard_server.py` (22, new 2026-08-09) is the HTTP-level
-suite over `dashboard/server.py` — a real `ThreadingHTTPServer` bound to
-127.0.0.1 on an OS-assigned ephemeral port, driven with `urllib` against a
-hand-built run directory (loopback-only traffic to a server this process
-itself owns, not a call to any external network). `DashboardServerTest`
-(11) covers static serving + path-traversal rejection, the same
-attach/snapshot/node-detail/approval-resolve/halt/events routes
-`test_dashboard_state.py` covers at the `RunState` layer, plus malformed
-JSON and unknown-route handling. `SubagentsInterjectDiffThinkingTest` (5)
-covers the routes that carry the TUI's additions over as JSON:
-`POST /api/node/<id>/interject` (409 with no live session, 200 and a
-written `prompt-queue.jsonl` once a forged logdir line makes one live),
-`GET /api/node/<id>/thinking` (a forged trace line round-trips to
-`{"role": "assistant", "text": "..."}`), and `GET /api/node/<id>/diff/
-<tag>` (a hand-written file under `out/.versions/<node>/` diffs against
-the live artifact; unknown tag 404s). `ReadOnlyDashboardServerTest` (6,
-`control_enabled=False`) asserts every mutating route 403s — `halt`,
-`start_run`, `amend`, `reopen`, `interject` — while `attach` still
-succeeds, since `RunState` itself has no opinion on read-only mode (see
-the v5 section's `dashboard/server.py` bullet: that gate lives on the
-HTTP handler, not the state class, precisely so this test class can
-exercise it without touching `RunState` at all).
+Fixtures (`tests/fixtures/`): `fake_stream_agent.py` (a standalone script
+mimicking a streaming agent CLI — writes its pid immediately so a test can
+kill it before it emits anything), `fake_adapter.py`, `fake_provider.py` (pops
+canned responses **and validates each against the schema it was asked for**,
+so wiring the wrong response for a role fails loudly), and
+`run_node_subprocess.py`.
 
-### `tests/test_provider_config.py` (34 tests)
-
-`resolve()`'s precedence chain frozen (built-in opencode default; each
-higher level wins; unknown config keys ignored; malformed/non-object
-config raises), `require()` passing/raising, and `ensure_user_config`
-writing the sample once and never overwriting an existing file.
-`EnvFileLoaderTest` covers `load_env_file`'s cwd/ancestor/installed-repo-root
-search (see the Provider configuration section's `.env` bullet).
-`ConfigFilePathTest` (5, new 2026-08-09) mirrors it one-for-one for
-`config_file_path()`'s matching search over `provider.json` — cwd, then
-ancestors, then the installed repo root via a mocked `_installed_repo_root`,
-plus an end-to-end `resolve()` call proving an edited model value in a
-cwd-discovered `provider.json` actually takes effect (the regression this
-was added for: it silently didn't, before the fix in the same section).
-
-### v0 (`tests/test_v0_resume.py`, 4 tests)
-
-1. `ResumeAfterSessionCrashTest` — launches `run_node` as a real OS
-   subprocess (`tests/fixtures/run_node_subprocess.py`), polls for
-   `session_captured`, then `SIGKILL`s **both** the runner subprocess *and*
-   the actual fake-CLI child process (they end up in different process
-   groups because `LocalEnvironment.exec` gives the agent CLI its own
-   session — killing only the runner's group would leak the child). Verifies
-   the child pid is actually dead, then resumes in-process and asserts
-   exactly one `episode_completed`, a `resumed_session` redispatch, and the
-   fake CLI's resume-acknowledgment text in the final artifact (proving real
-   continuation, not a lucky fresh run).
-2. `ResumeBeforeSessionCrashTest` — same mechanics, but kills during a
-   `--startup-delay` window before any stdout line exists, so resume must
-   fall back to `no_session_captured`.
-3. `ResumeAfterCompleteIsNoopTest` — calls `run_node` twice to completion;
-   asserts the second call appends zero new events and returns the replayed
-   result without touching the artifact.
-4. `EventLogFsyncTest` — mocks `os.fsync` to confirm `EventLog.append` truly
-   calls it (not just `flush()`), once per append.
-
-### v1 units (`tests/test_v1_units.py`, 15 tests)
-
-`GatesTest`/`TreeValidationTest`/`PromotionCapTest` exercise gates.py/tree.py/
-manifest.py directly (no I/O beyond a temp `tree.json`).
-`ProviderStructuredOutputTest` drives `OpenAICompatibleProvider.complete_json`
-against an injected fake `transport` callable: malformed JSON then valid,
-schema-violating JSON then valid, exhausting retries raises `ProviderError`,
-and a code-fence-wrapped response still parses.
-
-### v1 round loop (`tests/test_v1_round_loop.py`, 6 tests)
-
-Writer backend is `fake_stream_agent.py`/`FakeStreamAgentAdapter` (same
-fixtures v0 uses). Orchestrator/Reviewer backend is
-`tests/fixtures/fake_provider.py`'s `FakeProvider` — a scripted queue of
-canned `complete_json` responses that still validates each one against the
-schema it was asked for, so a test that wires the wrong response for a role
-fails loudly instead of `round_loop.py` silently misbehaving.
-
-1. `LinearChainRoundLoopTest` — two-node dependency chain (`b depends_on
-   a`) runs end to end in order; asserts final status, that the orchestrator
-   was asked exactly twice (halts on `is_complete()` without a third call),
-   and two manifest lines.
-2. `GateFailureEscalatesTest` — a node with an unsatisfiable gate
-   (`len:9999-99999`) retries up to `max_attempts`, lands on `"blocked"`,
-   and the run escalates (an `run_escalated` event) instead of looping.
-3. `ResumeSkipsPassedNodesTest` — calls `run_round_loop` twice against the
-   same `run_dir`/`tree.json`. First call processes node `a` then halts
-   (simulating a crash boundary right after completion, before node `b`
-   — now ready — is ever touched: asserts `b`'s pidfile never appears).
-   Second call resumes and finishes `b`; asserts node `a`'s
-   `episode_completed` count is still exactly 1 across both calls.
-4. `ResumeInFlightWriterNodeTest` — forges `tree.json`/`events.jsonl` into
-   the state a real crash would leave (node `status: "dispatched"`,
-   `events.jsonl` has `node_dispatched` + `session_captured` but no
-   `episode_completed` — the same window `test_v0_resume.py`'s
-   `ResumeAfterSessionCrashTest` proves survives a real `kill -9`), then
-   calls `run_round_loop` once. Asserts the node resumes via the
-   `resumed_session` path and that the orchestrator was asked about node
-   `b` only — node `a`'s recovery happened before the orchestrator was
-   consulted at all, per `round_loop.py`'s doc comment.
-5. `PerNodeToolRestrictionTest` — `ClaudeCodeAdapter(allowed_tools=(...))`
-   puts `--allowedTools` and the given tool names on the built command
-   line; omitting it omits the flag.
-
-### v2 (`tests/test_v2_*.py`, 58 tests)
-
-All against fakes — `FakeProvider` for every `complete_json` call,
-`FakeStreamAgentAdapter`/`fake_stream_agent.py` for the one real-subprocess
-Writer episode in the pilot tests. No new fixtures were needed. The
-deterministic-survey and retrieval suites (PLAN-zeromem.md §3.8/§4.6) never
-import `sentence-transformers` — vectors are injected — so the core suite
-stays free of the `retrieval` extra.
-
-- `test_v2_intake.py` (4) — the 7-question-then-finalize call count; an
-  unanswered dimension shows up in `assumptions`; `render_spec_md`
-  formatting; `run_intake` freezes `spec.md` to disk.
-- `test_v2_survey.py` (15) — `chunk_text` splits on headings and folds tiny
-  fragments into neighbors; `survey_chunks` converts window-local boundary
-  indices to global ones across multiple windows and makes zero calls on
-  fewer than 2 chunks; `assemble_spine` covers the no-votes/one-unit case,
-  a confident boundary actually splitting, a low-confidence boundary being
-  dropped, duplicate votes on one boundary keeping the higher-confidence
-  label, and an undersized unit getting folded into a neighbor;
-  `save_spine`/`load_spine` round-trip.
-- `test_v2_planner.py` (10) — `leaf_gate` unit tests for each of the three
-  data-dependent failure reasons; `build_tree` for a flat all-leaves
-  partition, a child that fails the leaf gate triggering a second
-  recursive call (asserts the resulting node id is
-  `<parent-candidate-id>.<child-id>`), the depth cap and the single-unit
-  case both forcing a leaf with **zero** provider calls, the node cap
-  cutting off recursion early, and a round trip of the built tree through
-  `TaskTree.save`/`TaskTree.load`.
-- `test_v2_pilot.py` (7) — `select_pilot_nodes` picks the id-sorted median
-  per shape, not the first; a full `run_pilot` → `approve_pilot` cycle
-  asserts the edit lands as the canonical artifact, exactly one
-  `complete_json` call happens, and both the `pilot_awaiting_approval` and
-  `pilot_approved` events are durable; approving with **no** edit asserts
-  zero rules and zero provider calls; `freeze_contract`/`amend_contract`
-  cover the round trip, the token-ceiling rejection leaving no partial
-  write, and amendment appending without erasing prior rules.
-- `test_v2_survey_deterministic.py` (12, PLAN-zeromem.md §3.8) — all of
-  it against hand-built vectors injected through `embed_fn`, so the core
-  suite stays free of the `retrieval` extra: a clean topic shift emits
-  exactly one vote at the boundary (a `[0,0,1,0,0]` dissimilarity series
-  fires only index 2); a uniform corpus emits no high-confidence votes and
-  `assemble_spine` folds to one unit; the lone odd chunk's plateau
-  (`[0,0,1,1,0,0]`) fires nothing at `smoothing_window=2` — the §3.8 test
-  8 requirement that forced the implemented-variant algorithm in
-  `survey_chunks_deterministic`; a purely uniform corpus still emits a
-  vote when an author heading (boost) arms the candidate; confidence is
-  min-max-normalized into [0,1]; `_label_for_chunk` covers the heading,
-  first-8-words fallback, and 120-char cap; `embeddings_available()`
-  returns False without the extra and `embed_texts` raises
-  `EmbeddingsUnavailable`; an end-to-end spine assembly stays contiguous
-  and covers every chunk.
-- `test_v2_retrieval.py` (10, PLAN-zeromem.md §4.6) — BM25 ranks the
-  exact-term-match chunk first and IDF downweights a term that appears in
-  every chunk; candidates are restricted to the node's own units (a
-  higher-scoring chunk in another unit is never returned); closure pulls
-  in the winner's adjacent chunks (clamped to its unit); results come
-  back deduped in ascending document order; an injected fake `dense`
-  scorer flips the top rank vs BM25-only (fusion = `rho*dense +
-  (1-rho)*bm25` after min-max on each view); no embeddings degrades to
-  BM25 without error; `build_chunk_index` is idempotent (second call
-  rewrites nothing — mtime unchanged) and every line round-trips
-  `unit_id`/`index`/`tokens`/`text`; materialized `spine/<id>.md` input
-  paths resolve to units while v4 finding paths pass through.
-
-### v3 (`tests/test_v3_*.py`, 28 tests)
-
-Same fakes, no new fixtures — `FakeStreamAgentAdapter`/`fake_stream_agent.py`
-for repair-writer dispatch, `FakeProvider` for Reviewer calls, and the real
-`LocalEnvironment` for `compile.py` (plain shell one-liners, no LaTeX
-toolchain needed since the compile gate is a generic injected command).
-
-- `test_v3_assemble.py` (3) — tree.json array order round-trips through
-  `ordered_node_ids`; `assemble` concatenates in that order and writes a
-  correct index; a not-yet-passed node raises `AssemblyNotReadyError`
-  naming it.
-- `test_v3_checks.py` (5) — each check's true-positive case (missing/empty
-  artifact, gate drift, missing manifest line) plus an end-to-end
-  `run_cross_cutting_checks` → `write_checks_json` round trip.
-- `test_v3_compile.py` (4) — no command configured is a trivial pass;
-  successful/failing commands set `passed`/`exit_code`/`log` correctly and
-  the log lands on disk; runs inside `assembly_dir` by default.
-- `test_v3_repair.py` (4) — a repair dispatches a genuinely new episode
-  under the derived id (not a no-op replay of the node's original
-  `episode_completed`), the repaired text lands on the real artifact path,
-  and the pre-repair content is snapshotted first; a repair that still
-  fails its gates leaves the live artifact untouched and transitions to
-  `"stale"`; repeated failure exhausts `max_attempts` to `"blocked"`; a
-  node with judgment items routes through the Reviewer (asserted via
-  `FakeProvider` call count) before being allowed back to `"passed"`.
-- `test_v3_assembly_loop.py` (5) — `find_offending_nodes` matches by
-  artifact filename in document order; checks failing escalates before any
-  compile attempt; a full compile-fail → attribute → repair → reassemble →
-  recompile-clean cycle (grep-based fake "compiler," `--session-id` as the
-  literal marker string proving the repaired content actually flowed
-  through); an unattributable compile failure escalates without dispatching
-  any repair.
-- `test_v3_revalidate.py` (10) — `classify_verdict`'s four buckets (pass →
-  clean; all-patchable failures → patchable; missing class → regenerate;
-  mixed patchable+regenerate → regenerate); `estimate_revalidation_cost`
-  counts only passed nodes and scales with contract/artifact size;
-  `run_revalidation_pass` is read-only (asserted via `FakeProvider` call
-  count matching exactly the passed-node count) and marks non-clean nodes
-  `"stale"`; `apply_revalidation_triage` leaves clean nodes untouched and
-  routes patchable through `repair.run_repair`. `PrefilterRevalidationTest`
-  (3, PLAN-zeromem.md §2.7) — with `amendment_text`+`prefilter=True`, nodes
-  the amendment provably can't bear on are skipped: zero provider calls
-  for them (FakeProvider's queue holds exactly one verdict), they stay
-  `"passed"`, and their audit file carries `prefiltered: true` + `reason`;
-  `prefilter=False` reviews every node; the estimate reports a nonzero
-  `skipped_count` with a lower token estimate than the unfiltered pass.
-- `test_v3_prefilter.py` (10, PLAN-zeromem.md §2.7's unit set) —
-  `artifact_may_be_affected`/`distinguishing_terms` directly: stopwords
-  dropped (incl. "every" from the harness list); an amendment with no
-  distinguishing terms disables the filter; absent terms skip with a
-  reason; a term present in the artifact *or* the rubric forces review;
-  plural/singular variants match; word-boundary matching (not substring);
-  shape mismatch skips when terms are absent, shape match forces review.
-
-### v4 (`tests/test_v4_*.py`, 9 tests)
-
-Same fakes as v0-v3, no new fixtures — `FakeStreamAgentAdapter`/
-`fake_stream_agent.py` for research-query dispatch. Since the fake CLI
-never actually writes a file, every dispatch test here exercises the
-"agent ignored the write-to-file instruction, fall back to the episode's
-own visible output" path documented in `research.py`, the same fallback
-`v1/writer.py`'s promotion mechanism already relies on for the same
-reason.
-
-- `test_v4_mcp_research.py` (2) — `allowed_tools_for("web_search")` returns
-  exactly `(str(SEARXNG_TOOL_PATH),)`; `allowed_tools_for("doc_retrieval")`
-  raises (no gptme tool wired up for it yet). Rewritten 2026-08-09 for the
-  gptme/SearXNG-only module (see the v4 section above) — the prior version
-  covered the removed Claude-Code-era `WebSearch`/`WebFetch`/Context7
-  allowlists and `write_mcp_config`.
-- `test_v4_research.py` (2) — a fresh query dispatches a genuinely new
-  episode under `research_node_id`'s derived id and caps a 2,000-word fake
-  result down to the token budget (asserted via the truncation marker); a
-  second call for the *same* query returns byte-identical cached text and
-  appends zero new `episode_completed` events, even though a fresh
-  dispatch would have produced different content — proving the cache is
-  actually being hit, not that the two dispatches coincidentally agreed.
-- `test_v4_research_loop.py` (5) — `attach_finding` unit tests covering all
-  three cases (passing finding attaches, failing/empty finding is skipped,
-  attaching twice never duplicates the path) without needing a real
-  dispatch; an end-to-end `run_research_loop` asserts the finding path
-  lands in `node.inputs` and that mutation survives a `TaskTree.load`
-  round trip from disk; an unknown node id in the plan raises `KeyError`
-  rather than silently no-oping.
-
-### SearXNG web-search tool (`tests/test_searxng_tool.py`, 10 tests, new)
-
-Only the pure-Python surface of `adapters/tools/searxng_search.py` is
-tested — `search()`/`_format_results()`/`searxng_base_url()` — never
-`execute_websearch()`, which imports `gptme.message` internally and only
-ever runs inside the gptme worker subprocess; testing it would break the
-"core package and test suite stay gptme-free" rule the rest of the suite
-holds to. `urllib.request.urlopen` is monkeypatched (`unittest.mock.patch`)
-with a fake response object rather than hitting a real SearXNG instance —
-no network, no Docker dependency for `python3 -m unittest discover`.
-Covers: default/env-overridden `KUSUDAEMON_SEARXNG_URL`; a successful
-query parses and caps `results` to `MAX_NUM_RESULTS`; connection-refused
-and non-JSON/HTTP-error responses raise `SearxngSearchError` with a
-message pointing at the actual fix (`docker ps`, enabling `json` in
-`search.formats`); `_format_results`'s title/url/snippet formatting, the
-no-results case, and surfaced `answers`.
-
-Fixtures (`tests/fixtures/`):
-- `fake_stream_agent.py` — standalone script mimicking Claude Code's
-  `stream-json` output: writes its own pid to `--pidfile` immediately (so a
-  test can find and kill it before it emits anything), emits a `session_id`
-  line, sleeps `--work-delay`, emits a completion line; with `--resume <id>`
-  it emits a resume-acknowledgment line and finishes fast instead.
-- `fake_adapter.py` — `FakeStreamAgentAdapter(CommandAgentAdapter)`, the test
-  double for `ClaudeCodeAdapter`: `supports_session_resume = True`, same
-  `resume_session_id` passthrough.
-- `fake_provider.py` — `FakeProvider`, the test double for
-  `OpenAICompatibleProvider`: `complete_json` pops the next canned response
-  off a list and asserts it validates against the schema it was called with.
-- `run_node_subprocess.py` — CLI wrapper so `run_node` can be launched as an
-  independently-killable OS process.
+Two suite-wide rules learned the hard way: `_EnvIsolatedTest` snapshots and
+restores the **entire** `os.environ` (partial restore leaked freshly-set vars
+into later tests and broke unrelated suites by run order), and anything
+needing an optional extra must inject its vectors/objects rather than import
+the extra.
