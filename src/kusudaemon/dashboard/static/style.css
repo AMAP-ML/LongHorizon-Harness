@@ -975,9 +975,11 @@ button.icon-btn {
   background-color: var(--bg-darkest);
   border-radius: var(--radius-sm);
   border: 1px solid var(--border-subtle);
-  max-height: 180px;
+  max-height: 320px;
   overflow-y: auto;
   line-height: 1.55;
+  white-space: pre-wrap;
+  word-break: break-word;
 }
 
 /* Pane 3: Right Workbench Panel */
@@ -1300,8 +1302,16 @@ table.tree tr:hover td {
 .trace-entry.trace-user .trace-role { color: var(--accent-amber); }
 .trace-entry.trace-system .trace-role { color: var(--text-dim); }
 .trace-entry.trace-tool .trace-role { color: var(--accent-green); }
+.trace-entry.trace-tool_call { color: var(--accent-green); }
+.trace-entry.trace-tool_call .trace-role { color: var(--accent-green); }
+.trace-entry.trace-diff .trace-role { color: var(--accent-cyan); }
+.trace-entry.trace-error { color: var(--accent-red); font-weight: 600; }
+.trace-entry.trace-error .trace-role { color: var(--accent-red); }
+.trace-entry.trace-thinking { color: var(--accent-purple); font-style: italic; }
+.trace-entry.trace-thinking .trace-role { color: var(--accent-purple); }
 .trace-entry.trace-logdir { color: var(--text-dim); font-style: italic; }
 .trace-entry.trace-raw { color: var(--text-dim); }
+.trace-diff-pre { margin: 4px 0 0; }
 
 /* Form Controls */
 .form-grid {

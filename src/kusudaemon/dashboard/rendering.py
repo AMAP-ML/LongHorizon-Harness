@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import difflib
 import json
+import re
 from typing import Any, NamedTuple
 
 # ----------------------------------------------------------------------
@@ -138,9 +139,34 @@ def format_diff_plain(old_text: str, new_text: str, **kwargs: Any) -> str:
 # --output-format json). Unparsable / unrecognized lines are shown dim and
 # verbatim rather than dropped, so nothing the agent actually emitted is
 # hidden from the operator.
+#
+# gptme itself never emits a distinct "thinking" event: both its Anthropic
+# and OpenAI-compatible backends fold reasoning straight into the
+# assistant message's own `content` string as a literal
+# `<think>...</think>` (Anthropic additionally appends a
+# `<!-- think-sig: ... -->` comment inside, to round-trip the signature —
+# see gptme/llm/llm_anthropic.py's `_extract_thinking_content` and
+# llm_openai.py's reasoning_content handling). A parser that only looks
+# for a separate `"type": "thinking"` record — as this one used to — never
+# finds anything, hence "waiting for thinking stream trace" forever even
+# on a reasoning model. `_extract_thinking` below pulls those tags back
+# out of `content` so they render as their own entries.
+#
+# Similarly, gptme's Writer tools (save/append/patch) are invoked as
+# fenced code blocks embedded in the assistant's own markdown content
+# (```save <path>\n<content>\n```, ```patch <path>\n<<<<<<< ORIGINAL...```
+# — see gptme/tools/save.py and patch.py), not as a structured tool-call
+# event; and their results come back as a fresh `role: "system"` message
+# ("Saved to <path>", "Error: ..."). `_emit_assistant_content` extracts
+# those code blocks into their own `tool_call` entries and, for
+# save/append/patch, synthesizes a unified `diff` entry so a file edit is
+# visible without the operator having to diff `out/<node>.md` by hand.
+# `_looks_like_error` reclassifies an obviously-failed tool result
+# (`"Error: ..."`, a traceback) out of the dim `system` bucket into `error`
+# so failures aren't lost in a wall of routine tool-result text.
 # ----------------------------------------------------------------------
 class TraceEntry(NamedTuple):
-    role: str  # "assistant" | "user" | "system" | "tool" | "logdir" | "raw"
+    role: str  # "assistant" | "user" | "system" | "tool" | "tool_call" | "diff" | "error" | "thinking" | "logdir" | "raw"
     text: str
 
 
@@ -149,14 +175,119 @@ ROLE_STYLE: dict[str, str] = {
     "user": "bold yellow",
     "system": "dim",
     "tool": "green",
+    "tool_call": "bold green",
+    "diff": "bold blue",
+    "error": "bold red",
     "thinking": "italic magenta",
     "logdir": "dim italic",
     "raw": "dim",
 }
 
+# Matches both `<think>...</think>` (OpenAI-compatible backends, per
+# gptme/llm/llm_openai.py) and `<thinking>...</thinking>` (some models emit
+# the long form; gptme's own codeblock.py tolerates both closing tags too).
+_THINK_BLOCK_RE = re.compile(r"<think(?:ing)?>(.*?)</think(?:ing)?>", re.DOTALL | re.IGNORECASE)
+# Anthropic embeds the extended-thinking signature as a trailing HTML
+# comment inside the block so it can round-trip on the next API call
+# (llm_anthropic.py's `parsed_block.append(f"<think>\n...\n<!-- think-sig:
+# {signature} -->\n</think>")`) -- meaningless to a human, strip it.
+_THINK_SIG_RE = re.compile(r"<!--\s*think-sig:.*?-->", re.DOTALL)
+# A markdown fenced code block: ```<lang line>\n<body>```. Lazy on the body
+# so a stray ``` inside saved content (e.g. the model is writing a markdown
+# file that itself contains a fenced block) can still confuse this -- a
+# known, accepted simplification, same tradeoff gptme's own codeblock.py
+# extraction makes.
+_CODEBLOCK_RE = re.compile(r"```([^\n`]*)\n(.*?)```", re.DOTALL)
+# gptme's patch tool's own ORIGINAL/UPDATED marker format (patch.py's
+# ORIGINAL/DIVIDER/UPDATED constants) -- already carries both old and new
+# text, so no prior file state is needed to diff it.
+_PATCH_HUNK_RE = re.compile(r"<<<<<<< ORIGINAL\n(.*?)\n=======\n(.*?)\n>>>>>>> UPDATED", re.DOTALL)
+
+_FILE_WRITE_TOOLS = {"save", "append"}
+_ERROR_PREFIXES = ("error", "tool operation error", "traceback", "exception")
+
+
+def _looks_like_error(text: str) -> bool:
+    return text.strip()[:40].lower().startswith(_ERROR_PREFIXES)
+
+
+def _extract_thinking(content: str) -> tuple[str, list[str]]:
+    thoughts: list[str] = []
+
+    def _take(match: "re.Match[str]") -> str:
+        text = _THINK_SIG_RE.sub("", match.group(1)).strip()
+        if text:
+            thoughts.append(text)
+        return ""
+
+    remaining = _THINK_BLOCK_RE.sub(_take, content)
+    return remaining, thoughts
+
+
+def _emit_assistant_content(entries: list[TraceEntry], content: str, file_state: dict[str, str]) -> None:
+    """Split one assistant message into thinking / narration / tool-call /
+    diff entries. ``file_state`` tracks each written path's last-known
+    content *within this trace* so a second ``save`` to the same path (the
+    common case: a Writer iterating on ``out/<node>.md`` across turns)
+    diffs against the prior turn's content rather than showing the whole
+    file as newly added every time."""
+    content, thoughts = _extract_thinking(content)
+    for thought in thoughts:
+        entries.append(TraceEntry("thinking", thought))
+
+    pos = 0
+    for match in _CODEBLOCK_RE.finditer(content):
+        before = content[pos : match.start()].strip()
+        if before:
+            entries.append(TraceEntry("assistant", before))
+        pos = match.end()
+
+        lang_line = match.group(1).strip()
+        body = match.group(2)
+        if body.endswith("\n"):
+            body = body[:-1]
+        parts = lang_line.split(None, 1)
+        tool = parts[0].lower() if parts else ""
+        arg = parts[1].strip() if len(parts) > 1 else ""
+
+        if not tool:
+            # An unlabeled code block isn't a tool invocation -- leave it
+            # as ordinary narration, fence and all.
+            entries.append(TraceEntry("assistant", content[match.start() : match.end()]))
+            continue
+
+        entries.append(TraceEntry("tool_call", f"{tool} {arg}".strip()))
+
+        if tool in _FILE_WRITE_TOOLS and arg:
+            # Diff against the on-disk representation (trailing newline
+            # included, matching what execute_save_impl actually writes),
+            # not the fence-stripped `body` -- otherwise an unchanged last
+            # line shows up as a spurious remove+add purely because one
+            # side has a trailing "\n" and the other doesn't.
+            old_disk = file_state.get(arg, "")
+            body_disk = body if body.endswith("\n") else body + "\n"
+            new_disk = old_disk + body_disk if tool == "append" else body_disk
+            diff_text = format_diff_plain(old_disk, new_disk, old_label=arg, new_label=arg)
+            if diff_text and diff_text != "(no differences)":
+                entries.append(TraceEntry("diff", diff_text))
+            file_state[arg] = new_disk
+        elif tool == "patch" and arg:
+            diffs = []
+            for original, updated in _PATCH_HUNK_RE.findall(body):
+                d = format_diff_plain(original, updated, old_label=arg, new_label=arg)
+                if d and d != "(no differences)":
+                    diffs.append(d)
+            if diffs:
+                entries.append(TraceEntry("diff", "\n".join(diffs)))
+
+    tail = content[pos:].strip()
+    if tail:
+        entries.append(TraceEntry("assistant", tail))
+
 
 def parse_trace(raw: str) -> list[TraceEntry]:
     entries: list[TraceEntry] = []
+    file_state: dict[str, str] = {}
     for line in (raw or "").splitlines():
         line = line.strip()
         if not line:
@@ -188,8 +319,13 @@ def parse_trace(raw: str) -> list[TraceEntry]:
                 entries.append(TraceEntry("thinking", thinking if isinstance(thinking, str) else json.dumps(thinking)))
             content = record.get("content")
             text = content if isinstance(content, str) else (json.dumps(content) if content is not None else "")
-            if text:
-                entries.append(TraceEntry(role if role in ROLE_STYLE else "raw", text))
+            if text and role == "assistant":
+                _emit_assistant_content(entries, text, file_state)
+            elif text:
+                role_out = role if role in ROLE_STYLE else "raw"
+                if role == "system" and _looks_like_error(text):
+                    role_out = "error"
+                entries.append(TraceEntry(role_out, text))
             continue
         entries.append(TraceEntry("raw", json.dumps(record)))
     return entries

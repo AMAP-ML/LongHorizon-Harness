@@ -195,6 +195,32 @@ function truncate(text, n) {
   return text.length > n ? text.slice(0, n) + "\n…[truncated]" : text;
 }
 
+// Shared by the drawer's Thinking tab and the live thinking-stream widget
+// (rendering.parse_trace on the backend feeds both /api/node/<id>/thinking
+// calls). A "diff" entry's text is a plain unified diff (rendering.py's
+// format_diff_plain) -- classify each line by its leading character so it
+// gets the same add/remove/hunk/header coloring as the dedicated Diff tab,
+// rather than dumping raw +/- text.
+function diffLineKind(line) {
+  if (line.startsWith("+++") || line.startsWith("---")) return "header";
+  if (line.startsWith("@@")) return "hunk";
+  if (line.startsWith("+")) return "add";
+  if (line.startsWith("-")) return "remove";
+  return "context";
+}
+
+function renderTraceEntry(e) {
+  const body =
+    e.role === "diff"
+      ? el(
+          "pre",
+          { class: "diff-pre trace-diff-pre" },
+          (e.text || "").split("\n").map((line) => el("div", { class: `diff-line diff-${diffLineKind(line)}` }, line))
+        )
+      : e.text;
+  return el("div", { class: `trace-entry trace-${e.role}` }, [el("span", { class: "trace-role" }, `[${e.role}] `), body]);
+}
+
 function liveMap() {
   const m = {};
   for (const s of state.snapshot.subagents || []) m[s.id] = s;
@@ -505,12 +531,7 @@ function renderCenterStream() {
         ]),
         el("div", { class: "thinking-live-body", id: "thinking-live-stream" },
           entries.length
-            ? entries.slice(-15).map((e) =>
-                el("div", { class: `trace-entry trace-${e.role}`, style: "margin-bottom:4px; font-size:12px; line-height:1.4;" }, [
-                  el("span", { class: "trace-role", style: e.role === "thinking" ? "color:var(--accent-purple); font-style:italic;" : "" }, `[${e.role}] `),
-                  e.text
-                ])
-              )
+            ? entries.slice(-15).map(renderTraceEntry)
             : [el("span", { class: "dim" }, `Waiting for thinking stream trace from ${targetLabel}...`)]
         ),
       ])
@@ -872,9 +893,7 @@ function renderThinkingTab() {
   loadThinkingIfNeeded();
   if (state.nodeThinking === "loading" || state.nodeThinking === null) return el("div", { class: "empty-state" }, "Loading trace…");
   if (!state.nodeThinking.length) return el("div", { class: "empty-state" }, "(no trace yet)");
-  return el("div", { class: "trace-log" }, state.nodeThinking.map((e) =>
-    el("div", { class: `trace-entry trace-${e.role}` }, [el("span", { class: "trace-role" }, `[${e.role}] `), e.text])
-  ));
+  return el("div", { class: "trace-log" }, state.nodeThinking.map(renderTraceEntry));
 }
 
 function renderNodeDrawer() {

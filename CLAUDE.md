@@ -621,6 +621,32 @@ prompt, not that node's own handoff).
 - `dashboard/gptme_queue.py` — a from-scratch reimplementation of gptme's
   queue file protocol (not an import), so the long-lived server process stays
   independent of whether the gptme extra is installed.
+- `dashboard/rendering.py`'s `parse_trace` — turns the raw tee'd
+  `trace.jsonl` (gptme's `--output-format json` stream) into the entries
+  the Thinking tab and live-stream widget render. Two non-obvious gaps this
+  closes (2026-08-10): **gptme never emits a distinct `"thinking"` event**
+  — both its Anthropic and OpenAI-compatible backends fold reasoning
+  straight into the assistant message's own `content` as a literal
+  `<think>...</think>` (see `gptme/llm/llm_anthropic.py`'s
+  `_extract_thinking_content` / `llm_openai.py`'s `reasoning_content`
+  handling) — so a parser only matching a separate event type showed
+  "waiting for thinking stream" forever, even on a reasoning model;
+  `_extract_thinking` pulls the tags back out of `content` instead.
+  **Tool calls are markdown code fences embedded in that same content**
+  (` ```save <path>` / ` ```patch <path>` / ` ```append <path>`, per
+  `gptme/tools/save.py` and `patch.py`), not a structured event, and their
+  results come back as a fresh `role: "system"` message — `Saved to
+  <path>` or `Error: ...` indistinguishably. `_emit_assistant_content`
+  extracts each fence into its own `tool_call` entry and, for
+  save/append/patch, synthesizes a `diff` entry (`patch`'s own
+  ORIGINAL/UPDATED markers already carry both sides; `save`/`append` diff
+  against `file_state`, a per-parse map of each path's last-known content,
+  so a Writer iterating on `out/<node>.md` across turns gets a per-turn
+  diff instead of "whole file added" every time — diffed against the
+  on-disk-shaped text, trailing newline included, since diffing against
+  the fence-stripped body makes an unrelated last line show up as a
+  spurious remove+add). `_looks_like_error` reclassifies an obviously
+  failed tool result out of the dim `system` bucket into `error`.
 - `dashboard/server.py` — stdlib `ThreadingHTTPServer` (no new dependency);
   one thread so the SSE `/api/stream` connection never blocks other requests.
   Owns transport only: routing, JSON, traversal-safe static serving, and
@@ -709,7 +735,7 @@ Stdlib `unittest`. No pytest, no network, no agent binary, no API key.
 python3 -m unittest discover -s tests -p "test_*.py" -v
 ```
 
-**343 tests, ~20s, all passing** (2026-08-10).
+**362 tests, ~23s, all passing** (2026-08-10).
 
 **Every test file starts with `sys.path.insert(0, str(_REPO_ROOT / "src"))`.
 This is load-bearing, not boilerplate.** Stale `_editable_impl_*.pth` files
@@ -732,7 +758,8 @@ guard into any new test file.
 | `test_v3_revalidate.py` / `_prefilter.py` | 10/10 | four triage buckets, read-only phase 1, pre-filter skip/force rules |
 | `test_v3_document_review.py` | 14 | windowed call count flat in node count, id attribution and dropping |
 | `test_v4_*.py` | 2/2/5 | allowlist, derived-id dispatch + cache hit, finding attachment |
-| `test_dashboard_state.py` / `_server.py` | 22/22 | `RunState` directly (no port), then HTTP over a real loopback `ThreadingHTTPServer` incl. traversal rejection and `--no-control` 403s; §11.10.14 read-only poll leaves runs unmutated; §11.10.15 bounded cache + 8-thread hammer | 
+| `test_dashboard_state.py` / `_server.py` | 25/22 | `RunState` directly (no port), then HTTP over a real loopback `ThreadingHTTPServer` incl. traversal rejection and `--no-control` 403s; §11.10.14 read-only poll leaves runs unmutated; §11.10.15 bounded cache + 8-thread hammer |
+| `test_dashboard_rendering.py` | 14 | `parse_trace`: `<think>`/`<thinking>` tag extraction incl. the Anthropic think-sig comment, `save`/`append`/`patch` code-fence → `tool_call` + `diff` entries, per-path diff continuity across turns (not "whole file added" every time), `error` vs routine `system` classification | 
 | `test_pipeline_prompts.py` / `_backends.py` / `test_driver_phases.py` | 14/7/2 | byte-identical default prompt, adapter wiring, phase detail preservation, §11.10.15 contract-cache bound | 
 | `test_pipeline_approvals.py` | 4 | §11.10.12 incremental approvals scanning: each record parsed once across polls, torn tail re-read, cross-thread wait/resolve |
 | `test_gptme_adapter.py` / `test_searxng_tool.py` | 15/12 | command construction and output parsing; monkeypatched `urlopen`, never `execute_websearch` (it imports gptme) |
