@@ -113,9 +113,13 @@ function loadLiveThinking() {
   const targetId = liveSub ? liveSub.id : "main";
   apiGet(`/api/node/${encodeURIComponent(targetId)}/thinking`)
     .then((d) => {
-      state.liveThinkingEntries = d.entries || [];
-      state.liveThinkingTarget = targetId;
-      render();
+      const entries = d.entries || [];
+      const changed = JSON.stringify(entries) !== JSON.stringify(state.liveThinkingEntries) || state.liveThinkingTarget !== targetId;
+      if (changed) {
+        state.liveThinkingEntries = entries;
+        state.liveThinkingTarget = targetId;
+        render();
+      }
     })
     .catch(() => {});
 }
@@ -406,64 +410,7 @@ function renderCenterStream() {
     ]) : null,
   ]);
 
-  // Separate Failure Error Card (rendered above Resume Card)
-  const hasError = snap.phase_status === "error" || snap.phase_status === "escalated" || (snap.phase_detail && snap.phase_detail.toLowerCase().includes("error"));
-  if (hasError) {
-    feed.appendChild(
-      el("div", { class: "stream-card phase-error-card" }, [
-        el("div", { class: "card-title" }, [
-          el("span", { style: "color:var(--accent-red); font-weight:700;" }, `❌ Phase Failure Error (${snap.phase ? snap.phase.toUpperCase() : "FAILURE"})`),
-          badge(snap.phase_status || "error"),
-        ]),
-        el("div", { class: "error-body" }, snap.phase_detail || "Phase execution failed. Review details or click Resume below to retry."),
-      ])
-    );
-  }
-
-  // Separate Resume Status Card (rendered below Error Card)
-  const isStoppedOrHalted = snap.halted || snap.phase_status === "error" || snap.phase_status === "paused" || snap.phase_status === "escalated";
-  if (isStoppedOrHalted && snap.control_enabled) {
-    feed.appendChild(
-      el("div", { class: "stream-card resume-banner" }, [
-        el("div", { class: "card-title" }, [
-          el("span", { style: "color:var(--accent-amber); font-weight:600;" }, `▶ Resume Run (Status: ${snap.phase_status || (snap.halted ? "halted" : "stopped")})`),
-          el("button", { class: "primary", disabled: state.busy ? "" : null, onclick: () => guarded(resumeAttached) }, "▶ Resume / Continue Run"),
-        ]),
-        el("div", { style: "font-size:12px; color:var(--text-muted); margin-top:4px;" }, "Click Resume / Continue to re-trigger execution from the last saved checkpoint."),
-      ])
-    );
-  }
-
-
-  // Live Thinking Stream Widget for active run / subagents
-  if (snap.attached) {
-    const subagents = snap.subagents || [];
-    const liveSub = subagents.find((s) => s.live);
-    const targetLabel = liveSub ? `Subagent: ${liveSub.id} (${liveSub.role})` : `Main Phase: ${snap.phase || "active"}`;
-    const entries = state.liveThinkingEntries || [];
-
-    feed.appendChild(
-      el("div", { class: "stream-card thinking-live-card" }, [
-        el("div", { class: "card-title" }, [
-          el("span", { style: "color:var(--accent-purple); font-weight:600;" }, `🧠 Bot Thinking Stream [${targetLabel}]`),
-          entries.length ? el("span", { class: "badge", "data-status": "passed" }, `${entries.length} entries`) : null,
-          liveSub ? el("button", { class: "xs-btn", onclick: () => openNode(liveSub.id) }, "Open Details") : null,
-        ]),
-        el("div", { class: "thinking-live-body", id: "thinking-live-stream" },
-          entries.length
-            ? entries.slice(-15).map((e) =>
-                el("div", { class: `trace-entry trace-${e.role}`, style: "margin-bottom:4px; font-size:12px; line-height:1.4;" }, [
-                  el("span", { class: "trace-role", style: e.role === "thinking" ? "color:var(--accent-purple); font-style:italic;" : "" }, `[${e.role}] `),
-                  e.text
-                ])
-              )
-            : [el("span", { class: "dim" }, `Waiting for thinking stream trace from ${targetLabel}...`)]
-        ),
-      ])
-    );
-  }
-
-  // Render Approvals (Pending & Resolved)
+  // 1. Render Approvals (Pending & Resolved)
   const approvals = snap.approvals || [];
   approvals.forEach((a) => {
     const isPending = a.status === "pending";
@@ -519,7 +466,7 @@ function renderCenterStream() {
     feed.appendChild(el("div", { class: "stream-card approval" + (isPending ? " pending" : ""), style: cardStyle }, parts));
   });
 
-  // Events (Newest at bottom)
+  // 2. Events (Chronological history - newest at bottom)
   const events = (snap.events || []).slice(-20);
   events.forEach((ev) => {
     let msgText = `${ev.type}${ev.phase ? ` [${ev.phase}]` : ""}${ev.status ? ` - ${ev.status}` : ""}`;
@@ -541,6 +488,62 @@ function renderCenterStream() {
       ])
     );
   });
+
+  // 3. Live Thinking Stream Widget for active run / subagents
+  if (snap.attached) {
+    const subagents = snap.subagents || [];
+    const liveSub = subagents.find((s) => s.live);
+    const targetLabel = liveSub ? `Subagent: ${liveSub.id} (${liveSub.role})` : `Main Phase: ${snap.phase || "active"}`;
+    const entries = state.liveThinkingEntries || [];
+
+    feed.appendChild(
+      el("div", { class: "stream-card thinking-live-card" }, [
+        el("div", { class: "card-title" }, [
+          el("span", { style: "color:var(--accent-purple); font-weight:600;" }, `🧠 Bot Thinking Stream [${targetLabel}]`),
+          entries.length ? el("span", { class: "badge", "data-status": "passed" }, `${entries.length} entries`) : null,
+          liveSub ? el("button", { class: "xs-btn", onclick: () => openNode(liveSub.id) }, "Open Details") : null,
+        ]),
+        el("div", { class: "thinking-live-body", id: "thinking-live-stream" },
+          entries.length
+            ? entries.slice(-15).map((e) =>
+                el("div", { class: `trace-entry trace-${e.role}`, style: "margin-bottom:4px; font-size:12px; line-height:1.4;" }, [
+                  el("span", { class: "trace-role", style: e.role === "thinking" ? "color:var(--accent-purple); font-style:italic;" : "" }, `[${e.role}] `),
+                  e.text
+                ])
+              )
+            : [el("span", { class: "dim" }, `Waiting for thinking stream trace from ${targetLabel}...`)]
+        ),
+      ])
+    );
+  }
+
+  // 4. Separate Failure Error Card (appended at bottom of feed after events)
+  const hasError = snap.phase_status === "error" || snap.phase_status === "escalated" || (snap.phase_detail && snap.phase_detail.toLowerCase().includes("error"));
+  if (hasError) {
+    feed.appendChild(
+      el("div", { class: "stream-card phase-error-card" }, [
+        el("div", { class: "card-title" }, [
+          el("span", { style: "color:var(--accent-red); font-weight:700;" }, `❌ Phase Failure Error (${snap.phase ? snap.phase.toUpperCase() : "FAILURE"})`),
+          badge(snap.phase_status || "error"),
+        ]),
+        el("div", { class: "error-body" }, snap.phase_detail || "Phase execution failed. Review details or click Resume below to retry."),
+      ])
+    );
+  }
+
+  // 5. Separate Resume Status Card (appended at bottom of feed below error card)
+  const isStoppedOrHalted = snap.halted || snap.phase_status === "error" || snap.phase_status === "paused" || snap.phase_status === "escalated";
+  if (isStoppedOrHalted && snap.control_enabled) {
+    feed.appendChild(
+      el("div", { class: "stream-card resume-banner" }, [
+        el("div", { class: "card-title" }, [
+          el("span", { style: "color:var(--accent-amber); font-weight:600;" }, `▶ Resume Run (Status: ${snap.phase_status || (snap.halted ? "halted" : "stopped")})`),
+          el("button", { class: "primary", disabled: state.busy ? "" : null, onclick: () => guarded(resumeAttached) }, "▶ Resume / Continue Run"),
+        ]),
+        el("div", { style: "font-size:12px; color:var(--text-muted); margin-top:4px;" }, "Click Resume / Continue to re-trigger execution from the last saved checkpoint."),
+      ])
+    );
+  }
 
   const promptBar = renderPromptBar();
 
@@ -1028,46 +1031,72 @@ function restoreFocusState(saved) {
   const field = root.querySelector(`[data-key="${CSS.escape(saved.key)}"]`);
   if (!field) return;
   field.value = saved.value;
-  field.focus();
+  try {
+    field.focus({ preventScroll: true });
+  } catch (e) {
+    field.focus();
+  }
   if (typeof saved.selectionStart === "number") {
     try { field.setSelectionRange(saved.selectionStart, saved.selectionEnd); } catch (e) {}
   }
 }
 
+function captureScrollStates() {
+  const map = new Map();
+  const selectors = ["#chat-feed-scroll", ".sidebar-content", ".workbench-content", ".drawer-body", "#thinking-live-stream"];
+  selectors.forEach((sel) => {
+    const el = root.querySelector(sel);
+    if (el) {
+      const atBottom = el.scrollHeight - el.scrollTop - el.clientHeight < 60;
+      map.set(sel, { scrollTop: el.scrollTop, atBottom });
+    }
+  });
+  return map;
+}
+
+function restoreScrollStates(savedMap) {
+  if (!savedMap) return;
+  savedMap.forEach((pos, sel) => {
+    const el = root.querySelector(sel);
+    if (el) {
+      if (sel === "#chat-feed-scroll" && pos.atBottom) {
+        el.scrollTop = el.scrollHeight;
+      } else {
+        el.scrollTop = pos.scrollTop;
+      }
+    }
+  });
+}
+
 function render() {
   const focusState = captureFocusState();
-  const feedBefore = document.getElementById("chat-feed-scroll");
-  const feedScrollTop = feedBefore ? feedBefore.scrollTop : null;
+  const scrollStates = captureScrollStates();
 
-  root.innerHTML = "";
-  root.appendChild(renderHeader());
+  const frag = document.createDocumentFragment();
+  frag.appendChild(renderHeader());
 
   const workspace = el("div", { class: "kd-workspace" }, [
     renderSidebar(),
     renderCenterStream(),
     renderRightWorkbench(),
   ]);
-  root.appendChild(workspace);
+  frag.appendChild(workspace);
 
   const nodeDrawer = renderNodeDrawer();
-  if (nodeDrawer) root.appendChild(nodeDrawer);
+  if (nodeDrawer) frag.appendChild(nodeDrawer);
 
   const newRunModal = renderNewRunModal();
-  if (newRunModal) root.appendChild(newRunModal);
+  if (newRunModal) frag.appendChild(newRunModal);
 
   if (state.toast) {
-    root.appendChild(el("div", { class: "toast" + (state.toast.isError ? " err" : "") }, state.toast.message));
+    frag.appendChild(el("div", { class: "toast" + (state.toast.isError ? " err" : "") }, state.toast.message));
   }
 
+  root.innerHTML = "";
+  root.appendChild(frag);
+
+  restoreScrollStates(scrollStates);
   restoreFocusState(focusState);
-  const feedAfter = document.getElementById("chat-feed-scroll");
-  if (feedAfter) {
-    if (feedScrollTop === null || (feedBefore && feedBefore.scrollHeight - feedScrollTop - feedBefore.clientHeight < 120)) {
-      feedAfter.scrollTop = feedAfter.scrollHeight;
-    } else {
-      feedAfter.scrollTop = feedScrollTop;
-    }
-  }
 }
 
 render();
