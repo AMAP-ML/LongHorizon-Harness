@@ -29,7 +29,7 @@ const state = {
   spineText: "",
   assembly: null,
   promptText: "",
-  promptMode: "auto", // 'auto' | 'amend' | 'reopen' | 'msg_agent'
+  promptMode: "msg_agent", // 'msg_agent' | 'auto' | 'amend' | 'reopen'
   targetAgentId: "main",
   newRun: { runId: "", goal: "", source: "", model: "", compile: "" },
   interjectDrafts: {}, // nodeId -> text
@@ -563,10 +563,10 @@ function renderPromptBar() {
   const disabled = !snap.control_enabled || state.busy;
 
   const modeSelector = el("div", { class: "prompt-mode-selector" }, [
+    el("button", { class: "mode-btn" + (state.promptMode === "msg_agent" ? " active" : ""), onclick: () => { state.promptMode = "msg_agent"; render(); } }, "💬 Message Agent"),
     el("button", { class: "mode-btn" + (state.promptMode === "auto" ? " active" : ""), onclick: () => { state.promptMode = "auto"; render(); } }, "New Run"),
     el("button", { class: "mode-btn" + (state.promptMode === "amend" ? " active" : ""), onclick: () => { state.promptMode = "amend"; render(); } }, "Amend Contract"),
     el("button", { class: "mode-btn" + (state.promptMode === "reopen" ? " active" : ""), onclick: () => { state.promptMode = "reopen"; render(); } }, "Reopen Node"),
-    el("button", { class: "mode-btn" + (state.promptMode === "msg_agent" ? " active" : ""), onclick: () => { state.promptMode = "msg_agent"; render(); } }, "💬 Message Agent"),
   ]);
 
   let targetSelector = null;

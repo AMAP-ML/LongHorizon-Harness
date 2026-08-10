@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import os
 import shutil
 import signal
 import time
@@ -29,9 +30,15 @@ class LocalEnvironment:
     async def exec(
         self,
         command: str,
-        timeout: int = 30,
+        timeout: int = 300,
         tee_path: str | None = None,
     ) -> ExecResult:
+        raw_env_timeout = os.getenv("KUSUDAEMON_EXEC_TIMEOUT")
+        if raw_env_timeout:
+            try:
+                timeout = int(raw_env_timeout)
+            except ValueError:
+                pass
         start = time.monotonic()
         proc = None
         io_task: asyncio.Task[None] | None = None

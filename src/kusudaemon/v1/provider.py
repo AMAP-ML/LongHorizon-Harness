@@ -22,6 +22,7 @@ Two things this module owns:
 from __future__ import annotations
 
 import json
+import os
 import random
 import threading
 import time
@@ -86,7 +87,7 @@ class OpenAICompatibleProvider:
         base_url: str | None = None,
         api_key: str | None = None,
         transport: Transport | None = None,
-        timeout: float = 30.0,
+        timeout: float = 300.0,
         max_http_retries: int = _DEFAULT_HTTP_RETRIES,
         base_retry_delay: float = 1.0,
         concurrency: int = _DEFAULT_CONCURRENCY,
@@ -96,7 +97,14 @@ class OpenAICompatibleProvider:
         self.model = resolved.model
         self.base_url = resolved.base_url.rstrip("/")
         self.api_key = resolved.api_key
-        self.timeout = timeout
+        raw_env_timeout = os.getenv("KUSUDAEMON_HTTP_TIMEOUT")
+        if raw_env_timeout:
+            try:
+                self.timeout = float(raw_env_timeout)
+            except ValueError:
+                self.timeout = timeout
+        else:
+            self.timeout = timeout
         self._transport = transport or self._http_transport
         self._max_http_retries = max_http_retries
         self._base_retry_delay = base_retry_delay

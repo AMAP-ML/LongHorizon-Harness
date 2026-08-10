@@ -10,7 +10,7 @@ class Environment(Protocol):
     async def exec(
         self,
         command: str,
-        timeout: int = 30,
+        timeout: int = 300,
         tee_path: str | None = None,
     ) -> ExecResult: ...
 

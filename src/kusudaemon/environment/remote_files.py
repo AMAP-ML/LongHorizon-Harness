@@ -33,12 +33,12 @@ async def write_remote_text(env: Environment, remote_path: str, content: str, mo
             except FileNotFoundError:
                 pass
 
-    result = await env.exec(f"chmod {shlex.quote(mode)} {shlex.quote(remote_path)}", timeout=30)
+    result = await env.exec(f"chmod {shlex.quote(mode)} {shlex.quote(remote_path)}", timeout=300)
     if result.exit_code != 0:
         raise RuntimeError(f"failed chmod {remote_path}: {result.stderr or result.stdout}")
 
 
 async def ensure_remote_dir(env: Environment, remote_path: str) -> None:
-    result = await env.exec(f"mkdir -p {shlex.quote(remote_path)}", timeout=30)
+    result = await env.exec(f"mkdir -p {shlex.quote(remote_path)}", timeout=300)
     if result.exit_code != 0:
         raise RuntimeError(f"failed creating {remote_path}: {result.stderr or result.stdout}")

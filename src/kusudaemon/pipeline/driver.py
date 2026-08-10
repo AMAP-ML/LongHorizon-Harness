@@ -351,30 +351,34 @@ class RecursiveDriver:
             units = [SpineUnit(id="unit-01", label="The goal", start_chunk=0, end_chunk=0, tokens=0)]
         else:
             chunks = chunk_text(source)
-            if self.options.survey_mode == "embedding" and embeddings_available():
-                votes = survey_chunks_deterministic(chunks)
-            else:
-                if self.options.survey_mode == "embedding":
-                    # Loud but non-fatal (PLAN-zeromem.md §3.7): the operator
-                    # paid for 250 calls they meant to avoid, but a missing
-                    # optional extra is a config problem, not a corpus
-                    # problem. Logged to the append-only event log — never
-                    # phase.json, whose detail field is clobbered by
-                    # _run_phase's tail call.
-                    self._log(
-                        {
-                            "node_id": "-",
-                            "role": "harness",
-                            "round": 0,
-                            "type": "survey_fallback",
-                            "reason": (
-                                "embedding mode requested but "
-                                "kusudaemon[retrieval] is not installed; "
-                                "falling back to the model survey"
-                            ),
-                        }
-                    )
-                votes = survey_chunks(chunks, self.provider)
+            # Subagent is optional — only spawn subagent if file/task is large
+            is_large_corpus = len(chunks) > 10 or len(source) > 50000
+            subagent_id = "explore-01" if is_large_corpus else None
+
+            if subagent_id:
+                self.log.record(subagent_id, "session_captured", {"role": "explorer", "phase": "survey"})
+            try:
+                if self.options.survey_mode == "embedding" and embeddings_available():
+                    votes = survey_chunks_deterministic(chunks)
+                else:
+                    if self.options.survey_mode == "embedding":
+                        self._log(
+                            {
+                                "node_id": subagent_id or "-",
+                                "role": "harness",
+                                "round": 0,
+                                "type": "survey_fallback",
+                                "reason": (
+                                    "embedding mode requested but "
+                                    "kusudaemon[retrieval] is not installed; "
+                                    "falling back to the model survey"
+                                ),
+                            }
+                        )
+                    votes = survey_chunks(chunks, self.provider)
+            finally:
+                if subagent_id:
+                    self.log.record(subagent_id, "session_ended", {"status": "done"})
             units = assemble_spine(chunks, votes)
             materialize_units(self.run_dir, chunks, units)
             build_chunk_index(self.run_dir, chunks, units)
