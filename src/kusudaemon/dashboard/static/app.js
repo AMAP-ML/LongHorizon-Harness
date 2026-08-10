@@ -20,7 +20,7 @@ const state = {
   nodeDiff: null,        // [{tag, lines}] once loaded, keyed to selectedNode
   nodeThinking: null,    // [{role, text}] once loaded, keyed to selectedNode
   liveThinkingEntries: [],
-  liveThinkingTarget: null,
+  liveThinkingTarget: null,  // live subagent, or the most recently dispatched one -- see loadLiveThinking()
   newRunOpen: false,
   busy: false,
   toast: null,
@@ -110,7 +110,24 @@ function loadLiveThinking() {
   }
   const subagents = snap.subagents || [];
   const liveSub = subagents.find((s) => s.live);
-  const targetId = liveSub ? liveSub.id : "main";
+  // Target the currently-live subagent, or -- if none is live right now
+  // -- the most recently dispatched one (RunState.subagents() returns
+  // dispatch order, so the last entry is the newest). gptme runs each
+  // turn synchronously, no token-level streaming (_gptme_worker.py's
+  // `stream=False`), so a fast episode can dispatch, produce its one
+  // message, and complete inside a single ~1.5s polling interval.
+  // Targeting only whatever is live *right now* misses that message
+  // entirely if dispatch and completion both land inside one polling
+  // gap (this node's `live` was never observed true), and reverting to
+  // "main" (which has no per-node trace of its own) the instant `live`
+  // clears wipes it even when it *was* briefly observed. Falling back to
+  // "most recent" instead of "main" fixes both.
+  const targetId = liveSub ? liveSub.id : (subagents.length ? subagents[subagents.length - 1].id : null);
+  if (!targetId) {
+    state.liveThinkingEntries = [];
+    state.liveThinkingTarget = null;
+    return;
+  }
   apiGet(`/api/node/${encodeURIComponent(targetId)}/thinking`)
     .then((d) => {
       const entries = d.entries || [];
@@ -436,7 +453,91 @@ function renderCenterStream() {
     ]) : null,
   ]);
 
-  // 1. Render Approvals (Pending & Resolved)
+  // 1. Events (Chronological history - newest at bottom)
+  const events = (snap.events || []).slice(-20);
+  events.forEach((ev) => {
+    let msgText = `${ev.type}${ev.phase ? ` [${ev.phase}]` : ""}${ev.status ? ` - ${ev.status}` : ""}`;
+    if (ev.type === "phase_auto_resuming") {
+      msgText = `🔄 Auto-resuming phase [${ev.phase}] (attempt ${ev.attempt || 1}) — Previous failure error: "${ev.error || "unknown"}"`;
+    } else if (ev.error) {
+      msgText += ` — Error: "${ev.error}"`;
+    }
+
+    const isAutoResume = ev.type === "phase_auto_resuming";
+    feed.appendChild(
+      el("div", { class: "stream-msg agent", style: isAutoResume ? "border-left: 3px solid var(--accent-amber); background: rgba(245, 158, 11, 0.05);" : "" }, [
+        el("div", { class: "msg-hdr" }, [
+          el("span", { class: "author", style: isAutoResume ? "color:var(--accent-amber);" : "" }, isAutoResume ? "🔄 Auto-Resume" : "Event"),
+          el("span", null, fmtTime(ev.ts)),
+          ev.node_id && ev.node_id !== "-" ? el("span", { class: "node-link", onclick: () => openNode(ev.node_id) }, ev.node_id) : null,
+        ]),
+        el("div", { class: "msg-body", style: isAutoResume ? "font-weight:500; color:var(--text-bright);" : "" }, msgText),
+      ])
+    );
+  });
+
+  // 2. Live Thinking Stream Widget for active run / subagents. Target
+  // comes from state.liveThinkingTarget, which loadLiveThinking() derives
+  // from the live subagent or (once it's no longer live) the most
+  // recently dispatched one -- see that function for why "whichever
+  // subagent is live right now" misses fast episodes.
+  if (snap.attached && state.liveThinkingTarget) {
+    const subagents = snap.subagents || [];
+    const targetId = state.liveThinkingTarget;
+    const targetSub = subagents.find((s) => s.id === targetId);
+    const targetLabel = targetSub ? `${targetId} (${targetSub.role || targetSub.kind})` : targetId;
+    const entries = state.liveThinkingEntries || [];
+
+    feed.appendChild(
+      el("div", { class: "stream-card thinking-live-card" }, [
+        el("div", { class: "card-title" }, [
+          el("span", { style: "color:var(--accent-purple); font-weight:600;" }, targetLabel),
+          entries.length ? el("span", { class: "badge", "data-status": "passed" }, `${entries.length} entries`) : null,
+          el("button", { class: "xs-btn", onclick: () => openNode(targetId) }, "Open Details"),
+        ]),
+        el("div", { class: "thinking-live-body", id: "thinking-live-stream" },
+          entries.length
+            ? entries.slice(-15).map(renderTraceEntry)
+            : [el("span", { class: "dim" }, `Waiting for trace from ${targetLabel}...`)]
+        ),
+      ])
+    );
+  }
+
+  // 3. Separate Failure Error Card (appended at bottom of feed after events)
+  const hasError = snap.phase_status === "error" || snap.phase_status === "escalated" || (snap.phase_detail && snap.phase_detail.toLowerCase().includes("error"));
+  if (hasError) {
+    feed.appendChild(
+      el("div", { class: "stream-card phase-error-card" }, [
+        el("div", { class: "card-title" }, [
+          el("span", { style: "color:var(--accent-red); font-weight:700;" }, `❌ Phase Failure Error (${snap.phase ? snap.phase.toUpperCase() : "FAILURE"})`),
+          badge(snap.phase_status || "error"),
+        ]),
+        el("div", { class: "error-body" }, snap.phase_detail || "Phase execution failed. Review details or click Resume below to retry."),
+      ])
+    );
+  }
+
+  // 4. Separate Resume Status Card (appended at bottom of feed below error card)
+  const isStoppedOrHalted = snap.halted || snap.phase_status === "error" || snap.phase_status === "paused" || snap.phase_status === "escalated";
+  if (isStoppedOrHalted && snap.control_enabled) {
+    feed.appendChild(
+      el("div", { class: "stream-card resume-banner" }, [
+        el("div", { class: "card-title" }, [
+          el("span", { style: "color:var(--accent-amber); font-weight:600;" }, `▶ Resume Run (Status: ${snap.phase_status || (snap.halted ? "halted" : "stopped")})`),
+          el("button", { class: "primary", disabled: state.busy ? "" : null, onclick: () => guarded(resumeAttached) }, "▶ Resume / Continue Run"),
+        ]),
+        el("div", { style: "font-size:12px; color:var(--text-muted); margin-top:4px;" }, "Click Resume / Continue to re-trigger execution from the last saved checkpoint."),
+      ])
+    );
+  }
+
+  // 5. Approvals (Pending & Resolved) -- rendered last, so a pending
+  // question is the last thing in the feed, right above the prompt bar,
+  // instead of sitting above newer events/thinking-stream content where
+  // an operator scrolled to the bottom (the feed auto-scrolls to bottom
+  // on new content -- see captureFocusState/restoreFocusState) would
+  // never see it without scrolling back up.
   const approvals = snap.approvals || [];
   approvals.forEach((a) => {
     const isPending = a.status === "pending";
@@ -491,80 +592,6 @@ function renderCenterStream() {
     const cardStyle = isPending ? "border:1.5px solid var(--accent-amber); background:rgba(245, 158, 11, 0.08);" : "";
     feed.appendChild(el("div", { class: "stream-card approval" + (isPending ? " pending" : ""), style: cardStyle }, parts));
   });
-
-  // 2. Events (Chronological history - newest at bottom)
-  const events = (snap.events || []).slice(-20);
-  events.forEach((ev) => {
-    let msgText = `${ev.type}${ev.phase ? ` [${ev.phase}]` : ""}${ev.status ? ` - ${ev.status}` : ""}`;
-    if (ev.type === "phase_auto_resuming") {
-      msgText = `🔄 Auto-resuming phase [${ev.phase}] (attempt ${ev.attempt || 1}) — Previous failure error: "${ev.error || "unknown"}"`;
-    } else if (ev.error) {
-      msgText += ` — Error: "${ev.error}"`;
-    }
-
-    const isAutoResume = ev.type === "phase_auto_resuming";
-    feed.appendChild(
-      el("div", { class: "stream-msg agent", style: isAutoResume ? "border-left: 3px solid var(--accent-amber); background: rgba(245, 158, 11, 0.05);" : "" }, [
-        el("div", { class: "msg-hdr" }, [
-          el("span", { class: "author", style: isAutoResume ? "color:var(--accent-amber);" : "" }, isAutoResume ? "🔄 Auto-Resume" : "Event"),
-          el("span", null, fmtTime(ev.ts)),
-          ev.node_id && ev.node_id !== "-" ? el("span", { class: "node-link", onclick: () => openNode(ev.node_id) }, ev.node_id) : null,
-        ]),
-        el("div", { class: "msg-body", style: isAutoResume ? "font-weight:500; color:var(--text-bright);" : "" }, msgText),
-      ])
-    );
-  });
-
-  // 3. Live Thinking Stream Widget for active run / subagents
-  if (snap.attached) {
-    const subagents = snap.subagents || [];
-    const liveSub = subagents.find((s) => s.live);
-    const targetLabel = liveSub ? `Subagent: ${liveSub.id} (${liveSub.role})` : `Main Phase: ${snap.phase || "active"}`;
-    const entries = state.liveThinkingEntries || [];
-
-    feed.appendChild(
-      el("div", { class: "stream-card thinking-live-card" }, [
-        el("div", { class: "card-title" }, [
-          el("span", { style: "color:var(--accent-purple); font-weight:600;" }, `🧠 Bot Thinking Stream [${targetLabel}]`),
-          entries.length ? el("span", { class: "badge", "data-status": "passed" }, `${entries.length} entries`) : null,
-          liveSub ? el("button", { class: "xs-btn", onclick: () => openNode(liveSub.id) }, "Open Details") : null,
-        ]),
-        el("div", { class: "thinking-live-body", id: "thinking-live-stream" },
-          entries.length
-            ? entries.slice(-15).map(renderTraceEntry)
-            : [el("span", { class: "dim" }, `Waiting for thinking stream trace from ${targetLabel}...`)]
-        ),
-      ])
-    );
-  }
-
-  // 4. Separate Failure Error Card (appended at bottom of feed after events)
-  const hasError = snap.phase_status === "error" || snap.phase_status === "escalated" || (snap.phase_detail && snap.phase_detail.toLowerCase().includes("error"));
-  if (hasError) {
-    feed.appendChild(
-      el("div", { class: "stream-card phase-error-card" }, [
-        el("div", { class: "card-title" }, [
-          el("span", { style: "color:var(--accent-red); font-weight:700;" }, `❌ Phase Failure Error (${snap.phase ? snap.phase.toUpperCase() : "FAILURE"})`),
-          badge(snap.phase_status || "error"),
-        ]),
-        el("div", { class: "error-body" }, snap.phase_detail || "Phase execution failed. Review details or click Resume below to retry."),
-      ])
-    );
-  }
-
-  // 5. Separate Resume Status Card (appended at bottom of feed below error card)
-  const isStoppedOrHalted = snap.halted || snap.phase_status === "error" || snap.phase_status === "paused" || snap.phase_status === "escalated";
-  if (isStoppedOrHalted && snap.control_enabled) {
-    feed.appendChild(
-      el("div", { class: "stream-card resume-banner" }, [
-        el("div", { class: "card-title" }, [
-          el("span", { style: "color:var(--accent-amber); font-weight:600;" }, `▶ Resume Run (Status: ${snap.phase_status || (snap.halted ? "halted" : "stopped")})`),
-          el("button", { class: "primary", disabled: state.busy ? "" : null, onclick: () => guarded(resumeAttached) }, "▶ Resume / Continue Run"),
-        ]),
-        el("div", { style: "font-size:12px; color:var(--text-muted); margin-top:4px;" }, "Click Resume / Continue to re-trigger execution from the last saved checkpoint."),
-      ])
-    );
-  }
 
   const promptBar = renderPromptBar();
 
