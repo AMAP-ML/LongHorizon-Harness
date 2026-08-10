@@ -60,7 +60,7 @@ class DispatchDecision:
     reason: str
 
 
-def _arbitrate_empty_ready(tree: TaskTree) -> DispatchDecision | None:
+def _arbitrate_empty_ready(tree: TaskTree) -> DispatchDecision:
     """The three no-ready branches shared by the model and deterministic
     dispatch paths (PLAN-zeromem.md §1.3): all of this arbitration was
     already code-side, never model judgment."""
@@ -89,9 +89,7 @@ def decide_next_action(
 ) -> DispatchDecision:
     ready = tree.ready_nodes()
     if not ready:
-        decision = _arbitrate_empty_ready(tree)
-        if decision is not None:
-            return decision
+        return _arbitrate_empty_ready(tree)
 
     messages = [
         {"role": "system", "content": _SYSTEM_PROMPT},
@@ -108,6 +106,18 @@ def decide_next_action(
             f"orchestrator named non-ready node {node_id!r}; "
             f"harness fell back to {fallback!r} ({reason})".strip()
         )
+        node_id = fallback
+    elif action != "dispatch":
+        # §11.5: with ready nodes on the table, dispatch is the only legal
+        # action — a model answering "halt"/"escalate" ends the execute
+        # phase early and the driver reports a fake "done". Coerce, and
+        # record the coercion exactly like the non-ready id fallback.
+        fallback = ready[0]
+        reason = (
+            f"orchestrator answered {action!r} with ready nodes present; "
+            f"harness coerced to dispatch of {fallback!r} ({reason})".strip()
+        )
+        action = "dispatch"
         node_id = fallback
 
     return DispatchDecision(action=action, node_id=node_id, reason=reason)
@@ -130,12 +140,7 @@ def decide_next_action_deterministic(
     """
     ready = tree.ready_nodes()
     if not ready:
-        decision = _arbitrate_empty_ready(tree)
-        if decision is not None:
-            return decision
-        return DispatchDecision(
-            "halt", None, "nodes in flight; nothing new to dispatch"
-        )
+        return _arbitrate_empty_ready(tree)
     return DispatchDecision(
         "dispatch", ready[0], f"document-order policy (round {round_index})"
     )
@@ -151,9 +156,13 @@ def decide_next_action_with_policy(
 ) -> DispatchDecision:
     """The single dispatcher both the round loop and tests go through: the
     ``"document_order"`` path spends zero tokens, the ``"model"`` path is
-    today's call unchanged."""
+    today's call unchanged. Any other spelling is a real error (the old
+    fallback silently spent the per-round calls ``document_order`` exists
+    to avoid), so it raises instead of dispatching (§11.11)."""
     if policy == "document_order":
         return decide_next_action_deterministic(tree, round_index=round_index)
+    if policy != "model":
+        raise ValueError(f"unrecognized dispatch policy {policy!r} (model | document_order)")
     if provider is None:
         raise ValueError("policy='model' requires a provider")
     return decide_next_action(tree, manifest_path, provider, round_index=round_index)

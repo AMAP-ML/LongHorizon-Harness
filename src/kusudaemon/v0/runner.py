@@ -18,7 +18,7 @@ from ..adapters.base import AgentAdapter
 from ..environment.base import Environment
 from ..types import EpisodeBudget, EpisodeResult
 from .events import EventLog
-from .run_dir import events_path, node_artifact_path, node_trace_path
+from .run_dir import ensure_node_trace_path, events_path, node_artifact_path
 
 _SESSION_POLL_INTERVAL_SECONDS = 0.05
 
@@ -104,7 +104,7 @@ async def run_node(
             }
         )
 
-    trace_path = node_trace_path(run_dir, node_id)
+    trace_path = ensure_node_trace_path(run_dir, node_id)
     # A prior crashed attempt can leave stale content in trace_path. Clear it
     # before dispatching so the watcher below can't race the new subprocess
     # and mistake a leftover line from the old attempt for a fresh capture —
@@ -194,12 +194,23 @@ async def _watch_for_session_id(
     offset = 0
     while True:
         try:
-            with open(trace_path, "r", encoding="utf-8") as fh:
+            # Binary mode and byte offsets: text-mode seek only accepts
+            # opaque cookies from tell(), and readlines()+tell() consumes a
+            # partial trailing line — the offset advances past the bytes
+            # that will be written next, so a session_id that lands in a
+            # torn line is never re-read (§11.9). Advance only past the last
+            # complete line instead.
+            with open(trace_path, "rb") as fh:
                 fh.seek(offset)
-                new_lines = fh.readlines()
-                offset = fh.tell()
+                data = fh.read()
         except OSError:
+            data = b""
+        last_newline = data.rfind(b"\n")
+        if last_newline == -1:
             new_lines = []
+        else:
+            offset += last_newline + 1
+            new_lines = data[: last_newline + 1].decode("utf-8", errors="replace").splitlines()
         for line in new_lines:
             line = line.strip()
             if not line:

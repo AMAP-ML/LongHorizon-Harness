@@ -138,7 +138,10 @@ def run_from_args(argv: list[str] | None = None, *, env: Environment | None = No
 
     driver = RecursiveDriver(
         run_dir,
-        provider=OpenAICompatibleProvider(model=args.model),
+        # §11.9: on a bare `resume <id>` argv supplies no --model; the
+        # provider must honor the model recorded in run.spec.json, not
+        # silently fall back to the config default mid-run.
+        provider=OpenAICompatibleProvider(model=options.model),
         options=options,
         env=env,
     )

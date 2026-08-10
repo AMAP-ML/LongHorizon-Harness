@@ -109,6 +109,40 @@ class LinearChainRoundLoopTest(unittest.TestCase):
             manifest_lines = manifest_path(run_dir).read_text(encoding="utf-8").splitlines()
             self.assertEqual(len(manifest_lines), 2)
 
+            # §11.10.11: each audit file carries the dispatch-time gate cache
+            # *and* the reviewer verdict, merged — one evaluation, durable.
+            for node_id in ("a", "b"):
+                audit = json.loads((run_dir / "audit" / f"{node_id}.json").read_text(encoding="utf-8"))
+                self.assertEqual(audit["node"], node_id)
+                self.assertEqual(audit["verdict"], "pass")
+                self.assertTrue(all(g["passed"] for g in audit["gates"]))
+
+            # §11.10.16: a resume must continue round numbering, not append
+            # its round 0 into the first process's round-000.jsonl.
+            trace_files = sorted(p.name for p in (run_dir / "orchestrator").glob("round-*.jsonl"))
+            self.assertEqual(trace_files, ["round-000.jsonl", "round-001.jsonl", "round-002.jsonl"])
+            before = {
+                name: len((run_dir / "orchestrator" / name).read_text(encoding="utf-8").splitlines())
+                for name in trace_files
+            }
+
+            tree2 = asyncio.run(
+                run_round_loop(
+                    run_dir,
+                    tree_path(run_dir),
+                    writer_adapter_factory=_adapter_factory(root, run_dir, prompt_dir),
+                    env=LocalEnvironment(tmp_dir=str(prompt_dir)),
+                    provider=FakeProvider([]),
+                    prompt_for_node=lambda node: f"do {node.id}",
+                )
+            )
+            self.assertEqual(tree2.nodes["a"].status, "passed")
+            after = sorted(p.name for p in (run_dir / "orchestrator").glob("round-*.jsonl"))
+            self.assertEqual(after, ["round-000.jsonl", "round-001.jsonl", "round-002.jsonl", "round-003.jsonl"])
+            for name in before:
+                count = len((run_dir / "orchestrator" / name).read_text(encoding="utf-8").splitlines())
+                self.assertEqual(count, before[name], f"resume must not re-append into {name}")
+
             reloaded = TaskTree.load(tree_path(run_dir))
             self.assertEqual(reloaded.nodes["a"].status, "passed")
             self.assertEqual(reloaded.nodes["b"].status, "passed")
@@ -193,9 +227,12 @@ class ResumeSkipsPassedNodesTest(unittest.TestCase):
             first_provider = FakeProvider(
                 [
                     {"action": "dispatch", "node_id": "a", "reason": "start"},
-                    # b just became ready but we halt anyway, standing in for
-                    # a crash boundary right after a's completion.
-                    {"action": "halt", "reason": "pretend crash boundary"},
+                    # With §11.5, "halt" while a node is ready is coerced to
+                    # dispatch, so the loop can no longer be stopped by model
+                    # say-so — max_rounds=1 closes the call right after a's
+                    # completion instead, leaving the same mid-crash state
+                    # ("a" passed, "b" pending) a kill -9 would.
+                    {"action": "halt", "reason": "must never be reached"},
                 ]
             )
             asyncio.run(
@@ -207,6 +244,7 @@ class ResumeSkipsPassedNodesTest(unittest.TestCase):
                     provider=first_provider,
                     prompt_for_node=lambda node: f"do {node.id}",
                     writer_budget=budget,
+                    max_rounds=1,
                 )
             )
 
@@ -328,6 +366,52 @@ class ResumeInFlightWriterNodeTest(unittest.TestCase):
             self.assertIn("forged-session-1", artifact_text)
 
 
+class InPlaceRedispatchTest(unittest.TestCase):
+    """§11.10.5: a failing node with attempts left is re-dispatched in place
+    — the orchestrator is asked once, not once per attempt."""
+
+    def test_failing_node_retries_in_place_consuming_one_orchestrator_call(self) -> None:
+        with tempfile.TemporaryDirectory() as root_str:
+            root = Path(root_str)
+            run_dir = create_run_dir(root, "run-redispatch")
+            prompt_dir = root / "prompts"
+            prompt_dir.mkdir(parents=True, exist_ok=True)
+
+            _write_tree(
+                tree_path(run_dir),
+                [
+                    {
+                        "id": "a",
+                        "brief": "impossible",
+                        "artifact": "out/a.md",
+                        "gates": ["len:9999-99999"],
+                    }
+                ],
+            )
+            # Exactly ONE orchestrator decision: the harness already knows
+            # it wants "a" for attempts 2 and 3. FakeProvider raises if a
+            # second dispatch decision is ever requested.
+            provider = FakeProvider(
+                [{"action": "dispatch", "node_id": "a", "reason": "attempt 1"}]
+            )
+            tree = asyncio.run(
+                run_round_loop(
+                    run_dir,
+                    tree_path(run_dir),
+                    writer_adapter_factory=_adapter_factory(root, run_dir, prompt_dir),
+                    env=LocalEnvironment(tmp_dir=str(prompt_dir)),
+                    provider=provider,
+                    prompt_for_node=lambda node: f"do {node.id}",
+                    writer_budget=EpisodeBudget(max_duration_seconds=30),
+                    max_attempts=3,
+                )
+            )
+            self.assertEqual(len(provider.calls), 1)
+            self.assertEqual(tree.nodes["a"].status, "blocked")
+            self.assertEqual(tree.nodes["a"].attempts, 3)
+            self.assertIn("len:9999-99999", tree.nodes["a"].last_defect)
+
+
 class FeedbackCarryingRetryTest(unittest.TestCase):
     def test_gate_failure_records_defect_on_node(self) -> None:
         with tempfile.TemporaryDirectory() as root_str:
@@ -444,7 +528,6 @@ class FeedbackCarryingRetryTest(unittest.TestCase):
                         ],
                         "verdict": "fail",
                     },
-                    {"action": "dispatch", "node_id": "a", "reason": "attempt 2"},
                     {"items": [{"id": "R1", "pass": True}], "verdict": "pass"},
                 ]
             )

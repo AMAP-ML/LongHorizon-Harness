@@ -26,12 +26,13 @@ from ..v1.provider import OpenAICompatibleProvider
 from ..v1.tree import TaskTree
 from . import approvals as approval_store
 from .backends import build_writer_adapter
-from .driver import RunOptions, amend_and_revalidate, apply_triage
+from .driver import RunOptions, amend_contract_and_estimate, apply_triage, run_amendment_revalidation
 from .run_dir import (
     contract_path,
     events_path,
     phase_path,
     run_spec_path,
+    source_path,
     tree_path,
 )
 
@@ -143,8 +144,34 @@ def cmd_serve(argv: argparse.Namespace) -> int:
     return 0
 
 
+def _expand_source_arg(raw: str) -> str:
+    """The corpus text behind a --source value: for ``@path``/``-`` read
+    the file/stdin; anything else is inline text. Same rules as
+    run.py:_read_text_arg (mirrored here because --detach must resolve the
+    corpus *before* spawning its own run.py subprocess)."""
+    if raw.startswith("@"):
+        path = Path(raw[1:])
+        if not path.exists():
+            raise FileNotFoundError(f"source file not found: {path}")
+        return path.read_text(encoding="utf-8", errors="replace").strip()
+    if raw == "-":
+        return sys.stdin.read().strip()
+    return raw
+
+
 def cmd_run_detach(argv: argparse.Namespace) -> int:
     run_id = argv.run_id or _default_run_id()
+    # §11.10.8: the corpus must not ride through argv — an inline (non-@file)
+    # corpus hits E2BIG well before "corpus-scale". Write it into the run
+    # dir once (source.txt is exactly where driver._write_source_and_spec
+    # would put it) and pass @path, which run.py then reads instead of argv.
+    source_arg = argv.source
+    if source_arg and not source_arg.startswith("@"):
+        run_dir = Path(argv.runs_root).expanduser() / run_id
+        run_dir.mkdir(parents=True, exist_ok=True)
+        resolved = _expand_source_arg(source_arg)
+        source_path(run_dir).write_text(resolved, encoding="utf-8")
+        source_arg = f"@{source_path(run_dir)}"
     command = [
         sys.executable,
         "-m",
@@ -152,7 +179,7 @@ def cmd_run_detach(argv: argparse.Namespace) -> int:
         "--runs-root", argv.runs_root,
         "--run-id", run_id,
         "--goal", argv.goal,
-        "--source", argv.source,
+        "--source", source_arg,
         "--backend", argv.backend,
         "--max-rounds", str(argv.max_rounds),
         "--max-attempts", str(argv.max_attempts),
@@ -224,19 +251,40 @@ def cmd_approve(argv: argparse.Namespace) -> int:
 
 
 def cmd_amend(argv: argparse.Namespace) -> int:
+    # §11.10.4: the estimate is shown BEFORE the Reviewer pass runs — the
+    # §10 approval was theater when the tokens were already spent.
     run_dir = _run_dir(argv.runs_root, argv.run_id)
     provider = OpenAICompatibleProvider()
     options = _load_options(run_dir)
-    result = asyncio.run(
-        amend_and_revalidate(run_dir, rule_text=argv.text, reason=argv.reason, provider=provider)
+    phase1 = amend_contract_and_estimate(
+        run_dir, rule_text=argv.text, reason=argv.reason
     )
-    counts = result["counts"]
-    estimate = result.get("estimate", {})
+    estimate = phase1["estimate"]
+    print(
+        f"amended contract; revalidation would review "
+        f"{estimate.get('nodes', 0)} nodes (~{estimate.get('tokens', 0)} tokens, "
+        f"{estimate.get('skipped', 0)} pre-filtered)"
+    )
+    if not argv.yes:
+        try:
+            choice = input("run the revalidation review? [y/N] ").strip().lower()
+        except EOFError:
+            choice = "n"
+    else:
+        choice = "y"
+    if choice not in ("y", "yes"):
+        print("not running revalidation; the amended contract stands")
+        return 0
+    phase2 = run_amendment_revalidation(
+        run_dir,
+        contract_text=phase1["contract"],
+        rule_text=argv.text,
+        provider=provider,
+    )
+    counts = phase2["counts"]
     print(
         f"revalidation: clean={counts['clean']} patchable={counts['patchable']} "
-        f"regenerate={counts['regenerate']} "
-        f"({estimate.get('nodes', 0)} nodes, {estimate.get('skipped', 0)} "
-        f"pre-filtered, ~{estimate.get('tokens', 0)} tokens)"
+        f"regenerate={counts['regenerate']}"
     )
     if not argv.yes:
         try:
@@ -252,7 +300,7 @@ def cmd_amend(argv: argparse.Namespace) -> int:
     repaired = asyncio.run(
         apply_triage(
             run_dir,
-            triage=result["triage"],
+            triage=phase2["triage"],
             writer_adapter_factory=_writer_factory(options, run_dir),
             env=env,
             provider=provider,

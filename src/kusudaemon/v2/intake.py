@@ -43,8 +43,12 @@ _DIMENSION_HINTS: dict[str, str] = {
     "fidelity_to_source": "how closely wording should track the source",
 }
 
-# answer_fn: question text -> the user's raw answer ("" means unanswered).
-AnswerFn = Callable[[str], str]
+# answer_fn: (question text, rubric dimension id) -> the user's raw answer
+# ("" means unanswered). The dimension is passed so a caller can key the
+# approval (or anything else) on it — see §11.9: without it, a resume that
+# restarts the question loop can hand dimension 5's lingering answer to
+# dimension 1.
+AnswerFn = Callable[[str, str], str]
 
 QUESTION_SCHEMA: dict[str, Any] = {
     "type": "object",
@@ -121,7 +125,7 @@ def elicit_global_rubric(
         ]
         payload = provider.complete_json(messages, QUESTION_SCHEMA)
         question = str(payload["question"])
-        answer = answer_fn(question).strip()
+        answer = answer_fn(question, dimension).strip()
         transcript.append(f"Q ({dimension}): {question}\nA: {answer or '(no answer given)'}")
 
     finalize_messages = [

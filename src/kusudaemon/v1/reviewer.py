@@ -16,8 +16,15 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any
 
+from .gates import estimate_tokens
 from .provider import OpenAICompatibleProvider
 from .tree import TaskNode
+
+# §11.10.13: the reviewer's input side gets the §8 "small outputs
+# everywhere" treatment. 8k heuristic tokens is well above any leaf the
+# budget gates admit and well below any context window worth paying for —
+# the cap exists to keep a runaway artifact from blowing a one-shot call.
+DEFAULT_ARTIFACT_CAP_TOKENS = 8_000
 
 VERDICT_SCHEMA: dict[str, Any] = {
     "type": "object",
@@ -60,8 +67,33 @@ class ReviewVerdict:
     verdict: str = "pass"
 
 
+def cap_artifact_text(text: str, ceiling_tokens: int) -> str:
+    """§11.10.13: bound the artifact a Reviewer ever gets, using the
+    harness's own whitespace heuristic (the inverse of ``estimate_tokens``
+    — cutting at ``ceiling_tokens * 0.75`` words keeps the measured token
+    count at or under the ceiling). A truncated artifact is marked
+    explicitly rather than silently short: a verdict reached over a partial
+    artifact must at least say so."""
+    if ceiling_tokens <= 0:
+        return ""
+    word_limit = int(ceiling_tokens * 0.75)
+    words = text.split()
+    if len(words) <= word_limit:
+        return text
+    truncated = " ".join(words[:word_limit])
+    return (
+        f"{truncated}\n\n"
+        f"[ARTIFACT TRUNCATED at the ~{ceiling_tokens}-token reviewer ceiling; "
+        f"judge only what is shown above]"
+    )
+
+
 def review_node(
-    node: TaskNode, artifact_text: str, provider: OpenAICompatibleProvider
+    node: TaskNode,
+    artifact_text: str,
+    provider: OpenAICompatibleProvider,
+    *,
+    artifact_cap_tokens: int = DEFAULT_ARTIFACT_CAP_TOKENS,
 ) -> ReviewVerdict:
     if not node.judgment:
         return ReviewVerdict(node_id=node.id, items=[], verdict="pass")
@@ -74,7 +106,7 @@ def review_node(
         {"role": "system", "content": _SYSTEM_PROMPT},
         {
             "role": "user",
-            "content": f"Rubric:\n{rubric_lines}\n\nArtifact:\n{artifact_text}",
+            "content": f"Rubric:\n{rubric_lines}\n\nArtifact:\n{cap_artifact_text(artifact_text, artifact_cap_tokens)}",
         },
     ]
     payload = provider.complete_json(messages, VERDICT_SCHEMA)

@@ -153,7 +153,13 @@ async def run_assembly_loop(
             )
             repairs.append(outcome)
 
-        assembly = assemble(run_dir, tree, filename=filename)
+        # §11.7: a repair that left the node stale/blocked makes assemble()
+        # raise — that must escalate like every other not-ready state, not
+        # escape the loop as an uncaught AssemblyNotReadyError.
+        try:
+            assembly = assemble(run_dir, tree, filename=filename)
+        except AssemblyNotReadyError as exc:
+            return _escalate(log, checks, str(exc))
         compile_result = await run_compile(run_dir, env, compile_command)
 
     escalated = not compile_result.passed

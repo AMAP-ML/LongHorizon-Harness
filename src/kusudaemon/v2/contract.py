@@ -19,6 +19,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from pathlib import Path
 
+from ..v0.run_dir import write_text_atomic
 from ..v1.gates import estimate_tokens
 from .run_dir import contract_path
 
@@ -60,7 +61,7 @@ def freeze_contract(
         raise ContractCeilingExceeded(
             f"contract is ~{tokens} tokens, over the {token_ceiling} ceiling"
         )
-    contract_path(run_dir).write_text(text, encoding="utf-8")
+    write_text_atomic(contract_path(run_dir), text)
     return text
 
 
@@ -87,5 +88,5 @@ def amend_contract(
         raise ContractCeilingExceeded(
             f"contract is ~{tokens} tokens, over the {token_ceiling} ceiling"
         )
-    contract_path(run_dir).write_text(text, encoding="utf-8")
+    write_text_atomic(contract_path(run_dir), text)
     return text

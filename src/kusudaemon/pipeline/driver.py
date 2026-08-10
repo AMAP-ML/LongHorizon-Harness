@@ -40,6 +40,7 @@ from ..adapters.base import AgentAdapter
 from ..environment.base import Environment
 from ..types import EpisodeBudget
 from ..v0.events import EventLog
+from ..v0.run_dir import write_text_atomic
 from ..v0.run_dir import create_run_dir, events_path, manifest_path, node_artifact_path, spec_path
 from ..v1.provider import OpenAICompatibleProvider
 from ..v1.reviewer import ReviewVerdict
@@ -47,7 +48,12 @@ from ..v1.round_loop import run_round_loop
 from ..v1.tree import TaskNode, TaskTree
 from ..v2.contract import ContractRule, freeze_contract
 from ..v2.intake import run_intake
-from ..v2.pilot import approve_pilot, run_pilot, select_pilot_nodes
+from ..v2.pilot import (
+    approve_pilot,
+    run_pilot,
+    select_pilot_nodes,
+    snapshot_pilot_original,
+)
 from ..v2.planner import build_tree
 from ..v2.retrieval import build_chunk_index
 from ..v2.run_dir import contract_path
@@ -126,11 +132,10 @@ class RunOptions:
     inline_spans: bool = False
 
     def to_spec(self) -> dict[str, Any]:
-        return {
+        spec = {
             "goal": self.goal,
             "backend": self.backend,
             "model": self.model,
-            "source_text": self.source_text,
             "compile_command": self.compile_command,
             "research_plan": [
                 {"node_id": node_id, **asdict(query)}
@@ -144,6 +149,13 @@ class RunOptions:
             "survey_mode": self.survey_mode,
             "inline_spans": self.inline_spans,
         }
+        # §11.10.7: the corpus lives once, in source.txt. Embedding
+        # source_text here duplicated the run's largest file into a JSON
+        # every resume re-parses (*and* into the --detach argv, see
+        # cli.py); the spec records where the corpus is instead. Legacy
+        # specs that do embed it still load (from_spec reads the field).
+        spec["source"] = "source.txt"
+        return spec
 
     @staticmethod
     def from_spec(data: dict[str, Any]) -> "RunOptions":
@@ -151,6 +163,9 @@ class RunOptions:
             goal=str(data.get("goal", "")),
             backend=str(data.get("backend", "gptme")),
             model=data.get("model"),
+            # Legacy specs embedded source_text; spec["source"] just names
+            # the file in the run dir, which resume never needs to re-read —
+            # source.txt already exists (driver only writes it when missing).
             source_text=str(data.get("source_text", "")),
             compile_command=data.get("compile_command"),
             research_plan=parse_research_plan(data.get("research_plan")),
@@ -220,7 +235,11 @@ class RecursiveDriver:
                 break
         report = report or RunReport(status="done", phase=PHASES[-1])
         report.tree_counts = _count_statuses(self._load_tree())
-        self._log({"node_id": "-", "role": "harness", "round": 0, "type": "run_completed"})
+        # §11.9: run_completed is a claim about the run's outcome — logging
+        # it after a halt/escalate/error made the event log disagree with
+        # the report.
+        if report.status == "done":
+            self._log({"node_id": "-", "role": "harness", "round": 0, "type": "run_completed"})
         return report
 
     async def _run_phase(self, phase: str, *, round_index: int) -> RunReport:
@@ -264,12 +283,17 @@ class RecursiveDriver:
             raise ValueError("goal is required")
         run_intake(self.run_dir, goal, self.provider, self._answer_intake)
 
-    def _answer_intake(self, question: str) -> str:
+    def _answer_intake(self, question: str, dimension: str) -> str:
+        """§11.9: the approval is keyed on the rubric dimension, so a resume
+        that restarts the question loop reuses *that dimension's* pending
+        record instead of handing the next-dimension question whatever
+        answer is still sitting in the file."""
         approval = self._ask(
             "intake_question",
             title="Intake question",
             message=question,
             input_label="Your answer",
+            context={"dimension": dimension},
         )
         return approval.user_input.strip()
 
@@ -316,6 +340,7 @@ class RecursiveDriver:
             load_spine(self.run_dir),
             self.provider,
             input_path_for=lambda unit: unit_input_path(self.run_dir, unit),
+            log=self.log,
         )
         tree.save(tree_path(self.run_dir))
 
@@ -343,6 +368,8 @@ class RecursiveDriver:
                     EpisodeBudget(max_duration_seconds=_budget_seconds(node)),
                     self.log,
                 )
+            else:
+                snapshot_pilot_original(self.run_dir, node.id, artifact)
             approval = self._ask(
                 "pilot",
                 title=f"Approve pilot artifact for {node.id}",
@@ -535,19 +562,31 @@ class RecursiveDriver:
         return halt_path(self.run_dir).exists()
 
     def _load_tree(self) -> TaskTree:
-        try:
-            return TaskTree.load(tree_path(self.run_dir))
-        except (OSError, ValueError):
+        """§11.6: a tree.json that exists but cannot be parsed is a corrupt
+        durable file, not an empty tree. Swallowing the error made a
+        kill -9 mid-save resume as "zero nodes" while ``_phase_done("plan")``
+        still returned True — the run converged on an empty assembly.
+        Missing file (plan phase never ran) is the only empty-tree case."""
+        path = tree_path(self.run_dir)
+        if not path.exists():
             return TaskTree(nodes={})
+        return TaskTree.load(path)
 
     def _log(self, event: dict[str, Any]) -> None:
         self.log.append(event)
 
     def _write_source_and_spec(self) -> None:
-        source_path(self.run_dir).write_text(self.options.source_text, encoding="utf-8")
+        # §11.9: source.txt is protected on resume — an operator who fixed
+        # the corpus by hand keeps the fix; only a fresh run (no source.txt
+        # yet) writes it.
+        if not source_path(self.run_dir).exists():
+            write_text_atomic(source_path(self.run_dir), self.options.source_text)
         spec = run_spec_path(self.run_dir)
         if not spec.exists():
-            spec.write_text(json.dumps(self.options.to_spec(), ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+            write_text_atomic(
+                spec,
+                json.dumps(self.options.to_spec(), ensure_ascii=False, indent=2) + "\n",
+            )
 
     def _default_writer_factory(self) -> WriterAdapterFactory:
         def factory(node: TaskNode) -> AgentAdapter:
@@ -608,26 +647,23 @@ def _count_statuses(tree: TaskTree) -> dict[str, int]:
 # Post-run interventions (PLAN.md §10): contract amendment -> re-validation
 # triage, then apply; reopen one passed node as a scoped repair.
 # ----------------------------------------------------------------------
-async def amend_and_revalidate(
+def amend_contract_and_estimate(
     run_dir: str | Path,
     *,
     rule_text: str,
     reason: str,
-    provider: OpenAICompatibleProvider,
     prefilter: bool = True,
 ) -> dict[str, Any]:
-    """§10 contract amendment, first half: append the rule, run the
-    read-only re-validation pass, and return ``{contract, counts, estimate,
-    triage}`` for the operator to review before any repair is dispatched
-    (§10: "Present counts, get approval, then execute"). No writer runs
-    here.
+    """§10 contract amendment, phase 1 — **zero provider calls**: append
+    the rule and compute the re-validation cost estimate, so the operator
+    sees the token price before any Reviewer spends a single one (§10:
+    "Show the cost estimate and the counts, get approval, then execute";
+    §11.10.4: the estimate shown *after* the pass ran was theater).
 
-    ``prefilter`` (PLAN-zeromem.md §2): when enabled (default), the lexical
-    pre-filter skips nodes the amendment provably cannot bear on before the
-    Reviewer spends a call — ``estimate`` carries the skipped count so the
-    operator sees the real cost, not the unfiltered one."""
+    Returns ``{contract, estimate}``; the reviewer pass is a second,
+    separately-gated call (``run_amendment_revalidation``)."""
     from ..v2.contract import amend_contract
-    from ..v3.revalidate import estimate_revalidation_cost, summarize_triage
+    from ..v3.revalidate import estimate_revalidation_cost
 
     run_dir = Path(run_dir)
     contract_text = amend_contract(run_dir, rule_text, reason=reason)
@@ -635,18 +671,38 @@ async def amend_and_revalidate(
     estimate = estimate_revalidation_cost(
         run_dir, tree, contract_text, amendment_text=rule_text, prefilter=prefilter
     )
-    triage_by_node = run_revalidation_pass(
-        run_dir, tree, tree_path(run_dir), contract_text, provider,
-        amendment_text=rule_text, prefilter=prefilter,
-    )
     return {
         "contract": contract_text,
-        "counts": summarize_triage(triage_by_node),
         "estimate": {
             "nodes": estimate.node_count,
             "skipped": estimate.skipped_count,
             "tokens": estimate.estimated_tokens,
         },
+    }
+
+
+def run_amendment_revalidation(
+    run_dir: str | Path,
+    *,
+    contract_text: str,
+    rule_text: str,
+    provider: OpenAICompatibleProvider,
+    prefilter: bool = True,
+) -> dict[str, Any]:
+    """§10 contract amendment, phase 2 — the read-only re-validation pass
+    itself, gated separately from phase 1 so the estimate can be shown
+    before these Reviewer tokens are spent. Returns ``{counts, triage}``.
+    No writer runs here."""
+    from ..v3.revalidate import run_revalidation_pass, summarize_triage
+
+    run_dir = Path(run_dir)
+    tree = TaskTree.load(tree_path(run_dir))
+    triage_by_node = run_revalidation_pass(
+        run_dir, tree, tree_path(run_dir), contract_text, provider,
+        amendment_text=rule_text, prefilter=prefilter,
+    )
+    return {
+        "counts": summarize_triage(triage_by_node),
         "triage": {
             node_id: {
                 "classification": triage.classification,
@@ -656,6 +712,31 @@ async def amend_and_revalidate(
             for node_id, triage in triage_by_node.items()
         },
     }
+
+
+async def amend_and_revalidate(
+    run_dir: str | Path,
+    *,
+    rule_text: str,
+    reason: str,
+    provider: OpenAICompatibleProvider,
+    prefilter: bool = True,
+) -> dict[str, Any]:
+    """§10 contract amendment, both phases in one call (for callers that do
+    their own gating). Prefer the two-phase pair above — the estimate must
+    reach the operator before ``run_amendment_revalidation`` spends the
+    Reviewer tokens it prices."""
+    phase1 = amend_contract_and_estimate(
+        run_dir, rule_text=rule_text, reason=reason, prefilter=prefilter
+    )
+    phase2 = run_amendment_revalidation(
+        run_dir,
+        contract_text=phase1["contract"],
+        rule_text=rule_text,
+        provider=provider,
+        prefilter=prefilter,
+    )
+    return {**phase1, **phase2}
 
 
 async def apply_triage(

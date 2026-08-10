@@ -20,6 +20,8 @@ from pathlib import Path
 
 from ..v0.run_dir import (  # noqa: F401 — re-exported for v3 callers
     create_run_dir,
+    ensure_node_scratch_dir,
+    ensure_node_trace_path,
     events_path,
     manifest_path,
     node_artifact_path,
@@ -30,6 +32,9 @@ from ..v0.run_dir import (  # noqa: F401 — re-exported for v3 callers
 from ..v1.run_dir import (  # noqa: F401 — re-exported for v3 callers
     audit_dir,
     audit_path,
+    ensure_audit_dir,
+    ensure_audit_path,
+    ensure_orchestrator_dir,
     orchestrator_dir,
     round_trace_path,
     tree_path,

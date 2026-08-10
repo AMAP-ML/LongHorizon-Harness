@@ -62,6 +62,11 @@ from . import gptme_queue
 
 _DEFAULT_RUN_ID_PREFIX = "rec"
 
+# §11.10.15: the process-lifetime file cache is bounded — a dashboard
+# server watches many runs for days, and one entry per file per run must
+# not become one entry per hour of run activity.
+_CACHE_MAX_ENTRIES = 256
+
 
 def _now() -> float:
     return time.time()
@@ -75,11 +80,13 @@ class RunState:
     def __init__(self, runs_root: str | Path | None = None) -> None:
         self.runs_root = Path(runs_root) if runs_root else None
         self._lock = threading.Lock()
+        self._cache_lock = threading.Lock()
         self._attached: str | None = None
         self._hosts: dict[str, threading.Thread] = {}
         # Parse-on-change cache for the per-snapshot file reads: keyed by
         # path, value is (stat stamp, parsed result). Depends on the
-        # append-only invariant — see _cached_read.
+        # append-only invariant — see _cached_read. Bounded (§11.10.15) and
+        # guarded by _cache_lock.
         self._file_cache: dict[str, tuple[Any, Any]] = {}
 
     def _cached_read(self, path: Path, loader: Callable[[], Any]) -> Any:
@@ -87,6 +94,13 @@ class RunState:
         changes — the dashboard's hot path (a snapshot every _STREAM_INTERVAL
         per client) stops re-parsing files that haven't moved
         (PLAN-zeromem.md §10.2).
+
+        §11.10.15: bounded at ``_CACHE_MAX_ENTRIES`` (FIFO eviction — a
+        server meant to run for days is a process, not a garbage collector),
+        and the dict is mutated only under ``self._cache_lock``: the loader
+        itself runs unlocked so concurrent snapshot polls don't serialize
+        their parsing behind each other, but the two dict accesses both
+        hold the lock.
 
         **Depends on the append-only invariant**: events.jsonl and
         approvals.jsonl are append-only and fsync'd per record
@@ -103,10 +117,20 @@ class RunState:
             stamp = (stat.st_size, stat.st_mtime_ns)
         except OSError:
             stamp = None
-        if self._file_cache.get(key, (None, None))[0] == stamp:
-            return self._file_cache[key][1]
+        with self._cache_lock:
+            cached = self._file_cache.get(key)
+            if cached is not None and cached[0] == stamp:
+                return cached[1]
         value = loader()
-        self._file_cache[key] = (stamp, value)
+        with self._cache_lock:
+            current = self._file_cache.get(key)
+            if current is not None and current[0] != stamp:
+                # A concurrent writer landed a fresher entry while we were
+                # parsing — leave it; ours is already stale.
+                return value
+            if len(self._file_cache) >= _CACHE_MAX_ENTRIES:
+                del self._file_cache[next(iter(self._file_cache))]
+            self._file_cache[key] = (stamp, value)
         return value
 
     def _cached_events(self, run_dir: Path) -> list[dict[str, Any]]:
@@ -464,12 +488,19 @@ class RunState:
         if node is None:
             return None
         artifact = _read_text(node_artifact_path(run_dir, node_id)) or ""
-        from ..v1.gates import evaluate_gates
+        from ..v1.gates import evaluate_gates, read_gate_cache
 
-        gate_results = [
-            {"gate": result.gate, "passed": result.passed, "detail": result.detail}
-            for result in evaluate_gates(node.gates, artifact)
-        ]
+        # §11.10.11: gates were evaluated once, at dispatch, and cached in
+        # audit/<node>.json — read that instead of re-evaluating on every
+        # poll. Fall back to a live evaluation only when no dispatch has
+        # cached anything yet.
+        cached = read_gate_cache(run_dir / "audit" / f"{node_id}.json")
+        if cached is None:
+            cached = [
+                {"gate": result.gate, "passed": result.passed, "detail": result.detail}
+                for result in evaluate_gates(node.gates, artifact)
+            ]
+        gate_results = cached
         audit = _read_json(run_dir / "audit" / f"{node_id}.json") or {}
         manifest_lines = [
             item for item in _read_jsonl(manifest_path(run_dir)) if item.get("node") == node_id

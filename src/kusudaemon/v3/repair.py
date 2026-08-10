@@ -52,14 +52,14 @@ from ..adapters.base import AgentAdapter
 from ..environment.base import Environment
 from ..types import EpisodeBudget
 from ..v0.events import EventLog
-from ..v0.run_dir import node_artifact_path
-from ..v1.gates import GateResult, all_passed, evaluate_gates
+from ..v0.run_dir import node_artifact_path, write_text_atomic
+from ..v1.gates import GateResult, all_passed, evaluate_gates, write_gate_cache
 from ..v1.manifest import append_manifest_line
 from ..v1.provider import OpenAICompatibleProvider
 from ..v1.reviewer import ReviewVerdict, review_node
 from ..v1.tree import NodeBudget, TaskNode, TaskTree
 from ..v1.writer import run_writer_node
-from .run_dir import audit_path, version_snapshot_path
+from .run_dir import ensure_audit_path, version_snapshot_path
 
 RepairMode = Literal["patch", "regenerate"]
 
@@ -160,11 +160,21 @@ async def run_repair(
 
     verdict = ReviewVerdict(node_id=node.id, items=[], verdict="fail")
     if gates_ok:
-        node_artifact_path(run_dir, node.id).write_text(candidate_text, encoding="utf-8")
         verdict = review_node(node, candidate_text, provider)
-        audit_path(run_dir, node.id).write_text(
-            _audit_json(node.id, verdict), encoding="utf-8"
-        )
+        # §11.10.11: the repair re-evaluated gates against a *new* candidate
+        # — overwrite the dispatch-time cache, and merge (never clobber) it
+        # when writing the verdict to the same audit file.
+        audit = ensure_audit_path(run_dir, node.id)
+        write_gate_cache(audit, gate_results)
+        existing: dict = {}
+        try:
+            loaded = json.loads(audit.read_text(encoding="utf-8"))
+            if isinstance(loaded, dict):
+                existing = loaded
+        except (OSError, ValueError):
+            existing = {}
+        existing.update({"items": verdict.items, "verdict": verdict.verdict, "node": node.id})
+        audit.write_text(json.dumps(existing, indent=2, sort_keys=True) + "\n", encoding="utf-8")
 
     passed = gates_ok and verdict.verdict == "pass"
     log.append(
@@ -181,11 +191,14 @@ async def run_repair(
     )
 
     if passed:
+        node_artifact_path(run_dir, node.id).write_text(candidate_text, encoding="utf-8")
         node.status = "passed"
         artifact_text = candidate_text
     else:
         node.attempts += 1
         node.status = "blocked" if node.attempts >= max_attempts else "stale"
+        if snapshot_path is not None:
+            shutil.copy2(snapshot_path, node_artifact_path(run_dir, node.id))
         artifact_text = node_artifact_path(run_dir, node.id).read_text(encoding="utf-8")
 
     append_manifest_line(
@@ -208,8 +221,3 @@ async def run_repair(
         snapshot_path=snapshot_path,
         status=node.status,
     )
-
-
-def _audit_json(node_id: str, verdict: ReviewVerdict) -> str:
-    payload = {"node": node_id, "items": verdict.items, "verdict": verdict.verdict}
-    return json.dumps(payload, indent=2, sort_keys=True) + "\n"

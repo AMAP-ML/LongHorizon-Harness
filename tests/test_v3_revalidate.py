@@ -114,7 +114,7 @@ class RevalidationPassTest(unittest.TestCase):
             node_artifact_path(run_dir, "clean1").write_text("fine as is", encoding="utf-8")
             node_artifact_path(run_dir, "patch1").write_text("needs a small edit", encoding="utf-8")
             tree = TaskTree(nodes={"clean1": clean_node, "patch1": patch_node})
-            tree_path = Path(root_str) / "tree.json"
+            tree_path = run_dir / "tree.json"
             tree.save(tree_path)
 
             provider = FakeProvider([
@@ -139,6 +139,92 @@ class RevalidationPassTest(unittest.TestCase):
 
             self.assertTrue(revalidation_audit_path(run_dir, "clean1").exists())
             self.assertTrue(revalidation_audit_path(run_dir, "patch1").exists())
+
+    # §11.7: node_ids=[] meant "revalidate everything" — an explicit
+    # "revalidate nothing" became a full surprise pass.
+
+    def test_empty_node_ids_targets_nothing(self) -> None:
+        with tempfile.TemporaryDirectory() as root_str:
+            run_dir = create_run_dir(Path(root_str), "run-targets")
+            tree = TaskTree(nodes={"a": _node("a")})
+            tree_path = run_dir / "tree.json"
+            tree.save(tree_path)
+            provider = FakeProvider([])
+
+            triage = run_revalidation_pass(
+                run_dir, tree, tree_path, "some amendment", provider, node_ids=[]
+            )
+
+            self.assertEqual(provider.calls, [])
+            self.assertEqual(
+                summarize_triage(triage),
+                {"clean": 0, "patchable": 0, "regenerate": 0},
+                "no targets must mean no work and no escalations",
+            )
+
+    # §11.10.4: the cost estimate must be computable before any Reviewer
+    # token is spent, so the §10 approval is a genuine gate.
+
+    def test_estimate_phase_makes_zero_provider_calls(self) -> None:
+        from kusudaemon.pipeline.driver import amend_contract_and_estimate
+
+        with tempfile.TemporaryDirectory() as root_str:
+            run_dir = create_run_dir(Path(root_str), "run-est")
+            tree = TaskTree(nodes={"a": _node("a")})
+            tree_path = run_dir / "tree.json"
+            tree.save(tree_path)
+            node_artifact_path(run_dir, "a").write_text(
+                "a worked example shown in full", encoding="utf-8"
+            )
+
+            # The proof is structural: amend_contract_and_estimate's
+            # signature has no provider at all — nothing to spend tokens on.
+            phase1 = amend_contract_and_estimate(
+                run_dir, rule_text="every section needs a worked example", reason="amend test"
+            )
+
+            self.assertIn("contract", phase1)
+            self.assertIn("worked example", phase1["contract"])
+            self.assertEqual(phase1["estimate"]["nodes"], 1)
+            self.assertGreater(phase1["estimate"]["tokens"], 0)
+
+    def test_review_phase_is_evenly_split_from_estimate_phase(self) -> None:
+        from kusudaemon.pipeline.driver import (
+            amend_contract_and_estimate,
+            run_amendment_revalidation,
+        )
+
+        with tempfile.TemporaryDirectory() as root_str:
+            run_dir = create_run_dir(Path(root_str), "run-split")
+            tree = TaskTree(nodes={"a": _node("a")})
+            tree_path = run_dir / "tree.json"
+            tree.save(tree_path)
+            node_artifact_path(run_dir, "a").write_text(
+                "a worked example shown in full", encoding="utf-8"
+            )
+
+            phase1 = amend_contract_and_estimate(
+                run_dir, rule_text="every section needs a worked example", reason="amend test"
+            )
+            provider = FakeProvider(
+                [
+                    {
+                        "items": [{"id": "C1", "pass": False, "class": "patchable", "defect": "no worked example"}],
+                        "verdict": "fail",
+                    }
+                ]
+            )
+            phase2 = run_amendment_revalidation(
+                run_dir,
+                contract_text=phase1["contract"],
+                rule_text="every section needs a worked example",
+                provider=provider,
+            )
+
+            self.assertEqual(
+                phase2["counts"], {"clean": 0, "patchable": 1, "regenerate": 0}
+            )
+            self.assertIn("a", phase2["triage"])
 
 
 class PrefilterRevalidationTest(unittest.TestCase):

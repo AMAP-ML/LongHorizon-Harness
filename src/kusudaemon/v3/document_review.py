@@ -43,7 +43,12 @@ from typing import Any, Callable
 from ..v0.events import EventLog
 from ..v1.manifest import read_all_manifest_entries
 from ..v1.provider import OpenAICompatibleProvider
-from ..v1.reviewer import VERDICT_SCHEMA, ReviewVerdict
+from ..v1.reviewer import (
+    VERDICT_SCHEMA,
+    DEFAULT_ARTIFACT_CAP_TOKENS as ARTIFACT_CAP_TOKENS,
+    ReviewVerdict,
+    cap_artifact_text,
+)
 from ..v1.tree import TaskNode, TaskTree
 from ..v2.pilot import select_pilot_nodes
 from ..v2.run_dir import contract_path
@@ -318,8 +323,15 @@ def run_document_review(
                 if item.get("pass", True) is not False:
                     continue
                 absorb(_pass.id, item)
+            # §11.10.1: an unattributable defect escalated inside absorb —
+            # every remaining window, pass, and the depth pass would spend
+            # ~50 calls whose output the caller already discards.
+            if result.escalated:
+                break
+        if result.escalated:
+            break
 
-    if keep_depth_pass:
+    if keep_depth_pass and not result.escalated:
         for node in select_pilot_nodes(tree).values():
             artifact_path = Path(node.artifact)
             artifact = ""
@@ -332,7 +344,7 @@ def run_document_review(
             context = (
                 f"Frozen contract:\n{contract_text}\n\n"
                 f"Node: {node.id} ({node.shape})\nBrief: {node.brief}\n\n"
-                f"Artifact:\n{artifact}"
+                f"Artifact:\n{cap_artifact_text(artifact, ARTIFACT_CAP_TOKENS)}"
             )
             payload = provider.complete_json(
                 [

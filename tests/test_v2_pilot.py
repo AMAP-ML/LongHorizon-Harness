@@ -131,6 +131,38 @@ class PilotWorkflowTest(unittest.TestCase):
             self.assertEqual(rules, [])
             self.assertEqual(len(provider.calls), 0)
 
+    def test_on_disk_edit_diffed_against_snapshot_derives_rules(self) -> None:
+        with tempfile.TemporaryDirectory() as root_str:
+            root = Path(root_str)
+            run_dir = create_run_dir(root, "run1")
+            prompt_dir = root / "prompts"
+            prompt_dir.mkdir(parents=True, exist_ok=True)
+
+            node = _node("ch05", "prose-dominant")
+            log = EventLog(events_path(run_dir))
+            adapter = self._adapter(root, run_dir, prompt_dir, node.id)
+
+            artifact_text = asyncio.run(
+                run_pilot(
+                    run_dir, node, "write chapter 5", adapter,
+                    LocalEnvironment(tmp_dir=str(prompt_dir)),
+                    EpisodeBudget(max_duration_seconds=30), log,
+                )
+            )
+
+            # The §4.4 path: the operator edits the artifact ON DISK and
+            # approves with empty input. The diff must be against the
+            # snapshotted writer original, not the (now edited) live file.
+            edited_text = artifact_text + "\n\nUSER-EDITED-LINE\n"
+            node_artifact_path(run_dir, node.id).write_text(edited_text, encoding="utf-8")
+
+            provider = FakeProvider([{"rules": ["exclude the user-edited line class of content"]}])
+            rules = approve_pilot(run_dir, node, node_artifact_path(run_dir, node.id).read_text(encoding="utf-8"), provider, log)
+
+            self.assertEqual(len(rules), 1)
+            self.assertEqual(len(provider.calls), 1)
+            self.assertIsNotNone(log.last_event(node.id, "pilot_approved"))
+
 
 class ContractTest(unittest.TestCase):
     def test_freeze_then_load_round_trip(self) -> None:

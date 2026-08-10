@@ -12,7 +12,9 @@ enough to make node exit conditions machine-checkable today.
 
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass
+from pathlib import Path
 
 
 @dataclass
@@ -24,6 +26,32 @@ class GateResult:
 
 def evaluate_gates(gates: list[str], artifact_text: str) -> list[GateResult]:
     return [_evaluate_one(gate, artifact_text) for gate in gates]
+
+
+def write_gate_cache(path: str | Path, results: list[GateResult]) -> None:
+    """§11.10.11: persist one gate evaluation per dispatch, durably, into
+    ``audit/<node>.json``. Deterministic gates never need re-evaluating for
+    the same artifact — consumers (the dashboard node view) read the cache
+    instead of paying an evaluation per poll."""
+    payload = [
+        {"gate": result.gate, "passed": result.passed, "detail": result.detail}
+        for result in results
+    ]
+    Path(path).write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+
+
+def read_gate_cache(path: str | Path) -> list[dict] | None:
+    """The cached evaluation, or ``None`` when absent/malformed — which the
+    caller must treat as "evaluate now", never as "passed"."""
+    try:
+        data = json.loads(Path(path).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    if not isinstance(data, list) or not all(
+        isinstance(entry, dict) and "gate" in entry and "passed" in entry for entry in data
+    ):
+        return None
+    return data
 
 
 def all_passed(results: list[GateResult]) -> bool:

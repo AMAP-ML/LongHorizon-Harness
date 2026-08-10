@@ -154,5 +154,50 @@ class RetrievalTest(unittest.TestCase):
         self.assertEqual([s.chunk_index for s in spans], [0, 1, 2])
 
 
+class DenseScorerCacheTest(unittest.TestCase):
+    """§11.10.10: the embedding matrix is loaded once per process per
+    file-version, not once per node prompt."""
+
+    def test_matrix_is_loaded_once_across_scorer_construction(self) -> None:
+        import importlib.util
+        from unittest import mock
+
+        if importlib.util.find_spec("numpy") is None:
+            self.skipTest("numpy not installed")
+
+        from kusudaemon.v2 import retrieval
+        from kusudaemon.v2.run_dir import chunk_embeddings_meta_path, chunk_embeddings_path
+
+        with tempfile.TemporaryDirectory() as root_str:
+            run_dir = Path(root_str) / "run"
+            run_dir.mkdir()
+            meta_path = chunk_embeddings_meta_path(run_dir)
+            meta_path.parent.mkdir(parents=True, exist_ok=True)
+            meta_path.write_text(json.dumps({"model": "test-model"}), encoding="utf-8")
+            emb_path = chunk_embeddings_path(run_dir)
+            if not str(emb_path).endswith(".npy"):
+                emb_path = emb_path.with_suffix(emb_path.suffix + ".npy")
+
+            import numpy as np
+
+            np.save(str(emb_path), np.zeros((4, 8), dtype="float64"))
+
+            loads = {"n": 0}
+            real_load = np.load
+
+            def counting_load(*args, **kwargs):
+                loads["n"] += 1
+                return real_load(*args, **kwargs)
+
+            with mock.patch("numpy.load", counting_load):
+                scorer1 = retrieval._default_dense_scorer(run_dir)
+                scorer2 = retrieval._default_dense_scorer(run_dir)
+                scorer3 = retrieval._default_dense_scorer(run_dir)
+
+            self.assertIsNotNone(scorer1)
+            self.assertEqual(loads["n"], 1, "dense scorer must load the matrix once")
+            del scorer1, scorer2, scorer3
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -220,6 +220,136 @@ class BuildTreeTest(unittest.TestCase):
         self.assertEqual(tree.nodes["c0"].inputs, ["spine/unit-01.md"])
         self.assertEqual(tree.nodes["c1"].inputs, ["spine/unit-02.md"])
 
+    def test_gapped_partition_is_repaired_with_forced_leaves_and_events(self) -> None:
+        """§11.4: a model partition [0-1], [3-4] drops unit 2 from the tree
+        and therefore from assembly — the harness must fill the gap. The
+        planner's own faithfulness is not the invariant; the coverage is."""
+        import tempfile
+
+        from kusudaemon.v0.events import EventLog
+
+        units = _units(6, tokens=1000)
+        provider = FakeProvider(
+            [
+                {
+                    "children": [
+                        {
+                            "id": "left",
+                            "brief": "write left part",
+                            "unit_start": 0,
+                            "unit_end": 1,
+                            "estimated_calls": 3,
+                            "shape": "prose-dominant",
+                        },
+                        {
+                            "id": "right",
+                            "brief": "write right part",
+                            "unit_start": 3,
+                            "unit_end": 4,
+                            "estimated_calls": 3,
+                            "shape": "prose-dominant",
+                        },
+                    ]
+                }
+            ]
+        )
+        with tempfile.TemporaryDirectory() as root_str:
+            log = EventLog(root_str + "/events.jsonl")
+            tree = build_tree(
+                units, provider, depth_cap=4, node_cap=100, log=log,
+            )
+            covered: list[str] = []
+            for node in tree.nodes.values():
+                covered.extend(node.inputs)
+            # every unit 0..5 is covered by exactly one leaf
+            self.assertEqual(sorted(covered), [u.id for u in units])
+            self.assertIn("left", tree.nodes)
+            self.assertIn("right", tree.nodes)
+            self.assertTrue(any(node.id.startswith("gap") for node in tree.nodes.values()))
+            repaired = log.last_event("<root>", "planner_partition_repaired")
+            self.assertIsNotNone(repaired)
+            self.assertIn("gap", repaired["detail"])
+
+    def test_overlapping_partition_truncates_first_claim_wins(self) -> None:
+        import tempfile
+
+        from kusudaemon.v0.events import EventLog
+
+        units = _units(4, tokens=1000)
+        provider = FakeProvider(
+            [
+                {
+                    "children": [
+                        {
+                            "id": "first",
+                            "brief": "write first part",
+                            "unit_start": 0,
+                            "unit_end": 2,
+                            "estimated_calls": 3,
+                            "shape": "prose-dominant",
+                        },
+                        {
+                            "id": "second",
+                            "brief": "write second part",
+                            "unit_start": 1,
+                            "unit_end": 3,
+                            "estimated_calls": 3,
+                            "shape": "prose-dominant",
+                        },
+                    ]
+                }
+            ]
+        )
+        with tempfile.TemporaryDirectory() as root_str:
+            log = EventLog(root_str + "/events.jsonl")
+            tree = build_tree(units, provider, depth_cap=4, node_cap=100, log=log)
+            self.assertEqual(
+                sorted(unit for node in tree.nodes.values() for unit in node.inputs),
+                [u.id for u in units],
+            )
+            repaired = log.last_event("<root>", "planner_partition_repaired")
+            self.assertIsNotNone(repaired)
+            self.assertIn("overlap", repaired["detail"])
+
+    def test_node_cap_drop_emits_an_event(self) -> None:
+        import tempfile
+
+        from kusudaemon.v0.events import EventLog
+
+        units = _units(5, tokens=1000)
+        provider = FakeProvider(
+            [
+                {
+                    "children": [
+                        {
+                            "id": f"c{i}",
+                            "brief": f"write unit {i}",
+                            "unit_start": i,
+                            "unit_end": i,
+                            "estimated_calls": 3,
+                            "shape": "prose-dominant",
+                        }
+                        for i in range(5)
+                    ]
+                }
+            ]
+        )
+        with tempfile.TemporaryDirectory() as root_str:
+            log = EventLog(root_str + "/events.jsonl")
+            tree = build_tree(units, provider, depth_cap=4, node_cap=2, log=log)
+            self.assertLessEqual(len(tree.nodes), 2)
+            cap_events = [
+                event for event in log.read_all()
+                if event.get("type") == "planner_node_cap_reached"
+            ]
+            self.assertEqual(len(cap_events), 1)
+            self.assertIn("dropped", cap_events[0]["detail"])
+
+    def test_empty_spine_does_not_crash(self) -> None:
+        provider = FakeProvider([])
+        tree = build_tree([], provider, depth_cap=4, node_cap=100)
+        self.assertEqual(len(tree.nodes), 0)
+
     def test_resulting_tree_is_a_valid_taskree_round_trip(self) -> None:
         import json
         import tempfile

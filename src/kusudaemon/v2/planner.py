@@ -28,6 +28,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Callable
 
+from ..v0.events import EventLog
 from ..v1.provider import OpenAICompatibleProvider
 from ..v1.tree import NodeBudget, TaskNode, TaskTree
 from .survey import SpineUnit
@@ -172,6 +173,82 @@ class _NodeBudget:
         return True
 
 
+def _gap_candidate(
+    unit_start: int, unit_end: int, units: list[SpineUnit], tool_call_cap: int
+) -> Candidate:
+    span = units[unit_start : unit_end + 1]
+    return Candidate(
+        id=f"gap{unit_start}-{unit_end}",
+        brief=f"Produce the artifact for {span[0].label} (automatic gap fill).",
+        shape="prose-dominant",
+        unit_start=unit_start,
+        unit_end=unit_end,
+        estimated_calls=min(tool_call_cap, max(1, len(span))),
+        tokens=sum(unit.tokens for unit in span),
+    )
+
+
+def _repair_partition(
+    candidates: list[Candidate],
+    units: list[SpineUnit],
+    *,
+    tool_call_cap: int,
+) -> tuple[list[Candidate], str | None]:
+    """§11.4: never trust the model's partition to tile its slice. The
+    prompt asks for "every unit exactly once, in order" and the harness used
+    to take that on faith — a model emitting [0-3], [5-9] silently dropped
+    unit 4 from the tree and therefore from ``assembly/main.md``, with no
+    event. Truncate overlaps first-claim-wins, drop double-covered children,
+    and insert a forced candidate over every uncovered span. Returns the
+    repaired list and an event detail string, or ``None`` when the model's
+    partition was already exact."""
+    if not units:
+        return [], None
+    detail: list[str] = []
+    accepted: list[Candidate] = []
+    covered_through = -1
+    for cand in candidates:
+        start, end = cand.unit_start, cand.unit_end
+        if start <= covered_through:
+            if end <= covered_through:
+                detail.append(
+                    f"duplicate coverage {cand.id} [{start}..{end}] dropped"
+                )
+                continue
+            detail.append(
+                f"overlap {cand.id} [{start}..{end}] truncated to "
+                f"[{covered_through + 1}..{end}]"
+            )
+            start = covered_through + 1
+        if start > end:
+            detail.append(f"out-of-order {cand.id} [{start}..{end}] dropped")
+            continue
+        accepted.append(
+            Candidate(
+                id=cand.id,
+                brief=cand.brief,
+                shape=cand.shape,
+                unit_start=start,
+                unit_end=end,
+                estimated_calls=cand.estimated_calls,
+                tokens=cand.tokens,
+            )
+        )
+        covered_through = end
+    repaired: list[Candidate] = []
+    next_unit = 0
+    for cand in accepted:
+        if cand.unit_start > next_unit:
+            repaired.append(_gap_candidate(next_unit, cand.unit_start - 1, units, tool_call_cap))
+            detail.append(f"gap [{next_unit}..{cand.unit_start - 1}] filled with a forced leaf")
+        repaired.append(cand)
+        next_unit = cand.unit_end + 1
+    if next_unit <= len(units) - 1:
+        repaired.append(_gap_candidate(next_unit, len(units) - 1, units, tool_call_cap))
+        detail.append(f"gap [{next_unit}..{len(units) - 1}] filled with a forced leaf")
+    return repaired, "; ".join(detail) or None
+
+
 def build_tree(
     units: list[SpineUnit],
     provider: OpenAICompatibleProvider,
@@ -182,6 +259,7 @@ def build_tree(
     tool_call_cap: int = DEFAULT_TOOL_CALL_CAP,
     default_gates: tuple[str, ...] = ("nonempty",),
     input_path_for: Callable[[SpineUnit], str] | None = None,
+    log: EventLog | None = None,
 ) -> TaskTree:
     """Recurse level-at-a-time from the full spine to a flat set of leaf
     TaskNodes. Depth cap, node cap, and a size floor (a one-unit slice
@@ -193,9 +271,20 @@ def build_tree(
     should actually be (PLAN-zeromem.md §7) — e.g. a materialized file path
     under ``spine/`` — without this module ever knowing about run-directory
     layout itself. Left ``None``, a leaf's inputs are bare unit ids, today's
-    behavior."""
+    behavior.
+
+    ``log``, when supplied, receives the harness-side repair events:
+    ``planner_partition_repaired`` (the model's partition did not tile its
+    slice — §11.4) and ``planner_node_cap_reached`` (the node cap dropped
+    remaining units). Both were silent before; both are structural
+    corrections, not model judgment."""
     nodes: dict[str, TaskNode] = {}
     budget = _NodeBudget(node_cap)
+    cap_event_emitted = False
+
+    def emit(event: dict[str, Any]) -> None:
+        if log is not None:
+            log.append({"role": "harness", "round": 0, **event})
 
     def unique_id(node_id: str) -> str:
         if node_id not in nodes:
@@ -206,7 +295,20 @@ def build_tree(
         return f"{node_id}-{suffix}"
 
     def add_leaf(node_id: str, candidate: Candidate, slice_units: list[SpineUnit]) -> None:
+        nonlocal cap_event_emitted
         if not budget.take():
+            if not cap_event_emitted and slice_units:
+                cap_event_emitted = True
+                emit(
+                    {
+                        "node_id": node_id,
+                        "type": "planner_node_cap_reached",
+                        "detail": (
+                            f"node cap {node_cap} reached; "
+                            f"units {slice_units[0].id}..{slice_units[-1].id} dropped"
+                        ),
+                    }
+                )
             return
         node_id = unique_id(node_id)
         gates = [*default_gates, f"max_tokens:{token_budget}"]
@@ -240,6 +342,9 @@ def build_tree(
         add_leaf(node_id, candidate, slice_units)
 
     def recurse(slice_units: list[SpineUnit], depth: int, path: str) -> None:
+        nonlocal cap_event_emitted
+        if not slice_units:
+            return
         if len(slice_units) <= 1:
             forced_leaf(slice_units, path or slice_units[0].id, "single unit, cannot split further")
             return
@@ -251,6 +356,18 @@ def build_tree(
         if not candidates:
             forced_leaf(slice_units, path or f"depth{depth}", "planner returned no children")
             return
+        candidates, partition_detail = _repair_partition(
+            candidates, slice_units, tool_call_cap=tool_call_cap
+        )
+        if partition_detail:
+            emit(
+                {
+                    "node_id": path or "<root>",
+                    "type": "planner_partition_repaired",
+                    "detail": partition_detail,
+                    "slice_size": len(slice_units),
+                }
+            )
 
         for candidate in candidates:
             node_id = f"{path}.{candidate.id}" if path else candidate.id
@@ -263,6 +380,18 @@ def build_tree(
             else:
                 recurse(child_units, depth + 1, node_id)
             if budget.count >= node_cap:
+                if not cap_event_emitted:
+                    cap_event_emitted = True
+                    emit(
+                        {
+                            "node_id": node_id,
+                            "type": "planner_node_cap_reached",
+                            "detail": (
+                                f"node cap {node_cap} reached; further candidates "
+                                f"in this slice dropped"
+                            ),
+                        }
+                    )
                 break
 
     recurse(units, 0, "")

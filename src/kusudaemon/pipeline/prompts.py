@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import json
 import os
+import threading
 from pathlib import Path
 
 from ..v1.manifest import read_all_manifest_entries
@@ -55,8 +56,12 @@ _REGENERATE_RETRY_INSTRUCTION = (
 # serving a stale contract: amend_contract rewrites the file, the stamp
 # changes, the next read re-parses. ``_MISSING`` is a sentinel distinct
 # from every real stamp (a missing file's stamp is None).
+# §11.10.15: bounded — one entry per run directory, FIFO-evicted, and the
+# dict is only ever touched under the lock.
 _MISSING = object()
+_CONTRACT_CACHE_MAX = 64
 _contract_cache: dict[str, tuple] = {}
+_contract_lock = threading.Lock()
 
 
 def _load_contract_cached(run_dir: Path) -> str:
@@ -67,11 +72,15 @@ def _load_contract_cached(run_dir: Path) -> str:
         stamp = (stat.st_size, stat.st_mtime_ns)
     except OSError:
         stamp = None
-    cached = _contract_cache.get(key, (_MISSING, _MISSING))
-    if cached[0] == stamp:
-        return cached[1]
+    with _contract_lock:
+        cached = _contract_cache.get(key, (_MISSING, _MISSING))
+        if cached[0] == stamp:
+            return cached[1]
     text = load_contract(run_dir)
-    _contract_cache[key] = (stamp, text)
+    with _contract_lock:
+        if key not in _contract_cache and len(_contract_cache) >= _CONTRACT_CACHE_MAX:
+            del _contract_cache[next(iter(_contract_cache))]
+        _contract_cache[key] = (stamp, text)
     return text
 
 

@@ -12,12 +12,21 @@ outstanding *measurements* are carried forward here as §6).
 
 ## §0 Status
 
-Built and tested: v0–v5 plus Zero-Mem §§1–11. 299 tests, ~19s, green.
+Built and tested: v0–v5 plus Zero-Mem §§1–11. 345 tests, ~20s, green.
 
 The harness can take a corpus and a goal, elicit a rubric, discover structure,
 decompose recursively, pilot and freeze a contract, research, execute, review,
 repair, assemble, and be driven from a CLI or a web dashboard — with crash
 resume at every point.
+
+**§11.10 status:** 11.10.1–11.10.16 all shipped (2026-08-10). Ship-gate
+convention per §11: each numbered defect was fixed with a test that failed
+against the pre-fix code.
+
+**§11.11 status:** shipped (2026-08-10) — dispatch-policy spelling unified on
+`document_order` and unknown policies now raise instead of silently spending
+the model path's calls; `load_spine` drops unknown record keys instead of
+raising `TypeError`.
 
 What it cannot yet do, in the order that matters:
 
@@ -29,6 +38,7 @@ What it cannot yet do, in the order that matters:
 | §5 | **Dashboard hardening** | No auth of any kind; no cap on concurrent runs; gptme-native nested subagents invisible. Only §5.1 is a real exposure, and only once someone binds off loopback. |
 | §6 | **Ship-gate measurements** | Not code. Seven real-corpus checks the unit suite structurally cannot satisfy. |
 | §7 | **Eval harness** | `CLAUDE.md` §14 was never built. Without it §2's calibration and §6's measurements are one-off manual exercises. |
+| §11 | **Audit defects** | Not a missing feature: things already built that do not do what `CLAUDE.md` says they do. Four of them (§11.1–§11.4) silently violate a stated invariant, and one makes the pilot — the highest-signal input in the system — derive zero rules on the path the design actually describes. Ranked above everything except §2 for the ones marked **P0**. |
 
 **Ordering is not arbitrary.** §2 before §6, because §6's gates are stated in
 terms of artifact quality and there is currently no instrument that can read
@@ -271,8 +281,9 @@ genuinely independent, so the mechanism is a bounded fan-out over
   them one at a time. Gather it too.
 - **Dispatch policy interaction.** With `dispatch_policy="model"` the
   orchestrator picks one node per call; parallel dispatch wants a *set*.
-  Simplest correct answer: when `max_parallel > 1`, force the deterministic
-  policy for the fan-out and keep the model call only for the halt/escalate
+  Simplest correct answer: when `max_parallel > 1`, force the
+  document-order policy (`dispatch_policy="document_order"`) for the fan-out
+  and keep the model call only for the halt/escalate
   arbitration it already owns. Document that in the flag's help text.
 
 ### 3.3 Config and tests
@@ -404,7 +415,7 @@ suite** — each needs one real run over a real corpus. Several are blocked on
 |---|---|---|---|
 | 1 | §6 writer output contract | read one real `out/<node>.md`: prose, not a sign-off line | — |
 | 2 | §8 document review | operator agrees with most reported defects; post-repair artifacts still clear gates | — |
-| 3 | §1 dispatch policy | byte-identical `assembly/main.md` between `model` and `deterministic` on the same tree | measurement 1 |
+| 3 | §1 dispatch policy | byte-identical `assembly/main.md` between `model` and `document_order` on the same tree | measurement 1 |
 | 4 | §2 revalidation pre-filter | filtered and unfiltered triage agree on a real amendment | — |
 | 5 | §5 episode context discipline | `trace.jsonl` size before/after | — |
 | 6 | §3 embedding survey | boundary precision/recall vs. model mode against hand-drawn ground truth; only then consider flipping the default | — |
@@ -500,3 +511,326 @@ one that doesn't.
 
 Nothing recorded yet. One row per completed workstream or measurement:
 date, item, and what the number actually was.
+
+---
+
+## §11 Audit defects — built, but not doing what the design says
+
+Found by a read of `src/` against `CLAUDE.md` on 2026-08-09. Everything above
+this section is *missing* work; everything here is *present* work that is
+wrong, unreachable, or contradicts its own docstring. None of it is caught by
+the 299-test suite, which is the second finding in each case.
+
+Severity: **P0** = silently violates a stated invariant or loses operator
+work; **P1** = wrong under a reachable input; **P2** = cost or ergonomics.
+
+### 11.1 The repair guardrail is inverted (P0)
+
+`v3/repair.py:run_repair` lines ~162–169 writes `candidate_text` over the
+live artifact **before** `review_node` is called, and never restores the
+snapshot when the verdict comes back `fail`:
+
+```python
+if gates_ok:
+    node_artifact_path(run_dir, node.id).write_text(candidate_text, ...)  # live artifact, already overwritten
+    verdict = review_node(node, candidate_text, provider)                 # ...and only now reviewed
+```
+
+The module docstring, `CLAUDE.md` Part II, and §4.6 all state the opposite:
+"the repaired text is copied over the real artifact **only after** it
+re-clears both gates and review." As written, a repair that clears gates and
+fails review leaves the failed text in `out/<node>.md` with the node marked
+`stale`/`blocked` — and since `checks.py:check_no_gate_drift` only re-runs
+*gates*, assembly of a subsequent run can ship it.
+
+Fix: review first, write second; on `passed == False`, `shutil.copy2` the
+snapshot back over the artifact. The snapshot is already taken
+unconditionally, so nothing else is needed. Test: a repair whose reviewer
+verdict is `fail` must leave `out/<node>.md` byte-identical to its pre-repair
+content — this is the assertion `test_v3_repair.py` is missing.
+
+### 11.2 A failed repair records `gates: "pass"` in the manifest (P0)
+
+Same function: `gate_results = evaluate_gates(...) if episode_ok else []`,
+and `append_manifest_line` computes
+`"gates": "pass" if all(r.passed for r in gate_results) else "fail"`.
+`all([])` is `True`, so a repair whose episode never completed writes a
+**passing** manifest line. That line is what `document_review.py:
+build_document_index` and `checks.py:check_manifest_recorded` read, so the
+harness's own derived record now disagrees with `tree.json`. Fix: make
+`append_manifest_line` treat an empty `gate_results` as `fail`, or pass an
+explicit `episode_ok` through. Cheap, and it protects every future caller.
+
+### 11.3 The pilot diff is unobtainable on the path §4.4 describes (P0)
+
+`§4.4` is explicit: "the operator edits the file on disk, and `approve`
+diffs original vs. edited." But `pilot.py:approve_pilot` reads the original
+from `node_artifact_path(run_dir, node.id)` — the same file the operator just
+edited — and `driver.py:_phase_pilot` passes
+`edited = approval.user_input.strip() or _read_artifact(...)`. So on the
+on-disk-edit path `original == edited`, the diff is empty,
+`_derive_contract_rules` is skipped by design, and **`contract.md` freezes
+with zero rules**. The mechanism only works if the operator pastes the entire
+edited artifact into an approval text field — which the driver then shows
+truncated at 2400 chars.
+
+Nothing in the system preserves the Writer's pre-edit output: `run_pilot`
+returns `artifact_text` and the driver discards it. Fix: have `run_pilot`
+snapshot to `out/.versions/<node>/pilot-original.md` (the mechanism
+`repair.py` already has) and have `approve_pilot` diff against *that*. Test:
+edit the artifact on disk, approve with empty input, assert a non-empty rule
+list — currently impossible to make pass.
+
+### 11.4 The planner never checks that a partition covers its slice (P0)
+
+`v2/planner.py:plan_level` clamps `unit_start`/`unit_end` into range and
+computes token sums, but nothing verifies the children *tile* the slice. The
+system prompt asks for "every unit in the slice exactly once, in order, with
+no gaps and no overlap" and then the harness trusts it — which is precisely
+the model-judgment-instead-of-code that invariant 2 exists to forbid. A model
+that emits `[0-3], [5-9]` silently drops unit 4 from the tree, and therefore
+from `assembly/main.md`, with no event, no check, and no way to notice short
+of reading the corpus.
+
+Fix: after clamping, verify the candidate ranges are a partition of
+`0..len(units)-1`; on a gap, insert a forced leaf for the uncovered span
+(the `forced_leaf` machinery already exists); on an overlap, truncate to
+first-claim-wins. Log a `planner_partition_repaired` event either way. Test:
+a fake provider returning a gapped partition must still produce a tree whose
+leaves' `inputs` cover every unit.
+
+Adjacent, same file, same class of silence: `_NodeBudget.take()` returns
+`False` when `node_cap` is hit and `add_leaf` **just returns** — the
+remaining corpus is dropped with no event. Emit one.
+
+### 11.5 The orchestrator can halt a run that still has ready nodes (P1)
+
+`v1/orchestrator.py:decide_next_action` corrects a model that names a
+non-ready node, but takes `action` verbatim. A model answering `"halt"` while
+`ready` is non-empty ends the execute phase early; `round_loop.py` breaks and
+`driver._phase_execute` reports `done` because `tree.is_blocked()` is False.
+Every other halt/escalate decision in this module is already code-side
+(`_arbitrate_empty_ready`); this one isn't, for no stated reason. Fix: when
+`ready` is non-empty, only `dispatch` is a legal action — coerce anything
+else and record the coercion in the reason string, exactly as the non-ready
+node-id fallback already does.
+
+While there: `_arbitrate_empty_ready` never returns `None`, so
+`if decision is not None` is dead in both callers and
+`decide_next_action_deterministic`'s trailing fallback (lines ~136–138) is
+unreachable. Either tighten the return type to `DispatchDecision` and drop
+the branches, or make the function actually return `None` for the in-flight
+case it documents.
+
+### 11.6 `tree.json` has none of `events.jsonl`'s durability (P1)
+
+`v1/tree.py:save` is `Path.write_text(...)` — truncate, write, no `fsync`,
+no temp-file-and-rename. It is called on every status transition, and it is
+the file `is_ready`/`is_complete`/`require_complete`/resume all read. A
+`kill -9` mid-write leaves truncated JSON, and unlike `EventLog.read_all`
+there is no torn-tail tolerance: `TaskTree.load` raises, `driver._load_tree`
+swallows it into an **empty tree**, and `_phase_done("plan")` still returns
+True because the file exists. The run resumes with zero nodes.
+
+`v0/events.py` gets this exactly right and says why. Fix: write to
+`tree.json.tmp`, `fsync`, `os.replace`. Same treatment for `contract.md`,
+`spine.json`, `phase.json`, and `audit/<node>.json`. Test: truncate
+`tree.json` to half its bytes and assert resume raises loudly rather than
+converging on an empty tree.
+
+Related: `pipeline/approvals.py:append` flushes but does **not** `fsync`,
+while its own module docstring calls resolution "a durable fact on disk, not
+a pipe buffer." The record it can lose is the operator's pilot edit.
+
+### 11.7 Reachable crashes and falsy-value bugs (P1)
+
+| Site | Trigger | Effect |
+|---|---|---|
+| `v2/planner.py:build_tree` | empty spine (`units == []`) | `forced_leaf` indexes `slice_units[0]` → `IndexError` |
+| `v3/revalidate.py:run_revalidation_pass` | `node_ids=[]` | `node_ids or [...]` falls through to **every** passed node — an explicit "revalidate nothing" runs a full pass |
+| `v3/assembly_loop.py` line ~156 | any repair that leaves a node `stale`/`blocked` | the second `assemble()` is outside the `try`, so `AssemblyNotReadyError` escapes instead of escalating like the first one does |
+| `v1/tree.py:TaskTree.load` | node dict missing `id` | dict-comprehension key is evaluated before `from_dict`, so a bare `KeyError` escapes the `TreeValidationError` contract |
+| `v1/tree.py:_validate_dependencies` | a `depends_on` cycle | not detected; every node is unready forever and the run escalates with "no ready nodes and nothing in flight", naming nothing |
+
+### 11.8 The writer is told to stay out of the directory it must write (P1)
+
+`pipeline/backends.py:_hidden_paths_for` filters `_HIDDEN_RUN_PATHS` against
+`f"out/{node.id}.md"` and `f"scratch/{node.id}"` — but the tuple contains
+`"out/"` and `"scratch/"`, so **nothing ever matches and nothing is ever
+removed**. The comment ("each entry minus the node's own paths") describes an
+intent the code cannot express. Consequence:
+`cli_agent.py:_hidden_paths_notice` appends "stay out of `scratch/`" to the
+same prompt in which `v1/writer.py` instructs the agent to write
+`scratch/<node>/promotion.json`. A model that obeys the notice produces no
+promotion, and the harness silently falls back to the episode's visible
+output — which is the exact degradation `PLAN-zeromem.md` §6 was meant to
+remove. Fix: prefix-match, and add the assertion `test_pipeline_backends.py`
+is missing (`"scratch/" not in hidden_paths_for(node)`).
+
+### 11.9 Resume-correctness gaps (P1)
+
+- **Intake misattributes an answer.** `driver._answer_intake` calls
+  `find_pending(kind="intake_question")` with no context, and
+  `v2/intake.py:elicit_global_rubric` restarts from dimension 1 on resume.
+  The still-pending record from dimension 5 is therefore returned as
+  dimension 1's answer. Key the approval on the dimension (or a hash of the
+  question) and the reuse becomes correct instead of coincidental.
+- **Stale promotion.** `v1/writer.py:_read_promotion` reads
+  `scratch/<node>/promotion.json` whether or not this attempt wrote it. A
+  retry that ignores the instruction inherits attempt 1's handoff and the
+  manifest records it as this attempt's. Stamp it with the attempt, or unlink
+  it before dispatch (`v0/runner.py` already unlinks `trace.jsonl` for the
+  same reason).
+- **Session-id watcher desync.** `v0/runner.py:_watch_for_session_id` does
+  `readlines()` then `fh.tell()`; a partial trailing line is consumed and the
+  offset advances past it, so the remainder is never re-read and the
+  `session_id` in that line is lost. Only track the offset up to the last
+  `\n`.
+- **Resume ignores the recorded model.** `pipeline/run.py:run_from_args`
+  rebuilds `RunOptions` from `run.spec.json` (correctly) but constructs
+  `OpenAICompatibleProvider(model=args.model)` from **argv**, which on a bare
+  `resume <id>` is `None`. Orchestrator/planner/reviewer silently switch to
+  the config default model mid-run. Use `options.model`.
+- **`source.txt` is rewritten from `run.spec.json` on every construction**
+  (`driver._write_source_and_spec`), so a hand-fixed corpus is reverted on
+  resume.
+- **`run_completed` is logged unconditionally** at the end of
+  `RecursiveDriver.run`, including for `halted`, `escalated`, and `error`.
+
+### 11.10 Token and I/O waste (P2)
+
+Ranked by how much it costs on a real run:
+
+1. **Document review keeps paying after it has already given up.**
+   `v3/document_review.py:run_document_review` sets `result.escalated` inside
+   `absorb` and then continues every remaining window, every remaining pass,
+   and the depth pass — up to ~50 `complete_json` calls whose output the
+   caller discards. Break out of the pass loop on first escalation.
+   ✓ **shipped 2026-08-10.**
+2. **The provider re-discovers a 400 on every attempt.**
+   `v1/provider.py:complete_json` calls `make_payload(with_format=True)` at
+   the top of each retry, so an endpoint that rejects `response_format`
+   costs two HTTP requests per attempt instead of one. Latch the fallback
+   after the first 400. ✓ **shipped 2026-08-10.**
+3. **There is no backoff anywhere.** `CLAUDE.md` §12 claims free-tier rate
+   limits "exercise backoff and resume continuously"; no code implements it.
+   A 429 or 503 raises `ProviderHTTPError` straight through
+   `complete_json` → the phase → `RunReport(status="error")`. Honor
+   `Retry-After` and retry 429/5xx with jitter. §3.2 already wants a
+   semaphore here — do both in one pass. ✓ **shipped 2026-08-10.**
+4. **§10's "show the cost before spending it" is not honored.**
+   `driver.amend_and_revalidate` calls `estimate_revalidation_cost` and then
+   immediately `run_revalidation_pass` in the same function, returning both.
+   The estimate is shown *after* the tokens are gone; only the repair half is
+   actually gated. Split it, or the §10 approval is theater. The estimate
+   pass also re-reads and re-tokenizes every artifact the review pass then
+   re-reads. ✓ **shipped 2026-08-10.**
+5. **Every retry costs an extra orchestrator round-trip.** A gate or review
+   failure sets the node back to `pending` and returns to the top of the
+   round loop, spending another dispatch call to re-choose the node the
+   harness already knows it wants. Redispatch in place when `attempts <
+   max_attempts`. ✓ **shipped 2026-08-10.**
+6. **`manifest.jsonl` gets one line per *attempt*, not per completed leaf.**
+   `round_loop.dispatch` and `repair.run_repair` both append unconditionally.
+   `_read_manifest_by_node` papers over it with last-wins, but
+   `read_all_manifest_entries` (document review, `_promotions_of`) does not,
+   so a thrice-retried node contributes three index rows. Either append once
+   on terminal transition or de-dupe on read. ✓ **shipped 2026-08-10**
+   (de-dupe on read).
+7. **The corpus is stored twice.** `run.spec.json` embeds the whole
+   `source_text` alongside `source.txt`. Store a path.
+   ✓ **shipped 2026-08-10.**
+8. **`--detach` passes the corpus through argv.**
+   `cli.py:cmd_run_detach` forwards `--source argv.source` verbatim; an
+   inline (non-`@file`) corpus hits `E2BIG` well before "corpus-scale."
+   Write it to the run dir and pass `@path`. ✓ **shipped 2026-08-10.**
+9. **`_merge_small_segments` is O(n²) in corpus size.**
+   `v2/survey.py` re-runs `estimate_tokens(merged[-1])` on a string it is
+   also concatenating in place. Track a running token count and join once.
+   ✓ **shipped 2026-08-10.**
+10. **Dense retrieval reloads and de-vectorizes itself.**
+    `v2/retrieval.py:_default_dense_scorer` does `np.load` of the whole
+    embedding matrix per `retrieve_spans` call (i.e. per node prompt) and
+    then computes cosine in a pure-Python `sum(a*b for ...)` over numpy rows.
+    Cache the matrix; use `@`. ✓ **shipped 2026-08-10** (matrix cached per
+    `(path, mtime, size)`, `@` matmul, `np.linalg.norm` — plus a test that
+    `np.load` fires once across scorer constructions).
+11. **Gates are re-evaluated per consumer.** Gates are deterministic and
+    evaluated at dispatch; the dashboard's node view and repair re-evaluate
+    them against the same artifact per poll / per run. Cache results in
+    `audit/<node>.json` at dispatch and read them everywhere else. ✓
+    **shipped 2026-08-10** (`v1/gates.write_gate_cache`/`read_gate_cache`,
+    merged verdict write, repair refresh, dashboard cache-first read).
+12. **`wait_for_resolution` re-parses the whole approvals file every second,
+    forever.** With pilot records embedding artifact text, an overnight wait
+    is a few hundred thousand full JSON parses. Stat the file first, or seek
+    from a remembered offset. ✓ **shipped 2026-08-10** — an
+    `_ApprovalScanner` reads only the bytes appended since the last poll
+    (stat size guard, offset advances only to the last `\n` — the torn-tail
+    trap §11.9 documents — so each record is parsed exactly once across an
+    overnight wait).
+13. **Reviewer input is uncapped.** `v1/reviewer.py` and
+    `v3/revalidate.py` interpolate the full artifact with no ceiling, even
+    though `node.budget.tokens` is right there. §8's "small outputs
+    everywhere" has no input-side counterpart. ✓ **shipped 2026-08-10** —
+    `cap_artifact_text` (the inverse of the harness's own whitespace token
+    heuristic, so measured tokens can't exceed the ceiling) with an explicit
+    truncation marker, wired into `review_node`, the re-validation reviewer,
+    the depth pass, and the re-validation *estimate* so "show the cost"
+    matches what will actually be sent.
+14. **Path helpers mutate the filesystem.** `node_artifact_path` and
+    `node_scratch_dir`/`audit_dir`/`orchestrator_dir` `mkdir` as a side
+    effect, so read-only surfaces (`dashboard/state.py`, `v3/checks.py`)
+    create directories in runs they are only inspecting. Split the getter
+    from the ensure. ✓ **shipped 2026-08-10** — every helper is a pure
+    getter; writers call `ensure_node_scratch_dir`/`ensure_audit_path`/
+    `ensure_orchestrator_dir` (runner, round-loop trace/audit, repair,
+    v4 research). Regression test: an inspect-only `RunState` poll leaves a
+    fresh run's `audit/`, `orchestrator/`, and `scratch/<id>/` uncreated.
+15. **Two unbounded process-lifetime caches**: `prompts._contract_cache` and
+    `RunState._file_cache` are keyed by path and never evicted — one entry
+    per file per run, in a server meant to run for days. `RunState` also
+    documents itself as thread-safe while `_cached_read` mutates the dict
+    outside `self._lock`. ✓ **shipped 2026-08-10** — both bounded (256 /
+    64 entries, FIFO eviction of the oldest key), `_cached_read` mutates
+    only under a dedicated lock with the loader itself unlocked (concurrent
+    snapshot polls don't serialize on parsing), and a 8-thread hammer test
+    exercises the concurrent path.
+16. **`orchestrator/round-NN.jsonl` conflates process runs.** `round_index`
+    restarts at 0 on resume and the file is opened `"a"`, so round 0 of the
+    third resume appends to round 0 of the first. ✓ **shipped 2026-08-10**
+    — `round_loop` picks up one past the highest `round-*.jsonl` on disk,
+    so each process run's rounds are a fresh, numbered, never-revisited
+    file (events' `round` field carries the same rebased index).
+
+### 11.11 Docstrings that are now false
+
+Cheap to fix, and each one is a trap for the next reader. The repair
+(§11.1), backoff (§11.10.3), and hidden_paths (§11.8) claims are now true —
+their fixes landed with the release notes above; what remains:
+
+- `CLAUDE.md` §13 / Part II — the deterministic dispatch policy is called
+  `"deterministic"` in the docs and `"document_order"` in
+  `v1/orchestrator.py`, `cli.py`, and `run.py`. Only the code's spelling is
+  accepted by `--dispatch-policy`, and `decide_next_action_with_policy`
+  treats every unrecognized value as `"model"` — so a doc-following
+  `--dispatch-policy deterministic` would silently spend the per-round calls
+  it was meant to avoid, if argparse's `choices` didn't reject it first. Pick
+  one spelling.
+- `v2/survey.py:load_spine` — "tolerates a legacy `spine.json` missing any
+  field... as long as that field carries a default." `SpineUnit` has no
+  defaulted fields, so `SpineUnit(**item)` raises `TypeError` on exactly the
+  input the comment promises to accept.
+
+### 11.12 Sequencing
+
+```
+[x] P0 batch — 11.1–11.4 shipped (2026-08-09)
+[x] P1 batch — 11.5–11.9 shipped (2026-08-09/10)
+[x] P2 — 11.10 all shipped (2026-08-10)
+[ ] 11.11 docstring corrections, folded into whichever commit fixes the code
+```
+
+**Ship gate for §11 as a whole:** the suite grows by one test per numbered
+defect, each written to fail against today's `HEAD` first. A fix without that
+demonstration is indistinguishable from a fix that does nothing.

@@ -180,6 +180,24 @@ class SpinePersistenceTest(unittest.TestCase):
             self.assertEqual(len(loaded), 1)
             self.assertEqual(loaded[0].id, "unit-01")
 
+    def test_load_spine_drops_unknown_fields(self) -> None:
+        # §11.11: a spine.json carrying a field added by a newer version is
+        # exactly the legacy input the old comment promised to accept — and
+        # SpineUnit(**item) raised TypeError on it. Unknown keys are dropped.
+        import json as _json
+
+        with tempfile.TemporaryDirectory() as root_str:
+            run_dir = create_run_dir(Path(root_str), "run1")
+            future = [
+                {"id": "unit-01", "label": "Intro", "start_chunk": 0, "end_chunk": 1,
+                 "tokens": 900, "weight": 1.0}
+            ]
+            (run_dir / "spine.json").write_text(_json.dumps(future), encoding="utf-8")
+            loaded = load_spine(run_dir)
+            self.assertEqual(len(loaded), 1)
+            self.assertEqual(loaded[0].id, "unit-01")
+            self.assertEqual(loaded[0].tokens, 900)
+
 
 class MaterializeUnitsTest(unittest.TestCase):
     def _source_and_units(self) -> tuple[list[Chunk], list["object"]]:

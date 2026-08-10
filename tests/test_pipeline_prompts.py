@@ -112,6 +112,32 @@ class ContractCacheTest(unittest.TestCase):
         self.assertIn("updated rule two", second)
         self.assertNotEqual(first, second)
 
+    def test_contract_cache_is_bounded(self) -> None:
+        # §11.10.15: one entry per run dir, FIFO-evicted — a long-lived
+        # process watching many runs must not accumulate forever.
+        from kusudaemon.pipeline.prompts import _CONTRACT_CACHE_MAX, _contract_cache
+
+        _contract_cache.clear()
+        try:
+            with tempfile.TemporaryDirectory() as root_str:
+                root = Path(root_str)
+                run_dirs = []
+                for i in range(_CONTRACT_CACHE_MAX + 20):
+                    run_dir = root / f"run{i}"
+                    run_dir.mkdir()
+                    freeze_contract(run_dir, [ContractRule(source="p1", shape="prose", text=f"rule {i}")])
+                    run_dirs.append(run_dir)
+                for run_dir in run_dirs:
+                    text = _load_contract_cached(run_dir)
+                    self.assertIn(f"rule", text)
+            self.assertLessEqual(
+                len(_contract_cache),
+                _CONTRACT_CACHE_MAX,
+                "contract cache must evict FIFO past its bound",
+            )
+        finally:
+            _contract_cache.clear()
+
 
 def _retrieval_run(root: Path) -> Path:
     """A run dir with a built chunk index + spine, so inline spans resolve."""

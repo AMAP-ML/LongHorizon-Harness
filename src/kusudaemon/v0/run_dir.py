@@ -11,7 +11,39 @@ full layout, just the pieces a single Writer node needs:
 
 from __future__ import annotations
 
+import os
+import tempfile
 from pathlib import Path
+
+
+def write_text_atomic(path: str | Path, text: str) -> None:
+    """Truncate-proof write: temp file in the same directory, ``fsync``,
+    ``os.replace`` (PLAN.md §11.6).
+
+    ``Path.write_text`` truncates in place, so a kill -9 mid-write leaves a
+    truncated tree.json / contract.md / phase.json / audit file — none of
+    which has events.jsonl's torn-tail tolerance. ``os.replace`` is atomic
+    on POSIX: readers see either the old file or the new one, never half a
+    file. ``events.py`` documents the same reasoning for its fsync-per-append
+    contract.
+    """
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp_name = tempfile.mkstemp(
+        dir=str(path.parent), prefix=f".{path.name}.", suffix=".tmp"
+    )
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write(text)
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(tmp_name, path)
+    except BaseException:
+        try:
+            os.unlink(tmp_name)
+        except OSError:
+            pass
+        raise
 
 
 def create_run_dir(root: str | Path, run_id: str) -> Path:
@@ -39,7 +71,15 @@ def manifest_path(run_dir: str | Path) -> Path:
 
 
 def node_scratch_dir(run_dir: str | Path, node_id: str) -> Path:
-    path = Path(run_dir) / "scratch" / node_id
+    """Pure getter — §11.10.14: no mkdir side effect. Read-only surfaces
+    (dashboard, checks, assembler) must be able to resolve paths in runs
+    they are only inspecting; writers call ``ensure_node_scratch_dir``."""
+    return Path(run_dir) / "scratch" / node_id
+
+
+def ensure_node_scratch_dir(run_dir: str | Path, node_id: str) -> Path:
+    """``node_scratch_dir`` plus the mkdir — the variant writers call."""
+    path = node_scratch_dir(run_dir, node_id)
     path.mkdir(parents=True, exist_ok=True)
     return path
 
@@ -48,7 +88,14 @@ def node_trace_path(run_dir: str | Path, node_id: str) -> Path:
     return node_scratch_dir(run_dir, node_id) / "trace.jsonl"
 
 
+def ensure_node_trace_path(run_dir: str | Path, node_id: str) -> Path:
+    """``node_trace_path`` plus the parent mkdir. The subprocess tees its
+    live output into this file (v0/runner.py), so the directory must exist
+    before the agent starts, even though the path is also read by the
+    dashboard for its logdir discovery."""
+    ensure_node_scratch_dir(run_dir, node_id)
+    return node_trace_path(run_dir, node_id)
+
+
 def node_artifact_path(run_dir: str | Path, node_id: str) -> Path:
-    path = Path(run_dir) / "out"
-    path.mkdir(parents=True, exist_ok=True)
-    return path / f"{node_id}.md"
+    return Path(run_dir) / "out" / f"{node_id}.md"

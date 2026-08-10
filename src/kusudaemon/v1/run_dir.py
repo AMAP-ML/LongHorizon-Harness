@@ -26,7 +26,15 @@ def tree_path(run_dir: str | Path) -> Path:
 
 
 def audit_dir(run_dir: str | Path) -> Path:
-    path = Path(run_dir) / "audit"
+    """Pure getter — §11.10.14: no mkdir side effect (see v0's
+    ``node_scratch_dir`` for the split's rationale; readers far outnumber
+    writers here)."""
+    return Path(run_dir) / "audit"
+
+
+def ensure_audit_dir(run_dir: str | Path) -> Path:
+    """``audit_dir`` plus the mkdir — the variant writers call."""
+    path = audit_dir(run_dir)
     path.mkdir(parents=True, exist_ok=True)
     return path
 
@@ -35,8 +43,21 @@ def audit_path(run_dir: str | Path, node_id: str) -> Path:
     return audit_dir(run_dir) / f"{node_id}.json"
 
 
+def ensure_audit_path(run_dir: str | Path, node_id: str) -> Path:
+    """Pure ``audit_path`` plus the parent mkdir — what writers actually
+    want, without calling readers through a mutation."""
+    ensure_audit_dir(run_dir)
+    return audit_path(run_dir, node_id)
+
+
 def orchestrator_dir(run_dir: str | Path) -> Path:
-    path = Path(run_dir) / "orchestrator"
+    """Pure getter (see ``audit_dir``)."""
+    return Path(run_dir) / "orchestrator"
+
+
+def ensure_orchestrator_dir(run_dir: str | Path) -> Path:
+    """``orchestrator_dir`` plus the mkdir."""
+    path = orchestrator_dir(run_dir)
     path.mkdir(parents=True, exist_ok=True)
     return path
 

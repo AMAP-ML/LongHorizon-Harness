@@ -40,6 +40,8 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, Literal
 
+from ..v0.run_dir import write_text_atomic
+
 NodeStatus = Literal[
     "pending", "dispatched", "awaiting_review", "passed", "failed", "blocked", "stale"
 ]
@@ -132,6 +134,12 @@ class TaskTree:
         raw = json.loads(raw_text) if raw_text else []
         if not isinstance(raw, list):
             raise TreeValidationError(f"{path}: tree.json must contain a JSON array of nodes")
+        # §11.7: index the items before TaskNode.from_dict so a node dict
+        # missing 'id' raises the TreeValidationError contract, not a bare
+        # KeyError from inside the comprehension.
+        for item in raw:
+            if isinstance(item, dict) and "id" not in item:
+                raise TreeValidationError(f"{path}: node dict missing required 'id': {item!r}")
         nodes = {item["id"]: TaskNode.from_dict(item) for item in raw}
         if len(nodes) != len(raw):
             raise TreeValidationError(f"{path}: duplicate node ids")
@@ -141,8 +149,8 @@ class TaskTree:
 
     def save(self, path: str | Path) -> None:
         payload = [node.to_dict() for node in self.nodes.values()]
-        Path(path).write_text(
-            json.dumps(payload, indent=2, sort_keys=False) + "\n", encoding="utf-8"
+        write_text_atomic(
+            path, json.dumps(payload, indent=2, sort_keys=False) + "\n"
         )
 
     def _validate_dependencies(self) -> None:
@@ -152,6 +160,32 @@ class TaskTree:
                     raise TreeValidationError(
                         f"node {node.id!r} depends_on unknown node {dep!r}"
                     )
+        # §11.7: a depends_on cycle makes every node unready forever and the
+        # run escalates naming nothing ("no ready nodes and nothing in
+        # flight"). Detect it at load so the failure names the cycle.
+        for start_id in self.nodes:
+            visiting: set[str] = set()
+            visited: set[str] = set()
+
+            def visit(node_id: str) -> str | None:
+                if node_id in visiting:
+                    return node_id
+                if node_id in visited:
+                    return None
+                visiting.add(node_id)
+                for dep in self.nodes[node_id].depends_on:
+                    hit = visit(dep)
+                    if hit is not None:
+                        return hit
+                visiting.discard(node_id)
+                visited.add(node_id)
+                return None
+
+            hit = visit(start_id)
+            if hit is not None:
+                raise TreeValidationError(
+                    f"depends_on cycle detected involving node {hit!r}"
+                )
 
     def is_ready(self, node_id: str) -> bool:
         node = self.nodes[node_id]

@@ -72,6 +72,12 @@ async def run_writer_node(
     """Run (or resume) one Writer node. Returns (episode result, capped promotion)."""
     run_dir = Path(run_dir)
     promotion_path = node_scratch_dir(run_dir, node.id) / "promotion.json"
+    # §11.9: a retry that ignores the promotion instruction must not inherit
+    # the previous attempt's handoff — that would put attempt 1's text in
+    # this attempt's manifest line. Unlink before dispatch, the same way
+    # v0/runner.py unlinks trace.jsonl before a redispatch.
+    if promotion_path.exists():
+        promotion_path.unlink()
 
     result = await run_node(
         run_dir, node.id, writer_prompt(prompt, promotion_path), adapter, env, budget

@@ -22,6 +22,9 @@ Two things this module owns:
 from __future__ import annotations
 
 import json
+import random
+import threading
+import time
 import urllib.error
 import urllib.request
 from dataclasses import dataclass, field
@@ -33,6 +36,8 @@ from ..provider_config import require, resolve
 # Defaults: OpenCode Zen (see ..provider_config — the user can override via
 # ./provider.json, KUSUDAEMON_PROVIDER_*, or OPENAI_* env vars).
 _DEFAULT_STRUCTURED_RETRIES = 2
+_DEFAULT_HTTP_RETRIES = 3
+_DEFAULT_CONCURRENCY = 4
 
 
 class ProviderError(RuntimeError):
@@ -44,12 +49,15 @@ class ProviderHTTPError(ProviderError):
 
     lets callers react to specific statuses (e.g. `complete_json` retrying
     a 400 without `response_format`) instead of string-matching messages
-    (PLAN-zeromem.md §11.3).
+    (PLAN-zeromem.md §11.3). ``retry_after`` carries the endpoint's
+    ``Retry-After`` header (seconds) when the failed response had one, so
+    the §11.10.3 backoff can honor it.
     """
 
-    def __init__(self, status: int, message: str) -> None:
+    def __init__(self, status: int, message: str, retry_after: float | None = None) -> None:
         super().__init__(message)
         self.status = status
+        self.retry_after = retry_after
 
 
 @dataclass
@@ -79,6 +87,10 @@ class OpenAICompatibleProvider:
         api_key: str | None = None,
         transport: Transport | None = None,
         timeout: float = 120.0,
+        max_http_retries: int = _DEFAULT_HTTP_RETRIES,
+        base_retry_delay: float = 1.0,
+        concurrency: int = _DEFAULT_CONCURRENCY,
+        sleep: Callable[[float], None] = time.sleep,
     ) -> None:
         resolved = resolve(api_key=api_key or "", base_url=base_url or "", model=model or "")
         self.model = resolved.model
@@ -86,6 +98,13 @@ class OpenAICompatibleProvider:
         self.api_key = resolved.api_key
         self.timeout = timeout
         self._transport = transport or self._http_transport
+        self._max_http_retries = max_http_retries
+        self._base_retry_delay = base_retry_delay
+        self._sleep = sleep
+        # §11.10.3: concurrent callers (parallel tests, the dashboard, two
+        # drivers on one endpoint) share one throttle, so a 429 storm from
+        # one run can't starve the endpoint for the other.
+        self._throttle = threading.Semaphore(max(1, concurrency))
 
     def complete(
         self, messages: list[dict[str, str]], *, temperature: float = 0.0
@@ -138,9 +157,13 @@ class OpenAICompatibleProvider:
                 }
             return payload
 
+        # §11.10.2: latch the fallback after the first 400 — an endpoint
+        # that rejects `response_format` costs one structured-retry per
+        # validate-reprompt attempt, not two HTTP requests per attempt.
+        use_format = True
         for _attempt in range(retries + 1):
             try:
-                raw = self._call(make_payload(with_format=True))
+                raw = self._call(make_payload(with_format=use_format))
             except ProviderHTTPError as exc:
                 # §12's fallback must be reachable when the *endpoint* (not
                 # the model) rejects structured output: some OpenAI-compatible
@@ -150,6 +173,7 @@ class OpenAICompatibleProvider:
                 # (PLAN-zeromem.md §11.3).
                 if exc.status != 400:
                     raise
+                use_format = False
                 raw = self._call(make_payload(with_format=False))
             content = _first_choice_message(raw).get("content") or ""
             parsed, parse_error = _parse_json_object(content)
@@ -177,7 +201,26 @@ class OpenAICompatibleProvider:
         headers = {"Content-Type": "application/json", "User-Agent": "kusudaemon/1.0 (Python)"}
         if self.api_key:
             headers["Authorization"] = f"Bearer {self.api_key}"
-        return self._transport(f"{self.base_url}/chat/completions", payload, headers)
+        # §11.10.3: backoff for the throttles §12 says free tier exercises.
+        # 429 and 5xx are retryable; honor Retry-After when present, else
+        # exponential with jitter. Other 4xx is a caller bug and surfaces
+        # immediately.
+        attempt = 0
+        while True:
+            try:
+                with self._throttle:
+                    return self._transport(f"{self.base_url}/chat/completions", payload, headers)
+            except ProviderHTTPError as exc:
+                if exc.status == 400 or (exc.status < 500 and exc.status != 429):
+                    raise
+                if attempt >= self._max_http_retries:
+                    raise
+                if exc.retry_after is not None:
+                    delay = max(0.0, min(exc.retry_after, 60.0))
+                else:
+                    delay = self._base_retry_delay * (2 ** attempt)
+                self._sleep(delay * random.uniform(0.8, 1.2))
+                attempt += 1
 
     def _http_transport(
         self, url: str, payload: dict[str, Any], headers: dict[str, str]
@@ -189,11 +232,24 @@ class OpenAICompatibleProvider:
                 return json.loads(response.read().decode("utf-8"))
         except urllib.error.HTTPError as exc:
             detail = exc.read().decode("utf-8", errors="replace")
+            retry_after = _parse_retry_after(exc.headers.get("Retry-After"))
             raise ProviderHTTPError(
-                exc.code, f"HTTP {exc.code} from provider: {detail[:500]}"
+                exc.code, f"HTTP {exc.code} from provider: {detail[:500]}", retry_after=retry_after
             ) from exc
         except urllib.error.URLError as exc:
             raise ProviderError(f"provider request failed: {exc.reason}") from exc
+
+
+def _parse_retry_after(value: str | None) -> float | None:
+    """``Retry-After`` as HTTP-date or seconds; seconds only — a date is
+    ambiguous to parse without timezone tables, and §11.10.3 caps whatever
+    comes back at 60s anyway."""
+    if not value:
+        return None
+    try:
+        return float(value)
+    except ValueError:
+        return None
 
 
 def _first_choice_message(raw: dict[str, Any]) -> dict[str, Any]:

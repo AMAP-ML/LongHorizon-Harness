@@ -44,7 +44,11 @@ def append_manifest_line(
         "node": node_id,
         "artifact": str(artifact_path),
         "tokens": estimate_tokens(artifact_text),
-        "gates": "pass" if all(result.passed for result in gate_results) else "fail",
+        "gates": (
+            "pass"
+            if gate_results and all(result.passed for result in gate_results)
+            else "fail"
+        ),
         "unmet_gates": [
             {"gate": result.gate, "detail": result.detail}
             for result in gate_results
@@ -59,24 +63,39 @@ def append_manifest_line(
 
 
 def read_all_manifest_entries(manifest_path: str | Path) -> list[dict[str, Any]]:
-    """Every parseable line, in file order — unlike ``read_manifest_tail``,
-    not capped to the last ``n``. PLAN-zeromem.md §8.4: the document-review
-    passes read this whole index (promotions + tokens), since it's already
+    """Last line per node, in first-seen document order (§11.10.6).
+
+    Every dispatch appends a line (``round_loop.dispatch`` and
+    ``repair.run_repair`` both append unconditionally), so a thrice-retried
+    node contributes three rows; readers that iterate this list (document
+    review's index, ``prompts._promotions_of``, checks) would carry one
+    index row per attempt. The terminal line is the record of the node's
+    current state — the earlier rows are history, exactly like the
+    approvals reader's latest-record-wins merge. Unlike
+    ``read_manifest_tail``, not capped to the last ``n`` — PLAN-zeromem.md
+    §8.4 builds this whole index (promotions + tokens) because it's already
     a token-capped summary of every completed leaf, paid for once at
     dispatch time rather than re-derived from full artifact text."""
     path = Path(manifest_path)
     if not path.exists():
         return []
-    entries: list[dict[str, Any]] = []
+    merged: list[dict[str, Any]] = []
+    by_node: dict[str, int] = {}
     for line in path.read_text(encoding="utf-8").splitlines():
         line = line.strip()
         if not line:
             continue
         try:
-            entries.append(json.loads(line))
+            entry = json.loads(line)
         except json.JSONDecodeError:
             continue
-    return entries
+        node = str(entry.get("node", ""))
+        if node in by_node:
+            merged[by_node[node]] = entry
+        else:
+            by_node[node] = len(merged)
+            merged.append(entry)
+    return merged
 
 
 def read_manifest_tail(manifest_path: str | Path, n: int = 10) -> list[dict[str, Any]]:

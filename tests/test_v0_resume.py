@@ -28,8 +28,8 @@ from fake_adapter import FakeStreamAgentAdapter  # noqa: E402
 from kusudaemon.environment.local import LocalEnvironment  # noqa: E402
 from kusudaemon.types import EpisodeBudget  # noqa: E402
 from kusudaemon.v0.events import EventLog  # noqa: E402
-from kusudaemon.v0.run_dir import create_run_dir  # noqa: E402
-from kusudaemon.v0.runner import run_node  # noqa: E402
+from kusudaemon.v0.run_dir import create_run_dir, events_path  # noqa: E402
+from kusudaemon.v0.runner import _watch_for_session_id, run_node  # noqa: E402
 
 FAKE_CLI = _REPO_ROOT / "tests" / "fixtures" / "fake_stream_agent.py"
 RUN_NODE_SUBPROCESS = _REPO_ROOT / "tests" / "fixtures" / "run_node_subprocess.py"
@@ -389,6 +389,61 @@ class EventLogReadsOncePerDispatchTest(unittest.TestCase):
             # A fresh run consults episode_completed / node_dispatched /
             # session_captured — three in-memory scans over one parse.
             self.assertEqual(calls["n"], 1, "run_node must parse events.jsonl exactly once")
+
+
+class SessionIdWatcherTest(unittest.TestCase):
+    """§11.9: a session_id that lands on a torn line (no trailing newline
+    yet) must be re-read once the line completes. The old text-mode reader
+    advanced its offset past the partial bytes, so the completed line was
+    never seen and session_captured never fired — a kill -9 right after the
+    id hit disk resumed without a session."""
+
+    def _session_ids(self, log: EventLog) -> list[str]:
+        return [
+            e.get("session_id")
+            for e in log.read_all()
+            if e.get("type") == "session_captured"
+        ]
+
+    def test_session_id_in_torn_line_is_captured_when_line_completes(self) -> None:
+        with tempfile.TemporaryDirectory() as root_str:
+            root = Path(root_str)
+            run_dir = create_run_dir(root, "run1")
+            events_file = events_path(run_dir)
+            log = EventLog(events_file)
+            trace = root / "trace.jsonl"
+            trace.write_bytes(b'{"type":"logdir","payload":{"dir":"/tmp/x"},')
+
+            async def scenario() -> None:
+                stop = asyncio.Event()
+                watcher = asyncio.create_task(_watch_for_session_id(trace, log, "n", stop))
+                await asyncio.sleep(0.15)
+                self.assertEqual(self._session_ids(log), [])
+                # The writer finishes the line it was in the middle of.
+                trace.write_bytes(trace.read_bytes() + b'"session_id":"s1"}\n')
+                await asyncio.sleep(0.15)
+                stop.set()
+                await watcher
+                self.assertEqual(self._session_ids(log), ["s1"])
+
+            asyncio.run(scenario())
+
+    def test_stop_is_honored_before_file_exists(self) -> None:
+        with tempfile.TemporaryDirectory() as root_str:
+            root = Path(root_str)
+            run_dir = create_run_dir(root, "run2")
+            log = EventLog(events_path(run_dir))
+
+            async def scenario() -> None:
+                stop = asyncio.Event()
+                watcher = asyncio.create_task(
+                    _watch_for_session_id(root / "never-created.jsonl", log, "n", stop)
+                )
+                await asyncio.sleep(0.05)
+                stop.set()
+                await watcher  # must return, not loop forever
+
+            asyncio.run(scenario())
 
 
 if __name__ == "__main__":

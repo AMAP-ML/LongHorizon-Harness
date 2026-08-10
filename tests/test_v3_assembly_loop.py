@@ -158,6 +158,49 @@ class AssemblyLoopTest(unittest.TestCase):
             self.assertEqual(len(result.repairs), 0)
             self.assertIn("could not be attributed", result.escalation_reason)
 
+    # §11.7: a repair whose dispatch fails leaves the node stale/blocked, so
+    # the re-assemble *raises* AssemblyNotReadyError — it must escalate like
+    # every other not-ready state instead of escaping the loop as an
+    # uncaught exception.
+
+    def test_failed_repair_escalates_on_reassemble_not_raises(self) -> None:
+        with tempfile.TemporaryDirectory() as root_str:
+            root = Path(root_str)
+            node = _node("n1")
+            run_dir = self._seed_run(root, node, "content missing the marker")
+            tree = TaskTree(nodes={"n1": node})
+            tree_path = root / "tree.json"
+            tree.save(tree_path)
+
+            def broken_factory(repair_node: TaskNode) -> FakeStreamAgentAdapter:
+                return FakeStreamAgentAdapter(
+                    script_path=str(root / "no-such-agent.py"),
+                    pidfile=str(root / f"{repair_node.id}.pid"),
+                    prompt_dir=str(root / "prompts"),
+                    workspace_path=str(run_dir),
+                )
+
+            result = asyncio.run(
+                run_assembly_loop(
+                    run_dir, tree_path, manifest_path(run_dir),
+                    writer_adapter_factory=broken_factory,
+                    env=LocalEnvironment(),
+                    provider=FakeProvider([]),
+                    compile_command=(
+                        "grep -q PATCHED_CONTENT main.md "
+                        "|| (echo 'error: n1.md missing marker' && exit 1)"
+                    ),
+                    max_repairs=1,
+                    max_attempts=1,
+                )
+            )
+
+            self.assertTrue(result.escalated)
+            self.assertIn("not yet passed", result.escalation_reason)
+
+            reloaded = TaskTree.load(tree_path)
+            self.assertNotEqual(reloaded.nodes["n1"].status, "passed")
+
 
 if __name__ == "__main__":
     unittest.main()

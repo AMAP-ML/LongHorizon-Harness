@@ -108,12 +108,12 @@ class WriterAdapterHiddenPathsTest(unittest.TestCase):
         self.assertIn("events.jsonl", adapter.hidden_paths)
         self.assertIn("approvals.jsonl", adapter.hidden_paths)
         self.assertIn("audit/", adapter.hidden_paths)
-        self.assertIn("scratch/", adapter.hidden_paths)
-        self.assertIn("out/", adapter.hidden_paths)
-        # The node's own artifact path (out/n.md) is not in the list — the
-        # node is supposed to write exactly there. The list is made of the
-        # directory prefixes, so the exact artifact filename simply isn't
-        # present; assert the prefixes are, and that nothing mentions "n.md".
+        # §11.8: prefix-match — the hidden list drops the node's own
+        # artifact and scratch directories entirely, so the writer is never
+        # told to stay out of the place it must write out/<id>.md and
+        # scratch/<id>/promotion.json.
+        self.assertNotIn("scratch/", adapter.hidden_paths)
+        self.assertNotIn("out/", adapter.hidden_paths)
         self.assertFalse(any("n.md" in path for path in adapter.hidden_paths))
 
     def test_without_node_no_hidden_paths(self) -> None:

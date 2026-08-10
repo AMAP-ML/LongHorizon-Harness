@@ -75,6 +75,25 @@ def select_pilot_nodes(tree: TaskTree) -> dict[str, TaskNode]:
     return selected
 
 
+def _pilot_original_path(run_dir: str | Path, node_id: str) -> Path:
+    """Where the Writer's pre-edit pilot output is preserved, alongside
+    repair snapshots (§11.3: the path the operator edits — the live
+    artifact — cannot double as the diff's 'original')."""
+    path = Path(run_dir) / "out" / ".versions" / node_id
+    path.mkdir(parents=True, exist_ok=True)
+    return path / "pilot-original.md"
+
+
+def snapshot_pilot_original(run_dir: str | Path, node_id: str, text: str) -> Path:
+    """Persist the Writer's output before any operator edit. Only writes
+    when no snapshot exists, so a resume after a crash mid-phase cannot
+    clobber the true original with the (possibly edited) artifact."""
+    path = _pilot_original_path(run_dir, node_id)
+    if not path.exists():
+        path.write_text(text, encoding="utf-8")
+    return path
+
+
 async def run_pilot(
     run_dir: str | Path,
     node: TaskNode,
@@ -88,6 +107,7 @@ async def run_pilot(
     state. Returns the artifact text as produced, before any user edit."""
     await run_writer_node(run_dir, node, prompt, adapter, env, budget)
     artifact_text = _read_artifact(run_dir, node.id)
+    snapshot_pilot_original(run_dir, node.id, artifact_text)
     log.append(
         {"node_id": node.id, "role": "harness", "round": 0, "type": "pilot_awaiting_approval"}
     )
@@ -101,8 +121,12 @@ def approve_pilot(
     provider: OpenAICompatibleProvider,
     log: EventLog,
 ) -> list[ContractRule]:
-    """Resume point for a pilot sitting in ``pilot_awaiting_approval``."""
-    original = _read_artifact(run_dir, node.id)
+    """Resume point for a pilot sitting in ``pilot_awaiting_approval``. The
+    diff is taken against the Writer's snapshotted original, not the live
+    artifact (which the operator edits on disk, §4.4); a run resumed from a
+    snapshotless legacy state falls back to the live artifact."""
+    snapshot_path = _pilot_original_path(run_dir, node.id)
+    original = snapshot_path.read_text(encoding="utf-8") if snapshot_path.exists() else _read_artifact(run_dir, node.id)
     diff_text = _unified_diff(original, edited_text)
     node_artifact_path(run_dir, node.id).write_text(edited_text, encoding="utf-8")
 

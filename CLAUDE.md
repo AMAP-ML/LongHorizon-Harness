@@ -338,8 +338,13 @@ code plainly says is not repeated.
   the last one. `scan()` runs in-memory over an already-parsed list so a
   caller needs one parse per dispatch, not three.
 - `run_dir.py` — `create_run_dir` is idempotent; path helpers for
-  `spec.md`/`events.jsonl`/`manifest.jsonl`/`scratch/`/`out/`. Later layers
-  re-export these rather than duplicating them.
+  `spec.md`/`events.jsonl`/`manifest.jsonl`/`scratch/`/`out/`. **§11.10.14:
+  the helpers are pure getters.** Writers (`runner`, round-loop trace/audit,
+  `repair`, v4 research) call the explicit `ensure_node_scratch_dir`/
+  `ensure_node_trace_path`/`ensure_audit_path`/`ensure_orchestrator_dir`
+  variants, so an inspect-only dashboard poll or `v3/checks.py` pass never
+  creates directories in runs it is only reading. Later layers re-export
+  both flavors rather than duplicating them.
 - `runner.py` — `run_node(...)`, one idempotent entrypoint for both first run
   and resume. It inspects the node's furthest-reached state
   (`episode_completed` → no-op replay; `session_captured` → continuation if
@@ -382,7 +387,14 @@ Event vocabulary: `node_dispatched`, `session_captured`, `episode_completed`,
   removes the per-round call entirely.
 - `reviewer.py` — sees the artifact and rubric only. Skips the model call and
   auto-passes when `judgment` is empty: gates already ran in code, so there
-  is nothing left to ask an opinion about.
+  is nothing left to ask an opinion about. **Input-side ceiling (§11.10.13):**
+  `cap_artifact_text` truncates an oversized artifact at
+  `DEFAULT_ARTIFACT_CAP_TOKENS` (8k heuristic tokens — the inverse of
+  `estimate_tokens`, so the *measured* count can't exceed the ceiling) with
+  an explicit truncation marker, because a verdict reached over a partial
+  artifact must at least say so. The re-validation reviewer and document
+  review's depth pass share the capper, and re-validation's cost estimate
+  counts the same cap so the shown price matches what gets sent.
 - `writer.py` — wraps v0's `run_node` unchanged (crash resume inherited free)
   and asks the agent to write `scratch/<node>/promotion.json`. Missing or
   unparseable → fall back to the episode's visible output; the ~400-token cap
@@ -401,7 +413,17 @@ Event vocabulary: `node_dispatched`, `session_captured`, `episode_completed`,
   a failing node back to `pending`; exhausting it sets `blocked`, which makes
   the orchestrator escalate instead of looping. A failed attempt records its
   located defect in `last_defect` so the retry is a correction rather than an
-  i.i.d. resample.
+  i.i.d. resample. **Gates are evaluated exactly once per dispatch**
+  (11.10.11): `write_gate_cache` puts the results in `audit/<node>.json`,
+  the reviewer's verdict write merges into the same file instead of
+  clobbering the cache, repair refreshes it with a re-dispatch, and the
+  dashboard reads it — the gate cache lives alongside the verdict as §5's
+  "gate results + reviewer verdict" always described. **Round numbering
+  continues across process runs (§11.10.16):** the loop starts at one past
+  the highest `round-*.jsonl` on disk, so a resume never re-appends its
+  round 0 into the previous process's `round-000.jsonl` — each run's
+  rounds are a fresh, numbered file and `events.jsonl`'s `round` field
+  carries the same rebased index.
 
 ## v2 — intake, survey, planning, pilot, contract (`v2/`)
 
@@ -410,11 +432,14 @@ Event vocabulary: `node_dispatched`, `session_captured`, `episode_completed`,
   for an unanswered dimension, and must emit a matching assumption line.
   `answer_fn` is the seam to a real operator.
 - `survey.py` — chunking (model-free, folds undersized fragments into
-  neighbors), windowed `survey_chunks` (converts window-local boundary
-  indices back to global before returning), `assemble_spine` (harness-only
-  merge: highest-confidence vote per boundary, drop below the floor, fold
-  undersized units), and `materialize_units` (writes `spine/<id>.md`, so a
-  Writer's `inputs` resolve to real files it can open).
+  neighbors). The fold keeps a running token count per merged segment
+  (11.10.9) — re-estimating a string it was also concatenating in place was
+  O(n²) in corpus size. Also: windowed `survey_chunks` (converts
+  window-local boundary indices back to global before returning),
+  `assemble_spine` (harness-only merge: highest-confidence vote per
+  boundary, drop below the floor, fold undersized units), and
+  `materialize_units` (writes `spine/<id>.md`, so a Writer's `inputs`
+  resolve to real files it can open).
   `survey_chunks_deterministic` is the model-free alternative: embedding
   dissimilarity, smoothed, heading-boosted, thresholded at a quantile.
   **Implemented variant, deliberately:** candidates are *strict local maxima
@@ -445,7 +470,10 @@ Event vocabulary: `node_dispatched`, `session_captured`, `episode_completed`,
   min-max per view, pulls in ±1 adjacent chunks **clamped to the winner's own
   unit** (a retrieved paragraph whose antecedent is in the previous chunk is
   worse than useless), and returns deduped in **ascending document order**,
-  not score order. No embeddings is degradation to BM25, not failure.
+  not score order. No embeddings is degradation to BM25, not failure. The
+  dense scorer caches the loaded matrix on `(path, mtime, size)` and uses
+  `@`/`np.linalg.norm` (11.10.10) — the old path re-`np.load`ed the whole
+  matrix per node prompt and de-vectorized it in a pure-Python loop.
 
 ## v3 — assembly, repair, re-validation, document review (`v3/`)
 
@@ -545,7 +573,12 @@ prompt, not that node's own handoff).
   the unanswered record instead of stacking duplicates.
   `wait_for_resolution(timeout=None)` waits forever by default — the operator
   is the one surface that must never be rushed. Every surface resolves the
-  same file, so no surface owns a run.
+  same file, so no surface owns a run. **§11.10.12: the wait polls through
+  an `_ApprovalScanner` that parses only the bytes appended since the last
+  tick** (offset advances only to the last `\n`, so a torn tail is re-read
+  whole next tick) — a record is parsed exactly once across an overnight
+  wait instead of once per second per record. `Approver`, the scripted
+  test/automation resolver, still uses the whole-file `pending()`.
 - `backends.py` — the only module that constructs adapters. gptme is the only
   backend. `build_writer_adapter` passes `node.tools` through as the
   allowlist and **always layers the SearXNG tool on top** (deduped), so any
@@ -562,7 +595,8 @@ prompt, not that node's own handoff).
   phase's loud `survey_fallback` event, because a missing index here would
   spam the log once per node. The byte-for-byte default prompt is pinned by
   `test_pipeline_prompts.py::test_default_prompt_unchanged` — the regression
-  guard for the whole prompt surface.
+  guard for the whole prompt surface. §11.10.15 bounds the contract cache
+  (64 entries, FIFO, locked).
 - `run.py` / `cli.py` — one argument parser, one run loop:
   `kusudaemon run|resume|status|approve|amend|serve` (a flat command set),
   with `--detach` spawning `python -m kusudaemon.pipeline.run`. A run id whose
@@ -572,7 +606,10 @@ prompt, not that node's own handoff).
   second terminal while a driver is attached.
 - `dashboard/state.py` — `RunState`, which **reads fresh from disk on every
   call** (with a parse-on-change cache keyed on `(st_size, st_mtime_ns)`,
-  valid only because the logs are append-only). Deliberately imports no
+  valid only because the logs are append-only; §11.10.15 bounds it at 256
+  entries with FIFO eviction and mutates it only under a dedicated lock,
+  with the loader itself running unlocked so concurrent polls don't
+  serialize their parsing). Deliberately imports no
   `http.server` and no `gptme`, so it is testable with nothing installed;
   the `control_enabled` gate lives one layer up, on the HTTP handler.
   `subagents()` derives every distinct dispatched id from `events.jsonl` —
@@ -672,7 +709,7 @@ Stdlib `unittest`. No pytest, no network, no agent binary, no API key.
 python3 -m unittest discover -s tests -p "test_*.py" -v
 ```
 
-**299 tests, ~19s, all passing** (2026-08-09).
+**343 tests, ~20s, all passing** (2026-08-10).
 
 **Every test file starts with `sys.path.insert(0, str(_REPO_ROOT / "src"))`.
 This is load-bearing, not boilerplate.** Stale `_editable_impl_*.pth` files
@@ -685,18 +722,19 @@ guard into any new test file.
 |---|---|---|
 | `test_provider_config.py` | 35 | precedence chain, `require()`, `.env` and `provider.json` cwd/ancestor/installed-root search |
 | `test_v0_resume.py` | 5 | real-subprocess `SIGKILL` resume (both windows), no-op replay, fsync-per-append, single-parse dispatch |
-| `test_v1_units.py` | 20 | gates, tree validation, promotion cap, `complete_json` retry paths, artifact instruction |
-| `test_v1_round_loop.py` | 10 | dependency order, gate-failure escalation, resume of passed and in-flight nodes, tool restriction, deterministic dispatch |
+| `test_v1_units.py` | 33 | gates, tree validation, promotion cap, `complete_json` retry paths, artifact instruction, §11.10.13 reviewer input cap (truncation marked, ceiling measured) |
+| `test_v1_round_loop.py` | 11 | dependency order, gate-failure escalation, resume of passed and in-flight nodes, tool restriction, deterministic dispatch, gate cache merged into audit files, §11.10.16 round numbering continues across resumes |
 | `test_v1_orchestrator_policy.py` | 9 | `DispatchPolicy`, ready-set-bounded state |
 | `test_v2_intake.py` / `_survey.py` / `_planner.py` / `_pilot.py` | 4/22/12/7 | call counts, window→global index conversion, spine merge and folding, leaf gate, caps forcing leaves with zero calls, median pilot, contract ceiling |
 | `test_v2_survey_deterministic.py` | 12 | injected vectors only — clean shift fires once, uniform corpus silent, the lone-odd-chunk plateau that forced the implemented variant |
-| `test_v2_retrieval.py` | 10 | BM25/IDF, unit-restricted candidates, clamped closure, fusion flipping rank, idempotent index |
+| `test_v2_retrieval.py` | 11 | BM25/IDF, unit-restricted candidates, clamped closure, fusion flipping rank, idempotent index, matrix cached across scorer constructions |
 | `test_v3_assemble/checks/compile/repair/assembly_loop.py` | 3/5/4/4/5 | tree order, each check's true positive, injected compile command, derived-id repair + snapshot + rollback, attribute→repair→recompile |
 | `test_v3_revalidate.py` / `_prefilter.py` | 10/10 | four triage buckets, read-only phase 1, pre-filter skip/force rules |
 | `test_v3_document_review.py` | 14 | windowed call count flat in node count, id attribution and dropping |
 | `test_v4_*.py` | 2/2/5 | allowlist, derived-id dispatch + cache hit, finding attachment |
-| `test_dashboard_state.py` / `_server.py` | 18/22 | `RunState` directly (no port), then HTTP over a real loopback `ThreadingHTTPServer` incl. traversal rejection and `--no-control` 403s |
-| `test_pipeline_prompts.py` / `_backends.py` / `test_driver_phases.py` | 13/7/2 | byte-identical default prompt, adapter wiring, phase detail preservation |
+| `test_dashboard_state.py` / `_server.py` | 22/22 | `RunState` directly (no port), then HTTP over a real loopback `ThreadingHTTPServer` incl. traversal rejection and `--no-control` 403s; §11.10.14 read-only poll leaves runs unmutated; §11.10.15 bounded cache + 8-thread hammer | 
+| `test_pipeline_prompts.py` / `_backends.py` / `test_driver_phases.py` | 14/7/2 | byte-identical default prompt, adapter wiring, phase detail preservation, §11.10.15 contract-cache bound | 
+| `test_pipeline_approvals.py` | 4 | §11.10.12 incremental approvals scanning: each record parsed once across polls, torn tail re-read, cross-thread wait/resolve |
 | `test_gptme_adapter.py` / `test_searxng_tool.py` | 15/12 | command construction and output parsing; monkeypatched `urlopen`, never `execute_websearch` (it imports gptme) |
 
 Fixtures (`tests/fixtures/`): `fake_stream_agent.py` (a standalone script

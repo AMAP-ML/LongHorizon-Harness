@@ -37,7 +37,8 @@ from ..adapters.base import AgentAdapter
 from ..environment.base import Environment
 from ..types import EpisodeBudget
 from ..v0.events import EventLog
-from .gates import GateResult, all_passed, evaluate_gates, unmet
+from ..v0.run_dir import write_text_atomic
+from .gates import GateResult, all_passed, evaluate_gates, unmet, write_gate_cache
 from .manifest import append_manifest_line
 from .orchestrator import (
     DispatchDecision,
@@ -46,7 +47,14 @@ from .orchestrator import (
 )
 from .provider import OpenAICompatibleProvider
 from .reviewer import ReviewVerdict, review_node
-from .run_dir import audit_path, events_path, manifest_path, node_artifact_path, round_trace_path
+from .run_dir import (
+    ensure_audit_path,
+    ensure_orchestrator_dir,
+    events_path,
+    manifest_path,
+    node_artifact_path,
+    orchestrator_dir,
+)
 from .tree import TaskNode, TaskTree
 from .writer import run_writer_node
 
@@ -82,6 +90,11 @@ async def run_round_loop(
         )
         artifact_text = _read_artifact(run_dir, node.id)
         gate_results = evaluate_gates(node.gates, artifact_text)
+        # §11.10.11: evaluated once per dispatch (deterministic), durable in
+        # the audit file for every consumer; review and the dashboard read
+        # this instead of re-evaluating.
+        audit = ensure_audit_path(run_dir, node.id)
+        write_gate_cache(audit, gate_results)
         append_manifest_line(
             manifest,
             node_id=node.id,
@@ -108,7 +121,16 @@ async def run_round_loop(
         if node.status == "awaiting_review":
             await review(node)
 
-    for round_index in range(max_rounds):
+    # §11.10.16: round indices continue across process runs. round_index
+    # used to restart at 0 on every resume while the trace files were opened
+    # "a", so round 0 of the third resume appended to round 0 of the first —
+    # one file, three processes' interleaved rounds, impossible to separate.
+    # The orchestrator's own view is stateless per round, so rebasing the
+    # numbers is free: this run's rounds are just pick up where the last
+    # process left off.
+    first_round = _next_round_index(run_dir)
+    for offset in range(max_rounds):
+        round_index = first_round + offset
         decision = decide_next_action_with_policy(
             tree,
             str(manifest),
@@ -147,6 +169,18 @@ async def run_round_loop(
         await dispatch(node)
         if node.status == "awaiting_review":
             await review(node)
+        # §11.10.5: a gate or review failure that still has attempts left is
+        # a retry of the node the harness already knows it wants. Re-dispatch
+        # in place instead of round-tripping the orchestrator for a call
+        # whose only possible answer is "dispatch the same node again" — the
+        # retry's prompt differs (last_defect is carried forward by
+        # PLAN-zeromem.md §9), so this is a correction, not a resample.
+        while node.status == "pending" and node.attempts < max_attempts:
+            node.status = "dispatched"
+            tree.save(tree_path)
+            await dispatch(node)
+            if node.status == "awaiting_review":
+                await review(node)
 
     return tree
 
@@ -234,10 +268,41 @@ def _defect_from_verdict(verdict: ReviewVerdict) -> str:
 
 
 def _write_audit(run_dir: Path, node: TaskNode, verdict: ReviewVerdict) -> None:
-    payload = {"node": node.id, "items": verdict.items, "verdict": verdict.verdict}
-    audit_path(run_dir, node.id).write_text(
-        json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8"
-    )
+    path = ensure_audit_path(run_dir, node.id)
+    gates: dict | None = None
+    if path.exists():
+        try:
+            loaded = json.loads(path.read_text(encoding="utf-8"))
+            if isinstance(loaded, dict):
+                gates = loaded
+            elif isinstance(loaded, list):
+                # §11.10.11: the dispatch-time gate cache is the bare list
+                # write_gate_cache produced; carry it under "gates".
+                gates = {"gates": loaded}
+        except ValueError:
+            gates = None
+    existing = gates or {}
+    # §11.10.11: merge, never replace — the gate cache written at dispatch
+    # must survive the reviewer's write of items/verdict.
+    existing.update({"node": node.id, "items": verdict.items, "verdict": verdict.verdict})
+    path.write_text(json.dumps(existing, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+
+
+def _next_round_index(run_dir: Path) -> int:
+    """First round number for this process run: one past the highest
+    ``round-NNN.jsonl`` already on disk. §11.10.16 — see the caller."""
+    trace_dir = orchestrator_dir(run_dir)
+    if not trace_dir.exists():
+        return 0
+    highest = -1
+    for path in trace_dir.glob("round-*.jsonl"):
+        stem = path.stem
+        try:
+            index = int(stem.split("-", 1)[1])
+        except (IndexError, ValueError):
+            continue
+        highest = max(highest, index)
+    return highest + 1
 
 
 def _write_round_trace(
@@ -253,5 +318,5 @@ def _write_round_trace(
             "reason": decision.reason,
         },
     }
-    with open(round_trace_path(run_dir, round_index), "a", encoding="utf-8") as fh:
+    with open(ensure_orchestrator_dir(run_dir) / f"round-{round_index:03d}.jsonl", "a", encoding="utf-8") as fh:
         fh.write(json.dumps(line, sort_keys=True) + "\n")

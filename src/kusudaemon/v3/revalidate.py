@@ -39,10 +39,15 @@ from ..adapters.base import AgentAdapter
 from ..environment.base import Environment
 from ..types import EpisodeBudget
 from ..v0.events import EventLog
-from ..v0.run_dir import node_artifact_path
+from ..v0.run_dir import node_artifact_path, write_text_atomic
 from ..v1.gates import estimate_tokens
 from ..v1.provider import OpenAICompatibleProvider
-from ..v1.reviewer import VERDICT_SCHEMA, ReviewVerdict
+from ..v1.reviewer import (
+    VERDICT_SCHEMA,
+    DEFAULT_ARTIFACT_CAP_TOKENS as ARTIFACT_CAP_TOKENS,
+    ReviewVerdict,
+    cap_artifact_text,
+)
 from ..v1.tree import TaskNode, TaskTree
 from .prefilter import artifact_may_be_affected
 from .repair import RepairOutcome, run_repair
@@ -102,7 +107,9 @@ def estimate_revalidation_cost(
             if not needs_review:
                 skipped += 1
                 continue
-        total += contract_tokens + estimate_tokens(rubric_text) + estimate_tokens(artifact_text)
+        total += contract_tokens + estimate_tokens(rubric_text) + min(
+            estimate_tokens(artifact_text), ARTIFACT_CAP_TOKENS
+        )
     return RevalidationEstimate(
         node_count=len(passed), estimated_tokens=total, skipped_count=skipped
     )
@@ -146,7 +153,8 @@ def _review_against_contract(
             "role": "user",
             "content": (
                 f"Contract (amended):\n{contract_text}\n\n"
-                f"Node rubric:\n{rubric_lines}\n\nArtifact:\n{artifact_text}"
+                f"Node rubric:\n{rubric_lines}\n\n"
+                f"Artifact:\n{cap_artifact_text(artifact_text, ARTIFACT_CAP_TOKENS)}"
             ),
         },
     ]
@@ -189,7 +197,9 @@ def run_revalidation_pass(
     skip is auditable rather than invisible. The filter only ever produces
     clean; patchable/regenerate still require the Reviewer."""
     run_dir = Path(run_dir)
-    targets = node_ids or [n.id for n in tree.nodes.values() if n.status == "passed"]
+    # §11.7: `node_ids or [...]` made an explicit "revalidate nothing" run a
+    # full pass over every passed node. An empty list means no targets.
+    targets = node_ids if node_ids is not None else [n.id for n in tree.nodes.values() if n.status == "passed"]
     triage_by_node: dict[str, Triage] = {}
     for node_id in targets:
         node = tree.nodes[node_id]
@@ -205,14 +215,15 @@ def run_revalidation_pass(
                     verdict=ReviewVerdict(node_id=node_id, items=[], verdict="pass"),
                 )
                 triage_by_node[node_id] = triage
-                revalidation_audit_path(run_dir, node_id).write_text(
-                    _triage_json(triage, skipped_reason=reason), encoding="utf-8"
+                write_text_atomic(
+                    revalidation_audit_path(run_dir, node_id),
+                    _triage_json(triage, skipped_reason=reason),
                 )
                 continue
         triage = revalidate_node(run_dir, node, contract_text, provider)
         triage_by_node[node_id] = triage
-        revalidation_audit_path(run_dir, node_id).write_text(
-            _triage_json(triage), encoding="utf-8"
+        write_text_atomic(
+            revalidation_audit_path(run_dir, node_id), _triage_json(triage)
         )
         if triage.classification != "clean":
             node.status = "stale"

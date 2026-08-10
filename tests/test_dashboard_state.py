@@ -99,6 +99,47 @@ class RunStateTest(unittest.TestCase):
         self.assertIsNotNone(detail)
         self.assertFalse(detail["gate_results"][0]["passed"])
 
+    def test_node_detail_reads_cached_gates_not_revaluation(self) -> None:
+        # §11.10.11: gates are evaluated once at dispatch and cached in
+        # audit/<node>.json; the node view must read the cache. Prove it
+        # with a cache entry that claims a pass while the artifact on disk
+        # would fail — a live re-evaluation would flip it to failed.
+        self.state.attach("run-a")
+        audit_path = self.run_dir / "audit" / "1.json"
+        audit_path.parent.mkdir(parents=True, exist_ok=True)
+        audit_path.write_text(
+            json.dumps([{"gate": "nonempty", "passed": True, "detail": ""}])
+            + "\n",
+            encoding="utf-8",
+        )
+        (self.run_dir / "out" / "1.md").write_text("", encoding="utf-8")
+        detail = self.state.node_detail("1")
+        self.assertTrue(detail["gate_results"][0]["passed"])
+
+    def test_readonly_surfaces_do_not_mutate_the_run(self) -> None:
+        # §11.10.14: path helpers used to mkdir as a side effect, so an
+        # inspect-only dashboard poll created scratch/<node>/, audit/ and
+        # orchestrator/ inside runs it was only looking at. Reading a node
+        # must leave the run byte-for-byte as it was (modulo nothing).
+        run_dir = create_run_dir(self.runs_root, "run-ro")
+        tree = TaskTree(
+            nodes={
+                "9": TaskNode(id="9", brief="x", artifact="out/9.md", gates=["nonempty"]),
+            }
+        )
+        tree.save(tree_path(run_dir))
+        run_spec_path(run_dir).write_text(
+            json.dumps({"goal": "ro", "backend": "gptme", "source_text": ""}), encoding="utf-8"
+        )
+        state = RunState(self.runs_root)
+        self.assertTrue(state.attach("run-ro"))
+        self.assertIsNotNone(state.node_detail("9"))
+        self.assertIsNone(state.artifact("9"))
+        self.assertEqual(state.subagents(), [])
+        self.assertFalse((run_dir / "audit").exists())
+        self.assertFalse((run_dir / "orchestrator").exists())
+        self.assertFalse((run_dir / "scratch" / "9").exists())
+
     def test_resolve_pending_approval(self) -> None:
         self.state.attach("run-a")
         approval_id = self.state.snapshot()["pending_approvals"][0]["approval_id"]
@@ -171,6 +212,52 @@ class SnapshotEventCacheTest(unittest.TestCase):
         )
         snap = self.state.snapshot()
         self.assertEqual(snap["events_count"], 1)
+
+    def test_file_cache_is_bounded_with_fifo_eviction(self) -> None:
+        # §11.10.15: the process-lifetime cache must not grow one entry per
+        # file per run, in a server meant to run for days.
+        state = RunState(self.runs_root)
+        with tempfile.TemporaryDirectory() as root_str:
+            root = Path(root_str)
+            files = []
+            for i in range(300):
+                p = root / f"f{i}.txt"
+                p.write_text("x", encoding="utf-8")
+                files.append(p)
+            for p in files:
+                state._cached_read(p, lambda: "loaded")
+            self.assertLessEqual(len(state._file_cache), 256)
+            # FIFO: the oldest entries are the evicted ones.
+            self.assertNotIn(str(files[0]), state._file_cache)
+            self.assertIn(str(files[-1]), state._file_cache)
+
+    def test_file_cache_survives_concurrent_mutation(self) -> None:
+        # §11.10.15: _cached_read mutates the dict under a lock; a hammer
+        # of concurrent readers must neither corrupt the dict nor exceed
+        # the cap. (Against the old code this exceeds 256 and can throw.)
+        import threading
+
+        state = RunState(self.runs_root)
+        errors: list[BaseException] = []
+
+        def hammer(worker_id: int) -> None:
+            try:
+                for i in range(400):
+                    path = self.tmp / "hammer" / f"w{worker_id}-{i}.txt"
+                    path.parent.mkdir(parents=True, exist_ok=True)
+                    if not path.exists():
+                        path.write_text("x", encoding="utf-8")
+                    state._cached_read(path, lambda: "loaded")
+            except BaseException as exc:  # noqa: BLE001 — test collection
+                errors.append(exc)
+
+        threads = [threading.Thread(target=hammer, args=(w,)) for w in range(8)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout=30)
+        self.assertEqual(errors, [])
+        self.assertLessEqual(len(state._file_cache), 256)
 
 
 class SubagentsAndInterjectTest(unittest.TestCase):

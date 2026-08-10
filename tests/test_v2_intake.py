@@ -40,7 +40,7 @@ class IntakeTest(unittest.TestCase):
 
         asked: list[str] = []
 
-        def answer_fn(question: str) -> str:
+        def answer_fn(question: str, dimension: str) -> str:
             asked.append(question)
             return "a real answer"
 
@@ -63,11 +63,8 @@ class IntakeTest(unittest.TestCase):
         # Only blank out the answer for one dimension; the finalize call is
         # scripted above to reflect that, since the harness itself doesn't
         # decide what the default should be — the model does.
-        seen_dims = iter(RUBRIC_DIMENSIONS)
-
-        def scripted_answer_fn(question: str) -> str:
-            dim = next(seen_dims)
-            return "" if dim == "target_length" else f"answer for {dim}"
+        def scripted_answer_fn(question: str, dimension: str) -> str:
+            return "" if dimension == "target_length" else f"answer for {dimension}"
 
         rubric = elicit_global_rubric("summarize a textbook", provider, scripted_answer_fn)
         self.assertEqual(len(rubric.assumptions), 1)
@@ -94,10 +91,27 @@ class IntakeTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as root_str:
             root = Path(root_str)
             run_dir = create_run_dir(root, "run1")
-            run_intake(run_dir, "produce chapter summaries", provider, lambda q: "answered")
+            run_intake(run_dir, "produce chapter summaries", provider, lambda q, dimension: "answered")
             text = spec_path(run_dir).read_text(encoding="utf-8")
             self.assertIn("produce chapter summaries", text)
             self.assertIn("## Assumptions", text)
+
+    # §11.9: the answer_fn sees *which dimension* it is answering, so a
+    # real operator (or an approval record) can key context on it.
+
+    def test_answer_fn_receives_the_dimension_in_order(self) -> None:
+        questions = [{"question": f"q for {dim}?"} for dim in RUBRIC_DIMENSIONS]
+        finalize = _finalize_response({dim: "answered" for dim in RUBRIC_DIMENSIONS}, [])
+        provider = FakeProvider([*questions, finalize])
+
+        seen: list[str] = []
+
+        def answer_fn(question: str, dimension: str) -> str:
+            seen.append(dimension)
+            return "answered"
+
+        elicit_global_rubric("goal", provider, answer_fn)
+        self.assertEqual(seen, list(RUBRIC_DIMENSIONS))
 
 
 if __name__ == "__main__":

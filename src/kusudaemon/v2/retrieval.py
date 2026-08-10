@@ -113,7 +113,8 @@ def build_chunk_index(run_dir: str | Path, chunks: list[Chunk], units: list[Spin
     run_dir = Path(run_dir)
     index_path = chunk_index_path(run_dir)
     if index_path.exists():
-        existing = sum(1 for _ in index_path.open(encoding="utf-8"))
+        with index_path.open(encoding="utf-8") as fh:
+            existing = sum(1 for _ in fh)
         if existing == len(chunks):
             return False
     unit_of: dict[int, str] = {}
@@ -150,6 +151,13 @@ def _load_index(run_dir: Path) -> list[dict[str, Any]]:
     return [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines() if line.strip()]
 
 
+# §11.10.10: dense retrieval must not re-load and de-vectorize the whole
+# embedding matrix per node prompt. Keyed on (path, mtime, size) so an
+# index rebuilt mid-run is picked up while a static one is read exactly
+# once per process.
+_DENSE_CACHE: dict[tuple[str, int, int], Any] = {}
+
+
 def _default_dense_scorer(run_dir: Path) -> DenseScorer | None:
     emb_path = chunk_embeddings_path(run_dir)
     meta_path = chunk_embeddings_meta_path(run_dir)
@@ -158,7 +166,13 @@ def _default_dense_scorer(run_dir: Path) -> DenseScorer | None:
     try:
         import numpy as np
 
-        vectors = np.load(emb_path)
+        stat = emb_path.stat()
+        cache_key = (str(emb_path), stat.st_mtime_ns, stat.st_size)
+        vectors = _DENSE_CACHE.get(cache_key)
+        if vectors is None:
+            vectors = np.load(emb_path)
+            _DENSE_CACHE.clear()
+            _DENSE_CACHE[cache_key] = vectors
         meta = json.loads(meta_path.read_text(encoding="utf-8"))
         model_name = meta.get("model") or DEFAULT_EMBED_MODEL
 
@@ -166,15 +180,15 @@ def _default_dense_scorer(run_dir: Path) -> DenseScorer | None:
 
         def score(chunk_indices: list[int], query: str) -> list[float]:
             query_vec = embed_texts([query], model_name=model_name)[0]
-            rows = [vectors[i] for i in chunk_indices]
-            if not rows:
+            rows = vectors[list(chunk_indices)]
+            if rows.size == 0:
                 return []
-            q_norm = math.sqrt(sum(v * v for v in query_vec)) or 1.0
-            return [
-                sum(a * b for a, b in zip(query_vec, row))
-                / (q_norm * math.sqrt(sum(v * v for v in row)) or 1.0)
-                for row in rows
-            ]
+            q_norm = float(np.linalg.norm(query_vec)) or 1.0
+            norms = np.linalg.norm(rows, axis=1)
+            sims = (rows @ np.asarray(query_vec, dtype=rows.dtype)) / (
+                q_norm * np.maximum(norms, 1e-12)
+            )
+            return [float(s) for s in sims]
 
         return score
     except (ImportError, OSError, ValueError):

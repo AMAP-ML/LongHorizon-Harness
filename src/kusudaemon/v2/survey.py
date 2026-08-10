@@ -24,10 +24,11 @@ from __future__ import annotations
 
 import json
 import re
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, fields
 from pathlib import Path
 from typing import Any, Callable
 
+from ..v0.run_dir import write_text_atomic
 from ..v1.gates import estimate_tokens
 from ..v1.provider import OpenAICompatibleProvider
 from .run_dir import spine_path, spine_unit_path
@@ -80,15 +81,24 @@ def chunk_text(text: str, *, min_chunk_tokens: int = DEFAULT_MIN_CHUNK_TOKENS) -
 
 
 def _merge_small_segments(segments: list[str], min_tokens: int) -> list[str]:
+    # §11.10.9: a running token count instead of re-tokenizing the growing
+    # tail on every fold — the old loop was O(n²) in corpus size (it
+    # re-estimated a string it was also concatenating in place).
     merged: list[str] = []
+    running: list[int] = []
     for segment in segments:
-        if merged and estimate_tokens(merged[-1]) < min_tokens:
+        if merged and running[-1] < min_tokens:
             merged[-1] += segment
+            running[-1] += estimate_tokens(segment)
         else:
             merged.append(segment)
-    if len(merged) > 1 and estimate_tokens(merged[-1]) < min_tokens:
+            running.append(estimate_tokens(segment))
+    if len(merged) > 1 and running[-1] < min_tokens:
         merged[-2] += merged[-1]
         merged.pop()
+        running[-2] += running[-1]
+        running.pop()
+    return merged
     return merged
 
 
@@ -380,7 +390,7 @@ def _apply_min_size_floor(raw_units: list[list[Any]], min_unit_tokens: int) -> l
 
 def save_spine(run_dir: str | Path, units: list[SpineUnit]) -> None:
     payload = [asdict(unit) for unit in units]
-    spine_path(run_dir).write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+    write_text_atomic(spine_path(run_dir), json.dumps(payload, indent=2) + "\n")
 
 
 def load_spine(run_dir: str | Path) -> list[SpineUnit]:
@@ -389,12 +399,21 @@ def load_spine(run_dir: str | Path) -> list[SpineUnit]:
         return []
     raw_text = path.read_text(encoding="utf-8").strip()
     raw = json.loads(raw_text) if raw_text else []
-    # SpineUnit(**item) tolerates a legacy spine.json missing any field this
-    # module has added since it was written, as long as that field carries a
-    # default -- see materialize_units/unit_input_path below (PLAN-zeromem.md
-    # §7): a resumed pre-§7 run has a spine.json but no materialized units,
-    # and unit_input_path already falls back to the bare id in that case.
-    return [SpineUnit(**item) for item in raw]
+    # Records are constructed from the known SpineUnit field names only:
+    # an unknown key (a spine.json written by a newer version) is dropped
+    # instead of raising, and a field added later with a dataclass default
+    # tolerates a legacy file that predates it — the tolerance the original
+    # comment promised and SpineUnit(**item) never delivered (§11.11). A
+    # record missing a *required* field still raises, exactly as the
+    # dataclass demands. See materialize_units/unit_input_path
+    # (PLAN-zeromem.md §7): a resumed pre-§7 run has a spine.json but no
+    # materialized units, and unit_input_path already falls back to the
+    # bare id in that case.
+    known = {field.name for field in fields(SpineUnit)}
+    return [
+        SpineUnit(**{key: value for key, value in item.items() if key in known})
+        for item in raw
+    ]
 
 
 def materialize_units(

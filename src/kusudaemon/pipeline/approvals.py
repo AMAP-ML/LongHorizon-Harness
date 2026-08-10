@@ -30,6 +30,7 @@ Record shape (flat dict, JSON-serializable):
 from __future__ import annotations
 
 import json
+import os
 import threading
 import time
 import uuid
@@ -106,13 +107,17 @@ class Approval:
 
 
 def append(run_dir: str | Path, record: dict[str, Any] | Approval) -> None:
-    """Persist one record (pending or resolved). The file is the authority."""
+    """Persist one record (pending or resolved). The file is the authority.
+    fsync per append, like events.jsonl: the record that can be lost here is
+    the operator's pilot edit (§11.6), and a power loss or kill -9 must not
+    be able to eat it after this returns."""
     payload = record.to_dict() if isinstance(record, Approval) else dict(record)
     path = approvals_path(run_dir)
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("a", encoding="utf-8") as fh:
         fh.write(json.dumps(payload, ensure_ascii=False, sort_keys=True) + "\n")
         fh.flush()
+        os.fsync(fh.fileno())
 
 
 def read_all(run_dir: str | Path) -> list[Approval]:
@@ -167,15 +172,70 @@ def wait_for_resolution(
 ) -> Approval:
     """Block the calling (driver) thread until a resolved record for
     ``approval_id`` lands on disk. ``timeout=None`` waits forever — the
-    operator is the one control surface that must never be rushed."""
+    operator is the one control surface that must never be rushed.
+
+    §11.10.12: parses only the bytes appended since the last poll, never
+    the whole file again — pilot records embed artifact text, so an
+    overnight wait would otherwise be a full JSON parse of the growing log
+    every second."""
+    scanner = _ApprovalScanner(run_dir)
     deadline = None if timeout is None else time.monotonic() + timeout
     while True:
-        for item in read_all(run_dir):
+        for item in scanner.next_records():
             if item.approval_id == approval_id and item.status == "resolved":
                 return item
         if deadline is not None and time.monotonic() >= deadline:
             raise TimeoutError(f"approval {approval_id} was not resolved in time")
         time.sleep(poll_interval)
+
+
+class _ApprovalScanner:
+    """Persistent reader over ``approvals.jsonl`` for pollers.
+
+    Remembers the byte offset of the last complete line, so the poll loop
+    stores O(new bytes) per tick instead of O(log). The offset advances
+    only up to the last ``\\n`` — a torn trailing line (concurrent append)
+    is re-read whole next tick rather than consumed half, the same trap
+    v0/runner.py's session-id watcher documents (§11.9).
+    """
+
+    def __init__(self, run_dir: str | Path) -> None:
+        self._path = approvals_path(run_dir)
+        self._offset = 0
+
+    def next_records(self) -> list[Approval]:
+        try:
+            size = self._path.stat().st_size
+        except OSError:
+            return []
+        if size <= self._offset:
+            return []
+        with self._path.open("rb") as fh:
+            fh.seek(self._offset)
+            chunk = fh.read()
+        if chunk.endswith(b"\n"):
+            lines = chunk.split(b"\n")
+            consumed = len(chunk)
+        else:
+            *lines, partial = chunk.split(b"\n")
+            consumed = len(chunk) - len(partial)
+        self._offset += consumed
+        records: list[Approval] = []
+        for line in lines:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                data = json.loads(line.decode("utf-8"))
+            except (json.JSONDecodeError, UnicodeDecodeError):
+                continue
+            if not isinstance(data, dict) or "approval_id" not in data:
+                continue
+            try:
+                records.append(Approval.from_dict(data))
+            except (TypeError, ValueError):
+                continue
+        return records
 
 
 class Approver:

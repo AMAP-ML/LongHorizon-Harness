@@ -58,9 +58,18 @@ _HIDDEN_RUN_PATHS: tuple[str, ...] = ("events.jsonl", "approvals.jsonl", "audit/
 
 
 def _hidden_paths_for(node: TaskNode) -> tuple[str, ...]:
-    own_artifact = f"out/{node.id}.md"
-    own_scratch = f"scratch/{node.id}"
-    return tuple(path for path in _HIDDEN_RUN_PATHS if path not in (own_artifact, own_scratch))
+    """§11.8: prefix-match, not exact-match. The previous filter compared
+    each hidden entry against ``(out/<node>.md, scratch/<node>)`` exactly —
+    but the entries are ``"out/"`` and ``"scratch/"``, so nothing was ever
+    removed and every Writer was told to stay out of the directory it must
+    write (its artifact and its promotion file). An entry is dropped when
+    the node's own path equals it or lives beneath it."""
+    own_paths = (f"out/{node.id}.md", f"scratch/{node.id}")
+    return tuple(
+        path
+        for path in _HIDDEN_RUN_PATHS
+        if not any(own.startswith(path) or path.startswith(own) for own in own_paths)
+    )
 
 
 def build_writer_adapter(

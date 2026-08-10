@@ -28,6 +28,7 @@ from pathlib import Path
 
 from ..v0.run_dir import (  # noqa: F401 — re-exported for v4 callers
     create_run_dir,
+    ensure_node_scratch_dir,
     events_path,
     manifest_path,
     node_artifact_path,
@@ -57,7 +58,10 @@ from ..v3.run_dir import (  # noqa: F401 — re-exported for v4 callers
 
 
 def research_dir(run_dir: str | Path, node_id: str) -> Path:
-    path = node_scratch_dir(run_dir, node_id) / "research"
+    """Writer-side path only (findings land here) — §11.10.14: this is the
+    ensure variant; there is no read-only getter because nothing inspects a
+    research dir without writing a finding into it."""
+    path = ensure_node_scratch_dir(run_dir, node_id) / "research"
     path.mkdir(parents=True, exist_ok=True)
     return path
 

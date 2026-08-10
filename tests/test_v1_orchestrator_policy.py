@@ -25,6 +25,7 @@ sys.path.insert(0, str(_REPO_ROOT / "tests" / "fixtures"))
 
 from fake_provider import FakeProvider  # noqa: E402
 from kusudaemon.v1.orchestrator import (  # noqa: E402
+    decide_next_action,
     decide_next_action_deterministic,
     decide_next_action_with_policy,
     _compact_state,
@@ -112,6 +113,44 @@ class PolicyDispatcherTest(unittest.TestCase):
             decide_next_action_with_policy(
                 _ready_tree(), "/nonexistent/manifest.jsonl", None, round_index=0
             )
+
+    def test_policy_unknown_spelling_raises_not_model_fallback(self) -> None:
+        """§11.11: every unrecognized policy used to fall through to the
+        ``"model"`` path — a doc-following ``policy="deterministic"`` would
+        silently spend the very per-round calls ``document_order`` exists to
+        avoid. Unknown policies now raise instead of silently dispatching."""
+        provider = FakeProvider(
+            [{"action": "dispatch", "node_id": "a", "reason": "canned choice"}]
+        )
+        with self.assertRaises(ValueError):
+            decide_next_action_with_policy(
+                _ready_tree(), "/nonexistent/manifest.jsonl", provider,
+                round_index=0, policy="deterministic",
+            )
+        self.assertEqual(len(provider.calls), 0)
+
+
+class HaltCoercionTest(unittest.TestCase):
+    def test_halt_with_ready_nodes_is_coerced_to_dispatch(self) -> None:
+        """§11.5: a model answering "halt" while a node is ready would end
+        the execute phase early and the driver would report a fake "done".
+        Dispatch is the only legal action — the coercion is recorded in the
+        reason string, exactly like the non-ready-node-id fallback."""
+        provider = FakeProvider([{"action": "halt", "reason": "i am tired"}])
+        decision = decide_next_action(
+            _ready_tree(), "/nonexistent/manifest.jsonl", provider, round_index=0
+        )
+        self.assertEqual(decision.action, "dispatch")
+        self.assertEqual(decision.node_id, "a")
+        self.assertIn("coerced", decision.reason)
+        self.assertIn("i am tired", decision.reason)
+
+    def test_coercion_depends_on_ready_set(self) -> None:
+        provider = FakeProvider([{"action": "halt", "reason": "all done"}])
+        tree = _tree(_node("a", status="passed"))
+        decision = decide_next_action(tree, "/nonexistent/manifest.jsonl", provider, round_index=0)
+        self.assertEqual(decision.action, "halt")
+        self.assertEqual(decision.reason, "all nodes passed")
 
 
 class CompactStateBoundedTest(unittest.TestCase):

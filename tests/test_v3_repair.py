@@ -212,6 +212,45 @@ class RepairTest(unittest.TestCase):
             self.assertEqual(len(provider.calls), 1)
             self.assertEqual(outcome.verdict.verdict, "pass")
 
+    def test_repair_that_fails_review_leaves_artifact_byte_identical(self) -> None:
+        with tempfile.TemporaryDirectory() as root_str:
+            root = Path(root_str)
+            node = _node("ch06", judgment=["R1"])
+            node.rubric = {"R1": "must be thorough"}
+            run_dir, log = self._seed(root, node, "ORIGINAL CONTENT")
+            tree_path = root / "tree.json"
+            tree = TaskTree(nodes={node.id: node})
+            tree.save(tree_path)
+            prompt_dir = root / "prompts"
+            prompt_dir.mkdir(parents=True, exist_ok=True)
+
+            # The episode produces a fresh artifact (its stdout carries the
+            # marker, which v0 writes as candidate_text); the reviewer then
+            # rejects it.
+            adapter = self._adapter(root, prompt_dir, run_dir, node.id, "REVIEW_REJECTS_ME")
+            provider = FakeProvider(
+                [{"items": [{"id": "R1", "pass": False, "defect": "not thorough"}], "verdict": "fail"}]
+            )
+
+            outcome = asyncio.run(
+                run_repair(
+                    run_dir, node, tree, tree_path, manifest_path(run_dir),
+                    "scoped defect", adapter,
+                    LocalEnvironment(tmp_dir=str(prompt_dir)), EpisodeBudget(max_duration_seconds=30),
+                    provider, log,
+                )
+            )
+
+            self.assertFalse(outcome.passed)
+            self.assertEqual(outcome.status, "stale")
+            # §11.1: a repair that clears gates but fails review must NOT
+            # leave the failed text in out/<node>.md — the snapshot (taken
+            # unconditionally before dispatch) is restored.
+            self.assertEqual(
+                node_artifact_path(run_dir, "ch06").read_text(encoding="utf-8"),
+                "ORIGINAL CONTENT",
+            )
+
 
 if __name__ == "__main__":
     unittest.main()
