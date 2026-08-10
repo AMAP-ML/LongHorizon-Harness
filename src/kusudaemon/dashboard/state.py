@@ -312,15 +312,40 @@ class RunState:
 
     def node_gptme_logdir(self, node_id: str) -> Path | None:
         """Scan a node's trace.jsonl for the ``{"type": "logdir", ...}``
-        line ``_gptme_worker.py`` prints before ``gptme.chat()`` starts —
-        the same "watch the live tee for a marker line" trick
-        ``v0/runner.py``'s ``_watch_for_session_id`` already uses for
-        ``session_id``. Returns the *last* one seen, so a redispatched
-        (retried) attempt's logdir wins over a stale earlier one."""
+        line ``_gptme_worker.py`` prints before ``gptme.chat()`` starts.
+        If node_id is "main", "root", or "harness", checks current active phase,
+        live subagents, or the latest trace in the run's traces directory."""
         run_dir = self._attached_dir()
         if run_dir is None or not _safe_node_id(node_id):
             return None
-        return _last_logdir(node_trace_path(run_dir, node_id))
+        direct = _last_logdir(node_trace_path(run_dir, node_id))
+        if direct is not None:
+            return direct
+
+        if node_id in {"main", "root", "harness"}:
+            snap = self.snapshot()
+            current_phase = snap.get("phase")
+            if current_phase:
+                phase_logdir = _last_logdir(node_trace_path(run_dir, current_phase))
+                if phase_logdir is not None:
+                    return phase_logdir
+            subagents = snap.get("subagents") or []
+            for sub in subagents:
+                if sub.get("live"):
+                    sub_id = sub.get("id")
+                    if sub_id:
+                        sub_log = _last_logdir(node_trace_path(run_dir, sub_id))
+                        if sub_log is not None:
+                            return sub_log
+            traces_dir = run_dir / "traces"
+            if traces_dir.exists():
+                trace_files = sorted(traces_dir.glob("*.jsonl"), key=lambda p: p.stat().st_mtime, reverse=True)
+                for tf in trace_files:
+                    found = _last_logdir(tf)
+                    if found is not None:
+                        return found
+
+        return None
 
     def interject(self, node_id: str, text: str) -> bool:
         """Send a live message into a currently-running subagent's gptme
@@ -587,7 +612,32 @@ class RunState:
         run_dir = self._attached_dir()
         if run_dir is None or not _safe_node_id(node_id):
             return None
-        return _read_text(node_trace_path(run_dir, node_id))
+        text = _read_text(node_trace_path(run_dir, node_id))
+        if text and text.strip():
+            return text
+        if node_id in {"main", "root", "harness"}:
+            snap = self.snapshot()
+            current_phase = snap.get("phase")
+            if current_phase:
+                phase_text = _read_text(node_trace_path(run_dir, current_phase))
+                if phase_text and phase_text.strip():
+                    return phase_text
+            subagents = snap.get("subagents") or []
+            for sub in subagents:
+                if sub.get("live"):
+                    sub_id = sub.get("id")
+                    if sub_id:
+                        sub_text = _read_text(node_trace_path(run_dir, sub_id))
+                        if sub_text and sub_text.strip():
+                            return sub_text
+            traces_dir = run_dir / "traces"
+            if traces_dir.exists():
+                trace_files = sorted(traces_dir.glob("*.jsonl"), key=lambda p: p.stat().st_mtime, reverse=True)
+                for tf in trace_files:
+                    txt = _read_text(tf)
+                    if txt and txt.strip():
+                        return txt
+        return text
 
     def spec_text(self) -> str:
         run_dir = self._attached_dir()

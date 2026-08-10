@@ -348,6 +348,7 @@ button.icon-btn {
   margin-bottom: 4px;
   display: -webkit-box;
   -webkit-line-clamp: 2;
+  line-clamp: 2;
   -webkit-box-orient: vertical;
   overflow: hidden;
 }
@@ -739,6 +740,25 @@ button.icon-btn {
   font-size: 12px;
   padding-left: 8px;
   border-left: 2px solid var(--accent-green);
+}
+
+/* Separate Phase Failure Error Card */
+.phase-error-card {
+  border: 1.5px solid var(--accent-red);
+  background: rgba(239, 68, 68, 0.08);
+  margin-bottom: 8px;
+}
+.phase-error-card .error-body {
+  font-family: var(--font-mono);
+  font-size: 12px;
+  color: var(--text-bright);
+  background-color: var(--bg-darkest);
+  padding: 8px 10px;
+  border-radius: var(--radius-sm);
+  border: 1px solid rgba(239, 68, 68, 0.3);
+  margin-top: 8px;
+  white-space: pre-wrap;
+  word-break: break-word;
 }
 
 /* Resume Banner */

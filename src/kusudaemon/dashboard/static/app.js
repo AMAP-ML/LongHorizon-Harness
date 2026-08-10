@@ -19,6 +19,8 @@ const state = {
   drawerTab: "overview", // 'overview' | 'artifact' | 'diff' | 'thinking'
   nodeDiff: null,        // [{tag, lines}] once loaded, keyed to selectedNode
   nodeThinking: null,    // [{role, text}] once loaded, keyed to selectedNode
+  liveThinkingEntries: [],
+  liveThinkingTarget: null,
   newRunOpen: false,
   busy: false,
   toast: null,
@@ -27,11 +29,8 @@ const state = {
   spineText: "",
   assembly: null,
   promptText: "",
-  promptMode: "auto", // 'auto' | 'amend' | 'reopen'
-  // Draft text for every other free-text field, keyed so a periodic
-  // snapshot re-render (SSE/poll) can safely rebuild the field's DOM node
-  // from scratch without losing what's typed in it — see render()'s
-  // comment for why that rebuild happens on every live update.
+  promptMode: "auto", // 'auto' | 'amend' | 'reopen' | 'msg_agent'
+  targetAgentId: "main",
   newRun: { runId: "", goal: "", source: "", model: "", compile: "" },
   interjectDrafts: {}, // nodeId -> text
   reopenDrafts: {},    // nodeId -> text
@@ -50,26 +49,31 @@ async function apiGet(path) {
   return data;
 }
 
-async function apiPost(path, body) {
-  const res = await fetch(path, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(body || {}),
-  });
-  const data = await res.json().catch(() => ({}));
-  if (!res.ok) throw new Error(data.error || `${res.status} ${res.statusText}`);
-  return data;
+async function apiPost(path, body = {}) {
+  state.busy = true;
+  render();
+  try {
+    const res = await fetch(path, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) throw new Error(data.error || `${res.status} ${res.statusText}`);
+    return data;
+  } finally {
+    state.busy = false;
+    render();
+  }
 }
 
-function showToast(message, isError) {
-  state.toast = { message, isError };
+function showToast(msg, isError = false) {
+  state.toast = { message: msg, isError };
   render();
   setTimeout(() => {
-    if (state.toast && state.toast.message === message) {
-      state.toast = null;
-      render();
-    }
-  }, 4500);
+    state.toast = null;
+    render();
+  }, 4000);
 }
 
 async function guarded(fn) {
@@ -97,6 +101,25 @@ function snapshotFingerprint(snap) {
   return JSON.stringify(rest);
 }
 
+function loadLiveThinking() {
+  const snap = state.snapshot;
+  if (!snap || !snap.attached) {
+    state.liveThinkingEntries = [];
+    state.liveThinkingTarget = null;
+    return;
+  }
+  const subagents = snap.subagents || [];
+  const liveSub = subagents.find((s) => s.live);
+  const targetId = liveSub ? liveSub.id : "main";
+  apiGet(`/api/node/${encodeURIComponent(targetId)}/thinking`)
+    .then((d) => {
+      state.liveThinkingEntries = d.entries || [];
+      state.liveThinkingTarget = targetId;
+      render();
+    })
+    .catch(() => {});
+}
+
 function applySnapshot(snap) {
   if (snap && snap.attached && !snap.goal && state.snapshot && state.snapshot.run_id === snap.run_id && state.snapshot.goal) {
     snap.goal = state.snapshot.goal;
@@ -105,6 +128,9 @@ function applySnapshot(snap) {
   state.snapshot = snap;
   if (state.selectedNode && isLive(state.selectedNode)) {
     loadThinkingIfNeeded(true);
+  }
+  if (snap.attached) {
+    loadLiveThinking();
   }
   if (!unchanged) render();
 }
@@ -380,58 +406,65 @@ function renderCenterStream() {
     ]) : null,
   ]);
 
-  // Resume status banner if halted, error, or paused
+  // Separate Failure Error Card (rendered above Resume Card)
+  const hasError = snap.phase_status === "error" || snap.phase_status === "escalated" || (snap.phase_detail && snap.phase_detail.toLowerCase().includes("error"));
+  if (hasError) {
+    feed.appendChild(
+      el("div", { class: "stream-card phase-error-card" }, [
+        el("div", { class: "card-title" }, [
+          el("span", { style: "color:var(--accent-red); font-weight:700;" }, `❌ Phase Failure Error (${snap.phase ? snap.phase.toUpperCase() : "FAILURE"})`),
+          badge(snap.phase_status || "error"),
+        ]),
+        el("div", { class: "error-body" }, snap.phase_detail || "Phase execution failed. Review details or click Resume below to retry."),
+      ])
+    );
+  }
+
+  // Separate Resume Status Card (rendered below Error Card)
   const isStoppedOrHalted = snap.halted || snap.phase_status === "error" || snap.phase_status === "paused" || snap.phase_status === "escalated";
   if (isStoppedOrHalted && snap.control_enabled) {
     feed.appendChild(
       el("div", { class: "stream-card resume-banner" }, [
         el("div", { class: "card-title" }, [
-          el("span", { style: "color:var(--accent-amber);" }, `⚠️ Run status: ${snap.phase_status || (snap.halted ? "halted" : "stopped")}`),
+          el("span", { style: "color:var(--accent-amber); font-weight:600;" }, `▶ Resume Run (Status: ${snap.phase_status || (snap.halted ? "halted" : "stopped")})`),
           el("button", { class: "primary", disabled: state.busy ? "" : null, onclick: () => guarded(resumeAttached) }, "▶ Resume / Continue Run"),
         ]),
-        el("div", { style: "font-size:12px; color:var(--text-muted);" }, "Click Resume to continue execution automatically."),
+        el("div", { style: "font-size:12px; color:var(--text-muted); margin-top:4px;" }, "Click Resume / Continue to re-trigger execution from the last saved checkpoint."),
       ])
     );
   }
 
-  // Resolved Intake / Survey Answers Section
-  const approvals = snap.approvals || [];
-  const intakeApprovals = approvals.filter((a) => a.kind === "intake_question" || (a.user_input && a.status === "resolved"));
-  if (intakeApprovals.length > 0) {
-    feed.appendChild(
-      el("div", { class: "stream-card intake-summary-card" }, [
-        el("div", { class: "card-title" }, [
-          el("span", null, "📋 Intake & Survey Answers Provided"),
-          el("span", { class: "badge", "data-status": "passed" }, `${intakeApprovals.length} answered`),
-        ]),
-        el("div", { class: "intake-answers-list" }, intakeApprovals.map((a) =>
-          el("div", { class: "intake-qa-item" }, [
-            el("div", { class: "intake-q" }, `Q: ${a.message || a.title}`),
-            el("div", { class: "intake-a" }, `A: ${a.user_input || "(default accepted)"}`),
-          ])
-        )),
-      ])
-    );
-  }
 
-  // Live Thinking Stream Widget for active subagents
-  const subagents = snap.subagents || [];
-  const liveSub = subagents.find((s) => s.live);
-  if (liveSub) {
+  // Live Thinking Stream Widget for active run / subagents
+  if (snap.attached) {
+    const subagents = snap.subagents || [];
+    const liveSub = subagents.find((s) => s.live);
+    const targetLabel = liveSub ? `Subagent: ${liveSub.id} (${liveSub.role})` : `Main Phase: ${snap.phase || "active"}`;
+    const entries = state.liveThinkingEntries || [];
+
     feed.appendChild(
       el("div", { class: "stream-card thinking-live-card" }, [
         el("div", { class: "card-title" }, [
-          el("span", { style: "color:var(--accent-purple); font-weight:600;" }, `🧠 Bot Thinking Stream [Subagent: ${liveSub.id}]`),
-          el("button", { class: "xs-btn", onclick: () => openNode(liveSub.id) }, "Open Details"),
+          el("span", { style: "color:var(--accent-purple); font-weight:600;" }, `🧠 Bot Thinking Stream [${targetLabel}]`),
+          entries.length ? el("span", { class: "badge", "data-status": "passed" }, `${entries.length} entries`) : null,
+          liveSub ? el("button", { class: "xs-btn", onclick: () => openNode(liveSub.id) }, "Open Details") : null,
         ]),
-        el("div", { class: "thinking-live-body", id: `thinking-live-${liveSub.id}` }, [
-          el("span", { class: "dim" }, `Subagent ${liveSub.id} is active (${liveSub.role}). View full thinking trace in Subagents drawer.`),
-        ]),
+        el("div", { class: "thinking-live-body", id: "thinking-live-stream" },
+          entries.length
+            ? entries.slice(-15).map((e) =>
+                el("div", { class: `trace-entry trace-${e.role}`, style: "margin-bottom:4px; font-size:12px; line-height:1.4;" }, [
+                  el("span", { class: "trace-role", style: e.role === "thinking" ? "color:var(--accent-purple); font-style:italic;" : "" }, `[${e.role}] `),
+                  e.text
+                ])
+              )
+            : [el("span", { class: "dim" }, `Waiting for thinking stream trace from ${targetLabel}...`)]
+        ),
       ])
     );
   }
 
   // Render Approvals (Pending & Resolved)
+  const approvals = snap.approvals || [];
   approvals.forEach((a) => {
     const isPending = a.status === "pending";
     const parts = [
@@ -489,14 +522,22 @@ function renderCenterStream() {
   // Events (Newest at bottom)
   const events = (snap.events || []).slice(-20);
   events.forEach((ev) => {
+    let msgText = `${ev.type}${ev.phase ? ` [${ev.phase}]` : ""}${ev.status ? ` - ${ev.status}` : ""}`;
+    if (ev.type === "phase_auto_resuming") {
+      msgText = `🔄 Auto-resuming phase [${ev.phase}] (attempt ${ev.attempt || 1}) — Previous failure error: "${ev.error || "unknown"}"`;
+    } else if (ev.error) {
+      msgText += ` — Error: "${ev.error}"`;
+    }
+
+    const isAutoResume = ev.type === "phase_auto_resuming";
     feed.appendChild(
-      el("div", { class: "stream-msg agent" }, [
+      el("div", { class: "stream-msg agent", style: isAutoResume ? "border-left: 3px solid var(--accent-amber); background: rgba(245, 158, 11, 0.05);" : "" }, [
         el("div", { class: "msg-hdr" }, [
-          el("span", { class: "author" }, "Event"),
+          el("span", { class: "author", style: isAutoResume ? "color:var(--accent-amber);" : "" }, isAutoResume ? "🔄 Auto-Resume" : "Event"),
           el("span", null, fmtTime(ev.ts)),
           ev.node_id && ev.node_id !== "-" ? el("span", { class: "node-link", onclick: () => openNode(ev.node_id) }, ev.node_id) : null,
         ]),
-        el("div", { class: "msg-body" }, `${ev.type}${ev.phase ? ` [${ev.phase}]` : ""}${ev.status ? ` - ${ev.status}` : ""}`),
+        el("div", { class: "msg-body", style: isAutoResume ? "font-weight:500; color:var(--text-bright);" : "" }, msgText),
       ])
     );
   });
@@ -528,17 +569,17 @@ function renderPromptBar() {
   let targetSelector = null;
   if (state.promptMode === "msg_agent") {
     const subagents = snap.subagents || [];
-    const options = subagents.length
-      ? subagents.map((s) => el("option", { value: s.id, selected: (state.targetAgentId || subagents[0].id) === s.id ? "selected" : null }, `[${s.id}] ${s.kind} (${s.status})`))
-      : [el("option", { value: "" }, "(No subagents found)")];
+    const mainOpt = el("option", { value: "main", selected: (!state.targetAgentId || state.targetAgentId === "main") ? "selected" : null }, "🤖 Main Agent (Current Phase)");
+    const subOpts = subagents.map((s) => el("option", { value: s.id, selected: state.targetAgentId === s.id ? "selected" : null }, `[${s.id}] ${s.kind} (${s.status})`));
+    const options = [mainOpt, ...subOpts];
 
     const selectEl = el("select", {
       class: "agent-target-select",
       onchange: (e) => { state.targetAgentId = e.target.value; }
     }, options);
 
-    if (!state.targetAgentId && subagents.length) {
-      state.targetAgentId = subagents[0].id;
+    if (!state.targetAgentId) {
+      state.targetAgentId = "main";
     }
 
     targetSelector = el("div", { class: "agent-target-picker" }, [
@@ -553,7 +594,7 @@ function renderPromptBar() {
     placeholder:
       state.promptMode === "amend" ? "Enter contract amendment rule to append..." :
       state.promptMode === "reopen" ? "Node ID and defect description..." :
-      state.promptMode === "msg_agent" ? "Type a direct message to send to the subagent mid-episode..." :
+      state.promptMode === "msg_agent" ? "Type a direct message to send to the main agent or subagent mid-episode..." :
       "Type a run goal (or @path/to/file)...",
     rows: 1,
     disabled: disabled ? "" : null,
@@ -597,11 +638,7 @@ async function handlePromptSubmit() {
     state.promptText = "";
     showToast(`Reopen requested for node ${nodeId}`);
   } else if (state.promptMode === "msg_agent") {
-    const targetId = state.targetAgentId || (state.snapshot.subagents && state.snapshot.subagents[0] && state.snapshot.subagents[0].id);
-    if (!targetId) {
-      showToast("No target agent selected", true);
-      return;
-    }
+    const targetId = state.targetAgentId || "main";
     await apiPost(`/api/node/${encodeURIComponent(targetId)}/interject`, { text });
     state.promptText = "";
     showToast(`Message queued for agent ${targetId}`);

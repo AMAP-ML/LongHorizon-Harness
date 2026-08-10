@@ -286,6 +286,8 @@ class RecursiveDriver:
                     )
                     return RunReport(status="error", phase=phase, detail=str(exc))
                 # Auto-resume non-429/501 error automatically
+                err_msg = str(exc)
+                self._set_phase(phase, _IN_PROGRESS, detail=f"Auto-resuming (attempt {attempt}/{max_auto_attempts}) after error: {err_msg}")
                 self._log(
                     {
                         "node_id": "-",
@@ -294,7 +296,7 @@ class RecursiveDriver:
                         "type": "phase_auto_resuming",
                         "phase": phase,
                         "attempt": attempt,
-                        "error": str(exc),
+                        "error": err_msg,
                     }
                 )
                 await asyncio.sleep(1.0)
