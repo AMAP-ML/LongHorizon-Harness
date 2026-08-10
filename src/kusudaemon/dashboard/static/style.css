@@ -657,7 +657,12 @@ button.icon-btn {
   display: flex;
   flex-direction: column;
   gap: 20px;
-  scroll-behavior: smooth;
+  /* render() fully tears down and rebuilds #app on every snapshot tick
+     (~1.5s) -- a fresh element always starts at scrollTop:0, and
+     restoreScrollStates() then sets scrollTop back to scrollHeight to
+     pin it at the bottom. With smooth scrolling that reset-then-restore
+     plays as a visible "jump to top, animate back down" on every single
+     tick instead of an instant, invisible correction. */
 }
 
 /* Chat Feed Messages */

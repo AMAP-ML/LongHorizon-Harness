@@ -31,6 +31,7 @@ const state = {
   promptText: "",
   promptMode: "msg_agent", // 'msg_agent' | 'auto' | 'amend' | 'reopen'
   targetAgentId: "main",
+  targetAgentManual: false, // true once the operator picks a target by hand; see renderPromptBar
   newRun: { runId: "", goal: "", source: "", model: "", compile: "" },
   interjectDrafts: {}, // nodeId -> text
   reopenDrafts: {},    // nodeId -> text
@@ -331,7 +332,10 @@ function renderSidebar() {
       ? runs.map((r) =>
           el("li", {
             class: "run-item" + (r.attached ? " active" : ""),
-            onclick: () => guarded(() => apiPost("/api/attach", { run_id: r.id })),
+            onclick: () => guarded(() => {
+              state.targetAgentManual = false; // resume auto-following the live subagent in the new run
+              return apiPost("/api/attach", { run_id: r.id });
+            }),
           }, [
             el("div", { style: "display:flex; justify-content:space-between; align-items:flex-start; gap:8px;" }, [
               el("div", { class: "goal" }, r.goal || r.id),
@@ -385,6 +389,7 @@ function renderSidebar() {
                 e.stopPropagation();
                 state.promptMode = "msg_agent";
                 state.targetAgentId = s.id;
+                state.targetAgentManual = true;
                 render();
               }
             }, "💬 Message Agent")
@@ -618,42 +623,64 @@ function renderPromptBar() {
   ]);
 
   let targetSelector = null;
+  let msgTargetIsLive = true; // only meaningful in msg_agent mode; see below
   if (state.promptMode === "msg_agent") {
     const subagents = snap.subagents || [];
+    const anyLive = subagents.some((s) => s.live);
+
+    // Auto-follow whichever subagent is actually live instead of leaving
+    // the selection pinned to "main" (which -- outside a lucky fallback
+    // scan on the backend -- almost never has a live gptme session of its
+    // own) or to a previous target whose episode has since finished.
+    // Interjecting into a dead session always 409s ("no live session
+    // found for this node"); repeatedly hitting Send against a stale
+    // selection is exactly that. Once the operator manually picks a
+    // target, respect it until they attach a new run.
+    if (!state.targetAgentManual) {
+      const liveSub = subagents.find((s) => s.live);
+      state.targetAgentId = liveSub ? liveSub.id : "main";
+    }
+
     const mainOpt = el("option", { value: "main", selected: (!state.targetAgentId || state.targetAgentId === "main") ? "selected" : null }, "🤖 Main Agent (Current Phase)");
-    const subOpts = subagents.map((s) => el("option", { value: s.id, selected: state.targetAgentId === s.id ? "selected" : null }, `[${s.id}] ${s.kind} (${s.status})`));
+    const subOpts = subagents.map((s) => el("option", { value: s.id, selected: state.targetAgentId === s.id ? "selected" : null }, `[${s.id}] ${s.kind} (${s.status}${s.live ? ", live" : ""})`));
     const options = [mainOpt, ...subOpts];
 
     const selectEl = el("select", {
       class: "agent-target-select",
-      onchange: (e) => { state.targetAgentId = e.target.value; }
+      onchange: (e) => { state.targetAgentManual = true; state.targetAgentId = e.target.value; render(); },
     }, options);
 
-    if (!state.targetAgentId) {
-      state.targetAgentId = "main";
-    }
+    // "main" can still route to a live subagent via the backend's own
+    // fallback scan (RunState.node_gptme_logdir), so only treat it as
+    // definitely-dead when nothing at all is live.
+    msgTargetIsLive = state.targetAgentId === "main" ? anyLive : !!subagents.find((s) => s.id === state.targetAgentId && s.live);
 
     targetSelector = el("div", { class: "agent-target-picker" }, [
       el("label", { style: "font-size:11px; font-weight:600; color:var(--accent-purple);" }, "Target:"),
       selectEl,
+      !msgTargetIsLive
+        ? el("span", { style: "font-size:11px; color:var(--text-muted); margin-left:8px;" }, "not currently running -- nothing to message")
+        : null,
     ]);
   }
 
+  const msgBlocked = state.promptMode === "msg_agent" && !msgTargetIsLive;
   const ta = el("textarea", {
     class: "prompt-textarea",
     "data-key": "prompt-textarea",
     placeholder:
       state.promptMode === "amend" ? "Enter contract amendment rule to append..." :
       state.promptMode === "reopen" ? "Node ID and defect description..." :
+      msgBlocked ? "No live agent to message right now -- pick a different target or wait for one to start." :
       state.promptMode === "msg_agent" ? "Type a direct message to send to the main agent or subagent mid-episode..." :
       "Type a run goal (or @path/to/file)...",
     rows: 1,
-    disabled: disabled ? "" : null,
+    disabled: (disabled || msgBlocked) ? "" : null,
   });
   ta.value = state.promptText;
   ta.addEventListener("input", () => { state.promptText = ta.value; });
 
-  const sendBtn = el("button", { class: "primary", disabled: disabled ? "" : null, onclick: () => guarded(() => handlePromptSubmit()) }, "Send ↵");
+  const sendBtn = el("button", { class: "primary", disabled: (disabled || msgBlocked) ? "" : null, onclick: () => guarded(() => handlePromptSubmit()) }, "Send ↵");
 
   ta.addEventListener("keydown", (e) => {
     if (e.key === "Enter" && !e.shiftKey) {
@@ -690,6 +717,16 @@ async function handlePromptSubmit() {
     showToast(`Reopen requested for node ${nodeId}`);
   } else if (state.promptMode === "msg_agent") {
     const targetId = state.targetAgentId || "main";
+    const subagents = state.snapshot.subagents || [];
+    const targetIsLive = targetId === "main" ? subagents.some((s) => s.live) : !!subagents.find((s) => s.id === targetId && s.live);
+    if (!targetIsLive) {
+      // The Send button/textarea are already disabled for this case, but
+      // Enter-to-submit bypasses that (its keydown handler doesn't check
+      // `disabled`) -- catch it here too instead of firing a POST that
+      // can only 409 with "no live session found for this node".
+      showToast(`${targetId === "main" ? "No agent" : targetId} is not currently running -- nothing to message`, true);
+      return;
+    }
     await apiPost(`/api/node/${encodeURIComponent(targetId)}/interject`, { text });
     state.promptText = "";
     showToast(`Message queued for agent ${targetId}`);
