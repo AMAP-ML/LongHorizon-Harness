@@ -303,6 +303,9 @@ def load_env_file(path: Path | None = None) -> Path | None:
         return None
     for key, value in parse_env_lines(text).items():
         os.environ.setdefault(key, value)
+    os.environ.setdefault("OMP_NUM_THREADS", "1")
+    os.environ.setdefault("MKL_NUM_THREADS", "1")
+    os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
     return path
 
 

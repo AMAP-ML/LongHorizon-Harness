@@ -25,13 +25,14 @@ from kusudaemon.pipeline.run_dir import approvals_path  # noqa: E402
 _N_RECORDS = 700
 
 
-def _write_log(run_dir: Path, n: int) -> None:
+def _write_log(run_dir: Path, n: int, start: int = 0) -> None:
     lines = []
-    for i in range(n):
+    for i in range(start, n):
         record = approval_store.Approval.create("pilot", title=f"q{i}", message="x" * 400)
         lines.append(json.dumps(record.to_dict(), ensure_ascii=False, sort_keys=True))
     approvals_path(run_dir).parent.mkdir(parents=True, exist_ok=True)
-    approvals_path(run_dir).write_text("\n".join(lines) + "\n", encoding="utf-8")
+    with approvals_path(run_dir).open("a", encoding="utf-8") as fh:
+        fh.write("\n".join(lines) + "\n")
 
 
 class IncrementalScanTest(unittest.TestCase):
@@ -72,7 +73,7 @@ class IncrementalScanTest(unittest.TestCase):
             self.assertEqual([r.title for r in first], ["q0", "q1", "q2"])
             self.assertEqual(scanner.next_records(), [])
             self.assertEqual(scanner.next_records(), [])
-            _write_log(run_dir, 5)
+            _write_log(run_dir, 5, start=3)
             second = scanner.next_records()
             self.assertEqual([r.title for r in second], ["q3", "q4"])
 

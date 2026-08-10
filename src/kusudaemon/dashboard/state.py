@@ -353,11 +353,13 @@ class RunState:
 
     @staticmethod
     def _options_from_body(body: dict[str, Any], goal: str) -> RunOptions:
+        from ..pipeline.run import _read_text_arg
+
         return RunOptions(
-            goal=goal,
+            goal=_read_text_arg(goal),
             backend=str(body.get("backend") or _default_backend()),
             model=body.get("model") or None,
-            source_text=str(body.get("source", "")),
+            source_text=_read_text_arg(str(body.get("source", ""))),
             compile_command=body.get("compile_command") or None,
             research_plan=_parse_plan_payload(body.get("research_plan")),
             max_rounds=int(body.get("max_rounds", 100)),

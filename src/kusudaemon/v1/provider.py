@@ -86,7 +86,7 @@ class OpenAICompatibleProvider:
         base_url: str | None = None,
         api_key: str | None = None,
         transport: Transport | None = None,
-        timeout: float = 120.0,
+        timeout: float = 30.0,
         max_http_retries: int = _DEFAULT_HTTP_RETRIES,
         base_retry_delay: float = 1.0,
         concurrency: int = _DEFAULT_CONCURRENCY,
