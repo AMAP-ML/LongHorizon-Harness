@@ -98,8 +98,14 @@ function snapshotFingerprint(snap) {
 }
 
 function applySnapshot(snap) {
+  if (snap && snap.attached && !snap.goal && state.snapshot && state.snapshot.run_id === snap.run_id && state.snapshot.goal) {
+    snap.goal = state.snapshot.goal;
+  }
   const unchanged = snapshotFingerprint(snap) === snapshotFingerprint(state.snapshot);
   state.snapshot = snap;
+  if (state.selectedNode && isLive(state.selectedNode)) {
+    loadThinkingIfNeeded(true);
+  }
   if (!unchanged) render();
 }
 
@@ -184,6 +190,7 @@ function renderHeader() {
         el("span", { style: "color:var(--text-muted);" }, "Run:"),
         el("span", { style: "font-weight:600;" }, snap.run_id),
         badge(snap.phase_status || "running"),
+        (snap.pending_approvals || []).length ? el("span", { class: "badge", "data-status": "waiting_for_approval" }, "⚡ ACTION REQUIRED") : null,
         snap.halted ? badge("halted") : null,
       ])
     );
@@ -199,9 +206,10 @@ function renderHeader() {
 
   const actions = [];
   if (snap.attached && snap.control_enabled) {
-    if (snap.halted) {
+    const isStoppedOrHalted = snap.halted || snap.phase_status === "error" || snap.phase_status === "paused" || snap.phase_status === "escalated" || snap.phase_status === "halted";
+    if (isStoppedOrHalted) {
       actions.push(
-        el("button", { class: "primary", disabled: state.busy ? "" : null, onclick: () => guarded(resumeAttached) }, "▶ Resume")
+        el("button", { class: "primary", disabled: state.busy ? "" : null, onclick: () => guarded(resumeAttached) }, "▶ Resume / Continue")
       );
     } else {
       actions.push(
@@ -252,7 +260,22 @@ function renderSidebar() {
             class: "run-item" + (r.attached ? " active" : ""),
             onclick: () => guarded(() => apiPost("/api/attach", { run_id: r.id })),
           }, [
-            el("div", { class: "goal" }, r.goal || r.id),
+            el("div", { style: "display:flex; justify-content:space-between; align-items:flex-start; gap:8px;" }, [
+              el("div", { class: "goal" }, r.goal || r.id),
+              snap.control_enabled ? el("button", {
+                class: "icon-btn delete-btn",
+                title: "Delete Run",
+                onclick: (e) => {
+                  e.stopPropagation();
+                  guarded(async () => {
+                    if (confirm(`Delete run "${r.id}"? This action cannot be undone.`)) {
+                      await apiPost("/api/runs/delete", { run_id: r.id });
+                      showToast(`Deleted run ${r.id}`);
+                    }
+                  });
+                }
+              }, "🗑️") : null,
+            ]),
             el("div", { class: "meta" }, [badge(r.status || r.phase || "-"), el("span", null, r.id)]),
           ])
         )
@@ -282,6 +305,17 @@ function renderSidebar() {
             badge(s.status),
           ]),
           el("div", { class: "brief" }, `${s.kind} · ${s.role} · attempts=${s.attempts}${s.duration_ms ? ` · ${s.duration_ms}ms` : ""}`),
+          snap.control_enabled ? el("div", { style: "margin-top:6px; display:flex; justify-content:flex-end;" }, [
+            el("button", {
+              class: "xs-btn",
+              onclick: (e) => {
+                e.stopPropagation();
+                state.promptMode = "msg_agent";
+                state.targetAgentId = s.id;
+                render();
+              }
+            }, "💬 Message Agent")
+          ]) : null,
         ])
       ));
     }
@@ -322,85 +356,150 @@ function renderCenterStream() {
         el("p", null, "Start a new run or pick an existing one from the sidebar to begin."),
       ])
     );
-  } else {
+    return el("main", { class: "chat-stream-panel" }, [
+      el("div", { class: "chat-header" }, [
+        el("div", { class: "title" }, ["💬 Run Stream"]),
+      ]),
+      feed,
+      renderPromptBar(),
+    ]);
+  }
+
+  // Pinned Header Section at top (Goal & Phase stay fixed at top when scrolling)
+  const pinnedHeader = el("div", { class: "pinned-run-header" }, [
+    el("div", { class: "stream-msg user pinned-goal" }, [
+      el("div", { class: "msg-hdr" }, [el("span", { class: "author" }, "Goal"), el("span", null, "Run Spec")]),
+      el("div", { class: "msg-body" }, snap.goal || "(no goal recorded)"),
+    ]),
+    snap.phase ? el("div", { class: "stream-card pinned-phase" }, [
+      el("div", { class: "card-title" }, [
+        el("span", null, `🤖 Phase: ${snap.phase.toUpperCase()}`),
+        badge(snap.phase_status || "running"),
+      ]),
+      snap.phase_detail ? el("div", { style: "color:var(--accent-amber); font-size:12px; margin-top:4px;" }, snap.phase_detail) : null,
+    ]) : null,
+  ]);
+
+  // Resume status banner if halted, error, or paused
+  const isStoppedOrHalted = snap.halted || snap.phase_status === "error" || snap.phase_status === "paused" || snap.phase_status === "escalated";
+  if (isStoppedOrHalted && snap.control_enabled) {
     feed.appendChild(
-      el("div", { class: "stream-msg user" }, [
-        el("div", { class: "msg-hdr" }, [el("span", { class: "author" }, "Goal"), el("span", null, "Run Spec")]),
-        el("div", { class: "msg-body" }, snap.goal || "(no goal recorded)"),
+      el("div", { class: "stream-card resume-banner" }, [
+        el("div", { class: "card-title" }, [
+          el("span", { style: "color:var(--accent-amber);" }, `⚠️ Run status: ${snap.phase_status || (snap.halted ? "halted" : "stopped")}`),
+          el("button", { class: "primary", disabled: state.busy ? "" : null, onclick: () => guarded(resumeAttached) }, "▶ Resume / Continue Run"),
+        ]),
+        el("div", { style: "font-size:12px; color:var(--text-muted);" }, "Click Resume to continue execution automatically."),
       ])
     );
+  }
 
-    if (snap.phase) {
-      feed.appendChild(
-        el("div", { class: "stream-card" }, [
-          el("div", { class: "card-title" }, [
-            el("span", null, `🤖 Phase: ${snap.phase.toUpperCase()}`),
-            badge(snap.phase_status || "running"),
-          ]),
-          snap.phase_detail ? el("div", { style: "color:var(--accent-amber); font-size:12px; margin-top:4px;" }, snap.phase_detail) : null,
-        ])
-      );
+  // Resolved Intake / Survey Answers Section
+  const approvals = snap.approvals || [];
+  const intakeApprovals = approvals.filter((a) => a.kind === "intake_question" || (a.user_input && a.status === "resolved"));
+  if (intakeApprovals.length > 0) {
+    feed.appendChild(
+      el("div", { class: "stream-card intake-summary-card" }, [
+        el("div", { class: "card-title" }, [
+          el("span", null, "📋 Intake & Survey Answers Provided"),
+          el("span", { class: "badge", "data-status": "passed" }, `${intakeApprovals.length} answered`),
+        ]),
+        el("div", { class: "intake-answers-list" }, intakeApprovals.map((a) =>
+          el("div", { class: "intake-qa-item" }, [
+            el("div", { class: "intake-q" }, `Q: ${a.message || a.title}`),
+            el("div", { class: "intake-a" }, `A: ${a.user_input || "(default accepted)"}`),
+          ])
+        )),
+      ])
+    );
+  }
+
+  // Live Thinking Stream Widget for active subagents
+  const subagents = snap.subagents || [];
+  const liveSub = subagents.find((s) => s.live);
+  if (liveSub) {
+    feed.appendChild(
+      el("div", { class: "stream-card thinking-live-card" }, [
+        el("div", { class: "card-title" }, [
+          el("span", { style: "color:var(--accent-purple); font-weight:600;" }, `🧠 Bot Thinking Stream [Subagent: ${liveSub.id}]`),
+          el("button", { class: "xs-btn", onclick: () => openNode(liveSub.id) }, "Open Details"),
+        ]),
+        el("div", { class: "thinking-live-body", id: `thinking-live-${liveSub.id}` }, [
+          el("span", { class: "dim" }, `Subagent ${liveSub.id} is active (${liveSub.role}). View full thinking trace in Subagents drawer.`),
+        ]),
+      ])
+    );
+  }
+
+  // Render Approvals (Pending & Resolved)
+  approvals.forEach((a) => {
+    const isPending = a.status === "pending";
+    const parts = [
+      el("div", { class: "card-title" }, [
+        el("span", { style: isPending ? "color:var(--accent-amber); font-weight:700;" : "" }, `⚡ ${isPending ? "ACTION REQUIRED" : a.kind.toUpperCase()}: ${a.title}`),
+        badge(a.status),
+      ]),
+    ];
+    if (a.message) parts.push(el("div", { class: "card-text", style: isPending ? "font-size:14px; font-weight:500;" : "" }, a.message));
+
+    if (isPending && snap.control_enabled) {
+      const actionBtns = [];
+      if ((a.options || []).length) {
+        a.options.forEach((opt) => {
+          actionBtns.push(
+            el("button", {
+              class: opt.style === "primary" ? "primary" : "",
+              disabled: state.busy ? "" : null,
+              onclick: () => guarded(() => apiPost(`/api/approvals/${encodeURIComponent(a.approval_id)}/resolve`, { action: opt.value }).then(() => showToast("Approval resolved"))),
+            }, opt.label)
+          );
+        });
+      }
+      if (a.allow_input) {
+        const inputEl = el("input", { type: "text", "data-key": `approval-input-${a.approval_id}`, placeholder: a.input_label || "Provide response details or leave blank for default...", style: "margin-top:8px;" });
+        inputEl.value = state.approvalDrafts[a.approval_id] || "";
+        inputEl.addEventListener("input", () => { state.approvalDrafts[a.approval_id] = inputEl.value; });
+        parts.push(inputEl);
+        actionBtns.push(
+          el("button", { class: "primary", disabled: state.busy ? "" : null, onclick: () => guarded(async () => {
+            const val = state.approvalDrafts[a.approval_id] || "";
+            await apiPost(`/api/approvals/${encodeURIComponent(a.approval_id)}/resolve`, { action: "answer", user_input: val });
+            delete state.approvalDrafts[a.approval_id];
+            showToast("Submitted answer");
+          }) }, "Submit Input")
+        );
+        actionBtns.push(
+          el("button", { disabled: state.busy ? "" : null, onclick: () => guarded(async () => {
+            await apiPost(`/api/approvals/${encodeURIComponent(a.approval_id)}/resolve`, { action: "answer", user_input: "" });
+            delete state.approvalDrafts[a.approval_id];
+            showToast("Accepted default");
+          }) }, "Use Default")
+        );
+      }
+      parts.push(el("div", { class: "approval-actions" }, actionBtns));
+    } else if (a.status === "resolved") {
+      const answerDisplay = a.user_input ? `Answer given: "${a.user_input}"` : `Resolved via action: ${a.action || "completed"}`;
+      parts.push(el("div", { style: "font-size:12px; color:var(--text-bright); font-weight:500; margin-top:6px; background:var(--bg-tertiary); padding:6px 10px; border-radius:4px;" }, answerDisplay));
     }
 
-    const approvals = snap.approvals || [];
-    approvals.forEach((a) => {
-      const parts = [
-        el("div", { class: "card-title" }, [
-          el("span", null, `⚡ ${a.kind.toUpperCase()}: ${a.title}`),
-          badge(a.status),
+    const cardStyle = isPending ? "border:1.5px solid var(--accent-amber); background:rgba(245, 158, 11, 0.08);" : "";
+    feed.appendChild(el("div", { class: "stream-card approval" + (isPending ? " pending" : ""), style: cardStyle }, parts));
+  });
+
+  // Events (Newest at bottom)
+  const events = (snap.events || []).slice(-20);
+  events.forEach((ev) => {
+    feed.appendChild(
+      el("div", { class: "stream-msg agent" }, [
+        el("div", { class: "msg-hdr" }, [
+          el("span", { class: "author" }, "Event"),
+          el("span", null, fmtTime(ev.ts)),
+          ev.node_id && ev.node_id !== "-" ? el("span", { class: "node-link", onclick: () => openNode(ev.node_id) }, ev.node_id) : null,
         ]),
-      ];
-      if (a.message) parts.push(el("div", { class: "card-text" }, a.message));
-
-      if (a.status === "pending" && snap.control_enabled) {
-        const actionBtns = [];
-        if ((a.options || []).length) {
-          a.options.forEach((opt) => {
-            actionBtns.push(
-              el("button", {
-                class: opt.style === "primary" ? "primary" : "",
-                disabled: state.busy ? "" : null,
-                onclick: () => guarded(() => apiPost(`/api/approvals/${encodeURIComponent(a.approval_id)}/resolve`, { action: opt.value }).then(() => showToast("Approval resolved"))),
-              }, opt.label)
-            );
-          });
-        }
-        if (a.allow_input) {
-          const inputEl = el("input", { type: "text", "data-key": `approval-input-${a.approval_id}`, placeholder: a.input_label || "Provide response details...", style: "margin-top:8px;" });
-          inputEl.value = state.approvalDrafts[a.approval_id] || "";
-          inputEl.addEventListener("input", () => { state.approvalDrafts[a.approval_id] = inputEl.value; });
-          parts.push(inputEl);
-          actionBtns.push(
-            el("button", { class: "primary", disabled: state.busy ? "" : null, onclick: () => guarded(async () => {
-              const val = state.approvalDrafts[a.approval_id] || "";
-              await apiPost(`/api/approvals/${encodeURIComponent(a.approval_id)}/resolve`, { action: "answer", user_input: val });
-              delete state.approvalDrafts[a.approval_id];
-              showToast("Submitted answer");
-            }) }, "Submit Input")
-          );
-        }
-        parts.push(el("div", { class: "approval-actions" }, actionBtns));
-      } else if (a.status === "resolved") {
-        parts.push(el("div", { style: "font-size:11px; color:var(--text-muted); margin-top:4px;" }, `Resolved via action: ${a.action || "completed"}`));
-      }
-
-      feed.appendChild(el("div", { class: "stream-card approval" }, parts));
-    });
-
-    const events = (snap.events || []).slice(-15);
-    events.forEach((ev) => {
-      feed.appendChild(
-        el("div", { class: "stream-msg agent" }, [
-          el("div", { class: "msg-hdr" }, [
-            el("span", { class: "author" }, "Event"),
-            el("span", null, fmtTime(ev.ts)),
-            ev.node_id && ev.node_id !== "-" ? el("span", { class: "node-link", onclick: () => openNode(ev.node_id) }, ev.node_id) : null,
-          ]),
-          el("div", { class: "msg-body" }, `${ev.type}${ev.phase ? ` [${ev.phase}]` : ""}${ev.status ? ` - ${ev.status}` : ""}`),
-        ])
-      );
-    });
-  }
+        el("div", { class: "msg-body" }, `${ev.type}${ev.phase ? ` [${ev.phase}]` : ""}${ev.status ? ` - ${ev.status}` : ""}`),
+      ])
+    );
+  });
 
   const promptBar = renderPromptBar();
 
@@ -409,6 +508,7 @@ function renderCenterStream() {
       el("div", { class: "title" }, ["💬 Run Stream", snap.halted ? badge("halted") : null]),
       el("span", { style: "font-size:11px; color:var(--text-muted);" }, snap.attached ? `${snap.events_count || 0} events` : ""),
     ]),
+    pinnedHeader,
     feed,
     promptBar,
   ]);
@@ -422,12 +522,39 @@ function renderPromptBar() {
     el("button", { class: "mode-btn" + (state.promptMode === "auto" ? " active" : ""), onclick: () => { state.promptMode = "auto"; render(); } }, "New Run"),
     el("button", { class: "mode-btn" + (state.promptMode === "amend" ? " active" : ""), onclick: () => { state.promptMode = "amend"; render(); } }, "Amend Contract"),
     el("button", { class: "mode-btn" + (state.promptMode === "reopen" ? " active" : ""), onclick: () => { state.promptMode = "reopen"; render(); } }, "Reopen Node"),
+    el("button", { class: "mode-btn" + (state.promptMode === "msg_agent" ? " active" : ""), onclick: () => { state.promptMode = "msg_agent"; render(); } }, "💬 Message Agent"),
   ]);
+
+  let targetSelector = null;
+  if (state.promptMode === "msg_agent") {
+    const subagents = snap.subagents || [];
+    const options = subagents.length
+      ? subagents.map((s) => el("option", { value: s.id, selected: (state.targetAgentId || subagents[0].id) === s.id ? "selected" : null }, `[${s.id}] ${s.kind} (${s.status})`))
+      : [el("option", { value: "" }, "(No subagents found)")];
+
+    const selectEl = el("select", {
+      class: "agent-target-select",
+      onchange: (e) => { state.targetAgentId = e.target.value; }
+    }, options);
+
+    if (!state.targetAgentId && subagents.length) {
+      state.targetAgentId = subagents[0].id;
+    }
+
+    targetSelector = el("div", { class: "agent-target-picker" }, [
+      el("label", { style: "font-size:11px; font-weight:600; color:var(--accent-purple);" }, "Target:"),
+      selectEl,
+    ]);
+  }
 
   const ta = el("textarea", {
     class: "prompt-textarea",
     "data-key": "prompt-textarea",
-    placeholder: state.promptMode === "amend" ? "Enter contract amendment rule to append..." : state.promptMode === "reopen" ? "Node ID and defect description..." : "Type a run goal (or @path/to/file)...",
+    placeholder:
+      state.promptMode === "amend" ? "Enter contract amendment rule to append..." :
+      state.promptMode === "reopen" ? "Node ID and defect description..." :
+      state.promptMode === "msg_agent" ? "Type a direct message to send to the subagent mid-episode..." :
+      "Type a run goal (or @path/to/file)...",
     rows: 1,
     disabled: disabled ? "" : null,
   });
@@ -446,7 +573,8 @@ function renderPromptBar() {
   return el("div", { class: "prompt-container" }, [
     el("div", { class: "prompt-controls" }, [
       modeSelector,
-      el("span", { style: "font-size:11px; color:var(--text-muted);" }, "Press Enter to submit, Shift+Enter for newline"),
+      targetSelector,
+      el("span", { style: "font-size:11px; color:var(--text-muted);" }, "Press Enter to submit"),
     ]),
     el("div", { class: "prompt-input-wrapper" }, [ta, sendBtn]),
   ]);
@@ -468,6 +596,15 @@ async function handlePromptSubmit() {
     await apiPost("/api/reopen", { node_id: nodeId, defect });
     state.promptText = "";
     showToast(`Reopen requested for node ${nodeId}`);
+  } else if (state.promptMode === "msg_agent") {
+    const targetId = state.targetAgentId || (state.snapshot.subagents && state.snapshot.subagents[0] && state.snapshot.subagents[0].id);
+    if (!targetId) {
+      showToast("No target agent selected", true);
+      return;
+    }
+    await apiPost(`/api/node/${encodeURIComponent(targetId)}/interject`, { text });
+    state.promptText = "";
+    showToast(`Message queued for agent ${targetId}`);
   } else {
     const res = await apiPost("/api/runs", { goal: text });
     state.promptText = "";
@@ -546,8 +683,6 @@ function fetchWorkbenchData(id) {
 
 // ---------------------------------------------------------------------
 // Node / Subagent Detail Drawer
-// (Overview / Artifact / Diff / Thinking -- the same four the deleted
-// TUI's NodeDetail widget had, plus interject + reopen bars.)
 // ---------------------------------------------------------------------
 function openNode(id) {
   state.selectedNode = id;
@@ -598,14 +733,14 @@ function loadDiffIfNeeded() {
   ).then((results) => { state.nodeDiff = results; render(); }).catch(() => { state.nodeDiff = []; render(); });
 }
 
-function loadThinkingIfNeeded() {
-  if (state.nodeThinking !== null) return;
+function loadThinkingIfNeeded(force = false) {
+  if (state.nodeThinking !== null && !force && state.nodeThinking !== "loading") return;
   const id = state.selectedNode;
-  state.nodeThinking = "loading";
-  render();
+  if (!id) return;
+  if (state.nodeThinking === null) state.nodeThinking = "loading";
   apiGet(`/api/node/${encodeURIComponent(id)}/thinking`)
-    .then((d) => { state.nodeThinking = d.entries; render(); })
-    .catch(() => { state.nodeThinking = []; render(); });
+    .then((d) => { state.nodeThinking = d.entries || []; render(); })
+    .catch(() => { if (state.nodeThinking === "loading") state.nodeThinking = []; });
 }
 
 function renderOverview() {
@@ -888,9 +1023,13 @@ function render() {
   }
 
   restoreFocusState(focusState);
-  if (feedScrollTop !== null) {
-    const feedAfter = document.getElementById("chat-feed-scroll");
-    if (feedAfter) feedAfter.scrollTop = feedScrollTop;
+  const feedAfter = document.getElementById("chat-feed-scroll");
+  if (feedAfter) {
+    if (feedScrollTop === null || (feedBefore && feedBefore.scrollHeight - feedScrollTop - feedBefore.clientHeight < 120)) {
+      feedAfter.scrollTop = feedAfter.scrollHeight;
+    } else {
+      feedAfter.scrollTop = feedScrollTop;
+    }
   }
 }
 

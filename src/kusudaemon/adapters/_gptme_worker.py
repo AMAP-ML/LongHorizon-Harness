@@ -91,6 +91,20 @@ def main() -> int:
         from gptme.tools import init_tools
 
         tools = init_tools(allowlist)
+        for tool in tools:
+            if hasattr(tool, "execute") and callable(getattr(tool, "execute", None)):
+                orig_exec = tool.execute
+
+                def _make_safe(fn):
+                    def _safe_exec(*a, **kw):
+                        try:
+                            return fn(*a, **kw)
+                        except Exception as e:
+                            return f"Tool operation error ({type(e).__name__}): {e}. Please inspect this error and attempt self-correction."
+
+                    return _safe_exec
+
+                tool.execute = _make_safe(orig_exec)
         initial_msgs = gptme.get_prompt(
             tools=tools,
             tool_format=args.tool_format,

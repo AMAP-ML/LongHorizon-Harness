@@ -190,6 +190,26 @@ class RunState:
             self._attached = run_id
         return True
 
+    def delete_run(self, run_id: str) -> bool:
+        if not run_id or "/" in run_id or "\\" in run_id or run_id in {".", ".."}:
+            return False
+        if self.runs_root is None:
+            return False
+        run_dir = (self.runs_root / run_id).resolve()
+        try:
+            run_dir.relative_to(self.runs_root.resolve())
+        except ValueError:
+            return False
+        if not run_dir.is_dir():
+            return False
+        import shutil
+
+        with self._lock:
+            if self._attached == run_id:
+                self._attached = None
+            shutil.rmtree(run_dir, ignore_errors=True)
+        return True
+
     @property
     def attached_run_id(self) -> str | None:
         with self._lock:
@@ -215,6 +235,14 @@ class RunState:
                 "server_time": _now(),
             }
         spec = _read_json(run_spec_path(run_dir)) or {}
+        goal = str(spec.get("goal", "")).strip()
+        if not goal:
+            spec_md = _read_text(spec_path(run_dir)) or ""
+            if "## Goal" in spec_md:
+                try:
+                    goal = spec_md.split("## Goal", 1)[1].split("##", 1)[0].strip()
+                except Exception:
+                    pass
         phase = _read_json(phase_path(run_dir)) or {}
         events = self._cached_events(run_dir)
         tree = self._cached_tree(run_dir)
@@ -223,7 +251,7 @@ class RunState:
             "attached": True,
             "run_id": self.attached_run_id,
             "runs": self.list_runs(),
-            "goal": str(spec.get("goal", "")),
+            "goal": goal,
             "backend": str(spec.get("backend", "")),
             "phase": str(phase.get("phase", "")),
             "phase_status": str(phase.get("status", "")),

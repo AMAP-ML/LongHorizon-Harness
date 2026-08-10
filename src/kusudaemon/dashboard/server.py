@@ -105,6 +105,22 @@ def _post_runs(handler: "DashboardRequestHandler", match: Any, body: dict) -> tu
     return 200, {"run_id": run_id}
 
 
+@_route("POST", r"^/api/runs/delete$")
+def _post_delete_run(handler: "DashboardRequestHandler", match: Any, body: dict) -> tuple[int, Any]:
+    handler.require_control()
+    run_id = str(body.get("run_id", ""))
+    ok = handler.state.delete_run(run_id)
+    return (200, {"ok": True}) if ok else (400, {"ok": False, "error": "failed to delete run"})
+
+
+@_route("DELETE", r"^/api/runs/([^/]+)$")
+def _delete_run(handler: "DashboardRequestHandler", match: Any, body: dict) -> tuple[int, Any]:
+    handler.require_control()
+    run_id = unquote(match.group(1))
+    ok = handler.state.delete_run(run_id)
+    return (200, {"ok": True}) if ok else (400, {"ok": False, "error": "failed to delete run"})
+
+
 @_route("POST", r"^/api/halt$")
 def _post_halt(handler: "DashboardRequestHandler", match: Any, body: dict) -> tuple[int, Any]:
     handler.require_control()

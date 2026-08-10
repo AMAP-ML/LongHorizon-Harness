@@ -635,6 +635,134 @@ button.icon-btn {
   min-height: 24px;
 }
 
+/* Pinned Header Panel at top of stream */
+.pinned-run-header {
+  position: sticky;
+  top: 0;
+  z-index: 15;
+  background-color: var(--bg-secondary);
+  border-bottom: 1px solid var(--border-color);
+  padding: 10px 16px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  box-shadow: 0 4px 12px rgba(0,0,0,0.3);
+}
+
+.pinned-goal .msg-body {
+  padding: 8px 12px;
+  font-size: 12px;
+}
+
+.pinned-phase {
+  padding: 8px 12px;
+  margin: 0;
+}
+
+/* Delete Run Button */
+.delete-btn {
+  background: none;
+  border: none;
+  color: var(--accent-red);
+  cursor: pointer;
+  padding: 2px 6px;
+  border-radius: 4px;
+  font-size: 12px;
+  opacity: 0.7;
+  transition: opacity 0.15s ease, background 0.15s ease;
+}
+.delete-btn:hover {
+  opacity: 1;
+  background-color: var(--accent-red-bg);
+}
+
+/* Small Buttons */
+.xs-btn {
+  padding: 2px 8px;
+  font-size: 11px;
+  font-weight: 600;
+  border-radius: var(--radius-sm);
+  background-color: var(--bg-tertiary);
+  color: var(--text-primary);
+  border: 1px solid var(--border-color);
+  cursor: pointer;
+}
+.xs-btn:hover {
+  background-color: var(--bg-hover);
+  color: var(--text-bright);
+}
+
+/* Agent Target Picker in Prompt Bar */
+.agent-target-picker {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+.agent-target-select {
+  background-color: var(--bg-tertiary);
+  color: var(--text-bright);
+  border: 1px solid var(--border-color);
+  border-radius: var(--radius-sm);
+  padding: 2px 6px;
+  font-size: 11px;
+  font-family: var(--font-mono);
+  outline: none;
+}
+
+/* Intake & Survey Answers Summary Card */
+.intake-summary-card {
+  border-color: var(--accent-blue);
+  background: linear-gradient(180deg, var(--bg-secondary) 0%, rgba(56, 139, 253, 0.05) 100%);
+}
+.intake-answers-list {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  margin-top: 8px;
+}
+.intake-qa-item {
+  background-color: var(--bg-primary);
+  padding: 8px 10px;
+  border-radius: var(--radius-sm);
+  border: 1px solid var(--border-subtle);
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+.intake-q {
+  font-weight: 600;
+  color: var(--accent-blue);
+  font-size: 12px;
+}
+.intake-a {
+  color: var(--text-bright);
+  font-size: 12px;
+  padding-left: 8px;
+  border-left: 2px solid var(--accent-green);
+}
+
+/* Resume Banner */
+.resume-banner {
+  border: 1.5px solid var(--accent-amber);
+  background: rgba(245, 158, 11, 0.1);
+}
+
+/* Live Thinking Stream Card */
+.thinking-live-card {
+  border-color: var(--accent-purple);
+  background: linear-gradient(180deg, var(--bg-secondary) 0%, rgba(163, 113, 247, 0.05) 100%);
+}
+.thinking-live-body {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  padding: 8px 10px;
+  background-color: var(--bg-darkest);
+  border-radius: var(--radius-sm);
+  border: 1px solid var(--border-subtle);
+  max-height: 140px;
+  overflow-y: auto;
+}
+
 /* Pane 3: Right Workbench (Code/Artifacts/Spec/Logs) */
 .workbench-panel {
   flex: 1.4;

@@ -149,6 +149,7 @@ ROLE_STYLE: dict[str, str] = {
     "user": "bold yellow",
     "system": "dim",
     "tool": "green",
+    "thinking": "italic magenta",
     "logdir": "dim italic",
     "raw": "dim",
 }
@@ -175,11 +176,20 @@ def parse_trace(raw: str) -> list[TraceEntry]:
         if rtype == "logdir":
             entries.append(TraceEntry("logdir", f"session started (logdir={record.get('logdir', '')})"))
             continue
+        if rtype in ("thinking", "thought", "reasoning"):
+            content = record.get("content") or record.get("text") or record.get("thinking") or record.get("reasoning")
+            if content:
+                entries.append(TraceEntry("thinking", content if isinstance(content, str) else json.dumps(content)))
+            continue
         if rtype == "message":
             role = str(record.get("role") or "raw")
+            thinking = record.get("thinking") or record.get("reasoning") or record.get("thought")
+            if thinking:
+                entries.append(TraceEntry("thinking", thinking if isinstance(thinking, str) else json.dumps(thinking)))
             content = record.get("content")
-            text = content if isinstance(content, str) else json.dumps(content)
-            entries.append(TraceEntry(role if role in ROLE_STYLE else "raw", text))
+            text = content if isinstance(content, str) else (json.dumps(content) if content is not None else "")
+            if text:
+                entries.append(TraceEntry(role if role in ROLE_STYLE else "raw", text))
             continue
         entries.append(TraceEntry("raw", json.dumps(record)))
     return entries
@@ -187,3 +197,4 @@ def parse_trace(raw: str) -> list[TraceEntry]:
 
 def role_style(role: str) -> str:
     return ROLE_STYLE.get(role, "")
+

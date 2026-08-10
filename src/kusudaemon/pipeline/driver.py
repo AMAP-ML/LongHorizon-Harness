@@ -30,6 +30,7 @@ come from ``backends.py`` driven by ``RunOptions.backend``.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import time
 from dataclasses import asdict, dataclass, field
@@ -193,6 +194,25 @@ WriterAdapterFactory = Callable[[TaskNode], AgentAdapter]
 ResearchAdapterFactory = Callable[[TaskNode, ResearchQuery], AgentAdapter]
 
 
+def is_rate_limit_or_busy_error(exc: Exception | str) -> bool:
+    msg = str(exc).lower()
+    status = getattr(exc, "status", None) or getattr(exc, "status_code", None) or getattr(exc, "code", None)
+    if status in (429, 501):
+        return True
+    indicators = (
+        "429",
+        "too many requests",
+        "rate limit",
+        "rate_limit",
+        "501",
+        "too busy",
+        "server busy",
+        "overloaded",
+        "capacity",
+    )
+    return any(ind in msg for ind in indicators)
+
+
 class RecursiveDriver:
     """One pipeline run. Construction never touches the network; only
     :meth:`run` does, and each phase is individually resumable."""
@@ -247,14 +267,37 @@ class RecursiveDriver:
             return RunReport(status="done", phase=phase)
         self._set_phase(phase, _IN_PROGRESS)
         self._log({"node_id": "-", "role": "harness", "round": round_index, "type": "phase_started", "phase": phase})
-        try:
-            outcome: Any = await getattr(self, f"_phase_{phase}")()
-        except Exception as exc:  # noqa: BLE001 — the phase boundary is the reporter
-            self._set_phase(phase, "error", detail=str(exc))
-            self._log(
-                {"node_id": "-", "role": "harness", "round": round_index, "type": "phase_failed", "phase": phase}
-            )
-            return RunReport(status="error", phase=phase, detail=str(exc))
+        
+        max_auto_attempts = 3
+        attempt = 0
+        while True:
+            attempt += 1
+            if self._halted():
+                self._set_phase(_HALTED, detail=f"halted in {phase}")
+                return RunReport(status="halted", phase=phase, detail="halted by operator")
+            try:
+                outcome: Any = await getattr(self, f"_phase_{phase}")()
+                break
+            except Exception as exc:  # noqa: BLE001 — the phase boundary is the reporter
+                if is_rate_limit_or_busy_error(exc) or attempt >= max_auto_attempts:
+                    self._set_phase(phase, "error", detail=str(exc))
+                    self._log(
+                        {"node_id": "-", "role": "harness", "round": round_index, "type": "phase_failed", "phase": phase, "error": str(exc)}
+                    )
+                    return RunReport(status="error", phase=phase, detail=str(exc))
+                # Auto-resume non-429/501 error automatically
+                self._log(
+                    {
+                        "node_id": "-",
+                        "role": "harness",
+                        "round": round_index,
+                        "type": "phase_auto_resuming",
+                        "phase": phase,
+                        "attempt": attempt,
+                        "error": str(exc),
+                    }
+                )
+                await asyncio.sleep(1.0)
         status = "done" if outcome is not False else "escalated"
         # Preserve a detail the phase body already wrote (e.g.
         # _phase_research's "skipped: ...") instead of clobbering it with a
@@ -509,9 +552,16 @@ class RecursiveDriver:
         context = context or {}
         existing = approval_store.find_pending(self.run_dir, kind=kind, **context)
         approval = existing or self._create_approval(kind, title=title, message=message, input_label=input_label, context=context)
-        return approval_store.wait_for_resolution(
-            self.run_dir, approval.approval_id, poll_interval=self.poll_interval
-        )
+        current_phase = _read_phase(self.run_dir).get("phase", "intake")
+        dim_info = f" ({context['dimension']})" if context and "dimension" in context else ""
+        self._set_phase(current_phase, "waiting_for_approval", detail=f"Waiting for approval: {title}{dim_info}")
+        try:
+            res = approval_store.wait_for_resolution(
+                self.run_dir, approval.approval_id, poll_interval=self.poll_interval
+            )
+        finally:
+            self._set_phase(current_phase, _IN_PROGRESS, detail="")
+        return res
 
     def _create_approval(self, kind: str, *, title: str, message: str, input_label: str, context: dict[str, Any]):
         record = approval_store.Approval.create(

@@ -359,5 +359,40 @@ class RequestReopenTest(unittest.TestCase):
         self.assertIsNone(self.state.request_reopen("1", "   "))
 
 
+class DeleteRunTest(unittest.TestCase):
+    def setUp(self) -> None:
+        self.tmp = Path(tempfile.mkdtemp())
+        self.runs_root = self.tmp / "runs"
+        self.runs_root.mkdir()
+        self.run_dir = _write_scripted_run(self.runs_root, "run-del")
+        self.state = RunState(self.runs_root)
+        self.state.attach("run-del")
+
+    def tearDown(self) -> None:
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_delete_run_removes_directory_and_detaches(self) -> None:
+        self.assertTrue(self.run_dir.exists())
+        self.assertEqual(self.state.attached_run_id, "run-del")
+        ok = self.state.delete_run("run-del")
+        self.assertTrue(ok)
+        self.assertFalse(self.run_dir.exists())
+        self.assertIsNone(self.state.attached_run_id)
+
+    def test_delete_run_rejects_invalid_id(self) -> None:
+        self.assertFalse(self.state.delete_run("../invalid"))
+        self.assertFalse(self.state.delete_run(""))
+
+
+class RateLimitTest(unittest.TestCase):
+    def test_is_rate_limit_or_busy_error_detection(self) -> None:
+        from kusudaemon.pipeline.driver import is_rate_limit_or_busy_error
+
+        self.assertTrue(is_rate_limit_or_busy_error("HTTP 429 Too Many Requests"))
+        self.assertTrue(is_rate_limit_or_busy_error("501 Server Busy"))
+        self.assertTrue(is_rate_limit_or_busy_error("Model capacity overloaded"))
+        self.assertFalse(is_rate_limit_or_busy_error("FileNotFoundError: missing input file"))
+
+
 if __name__ == "__main__":
     unittest.main()
