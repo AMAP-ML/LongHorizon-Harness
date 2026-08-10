@@ -662,6 +662,31 @@ prompt, not that node's own handoff).
   lives only in its DOM node loses the operator's typing on the next tick.
   `snapshotFingerprint()` strips `server_time` before comparing snapshots —
   otherwise the freshly-stamped timestamp makes every tick look changed.
+  **The same full-teardown rule bit scrolling (2026-08-10):** a rebuilt
+  `#chat-feed-scroll` always starts at `scrollTop:0`;
+  `captureScrollStates`/`restoreScrollStates` correct that back to the
+  bottom on every render, but `.chat-feed` had `scroll-behavior: smooth`,
+  so the correction played as a visible jump-to-top-then-animate-down on
+  every ~1.5s tick instead of an invisible instant one — removed. The
+  live thinking widget (`renderCenterStream`'s section 2) has the same
+  hazard as `interject`'s default target below: `state.liveThinkingTarget`
+  (set by `loadLiveThinking()`) follows the live subagent, or — once it's
+  no longer live — the most recently dispatched one (`RunState.subagents()`
+  returns dispatch order), not `"main"`. gptme runs each turn
+  synchronously (`_gptme_worker.py`'s `stream=False`), so a fast episode
+  can dispatch, produce its one message, and complete inside a single
+  polling interval; reverting to `"main"` (no per-node trace of its own)
+  the instant `live` clears wiped that message before it was ever seen.
+  `renderPromptBar`'s message-target dropdown has the mirror bug: it
+  defaults to `"main"` and stays on whatever was last picked even after
+  that episode ends, and `main` almost never has a live session of its
+  own (`RunState.node_gptme_logdir`'s `"main"` fallback only succeeds by
+  scanning for a currently-live subagent) — so hitting Send kept re-firing
+  an interject that could only 409 (`"no live session found for this
+  node"`). It now auto-follows the live subagent (`state.targetAgentManual`
+  tracks whether the operator overrode that by hand) and disables Send
+  while the selected target isn't live, instead of letting the operator
+  retry into a guaranteed failure.
 
 ## Adapters (gptme-only)
 
