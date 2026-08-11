@@ -36,10 +36,9 @@ from .manifest import cap_promotion
 from .tree import TaskNode
 
 _ARTIFACT_INSTRUCTION = (
-    "\n\nProduce the full artifact text as your final answer — your last message in "
-    "this conversation becomes the artifact file verbatim. Do not close with a "
-    "status update, a summary of what you wrote, or an offer to make changes: write "
-    "the finished section itself, in full, as your last message."
+    "\n\nDo not close with a status update, a summary of what you wrote, or an "
+    "offer to make changes — the artifact file itself, saved with your file "
+    "tools, is what gets read next."
 )
 
 _PROMOTION_INSTRUCTION_TEMPLATE = (

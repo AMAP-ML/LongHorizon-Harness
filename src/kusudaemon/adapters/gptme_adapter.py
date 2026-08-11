@@ -67,6 +67,11 @@ class GptmeAdapter(CommandAgentAdapter):
     # constructs its own GptmeAdapter via the round loop's
     # writer_adapter_factory, same call shape as every other adapter.
     supports_tool_restriction = True
+    # gptme's save/patch tools write out/<node>.md directly, so an empty
+    # artifact after an episode means the agent genuinely produced nothing
+    # (PLAN.md §D0) -- v0/runner.py must not paper over that with a chat
+    # message.
+    has_file_tools = True
 
     def __init__(
         self,
@@ -81,6 +86,7 @@ class GptmeAdapter(CommandAgentAdapter):
         prompt_dir: str = f"{DEFAULT_TMP_DIR}/prompts",
         python_executable: str = sys.executable,
         hidden_paths: tuple[str, ...] = (),
+        hidden_path_exceptions: tuple[str, ...] = (),
     ) -> None:
         resolved = resolve(api_key=api_key or "", base_url=base_url or "", model=model or "")
         if not resolved.api_key:
@@ -120,6 +126,7 @@ class GptmeAdapter(CommandAgentAdapter):
             workspace_path=workspace_path,
             visible_output_parser=gptme_visible_output,
             hidden_paths=hidden_paths,
+            hidden_path_exceptions=hidden_path_exceptions,
         )
 
 

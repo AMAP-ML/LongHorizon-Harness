@@ -38,6 +38,14 @@ class CommandAgentAdapter:
     # round loop builds one adapter per node via a caller-supplied factory,
     # so this flag is informational rather than load-bearing for that path.
     supports_tool_restriction = False
+    # Overridden True by adapters whose agent can write files itself mid-
+    # episode (see GptmeAdapter) -- v0/runner.py's post-episode fallback
+    # (visible_output / actions_log) is a "last message becomes the
+    # artifact" mechanism inherited from the deleted Claude Code/Codex
+    # adapters (PLAN.md §D0) and must never run for one of these: an empty
+    # out/<node>.md after a real file-writing episode is a genuine failure,
+    # not raw log noise to paper over.
+    has_file_tools = False
 
     def __init__(
         self,
@@ -47,12 +55,19 @@ class CommandAgentAdapter:
         workspace_path: str = DEFAULT_WORKSPACE_PATH,
         visible_output_parser: Callable[[str], str] | None = None,
         hidden_paths: tuple[str, ...] = (),
+        hidden_path_exceptions: tuple[str, ...] = (),
     ) -> None:
         self.command_template = command_template
         self.prompt_dir = prompt_dir.rstrip("/") or "."
         self.workspace_path = workspace_path.rstrip("/")
         self.visible_output_parser = visible_output_parser
         self.hidden_paths = tuple(hidden_paths)
+        # PLAN.md §D2: a hidden entry like "out/" must still be hidden as a
+        # directory, with an explicit carve-out naming the node's OWN two
+        # paths (its artifact, its scratch dir) — not silently dropped from
+        # the hidden list altogether, which is what let every Writer read
+        # every other leaf's output (invariant 6).
+        self.hidden_path_exceptions = tuple(hidden_path_exceptions)
 
     async def run_episode(
         self,
@@ -72,7 +87,11 @@ class CommandAgentAdapter:
             self.prompt_dir,
             f"{_episode_prompt_label(live_trajectory_path)}_{uuid.uuid4().hex[:12]}.md",
         )
-        await write_remote_text(env, prompt_path, prompt + _hidden_paths_notice(self.hidden_paths))
+        await write_remote_text(
+            env,
+            prompt_path,
+            prompt + _hidden_paths_notice(self.hidden_paths, self.hidden_path_exceptions),
+        )
         # Substituted by explicit replace, not str.format: templates embed literal
         # braces (e.g. Codex passes inline-TOML `-c` overrides) that format() would
         # try to interpret as placeholders.
@@ -133,21 +152,38 @@ class CommandAgentAdapter:
         )
 
 
-def _hidden_paths_notice(hidden_paths: tuple[str, ...]) -> str:
+def _hidden_paths_notice(
+    hidden_paths: tuple[str, ...], hidden_path_exceptions: tuple[str, ...] = ()
+) -> str:
     """Tell the agent to stay out of the harness's own run directories.
 
     The run's logs, prompts and harness state may sit inside the workspace. They
-    are not task content, and reading them would leak other roles' context.
+    are not task content, and reading them would leak other roles' context —
+    including, critically, ``out/`` and ``scratch/``: those hold every OTHER
+    leaf's finished artifact and working notes, and a Writer that reads a
+    sibling's output produces exactly the correlated drift cross-agent
+    isolation (PLAN.md §2 invariant 6) exists to prevent. ``hidden_path_exceptions``
+    carves out the node's own two paths — the ones it is *supposed* to
+    touch — so the instruction to write ``out/<id>.md`` and the notice to
+    stay out of ``out/`` don't contradict each other (§D0/§D2).
     """
     if not hidden_paths:
         return ""
     listed = "\n".join(f"- {path}" for path in hidden_paths)
-    return (
+    notice = (
         "\n\nHarness-owned paths (off limits):\n"
         f"{listed}\n"
-        "These hold this run's own logs, prompts, and harness state. Never read, list, "
-        "search, or modify them, and never treat their contents as task input or evidence."
+        "These hold this run's own logs, prompts, and harness state — including "
+        "OTHER nodes' artifacts and scratch notes. Never read, list, search, or "
+        "modify them, and never treat their contents as task input or evidence."
     )
+    if hidden_path_exceptions:
+        exceptions = "\n".join(f"- {path}" for path in hidden_path_exceptions)
+        notice += (
+            "\n\nException — these are yours, and writing to them is the point:\n"
+            f"{exceptions}"
+        )
+    return notice
 
 
 def _episode_prompt_label(live_trajectory_path: str | None) -> str:

@@ -74,6 +74,7 @@ from ..v4.research import ResearchQuery
 from ..v4.research_loop import run_research_loop
 from . import approvals as approval_store
 from .backends import parse_research_plan
+from .liveness import record_driver_start
 from .prompts import build_node_prompt
 from .run_dir import halt_path, phase_path, run_spec_path, source_path, tree_path
 
@@ -249,6 +250,10 @@ class RecursiveDriver:
         create_run_dir(self.run_dir.parent, self.run_dir.name)
         self._write_source_and_spec()
         self.log = EventLog(events_path(self.run_dir))
+        # §D0c: record who is (supposed to be) making progress, so a
+        # phase.json frozen on "in_progress" by a dead process can be told
+        # apart from one genuinely mid-call.
+        record_driver_start(self.run_dir)
 
     # ------------------------------------------------------------------
     # Entry
@@ -359,7 +364,23 @@ class RecursiveDriver:
 
         source = source_path(self.run_dir).read_text(encoding="utf-8").strip()
         if not source:
-            units = [SpineUnit(id="unit-01", label="The goal", start_chunk=0, end_chunk=0, tokens=0)]
+            # PLAN.md §D4: this used to synthesize a single SpineUnit
+            # labeled "The goal", which build_tree then turned into one
+            # forced leaf briefed "Produce the artifact for The goal
+            # (single unit, cannot split further)" — is_complete() came
+            # back true and the run reported "done" having produced an
+            # artifact about nothing. A corpus-less goal is a real,
+            # first-class case (PLAN.md §A3's kind="none"), but until that
+            # lands a run with no source must fail loudly rather than
+            # silently converge on a fake success.
+            raise ValueError(
+                "no source text: a corpus-less run (--source omitted or "
+                "empty) is not yet supported as a real work-object kind "
+                "(PLAN.md §A3 kind=\"none\") — the harness previously faked "
+                "success on a single meaningless node instead of failing "
+                "here (§D4). Pass --source with the goal's corpus, or wait "
+                "for kind=\"none\" support."
+            )
         else:
             chunks = chunk_text(source)
             # Subagent is optional — only spawn subagent if file/task is large

@@ -122,6 +122,20 @@ def _validate_node(node: TaskNode) -> None:
         )
     if node.status not in _VALID_STATUSES:
         raise TreeValidationError(f"node {node.id!r} has unknown status {node.status!r}")
+    expected_artifact = f"out/{node.id}.md"
+    if node.artifact != expected_artifact:
+        # PLAN.md §D0: node.artifact used to be decorative -- every real
+        # reader (node_artifact_path, the dashboard, the assembler) derived
+        # the actual path from node.id independently, so a node.artifact
+        # that disagreed would silently point a Writer's prompt at a file
+        # nothing else ever reads or writes. Made the single source of
+        # truth instead: reject the disagreement at construction/load time.
+        raise TreeValidationError(
+            f"node {node.id!r} has artifact {node.artifact!r}, expected "
+            f"{expected_artifact!r} (out/<id>.md) — node.artifact must "
+            "agree with node_artifact_path, or a Writer's prompt and the "
+            "harness's own reads would point at two different files"
+        )
 
 
 @dataclass

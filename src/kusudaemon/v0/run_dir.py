@@ -99,3 +99,22 @@ def ensure_node_trace_path(run_dir: str | Path, node_id: str) -> Path:
 
 def node_artifact_path(run_dir: str | Path, node_id: str) -> Path:
     return Path(run_dir) / "out" / f"{node_id}.md"
+
+
+def resolve_stored(run_dir: str | Path, ref: str) -> Path:
+    """Turn a path *stored on disk* (``tree.json``'s ``inputs``/``artifact``,
+    a manifest promotion path) into a real filesystem path.
+
+    PLAN.md §D0b's rule, stated once: a path stored on disk is relative to
+    ``run_dir`` so the run directory stays movable; a path already absolute
+    (e.g. hand-authored, or a future workspace-mode input outside the run
+    dir) is returned unchanged. Every reader of a stored path — prompt
+    building, the dashboard's input-token/exists checks, document review,
+    the assembler — must call this instead of re-deriving the rule ad hoc.
+    Lives here (not in pipeline/run_dir.py) so v0-v3 modules can use it
+    without inverting the dependency direction onto pipeline/.
+    """
+    ref_path = Path(ref)
+    if ref_path.is_absolute():
+        return ref_path
+    return Path(run_dir) / ref_path

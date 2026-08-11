@@ -116,6 +116,9 @@ class LinearChainRoundLoopTest(unittest.TestCase):
                 self.assertEqual(audit["node"], node_id)
                 self.assertEqual(audit["verdict"], "pass")
                 self.assertTrue(all(g["passed"] for g in audit["gates"]))
+                # §D5: the audit record carries whether this verdict was
+                # reached over a truncated artifact.
+                self.assertFalse(audit["truncated"])
 
             # §11.10.16: a resume must continue round numbering, not append
             # its round 0 into the first process's round-000.jsonl.

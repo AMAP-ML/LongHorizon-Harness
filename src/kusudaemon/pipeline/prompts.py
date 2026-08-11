@@ -32,12 +32,14 @@ import os
 import threading
 from pathlib import Path
 
+from ..v0.run_dir import spec_path
 from ..v1.manifest import read_all_manifest_entries
 from ..v1.tree import TaskNode
 from ..v2.contract import load_contract
 from ..v2.retrieval import DEFAULT_TOP_K, retrieve_spans
 from ..v2.run_dir import contract_path
 from ..v2.survey import load_spine
+from .run_dir import resolve_stored
 
 _PATCH_RETRY_INSTRUCTION = (
     "Your previous attempt at this node failed with the feedback below. Make "
@@ -84,6 +86,79 @@ def _load_contract_cached(run_dir: Path) -> str:
     return text
 
 
+_SPEC_CACHE_MAX = 64
+_spec_cache: dict[str, tuple] = {}
+_spec_lock = threading.Lock()
+
+
+def _load_spec_cached(run_dir: Path) -> str:
+    """Same stat-stamp cache as ``_load_contract_cached`` above, over
+    ``spec.md`` — written once by intake and read by every node's prompt
+    (PLAN.md §D1)."""
+    path = spec_path(run_dir)
+    key = str(path)
+    try:
+        stat = os.stat(path)
+        stamp = (stat.st_size, stat.st_mtime_ns)
+    except OSError:
+        stamp = None
+    with _spec_lock:
+        cached = _spec_cache.get(key, (_MISSING, _MISSING))
+        if cached[0] == stamp:
+            return cached[1]
+    text = path.read_text(encoding="utf-8") if path.exists() else ""
+    with _spec_lock:
+        if key not in _spec_cache and len(_spec_cache) >= _SPEC_CACHE_MAX:
+            del _spec_cache[next(iter(_spec_cache))]
+        _spec_cache[key] = (stamp, text)
+    return text
+
+
+def _section(spec_md: str, heading: str) -> str:
+    if heading not in spec_md:
+        return ""
+    return spec_md.split(heading, 1)[1].split("\n##", 1)[0].strip()
+
+
+def _goal_and_rubric_block(run_dir: Path) -> str:
+    """PLAN.md §D1: a node's brief is often derived from a spine label or a
+    planner slice and never repeats the operator's actual goal string —
+    fatal on a corpus-less run, where the whole brief can otherwise be
+    "produce the artifact for The goal" with no clue what that goal was.
+    Renders goal + global rubric (and, once §A5 lands, unresolved
+    objections) straight from the frozen spec.md."""
+    spec_md = _load_spec_cached(run_dir)
+    goal = _section(spec_md, "## Goal")
+    if not goal:
+        return ""
+    lines = [f"Overall run goal (the reason this node exists at all): {goal}"]
+    rubric = _section(spec_md, "## Global rubric")
+    if rubric:
+        lines.append(f"Global rubric:\n{rubric}")
+    objections = _section(spec_md, "## Unresolved objections")
+    if objections:
+        lines.append(
+            "Unresolved objections raised at intake — weigh these, do not "
+            f"silently assume they were resolved:\n{objections}"
+        )
+    return "\n\n".join(lines)
+
+
+def _artifact_instruction(node: TaskNode, run_dir: Path) -> str:
+    """PLAN.md §D0: the artifact path appeared in no Writer prompt, in any
+    tier, ever — the single file path any Writer was ever given was
+    ``promotion.json``. ``node.artifact`` is the single source of truth
+    (asserted at tree load, ``v1/tree.py``); render it absolute, not
+    relative, because a relative path is only correct while the agent's cwd
+    happens to equal the run directory (§D0b — workspace mode breaks that)."""
+    absolute_path = resolve_stored(run_dir, node.artifact)
+    return (
+        f"Write your artifact to `{absolute_path}` using your file tools "
+        "(e.g. gptme's save/patch). That file is the deliverable; nothing "
+        "else you write or say is."
+    )
+
+
 def _promotions_of(node: TaskNode, run_dir: Path) -> str:
     if not node.depends_on:
         return ""
@@ -109,12 +184,23 @@ def build_node_prompt(
 ) -> str:
     run_dir = Path(run_dir)
     parts = [f"Your brief: {node.brief}"]
+    parts.append(_artifact_instruction(node, run_dir))
+    goal_block = _goal_and_rubric_block(run_dir)
+    if goal_block:
+        parts.append(goal_block)
     contract = _load_contract_cached(run_dir).strip()
     if contract:
         parts.append(
             "Global contract — every artifact you produce must satisfy it:\n" + contract
         )
     if node.inputs:
+        # §D0b: a path stored on a node (a materialized spine unit, a v4
+        # finding) is relative to run_dir; render it absolute so "read them
+        # with your tools" resolves correctly regardless of the agent's own
+        # cwd (workspace mode makes that the target repo root, not run_dir).
+        def _abs(item: str) -> str:
+            return str(resolve_stored(run_dir, item))
+
         if inline_spans:
             spans_block = _retrieved_spans_block(node, run_dir, top_k)
             if spans_block is not None:
@@ -123,7 +209,7 @@ def build_node_prompt(
                     parts.append(
                         "Inputs (read them with your tools before writing, and "
                         "cite them where relevant):\n"
-                        + "\n".join(f"- {item}" for item in finding_paths)
+                        + "\n".join(f"- {_abs(item)}" for item in finding_paths)
                     )
                 parts.append(spans_block)
             else:
@@ -134,12 +220,12 @@ def build_node_prompt(
                 parts.append(
                     "Inputs (read them with your tools before writing, and cite "
                     "them where relevant):\n"
-                    + "\n".join(f"- {item}" for item in node.inputs)
+                    + "\n".join(f"- {_abs(item)}" for item in node.inputs)
                 )
         else:
             parts.append(
                 "Inputs (read them with your tools before writing, and cite them "
-                "where relevant):\n" + "\n".join(f"- {item}" for item in node.inputs)
+                "where relevant):\n" + "\n".join(f"- {_abs(item)}" for item in node.inputs)
             )
     promotions = _promotions_of(node, run_dir)
     if promotions:

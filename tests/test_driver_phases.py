@@ -104,6 +104,26 @@ class PhaseDetailPreservationTest(unittest.TestCase):
         asyncio.run(scenario())
 
 
+class CorpusLessSurveyRaisesTest(unittest.TestCase):
+    """PLAN.md §D4: a run with no source text used to synthesize a single
+    SpineUnit labeled "The goal", producing one forced leaf whose entire
+    brief was boilerplate -- is_complete() came back true and the run
+    reported "done" having produced an artifact about nothing. Until
+    kind="none" (§A3) is real support, this must fail loudly instead."""
+
+    def test_empty_source_raises_instead_of_faking_a_spine(self) -> None:
+        import asyncio
+
+        async def scenario() -> None:
+            with tempfile.TemporaryDirectory() as root_str:
+                run_dir = Path(root_str) / "run"
+                driver = _ScriptedDriver(run_dir)
+                with self.assertRaises(ValueError):
+                    await driver._phase_survey()
+
+        asyncio.run(scenario())
+
+
 class ExplorerReasoningTest(unittest.TestCase):
     """§11.10.17 companion: survey's large-corpus explore-01 pseudo-agent
     wraps plain provider.complete_json calls, not a gptme episode -- by

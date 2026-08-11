@@ -284,7 +284,14 @@ def _write_audit(run_dir: Path, node: TaskNode, verdict: ReviewVerdict) -> None:
     existing = gates or {}
     # §11.10.11: merge, never replace — the gate cache written at dispatch
     # must survive the reviewer's write of items/verdict.
-    existing.update({"node": node.id, "items": verdict.items, "verdict": verdict.verdict})
+    existing.update(
+        {
+            "node": node.id,
+            "items": verdict.items,
+            "verdict": verdict.verdict,
+            "truncated": verdict.truncated,
+        }
+    )
     path.write_text(json.dumps(existing, indent=2, sort_keys=True) + "\n", encoding="utf-8")
 
 

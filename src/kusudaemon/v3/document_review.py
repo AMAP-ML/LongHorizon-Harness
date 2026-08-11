@@ -41,6 +41,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 from ..v0.events import EventLog
+from ..v0.run_dir import resolve_stored
 from ..v1.manifest import read_all_manifest_entries
 from ..v1.provider import OpenAICompatibleProvider
 from ..v1.reviewer import (
@@ -333,10 +334,8 @@ def run_document_review(
 
     if keep_depth_pass and not result.escalated:
         for node in select_pilot_nodes(tree).values():
-            artifact_path = Path(node.artifact)
+            artifact_path = resolve_stored(run_dir, node.artifact)
             artifact = ""
-            if not artifact_path.is_absolute():
-                artifact_path = run_dir / artifact_path
             try:
                 artifact = artifact_path.read_text(encoding="utf-8")
             except OSError:

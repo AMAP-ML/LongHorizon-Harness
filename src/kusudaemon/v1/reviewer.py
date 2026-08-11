@@ -65,6 +65,12 @@ class ReviewVerdict:
     node_id: str
     items: list[dict[str, Any]] = field(default_factory=list)
     verdict: str = "pass"
+    # PLAN.md §D5 (interim, ahead of §B6's fan-out): true when the artifact
+    # was cut by cap_artifact_text before the reviewer ever saw it, so a
+    # `passed` node's audit record honestly says this verdict only covers
+    # the head of the artifact -- a defect past the cut is structurally
+    # invisible to it.
+    truncated: bool = False
 
 
 def cap_artifact_text(text: str, ceiling_tokens: int) -> str:
@@ -102,11 +108,13 @@ def review_node(
         f"{judgment_id}: {node.rubric.get(judgment_id, '(no rubric text given)')}"
         for judgment_id in node.judgment
     )
+    capped_artifact = cap_artifact_text(artifact_text, artifact_cap_tokens)
+    truncated = capped_artifact != artifact_text
     messages = [
         {"role": "system", "content": _SYSTEM_PROMPT},
         {
             "role": "user",
-            "content": f"Rubric:\n{rubric_lines}\n\nArtifact:\n{cap_artifact_text(artifact_text, artifact_cap_tokens)}",
+            "content": f"Rubric:\n{rubric_lines}\n\nArtifact:\n{capped_artifact}",
         },
     ]
     payload = provider.complete_json(messages, VERDICT_SCHEMA)
@@ -114,4 +122,5 @@ def review_node(
         node_id=node.id,
         items=list(payload.get("items", [])),
         verdict=str(payload.get("verdict", "fail")),
+        truncated=truncated,
     )

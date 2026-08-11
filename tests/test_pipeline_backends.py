@@ -96,10 +96,19 @@ class WriterAdapterContextLengthTest(unittest.TestCase):
 
 
 class WriterAdapterHiddenPathsTest(unittest.TestCase):
-    """PLAN-zeromem.md §11.1: the run's own bookkeeping is off limits in the
-    episode prompt, minus the node's own artifact and scratch paths."""
+    """PLAN.md §D2: the run's own bookkeeping — including out/ and
+    scratch/ themselves, which hold every OTHER leaf's output — is off
+    limits in the episode prompt, with an explicit carve-out for the
+    node's own artifact and scratch paths.
 
-    def test_node_hides_run_paths_but_keeps_its_own(self) -> None:
+    §11.8's original fix (and its test, written from the same misreading)
+    inverted this: "out/".startswith("out/") is trivially true for every
+    node's own path, so the old filter dropped "out/" and "scratch/" from
+    the hidden list ENTIRELY, for every node, always — cross-agent
+    isolation (§2 invariant 6) was unenforced. These assertions are the
+    corrected regression guard, not new behavior."""
+
+    def test_node_hides_run_paths_and_carves_out_only_its_own(self) -> None:
         node = TaskNode(id="n", brief="b", artifact="out/n.md", gates=["nonempty"])
         with _EnvGuard():
             adapter = build_writer_adapter(
@@ -108,13 +117,14 @@ class WriterAdapterHiddenPathsTest(unittest.TestCase):
         self.assertIn("events.jsonl", adapter.hidden_paths)
         self.assertIn("approvals.jsonl", adapter.hidden_paths)
         self.assertIn("audit/", adapter.hidden_paths)
-        # §11.8: prefix-match — the hidden list drops the node's own
-        # artifact and scratch directories entirely, so the writer is never
-        # told to stay out of the place it must write out/<id>.md and
-        # scratch/<id>/promotion.json.
-        self.assertNotIn("scratch/", adapter.hidden_paths)
-        self.assertNotIn("out/", adapter.hidden_paths)
-        self.assertFalse(any("n.md" in path for path in adapter.hidden_paths))
+        # out/ and scratch/ are hidden -- every OTHER node's output lives
+        # under them, and a Writer must not be able to read it.
+        self.assertIn("scratch/", adapter.hidden_paths)
+        self.assertIn("out/", adapter.hidden_paths)
+        # The carve-out is separate from the hidden list, and names only
+        # this node's own two paths.
+        self.assertIn("out/n.md", adapter.hidden_path_exceptions)
+        self.assertIn("scratch/n", adapter.hidden_path_exceptions)
 
     def test_without_node_no_hidden_paths(self) -> None:
         with _EnvGuard():
@@ -122,6 +132,26 @@ class WriterAdapterHiddenPathsTest(unittest.TestCase):
                 "gptme", workspace_path="/tmp/ws", prompt_dir="/tmp/prompts"
             )
         self.assertEqual(adapter.hidden_paths, ())
+        self.assertEqual(adapter.hidden_path_exceptions, ())
+
+    def test_notice_hides_out_but_excepts_own_artifact(self) -> None:
+        # The rendered prompt notice, not just the raw tuples: an agent
+        # reading its own prompt must see both "out/ is off limits" and
+        # "except out/n.md", or the instruction to write there (§D0) and
+        # the notice to stay out of it (§D2) contradict each other.
+        from kusudaemon.adapters.cli_agent import _hidden_paths_notice
+
+        node = TaskNode(id="n", brief="b", artifact="out/n.md", gates=["nonempty"])
+        with _EnvGuard():
+            adapter = build_writer_adapter(
+                "gptme", workspace_path="/tmp/ws", prompt_dir="/tmp/prompts", node=node
+            )
+        notice = _hidden_paths_notice(adapter.hidden_paths, adapter.hidden_path_exceptions)
+        self.assertIn("out/", notice)
+        self.assertIn("out/n.md", notice)
+        out_index = notice.index("- out/\n")
+        exception_index = notice.index("out/n.md")
+        self.assertLess(out_index, exception_index)
 
 
 if __name__ == "__main__":

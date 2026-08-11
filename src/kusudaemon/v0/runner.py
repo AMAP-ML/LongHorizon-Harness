@@ -134,27 +134,37 @@ async def run_node(
 
     artifact_path = node_artifact_path(run_dir, node_id)
     # gptme writes the real artifact itself, mid-episode, via its own
-    # save/patch tool calls against this exact path (its workspace cwd is
-    # this run_dir) — so if the file already has content, that *is* the
-    # artifact and must never be clobbered by anything derived from the
-    # episode's raw output after the fact. Only fall back when the agent
-    # never actually wrote anything (crash, or an old adapter with no file
-    # tools that relies on "last message becomes the artifact").
+    # save/patch tool calls against this exact path — now that the prompt
+    # actually states that path (PLAN.md §D0; it didn't before) — so if the
+    # file already has content, that *is* the artifact and must never be
+    # clobbered by anything derived from the episode's raw output after the
+    # fact. Only fall back when the agent never actually wrote anything
+    # (crash, or an adapter with no file tools that relies on "last message
+    # becomes the artifact").
     existing = artifact_path.read_text(encoding="utf-8") if artifact_path.exists() else ""
     if not existing.strip():
-        visible_output = result.metadata.get("assistant_visible_output") or ""
-        # actions_log_diagnostics_only (cli_agent.py) is set when an adapter
-        # *has* a structured visible-output parser (gptme's --output-format
-        # json) but it found no real assistant message — meaning actions_log
-        # is raw protocol/tool-call JSON, not prose, and must not be written
-        # as if it were content (this is exactly how a bare
-        # ``{"type": "logdir", ...}`` bootstrap line — everything printed
-        # before a crash mid-episode — used to end up masquerading as a
-        # node's artifact). An adapter with no parser at all (fake/test
-        # adapters) still falls back to the raw log, unchanged.
-        diagnostics_only = bool(result.metadata.get("actions_log_diagnostics_only"))
-        artifact_text = visible_output or ("" if diagnostics_only else result.actions_log)
-        artifact_path.write_text(artifact_text, encoding="utf-8")
+        if getattr(adapter, "has_file_tools", False):
+            # PLAN.md §D0: an adapter that can write files (gptme) had every
+            # opportunity to save the real artifact. An empty file here is a
+            # genuine failure, not raw log noise to paper over — write "" so
+            # the `nonempty` gate fails cleanly instead of a chat sentence
+            # (or a stray save-fence) masquerading as a passed node.
+            artifact_path.write_text("", encoding="utf-8")
+        else:
+            visible_output = result.metadata.get("assistant_visible_output") or ""
+            # actions_log_diagnostics_only (cli_agent.py) is set when an
+            # adapter *has* a structured visible-output parser (gptme's
+            # --output-format json) but it found no real assistant message —
+            # meaning actions_log is raw protocol/tool-call JSON, not prose,
+            # and must not be written as if it were content (this is exactly
+            # how a bare ``{"type": "logdir", ...}`` bootstrap line —
+            # everything printed before a crash mid-episode — used to end up
+            # masquerading as a node's artifact). An adapter with no parser
+            # at all (fake/test adapters) still falls back to the raw log,
+            # unchanged.
+            diagnostics_only = bool(result.metadata.get("actions_log_diagnostics_only"))
+            artifact_text = visible_output or ("" if diagnostics_only else result.actions_log)
+            artifact_path.write_text(artifact_text, encoding="utf-8")
 
     # v0 does not write manifest.jsonl: a single Writer node has no gates to
     # evaluate and no way to derive the PLAN.md §6 manifest schema. That

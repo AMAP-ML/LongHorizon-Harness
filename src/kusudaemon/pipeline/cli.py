@@ -27,10 +27,12 @@ from ..v1.tree import TaskTree
 from . import approvals as approval_store
 from .backends import build_writer_adapter
 from .driver import RunOptions, amend_contract_and_estimate, apply_triage, run_amendment_revalidation
+from .liveness import run_liveness
 from .run_dir import (
     contract_path,
     events_path,
     phase_path,
+    resolve_runs_root,
     run_spec_path,
     source_path,
     tree_path,
@@ -120,7 +122,21 @@ def build_pipeline_parser() -> argparse.ArgumentParser:
 
 
 def _run_dir(root: str, run_id: str) -> Path:
-    return Path(root).expanduser() / run_id
+    return resolve_runs_root(root) / run_id
+
+
+def _require_existing_run(root: str, run_id: str) -> Path | None:
+    """§D0b: status/approve/amend/resume must error against a run that
+    doesn't exist rather than let ``create_run_dir`` conjure an empty one —
+    printing the resolved absolute path is the point: every reported
+    instance of the "wrong directory" bug was invisible precisely because
+    the path was never shown. ``run --run-id`` is exempt; it is allowed to
+    create."""
+    run_dir = _run_dir(root, run_id)
+    if not (run_dir / "events.jsonl").is_file():
+        print(f"no run at {run_dir} (missing events.jsonl)", file=sys.stderr)
+        return None
+    return run_dir
 
 
 def cmd_run(argv: argparse.Namespace) -> int:
@@ -167,7 +183,7 @@ def cmd_run_detach(argv: argparse.Namespace) -> int:
     # would put it) and pass @path, which run.py then reads instead of argv.
     source_arg = argv.source
     if source_arg and not source_arg.startswith("@"):
-        run_dir = Path(argv.runs_root).expanduser() / run_id
+        run_dir = _run_dir(argv.runs_root, run_id)
         run_dir.mkdir(parents=True, exist_ok=True)
         resolved = _expand_source_arg(source_arg)
         source_path(run_dir).write_text(resolved, encoding="utf-8")
@@ -205,9 +221,8 @@ def cmd_run_detach(argv: argparse.Namespace) -> int:
 
 
 def cmd_status(argv: argparse.Namespace) -> int:
-    run_dir = _run_dir(argv.runs_root, argv.run_id)
-    if not run_dir.is_dir():
-        print(f"no such run: {run_dir}", file=sys.stderr)
+    run_dir = _require_existing_run(argv.runs_root, argv.run_id)
+    if run_dir is None:
         return 1
     import json
 
@@ -217,9 +232,13 @@ def cmd_status(argv: argparse.Namespace) -> int:
     except OSError:
         pass
     print(f"run:      {argv.run_id}")
+    print(f"dir:      {run_dir}")
     print(f"phase:    {phase.get('phase', '-')} ({phase.get('status', '-')})")
     if phase.get("detail"):
         print(f"detail:   {phase['detail']}")
+    liveness = run_liveness(run_dir)
+    if liveness.stalled:
+        print(f"STALLED:  {liveness.reason}")
     tree = TaskTree.load(tree_path(run_dir)) if tree_path(run_dir).exists() else None
     if tree is not None:
         counts: dict[str, int] = {}
@@ -238,7 +257,9 @@ def cmd_status(argv: argparse.Namespace) -> int:
 
 
 def cmd_approve(argv: argparse.Namespace) -> int:
-    run_dir = _run_dir(argv.runs_root, argv.run_id)
+    run_dir = _require_existing_run(argv.runs_root, argv.run_id)
+    if run_dir is None:
+        return 1
     pending = approval_store.pending(run_dir)
     if not pending:
         print("no pending approvals", file=sys.stderr)
@@ -253,7 +274,9 @@ def cmd_approve(argv: argparse.Namespace) -> int:
 def cmd_amend(argv: argparse.Namespace) -> int:
     # §11.10.4: the estimate is shown BEFORE the Reviewer pass runs — the
     # §10 approval was theater when the tokens were already spent.
-    run_dir = _run_dir(argv.runs_root, argv.run_id)
+    run_dir = _require_existing_run(argv.runs_root, argv.run_id)
+    if run_dir is None:
+        return 1
     provider = OpenAICompatibleProvider()
     options = _load_options(run_dir)
     phase1 = amend_contract_and_estimate(
@@ -314,7 +337,11 @@ def cmd_amend(argv: argparse.Namespace) -> int:
 def cmd_resume(argv: argparse.Namespace) -> int:
     # Resume is exactly "run with an existing run-id": the driver converges
     # from durable state (§10), so there is no separate resume code path —
-    # argv contributes nothing but the run id.
+    # argv contributes nothing but the run id. But unlike `run --run-id`,
+    # resume must never *create* a run: an id typo or a stale --runs-root
+    # would otherwise silently start a fresh, empty run (§D0b).
+    if _require_existing_run(argv.runs_root, argv.run_id) is None:
+        return 1
     from .run import run_from_args
 
     return run_from_args(["--runs-root", argv.runs_root, "--run-id", argv.run_id])

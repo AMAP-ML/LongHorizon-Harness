@@ -50,26 +50,32 @@ from ..v4.research import ResearchQuery
 WRITER_BACKENDS = ("gptme",)
 _RESEARCH_CAPABLE: tuple[str, ...] = ("gptme",)
 
-# PLAN-zeromem.md §11.1: the run's own bookkeeping, off limits to every
-# Writer's prompt. Each entry minus the node's own paths — its artifact and
-# its scratch dir, both of which it is *supposed* to touch (writing
-# out/<node>.md is the entire point of the episode).
+# PLAN.md §D2: the run's own bookkeeping, off limits to every Writer's
+# prompt — including "out/" and "scratch/" themselves, which hold every
+# OTHER leaf's finished artifact and working notes. A Writer that can read
+# out/ch03.md while writing ch04 produces exactly the correlated drift
+# cross-agent isolation (§2 invariant 6) exists to prevent, and it's
+# invisible because the artifact looks *more* coherent, not less.
 _HIDDEN_RUN_PATHS: tuple[str, ...] = ("events.jsonl", "approvals.jsonl", "audit/", "scratch/", "out/")
 
 
 def _hidden_paths_for(node: TaskNode) -> tuple[str, ...]:
-    """§11.8: prefix-match, not exact-match. The previous filter compared
-    each hidden entry against ``(out/<node>.md, scratch/<node>)`` exactly —
-    but the entries are ``"out/"`` and ``"scratch/"``, so nothing was ever
-    removed and every Writer was told to stay out of the directory it must
-    write (its artifact and its promotion file). An entry is dropped when
-    the node's own path equals it or lives beneath it."""
-    own_paths = (f"out/{node.id}.md", f"scratch/{node.id}")
-    return tuple(
-        path
-        for path in _HIDDEN_RUN_PATHS
-        if not any(own.startswith(path) or path.startswith(own) for own in own_paths)
-    )
+    """The full hidden list, unfiltered. §D2 (fixing §11.8's inversion): the
+    node's own carve-out is no longer expressed by dropping "out/"/"scratch/"
+    from this list — that hid the whole directory from every node, always,
+    since e.g. "out/a.md".startswith("out/") is trivially true for EVERY
+    node's own path, not just a coincidence for one. See
+    ``_hidden_path_exceptions_for`` for the actual carve-out."""
+    return _HIDDEN_RUN_PATHS
+
+
+def _hidden_path_exceptions_for(node: TaskNode) -> tuple[str, ...]:
+    """The node's own two paths — its artifact and its scratch dir — which
+    it is *supposed* to touch (writing out/<node>.md is the entire point of
+    the episode). Rendered as an explicit exception alongside the hidden
+    list (``cli_agent.py:_hidden_paths_notice``) rather than by removing the
+    broader entry."""
+    return (f"out/{node.id}.md", f"scratch/{node.id}")
 
 
 def build_writer_adapter(
@@ -103,9 +109,11 @@ def build_writer_adapter(
             # validated by leaf_gate) becomes the episode's OpenAI-compatible
             # context length instead of the adapter's own default.
             kwargs["context_length"] = node.budget.tokens
-            # PLAN-zeromem.md §11.1: hide the run's own bookkeeping (minus
-            # the node's own artifact/scratch paths) in the episode prompt.
+            # PLAN.md §D2: hide the run's own bookkeeping in the episode
+            # prompt, with an explicit carve-out for the node's own
+            # artifact/scratch paths (not a silent drop from the list).
             kwargs["hidden_paths"] = _hidden_paths_for(node)
+            kwargs["hidden_path_exceptions"] = _hidden_path_exceptions_for(node)
         return GptmeAdapter(**kwargs)
     raise ValueError(f"unknown backend: {backend!r}")
 
