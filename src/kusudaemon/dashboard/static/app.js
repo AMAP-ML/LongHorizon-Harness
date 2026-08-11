@@ -19,8 +19,9 @@ const state = {
   drawerTab: "overview", // 'overview' | 'artifact' | 'diff' | 'thinking'
   nodeDiff: null,        // [{tag, lines}] once loaded, keyed to selectedNode
   nodeThinking: null,    // [{role, text}] once loaded, keyed to selectedNode
-  liveThinkingEntries: [],
-  liveThinkingTarget: null,  // live subagent, or the most recently dispatched one -- see loadLiveThinking()
+  liveThinkingAgents: [], // [{id, label, entries, live}] -- every currently-active agent, polled continuously; see loadLiveThinking()
+  liveThinkingActiveTab: null,  // which agent's stream the toggle currently shows
+  liveThinkingTabManual: false, // true once the operator picks a tab by hand; see renderCenterStream
   newRunOpen: false,
   busy: false,
   toast: null,
@@ -105,41 +106,47 @@ function snapshotFingerprint(snap) {
 function loadLiveThinking() {
   const snap = state.snapshot;
   if (!snap || !snap.attached) {
-    state.liveThinkingEntries = [];
-    state.liveThinkingTarget = null;
+    if (state.liveThinkingAgents.length) { state.liveThinkingAgents = []; render(); }
     return;
   }
   const subagents = snap.subagents || [];
-  const liveSub = subagents.find((s) => s.live);
-  // Target the currently-live subagent, or -- if none is live right now
-  // -- the most recently dispatched one (RunState.subagents() returns
-  // dispatch order, so the last entry is the newest). gptme runs each
-  // turn synchronously, no token-level streaming (_gptme_worker.py's
-  // `stream=False`), so a fast episode can dispatch, produce its one
-  // message, and complete inside a single ~1.5s polling interval.
-  // Targeting only whatever is live *right now* misses that message
-  // entirely if dispatch and completion both land inside one polling
-  // gap (this node's `live` was never observed true), and reverting to
-  // "main" (which has no per-node trace of its own) the instant `live`
-  // clears wipes it even when it *was* briefly observed. Falling back to
-  // "most recent" instead of "main" fixes both.
-  const targetId = liveSub ? liveSub.id : (subagents.length ? subagents[subagents.length - 1].id : null);
-  if (!targetId) {
-    state.liveThinkingEntries = [];
-    state.liveThinkingTarget = null;
-    return;
-  }
-  apiGet(`/api/node/${encodeURIComponent(targetId)}/thinking`)
-    .then((d) => {
-      const entries = d.entries || [];
-      const changed = JSON.stringify(entries) !== JSON.stringify(state.liveThinkingEntries) || state.liveThinkingTarget !== targetId;
-      if (changed) {
-        state.liveThinkingEntries = entries;
-        state.liveThinkingTarget = targetId;
-        render();
-      }
-    })
-    .catch(() => {});
+  const liveSubs = subagents.filter((s) => s.live);
+  // Target every currently-live subagent at once -- not just one -- so
+  // concurrent dispatch (a config change away, per CLAUDE.md's v1 round
+  // loop notes) shows every stream simultaneously instead of the
+  // dashboard picking one and hiding the rest. When nothing is live right
+  // now, fall back to the most recently dispatched subagent (dispatch
+  // order, per RunState.subagents()): gptme runs each turn synchronously,
+  // no token-level streaming (_gptme_worker.py's `stream=False`), so a
+  // fast episode can dispatch, produce its one message, and complete
+  // inside a single ~1.5s polling gap, and this node's `live` may never
+  // be observed true. Always poll "main" too -- node_gptme_logdir's
+  // phase/traces-dir fallback can resolve a session for it even when no
+  // tree node claims it -- but only surface its card once it actually has
+  // entries, so it doesn't sit there as a permanent empty "waiting" card.
+  let targets = liveSubs.map((s) => s.id);
+  if (!targets.length && subagents.length) targets = [subagents[subagents.length - 1].id];
+  if (!targets.includes("main")) targets = targets.concat(["main"]);
+
+  Promise.all(
+    targets.map((id) =>
+      apiGet(`/api/node/${encodeURIComponent(id)}/thinking`)
+        .then((d) => ({ id, entries: d.entries || [] }))
+        .catch(() => ({ id, entries: null }))
+    )
+  ).then((results) => {
+    const next = [];
+    for (const { id, entries } of results) {
+      if (entries === null) continue;
+      if (id === "main" && !entries.length) continue;
+      const sub = subagents.find((s) => s.id === id);
+      next.push({ id, label: sub ? `${id} (${sub.role || sub.kind})` : id, entries, live: sub ? sub.live : false });
+    }
+    if (JSON.stringify(next) !== JSON.stringify(state.liveThinkingAgents)) {
+      state.liveThinkingAgents = next;
+      render();
+    }
+  });
 }
 
 function applySnapshot(snap) {
@@ -239,6 +246,99 @@ function renderTraceEntry(e) {
   return el("div", { class: `trace-entry trace-${e.role}` }, [el("span", { class: "trace-role" }, `[${e.role}] `), body]);
 }
 
+// Renders one events.jsonl record for the chat feed. `phase_failed` (and
+// its "escalated" cousins) used to get a second, separately-styled copy
+// pinned to a fixed position derived from the *current* snapshot status
+// rather than from when the failure actually happened -- see
+// renderCenterStream's history-merge comment for the ordering bug that
+// caused. Styling it here instead means it's still visually distinct, but
+// sits at its real place in history.
+function renderEventEntry(ev) {
+  const isAutoResume = ev.type === "phase_auto_resuming";
+  const isFailure = ev.type === "phase_failed" || ev.type === "run_escalated" || (ev.type === "phase_done" && ev.status === "escalated");
+  if (isFailure) {
+    return el("div", { class: "stream-card phase-error-card" }, [
+      el("div", { class: "card-title" }, [
+        el("span", { style: "color:var(--accent-red); font-weight:700;" }, `❌ Phase Failure (${ev.phase ? ev.phase.toUpperCase() : "FAILURE"})`),
+        el("span", null, fmtTime(ev.ts)),
+      ]),
+      el("div", { class: "error-body" }, ev.error || ev.reason || "Phase execution failed. Review details or click Resume below to retry."),
+    ]);
+  }
+  let msgText = `${ev.type}${ev.phase ? ` [${ev.phase}]` : ""}${ev.status ? ` - ${ev.status}` : ""}`;
+  if (isAutoResume) {
+    msgText = `🔄 Auto-resuming phase [${ev.phase}] (attempt ${ev.attempt || 1}) — Previous failure error: "${ev.error || "unknown"}"`;
+  } else if (ev.error) {
+    msgText += ` — Error: "${ev.error}"`;
+  }
+  return el("div", { class: "stream-msg agent", style: isAutoResume ? "border-left: 3px solid var(--accent-amber); background: rgba(245, 158, 11, 0.05);" : "" }, [
+    el("div", { class: "msg-hdr" }, [
+      el("span", { class: "author", style: isAutoResume ? "color:var(--accent-amber);" : "" }, isAutoResume ? "🔄 Auto-Resume" : "Event"),
+      el("span", null, fmtTime(ev.ts)),
+      ev.node_id && ev.node_id !== "-" ? el("span", { class: "node-link", onclick: () => openNode(ev.node_id) }, ev.node_id) : null,
+    ]),
+    el("div", { class: "msg-body", style: isAutoResume ? "font-weight:500; color:var(--text-bright);" : "" }, msgText),
+  ]);
+}
+
+// Renders one approval record (pending question or resolved answer) for
+// the chat feed. Split out of renderCenterStream so the same markup can
+// be used both for resolved approvals (interleaved into chronological
+// history) and pending ones (pinned at the bottom) -- see that function.
+function renderApprovalEntry(a, snap) {
+  const isPending = a.status === "pending";
+  const parts = [
+    el("div", { class: "card-title" }, [
+      el("span", { style: isPending ? "color:var(--accent-amber); font-weight:700;" : "" }, `⚡ ${isPending ? "ACTION REQUIRED" : a.kind.toUpperCase()}: ${a.title}`),
+      badge(a.status),
+    ]),
+  ];
+  if (a.message) parts.push(el("div", { class: "card-text", style: isPending ? "font-size:14px; font-weight:500;" : "" }, a.message));
+
+  if (isPending && snap.control_enabled) {
+    const actionBtns = [];
+    if ((a.options || []).length) {
+      a.options.forEach((opt) => {
+        actionBtns.push(
+          el("button", {
+            class: opt.style === "primary" ? "primary" : "",
+            disabled: state.busy ? "" : null,
+            onclick: () => guarded(() => apiPost(`/api/approvals/${encodeURIComponent(a.approval_id)}/resolve`, { action: opt.value }).then(() => showToast("Approval resolved"))),
+          }, opt.label)
+        );
+      });
+    }
+    if (a.allow_input) {
+      const inputEl = el("input", { type: "text", "data-key": `approval-input-${a.approval_id}`, placeholder: a.input_label || "Provide response details or leave blank for default...", style: "margin-top:8px;" });
+      inputEl.value = state.approvalDrafts[a.approval_id] || "";
+      inputEl.addEventListener("input", () => { state.approvalDrafts[a.approval_id] = inputEl.value; });
+      parts.push(inputEl);
+      actionBtns.push(
+        el("button", { class: "primary", disabled: state.busy ? "" : null, onclick: () => guarded(async () => {
+          const val = state.approvalDrafts[a.approval_id] || "";
+          await apiPost(`/api/approvals/${encodeURIComponent(a.approval_id)}/resolve`, { action: "answer", user_input: val });
+          delete state.approvalDrafts[a.approval_id];
+          showToast("Submitted answer");
+        }) }, "Submit Input")
+      );
+      actionBtns.push(
+        el("button", { disabled: state.busy ? "" : null, onclick: () => guarded(async () => {
+          await apiPost(`/api/approvals/${encodeURIComponent(a.approval_id)}/resolve`, { action: "answer", user_input: "" });
+          delete state.approvalDrafts[a.approval_id];
+          showToast("Accepted default");
+        }) }, "Use Default")
+      );
+    }
+    parts.push(el("div", { class: "approval-actions" }, actionBtns));
+  } else if (a.status === "resolved") {
+    const answerDisplay = a.user_input ? `Answer given: "${a.user_input}"` : `Resolved via action: ${a.action || "completed"}`;
+    parts.push(el("div", { style: "font-size:12px; color:var(--text-bright); font-weight:500; margin-top:6px; background:var(--bg-tertiary); padding:6px 10px; border-radius:4px;" }, answerDisplay));
+  }
+
+  const cardStyle = isPending ? "border:1.5px solid var(--accent-amber); background:rgba(245, 158, 11, 0.08);" : "";
+  return el("div", { class: "stream-card approval" + (isPending ? " pending" : ""), style: cardStyle }, parts);
+}
+
 function liveMap() {
   const m = {};
   for (const s of state.snapshot.subagents || []) m[s.id] = s;
@@ -334,6 +434,7 @@ function renderSidebar() {
             class: "run-item" + (r.attached ? " active" : ""),
             onclick: () => guarded(() => {
               state.targetAgentManual = false; // resume auto-following the live subagent in the new run
+              state.liveThinkingTabManual = false;
               return apiPost("/api/attach", { run_id: r.id });
             }),
           }, [
@@ -458,72 +559,81 @@ function renderCenterStream() {
     ]) : null,
   ]);
 
-  // 1. Events (Chronological history - newest at bottom)
-  const events = (snap.events || []).slice(-20);
-  events.forEach((ev) => {
-    let msgText = `${ev.type}${ev.phase ? ` [${ev.phase}]` : ""}${ev.status ? ` - ${ev.status}` : ""}`;
-    if (ev.type === "phase_auto_resuming") {
-      msgText = `🔄 Auto-resuming phase [${ev.phase}] (attempt ${ev.attempt || 1}) — Previous failure error: "${ev.error || "unknown"}"`;
-    } else if (ev.error) {
-      msgText += ` — Error: "${ev.error}"`;
+  // 1. Chronological history: events and already-resolved approvals,
+  // strictly interleaved by when they actually happened (oldest first,
+  // newest at the bottom). This used to be split into fixed sections --
+  // events, then a "phase error" card pinned by *current* snapshot
+  // status, then approvals last -- so a phase failure that happened
+  // after the operator had already answered some intake questions
+  // rendered above those already-answered questions instead of below
+  // them. Still-pending approvals are held out and rendered separately at
+  // the very bottom (see the end of this function) regardless of when
+  // they were created, so an operator scrolled to the bottom still never
+  // has to scroll back up to find one.
+  const approvals = snap.approvals || [];
+  const pendingApprovals = approvals.filter((a) => a.status === "pending");
+  const resolvedApprovals = approvals.filter((a) => a.status !== "pending");
+  const historyItems = [
+    ...(snap.events || []).slice(-20).map((ev) => ({ ts: ev.ts || 0, node: renderEventEntry(ev) })),
+    ...resolvedApprovals.map((a) => ({ ts: a.created_at || 0, node: renderApprovalEntry(a, snap) })),
+  ];
+  historyItems.sort((x, y) => x.ts - y.ts);
+  historyItems.forEach((item) => feed.appendChild(item.node));
+
+  // 2. Live Thinking Stream Widget -- a tabbed chat window per currently-
+  // active agent (every live subagent, plus "main" when it has its own
+  // active session), all polled continuously by loadLiveThinking() so
+  // none of them go stale while backgrounded; only the *display* toggles
+  // between tabs, one panel at a time -- "separate chat windows you can
+  // toggle between," not everything stacked at once. Auto-follows the
+  // live one until the operator clicks a tab by hand (mirrors
+  // renderPromptBar's targetAgentManual pattern), so an operator who
+  // hasn't touched it always lands on whatever's actually running.
+  const thinkAgents = state.liveThinkingAgents || [];
+  if (snap.attached && thinkAgents.length) {
+    if (!state.liveThinkingTabManual || !thinkAgents.find((a) => a.id === state.liveThinkingActiveTab)) {
+      const liveAgent = thinkAgents.find((a) => a.live);
+      state.liveThinkingActiveTab = (liveAgent || thinkAgents[0]).id;
     }
-
-    const isAutoResume = ev.type === "phase_auto_resuming";
-    feed.appendChild(
-      el("div", { class: "stream-msg agent", style: isAutoResume ? "border-left: 3px solid var(--accent-amber); background: rgba(245, 158, 11, 0.05);" : "" }, [
-        el("div", { class: "msg-hdr" }, [
-          el("span", { class: "author", style: isAutoResume ? "color:var(--accent-amber);" : "" }, isAutoResume ? "🔄 Auto-Resume" : "Event"),
-          el("span", null, fmtTime(ev.ts)),
-          ev.node_id && ev.node_id !== "-" ? el("span", { class: "node-link", onclick: () => openNode(ev.node_id) }, ev.node_id) : null,
-        ]),
-        el("div", { class: "msg-body", style: isAutoResume ? "font-weight:500; color:var(--text-bright);" : "" }, msgText),
-      ])
-    );
-  });
-
-  // 2. Live Thinking Stream Widget for active run / subagents. Target
-  // comes from state.liveThinkingTarget, which loadLiveThinking() derives
-  // from the live subagent or (once it's no longer live) the most
-  // recently dispatched one -- see that function for why "whichever
-  // subagent is live right now" misses fast episodes.
-  if (snap.attached && state.liveThinkingTarget) {
-    const subagents = snap.subagents || [];
-    const targetId = state.liveThinkingTarget;
-    const targetSub = subagents.find((s) => s.id === targetId);
-    const targetLabel = targetSub ? `${targetId} (${targetSub.role || targetSub.kind})` : targetId;
-    const entries = state.liveThinkingEntries || [];
+    const active = thinkAgents.find((a) => a.id === state.liveThinkingActiveTab) || thinkAgents[0];
+    const entries = active.entries || [];
 
     feed.appendChild(
       el("div", { class: "stream-card thinking-live-card" }, [
+        el(
+          "div",
+          { class: "thinking-agent-tabs" },
+          thinkAgents.map((a) =>
+            el(
+              "button",
+              {
+                class: "thinking-agent-tab" + (a.id === active.id ? " active" : ""),
+                onclick: () => { state.liveThinkingTabManual = true; state.liveThinkingActiveTab = a.id; render(); },
+              },
+              [a.live ? "● " : "", a.label]
+            )
+          )
+        ),
         el("div", { class: "card-title" }, [
-          el("span", { style: "color:var(--accent-purple); font-weight:600;" }, targetLabel),
+          el("span", { style: "color:var(--accent-purple); font-weight:600;" }, active.label),
+          active.live ? el("span", { class: "badge", "data-status": "running" }, "live") : null,
           entries.length ? el("span", { class: "badge", "data-status": "passed" }, `${entries.length} entries`) : null,
-          el("button", { class: "xs-btn", onclick: () => openNode(targetId) }, "Open Details"),
+          el("button", { class: "xs-btn", onclick: () => openNode(active.id) }, "Open Details"),
         ]),
-        el("div", { class: "thinking-live-body", id: "thinking-live-stream" },
+        el(
+          "div",
+          { class: "thinking-live-body", "data-scroll-key": active.id },
           entries.length
             ? entries.slice(-15).map(renderTraceEntry)
-            : [el("span", { class: "dim" }, `Waiting for trace from ${targetLabel}...`)]
+            : [el("span", { class: "dim" }, `Waiting for trace from ${active.label}...`)]
         ),
       ])
     );
   }
 
-  // 3. Separate Failure Error Card (appended at bottom of feed after events)
-  const hasError = snap.phase_status === "error" || snap.phase_status === "escalated" || (snap.phase_detail && snap.phase_detail.toLowerCase().includes("error"));
-  if (hasError) {
-    feed.appendChild(
-      el("div", { class: "stream-card phase-error-card" }, [
-        el("div", { class: "card-title" }, [
-          el("span", { style: "color:var(--accent-red); font-weight:700;" }, `❌ Phase Failure Error (${snap.phase ? snap.phase.toUpperCase() : "FAILURE"})`),
-          badge(snap.phase_status || "error"),
-        ]),
-        el("div", { class: "error-body" }, snap.phase_detail || "Phase execution failed. Review details or click Resume below to retry."),
-      ])
-    );
-  }
-
-  // 4. Separate Resume Status Card (appended at bottom of feed below error card)
+  // 3. Resume Status Card -- persistent call-to-action tied to the
+  // *current* run status, not a point-in-time history entry, so it stays
+  // pinned here rather than joining the chronological merge above.
   const isStoppedOrHalted = snap.halted || snap.phase_status === "error" || snap.phase_status === "paused" || snap.phase_status === "escalated";
   if (isStoppedOrHalted && snap.control_enabled) {
     feed.appendChild(
@@ -537,66 +647,10 @@ function renderCenterStream() {
     );
   }
 
-  // 5. Approvals (Pending & Resolved) -- rendered last, so a pending
-  // question is the last thing in the feed, right above the prompt bar,
-  // instead of sitting above newer events/thinking-stream content where
-  // an operator scrolled to the bottom (the feed auto-scrolls to bottom
-  // on new content -- see captureFocusState/restoreFocusState) would
-  // never see it without scrolling back up.
-  const approvals = snap.approvals || [];
-  approvals.forEach((a) => {
-    const isPending = a.status === "pending";
-    const parts = [
-      el("div", { class: "card-title" }, [
-        el("span", { style: isPending ? "color:var(--accent-amber); font-weight:700;" : "" }, `⚡ ${isPending ? "ACTION REQUIRED" : a.kind.toUpperCase()}: ${a.title}`),
-        badge(a.status),
-      ]),
-    ];
-    if (a.message) parts.push(el("div", { class: "card-text", style: isPending ? "font-size:14px; font-weight:500;" : "" }, a.message));
-
-    if (isPending && snap.control_enabled) {
-      const actionBtns = [];
-      if ((a.options || []).length) {
-        a.options.forEach((opt) => {
-          actionBtns.push(
-            el("button", {
-              class: opt.style === "primary" ? "primary" : "",
-              disabled: state.busy ? "" : null,
-              onclick: () => guarded(() => apiPost(`/api/approvals/${encodeURIComponent(a.approval_id)}/resolve`, { action: opt.value }).then(() => showToast("Approval resolved"))),
-            }, opt.label)
-          );
-        });
-      }
-      if (a.allow_input) {
-        const inputEl = el("input", { type: "text", "data-key": `approval-input-${a.approval_id}`, placeholder: a.input_label || "Provide response details or leave blank for default...", style: "margin-top:8px;" });
-        inputEl.value = state.approvalDrafts[a.approval_id] || "";
-        inputEl.addEventListener("input", () => { state.approvalDrafts[a.approval_id] = inputEl.value; });
-        parts.push(inputEl);
-        actionBtns.push(
-          el("button", { class: "primary", disabled: state.busy ? "" : null, onclick: () => guarded(async () => {
-            const val = state.approvalDrafts[a.approval_id] || "";
-            await apiPost(`/api/approvals/${encodeURIComponent(a.approval_id)}/resolve`, { action: "answer", user_input: val });
-            delete state.approvalDrafts[a.approval_id];
-            showToast("Submitted answer");
-          }) }, "Submit Input")
-        );
-        actionBtns.push(
-          el("button", { disabled: state.busy ? "" : null, onclick: () => guarded(async () => {
-            await apiPost(`/api/approvals/${encodeURIComponent(a.approval_id)}/resolve`, { action: "answer", user_input: "" });
-            delete state.approvalDrafts[a.approval_id];
-            showToast("Accepted default");
-          }) }, "Use Default")
-        );
-      }
-      parts.push(el("div", { class: "approval-actions" }, actionBtns));
-    } else if (a.status === "resolved") {
-      const answerDisplay = a.user_input ? `Answer given: "${a.user_input}"` : `Resolved via action: ${a.action || "completed"}`;
-      parts.push(el("div", { style: "font-size:12px; color:var(--text-bright); font-weight:500; margin-top:6px; background:var(--bg-tertiary); padding:6px 10px; border-radius:4px;" }, answerDisplay));
-    }
-
-    const cardStyle = isPending ? "border:1.5px solid var(--accent-amber); background:rgba(245, 158, 11, 0.08);" : "";
-    feed.appendChild(el("div", { class: "stream-card approval" + (isPending ? " pending" : ""), style: cardStyle }, parts));
-  });
+  // 4. Pending approvals -- always last, right above the prompt bar; see
+  // this function's opening comment for why they're held out of the
+  // chronological merge above.
+  pendingApprovals.forEach((a) => feed.appendChild(renderApprovalEntry(a, snap)));
 
   const promptBar = renderPromptBar();
 
@@ -1126,7 +1180,7 @@ function restoreFocusState(saved) {
 
 function captureScrollStates() {
   const map = new Map();
-  const selectors = ["#chat-feed-scroll", ".sidebar-content", ".workbench-content", ".drawer-body", "#thinking-live-stream"];
+  const selectors = ["#chat-feed-scroll", ".sidebar-content", ".workbench-content", ".drawer-body"];
   selectors.forEach((sel) => {
     const el = root.querySelector(sel);
     if (el) {
@@ -1134,13 +1188,22 @@ function captureScrollStates() {
       map.set(sel, { scrollTop: el.scrollTop, atBottom });
     }
   });
+  // There can now be several live-thinking cards at once (one per active
+  // agent), so a single fixed id can't address them -- key each by the
+  // agent id its card was rendered with instead of a plain selector.
+  root.querySelectorAll(".thinking-live-body[data-scroll-key]").forEach((el) => {
+    const atBottom = el.scrollHeight - el.scrollTop - el.clientHeight < 60;
+    map.set(`thinking:${el.getAttribute("data-scroll-key")}`, { scrollTop: el.scrollTop, atBottom });
+  });
   return map;
 }
 
 function restoreScrollStates(savedMap) {
   if (!savedMap) return;
   savedMap.forEach((pos, sel) => {
-    const el = root.querySelector(sel);
+    const el = sel.startsWith("thinking:")
+      ? root.querySelector(`.thinking-live-body[data-scroll-key="${CSS.escape(sel.slice(9))}"]`)
+      : root.querySelector(sel);
     if (el) {
       if (sel === "#chat-feed-scroll" && pos.atBottom) {
         el.scrollTop = el.scrollHeight;

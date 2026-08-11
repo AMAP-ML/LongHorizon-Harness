@@ -973,6 +973,34 @@ button.icon-btn {
   box-shadow: var(--shadow-glow-purple);
 }
 
+/* One tab per agent (main + every live/recent subagent) -- toggles which
+   agent's chat window the card below shows, without dropping any of the
+   others: all of them keep polling in the background. */
+.thinking-agent-tabs {
+  display: flex;
+  gap: 4px;
+  flex-wrap: wrap;
+  margin-bottom: 10px;
+}
+
+.thinking-agent-tab {
+  padding: 3px 10px;
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--text-muted);
+  border: 1px solid var(--border-color);
+  background: var(--bg-darkest);
+  border-radius: 9999px;
+  cursor: pointer;
+  transition: all 0.2s ease;
+}
+
+.thinking-agent-tab.active {
+  background-color: rgba(168, 85, 247, 0.18);
+  border-color: rgba(168, 85, 247, 0.6);
+  color: var(--accent-purple);
+}
+
 .thinking-live-body {
   font-family: var(--font-mono);
   font-size: 11px;

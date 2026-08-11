@@ -567,7 +567,24 @@ prompt, not that node's own handoff).
   v1's round loop, and v3's assembly loop are each resume-idempotent.
   `halt.flag` is honored at phase boundaries only. Post-run interventions
   (`amend_and_revalidate`, `apply_triage`, `reopen_node`) keep §10's
-  read-only-then-approve-then-execute split.
+  read-only-then-approve-then-execute split. **`_phase_survey`'s optional
+  "explorer" subagent (2026-08-10 fix):** for a large corpus (>10 chunks or
+  >50000 chars) it wraps the model survey call with `session_captured`/
+  `episode_completed` events under a synthetic `explore-01` node id, purely
+  so the dashboard has something to show for that phase. It called
+  `self.log.record(subagent_id, ...)` — `EventLog` (`v0/events.py`) has no
+  `record` method, only `append`; this raised `AttributeError` on every
+  large-corpus run and killed the whole phase (`_run_phase`'s except-block
+  turns any phase exception into `phase_status: "error"`, so nothing
+  downstream — plan/pilot/research/execute — ever ran, which is also why
+  the dashboard showed no thinking at all and every `interject` 409'd with
+  "no live session found," not just why survey crashed). Fixed to call
+  `self._log({...})` like every other call site, and the closing event's
+  type changed from a made-up `"session_ended"` (which
+  `dashboard/state.py`'s `_summarize_subagent` doesn't recognize — it only
+  flips `completed`/`status` off the real `"episode_completed"`) to
+  `"episode_completed"`, so this pseudo-agent's dashboard status resolves
+  to "done" instead of sitting on "running" forever.
 - `approvals.py` — the cross-process human gate. Append-only
   `approvals.jsonl`, latest record per `approval_id` wins; resume **reuses**
   the unanswered record instead of stacking duplicates.
@@ -669,14 +686,30 @@ prompt, not that node's own handoff).
   so the correction played as a visible jump-to-top-then-animate-down on
   every ~1.5s tick instead of an invisible instant one — removed. The
   live thinking widget (`renderCenterStream`'s section 2) has the same
-  hazard as `interject`'s default target below: `state.liveThinkingTarget`
-  (set by `loadLiveThinking()`) follows the live subagent, or — once it's
-  no longer live — the most recently dispatched one (`RunState.subagents()`
-  returns dispatch order), not `"main"`. gptme runs each turn
+  hazard as `interject`'s default target below. gptme runs each turn
   synchronously (`_gptme_worker.py`'s `stream=False`), so a fast episode
   can dispatch, produce its one message, and complete inside a single
   polling interval; reverting to `"main"` (no per-node trace of its own)
   the instant `live` clears wiped that message before it was ever seen.
+  **2026-08-10, second pass:** the widget originally tracked one
+  `state.liveThinkingTarget` — the live subagent, or once it's no longer
+  live, the most recently dispatched one (`RunState.subagents()` returns
+  dispatch order) — and rendered exactly one card, so it visibly showed
+  only whichever single agent it had picked and hid every other agent's
+  thinking, including a genuinely-concurrent second subagent (parallel
+  dispatch is a config change away per §4.5) and `"main"`'s own session
+  when `node_gptme_logdir`'s phase/traces-dir fallback resolves one for
+  it. `loadLiveThinking()` now polls **every** currently-live subagent
+  plus that same most-recent fallback plus `"main"`, and
+  `state.liveThinkingAgents` (an array, not a single target) renders one
+  `.thinking-live-card` per agent that actually has entries — `"main"`'s
+  card is suppressed when it has none, so it doesn't sit there as a
+  permanent empty placeholder. Because there can now be more than one
+  `.thinking-live-body` on screen at once, `captureScrollStates`/
+  `restoreScrollStates` (needed regardless, per the full-teardown rule
+  above) key each one by a `data-scroll-key="<agent id>"` attribute
+  instead of the old fixed `#thinking-live-stream` id, which only ever
+  addressed one element.
   `renderPromptBar`'s message-target dropdown has the mirror bug: it
   defaults to `"main"` and stays on whatever was last picked even after
   that episode ends, and `main` almost never has a live session of its
@@ -687,6 +720,35 @@ prompt, not that node's own handoff).
   tracks whether the operator overrode that by hand) and disables Send
   while the selected target isn't live, instead of letting the operator
   retry into a guaranteed failure.
+  **2026-08-10, third pass — separate chat windows, and strict
+  chronological ordering:** stacking every agent's card at once (the
+  second pass, above) wasn't what was wanted; the operator asked for
+  "separate chat windows to toggle between." `renderCenterStream`'s
+  section 2 now renders one `.thinking-agent-tab` pill per entry in
+  `state.liveThinkingAgents` (all of them still polled every tick
+  regardless of which is shown, so switching tabs is instant and none of
+  them go stale while backgrounded) and only the active one's card;
+  `state.liveThinkingActiveTab`/`liveThinkingTabManual` mirror
+  `targetAgentId`/`targetAgentManual`'s auto-follow-until-touched pattern,
+  reset on run attach alongside it. Separately: the feed used to render in
+  fixed sections — events, then the live-thinking widget, then a "phase
+  error" card positioned by *current* `snap.phase_status`, then all
+  approvals (pending and resolved) last — so a phase failure that
+  happened *after* the operator had already answered some intake
+  questions rendered above those already-answered questions: wrong
+  history order. `renderEventEntry`/`renderApprovalEntry` (extracted from
+  the old inline per-item markup, unchanged) now feed one array sorted by
+  each item's own timestamp (`ev.ts`, `approval.created_at`) and appended
+  in that order — true chronological history, oldest first. The
+  `phase_failed`/`run_escalated` styling that used to live in the
+  separate error card moved into `renderEventEntry` itself (keyed off
+  `ev.type`, not `snap.phase_status`), so it's still visually distinct
+  but sits at its real place in history instead of a second, copy
+  pinned by current state. Pending approvals are the one deliberate
+  exception, still filtered out and rendered last, below the resume
+  banner: a question the operator hasn't answered yet needs to be at the
+  bottom regardless of when it was asked, or an operator scrolled to the
+  bottom would miss it.
 
 ## Adapters (gptme-only)
 

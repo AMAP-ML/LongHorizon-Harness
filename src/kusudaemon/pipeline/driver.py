@@ -356,7 +356,7 @@ class RecursiveDriver:
             subagent_id = "explore-01" if is_large_corpus else None
 
             if subagent_id:
-                self.log.record(subagent_id, "session_captured", {"role": "explorer", "phase": "survey"})
+                self._log({"node_id": subagent_id, "role": "explorer", "round": 0, "type": "session_captured", "phase": "survey"})
             try:
                 if self.options.survey_mode == "embedding" and embeddings_available():
                     votes = survey_chunks_deterministic(chunks)
@@ -378,7 +378,12 @@ class RecursiveDriver:
                     votes = survey_chunks(chunks, self.provider)
             finally:
                 if subagent_id:
-                    self.log.record(subagent_id, "session_ended", {"status": "done"})
+                    # "episode_completed", not the made-up "session_ended" this
+                    # replaced: dashboard/state.py's _summarize_subagent only
+                    # flips a subagent's status/completed off of that exact
+                    # type string (v0's event vocabulary), so anything else
+                    # left this pseudo-agent showing "running" forever.
+                    self._log({"node_id": subagent_id, "role": "explorer", "round": 0, "type": "episode_completed", "status": "done"})
             units = assemble_spine(chunks, votes)
             materialize_units(self.run_dir, chunks, units)
             build_chunk_index(self.run_dir, chunks, units)
