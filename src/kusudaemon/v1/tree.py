@@ -106,6 +106,19 @@ class TaskNode:
     attempts: int = 0
     last_defect: str = ""
     parent: str = ""
+    # PLAN.md §C1 (node-type template system): warn-severity gates shipped
+    # *before* the equivalent hard gates, so a real semantic bar can land
+    # and start emitting signals into the manifest/glossary without
+    # flipping a passing run into a failing one. Additive + defaulted to
+    # [] so every existing `tree.json` (which has no `warn_gates` key)
+    # loads unchanged. The harness evaluates these the same way it does
+    # `gates` (``v1/gates.evaluate_gates``, same handlers) but reports
+    # them separately in the manifest and audit; they never participate
+    # in `all_passed` or block a node from reaching `"passed"`. A template
+    # registry (`v6/templates.py`) is what populates *both* lists per
+    # node — direct construction with warn_gates stays legal for tests and
+    # hand-authored trees, the same way it does for gates.
+    warn_gates: list[str] = field(default_factory=list)
 
     def __post_init__(self) -> None:
         _validate_node(self)
@@ -138,6 +151,7 @@ class TaskNode:
             attempts=int(data.get("attempts", 0)),
             last_defect=str(data.get("last_defect", "")),
             parent=str(data.get("parent", "")),
+            warn_gates=list(data.get("warn_gates") or []),
         )
 
 

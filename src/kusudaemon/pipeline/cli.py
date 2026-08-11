@@ -71,6 +71,13 @@ def build_pipeline_parser() -> argparse.ArgumentParser:
     run_parser.add_argument("--max-rounds", type=int, default=100)
     run_parser.add_argument("--max-attempts", type=int, default=3)
     run_parser.add_argument(
+        "--max-parallel",
+        type=int,
+        default=1,
+        help="Writer episodes dispatched concurrently per round (PLAN.md §C2); "
+        "1 reproduces today's serial behavior exactly.",
+    )
+    run_parser.add_argument(
         "--dispatch-policy",
         choices=("model", "document_order"),
         default="model",
@@ -232,6 +239,7 @@ def cmd_run_detach(argv: argparse.Namespace) -> int:
         "--max-rounds", str(argv.max_rounds),
         "--max-attempts", str(argv.max_attempts),
         "--dispatch-policy", argv.dispatch_policy,
+        "--max-parallel", str(getattr(argv, "max_parallel", 1)),
     ]
     if workspace:
         command += ["--workspace", workspace]
@@ -444,6 +452,7 @@ def _run_argv(argv: argparse.Namespace, *, run_id: str | None) -> list[str]:
         "--max-rounds", str(argv.max_rounds),
         "--max-attempts", str(argv.max_attempts),
         "--dispatch-policy", argv.dispatch_policy,
+        "--max-parallel", str(getattr(argv, "max_parallel", 1)),
     ]
     if run_id:
         parts += ["--run-id", run_id]

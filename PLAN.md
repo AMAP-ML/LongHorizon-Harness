@@ -1218,8 +1218,38 @@ nothing else. Fixed by §A10's tiering.
         pre-fan-out truncation point, not just in isolation)
     [x] 13 new tests (553 total)
 
-[ ] §C1  node-type templates                  — the semantic bar — NOT STARTED
-[ ] §C2  parallel dispatch                    — now correctness, not throughput — NOT STARTED
+[x] §C1  node-type templates                  — the semantic bar — DONE 2026-08-11
+    [x] v6/templates.py registry (glossary_path param, glossary_for_tree,
+        write_tree_glossary — write-once, empty union writes nothing)
+    [x] five warn gates in v1/gates.py (`headers`/`problems>=5` resolved
+        via _evaluate_one's suffix-arg branch; headers:std's skip check
+        tracks the previous heading level, not a watermark)
+    [x] manifest `warned_gates`, planner `add_leaf` template application,
+        driver `_phase_plan` re-merge + `glossary_written` event
+    [x] v0/run_dir.py `glossary_path` (pure getter, re-exported from
+        pipeline/run_dir.py)
+    [x] 40 new tests (602 total): test_v6_templates.py (13),
+        test_v1_gates_c1.py (23), WarnGatesNeverBlockTest in
+        test_v1_round_loop.py (2), PhasePlanGlossaryC1Test in
+        test_driver_phases.py (2)
+[x] §C2  parallel dispatch                    — correctness, not throughput — DONE 2026-08-11
+    [x] threading.Lock inside EventLog.append (v0/events.py)
+    [x] single-writer _save_tree_locked (one asyncio.Lock funnels every
+        tree.save); provider asyncio.Semaphore around review verdicts
+    [x] assert no two in-flight nodes share an artifact
+    [x] gather the resume scan — crashed in-flight nodes resume in
+        max_parallel-sized chunks with zero new dispatch decisions
+    [x] wave fill: per-round orchestrator call names the first node,
+        ready-set iterations fill to max_parallel (code-derived, reason
+        "parallel wave fill (max_parallel=N)")
+    [x] max_parallel=1 byte-identical to pre-§C2 (chunks of 1 == same
+        sequential order; 98-file suite green before the new tests)
+    [x] --max-parallel / RunOptions.max_parallel round-tripped through
+        to_spec/from_spec and the detach argv; driver _phase_execute
+        forwards it (RunOptionsMaxParallelTest + MaxParallelForgingDriverTest)
+    [x] 9 new tests (611 total): test_v1_round_loop_parallel.py (4 incl.
+        a 3-episode 0.3s wave finishing < 0.8s wall clock with 1 provider
+        call), RunOptionsMaxParallelTest (4), MaxParallelForgingDriverTest (1)
 [ ] §C3  probe planner                                  — NOT STARTED
 [ ] §C4  dashboard hardening (auth first)               — NOT STARTED
 [ ] §C5  eval harness: calls-by-tier and escalation precision first — NOT STARTED

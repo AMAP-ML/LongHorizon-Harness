@@ -345,7 +345,7 @@ def build_tree(
             if input_path_for is not None
             else [unit.id for unit in slice_units]
         )
-        nodes[node_id] = TaskNode(
+        node = TaskNode(
             id=node_id,
             brief=candidate.brief,
             artifact=f"out/{node_id}.md",
@@ -355,6 +355,16 @@ def build_tree(
             budget=NodeBudget(tokens=token_budget, calls=tool_call_cap),
             depends_on=[],
         )
+        # PLAN.md §C1: apply the shape's node-type template's gates /
+        # judgment / rubric to the leaf. Warn-severity gates ship into
+        # ``node.warn_gates`` (not ``node.gates``) so a failing
+        # warn-gate never blocks the node from reaching "passed" — see
+        # ``v6/templates.py``'s module docstring for the "ship warn
+        # first, graduate after measuring" rationale.
+        from ..v6.templates import apply_template_to_node
+
+        apply_template_to_node(node)
+        nodes[node_id] = node
 
     def forced_leaf(slice_units: list[SpineUnit], node_id: str, reason: str) -> None:
         tokens = sum(unit.tokens for unit in slice_units)

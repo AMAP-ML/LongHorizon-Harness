@@ -39,7 +39,14 @@ def append_manifest_line(
     artifact_text: str,
     gate_results: list[GateResult],
     promotion: str,
+    warn_results: list[GateResult] | None = None,
 ) -> dict[str, Any]:
+    """§C1: ``warn_results`` carries the per-dispatch evaluations of
+    ``node.warn_gates`` (the node-type template gates — see ``v6/templates.py``;
+    absent when the node had no warn gates, today the common case). Recorded
+    into ``warned_gates`` so a downstream consumer (the manifest tail, the
+    document-review cross-leaf pass, an eval harness) can count
+    warn-only failures across a run without re-evaluating the gates."""
     line = {
         "node": node_id,
         "artifact": str(artifact_path),
@@ -57,6 +64,16 @@ def append_manifest_line(
         "promotion": cap_promotion(promotion),
         "ts": time.time(),
     }
+    # §C1: always present in the manifest line — an empty array is the
+    # honest signal "this node had no warn gates evaluated", not "warns
+    # were suppressed." Consumers filtering by `node.warn_gates` count
+    # would otherwise mistake the *absence* of the field (an old line
+    # from a pre-§C1 run) for "zero warns."
+    warn_results = warn_results or []
+    line["warned_gates"] = [
+        {"gate": result.gate, "passed": result.passed, "detail": result.detail}
+        for result in warn_results
+    ]
     with open(manifest_path, "a", encoding="utf-8") as fh:
         fh.write(json.dumps(line, sort_keys=True) + "\n")
     return line

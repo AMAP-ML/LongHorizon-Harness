@@ -621,5 +621,118 @@ class DeterministicDispatchRoundLoopTest(unittest.TestCase):
             self.assertEqual(reloaded.nodes["b"].status, "passed")
 
 
+class WarnGatesNeverBlockTest(unittest.TestCase):
+    """PLAN.md §C1: warn-severity gates are evaluated and recorded but can
+    never flip a passing run — ``all_passed`` looks at ``node.gates``
+    only. The warn results must reach the audit gate cache and the
+    manifest's ``warned_gates`` while the node still passes."""
+
+    def test_failing_warn_gate_leaves_node_passed_and_recorded(self) -> None:
+        with tempfile.TemporaryDirectory() as root_str:
+            root = Path(root_str)
+            run_dir = create_run_dir(root, "run-warn")
+            prompt_dir = root / "prompts"
+            prompt_dir.mkdir(parents=True, exist_ok=True)
+
+            _write_tree(
+                tree_path(run_dir),
+                [
+                    {
+                        "id": "a",
+                        "brief": "problems",
+                        "artifact": "out/a.md",
+                        "gates": ["nonempty"],
+                        # The fake agent's artifact fallback is not a
+                        # problem set, so this warn gate must fail...
+                        "warn_gates": ["problems>=5", "headers:std"],
+                    }
+                ],
+            )
+
+            provider = FakeProvider(
+                [{"action": "dispatch", "node_id": "a", "reason": "only node"}]
+            )
+
+            tree = asyncio.run(
+                run_round_loop(
+                    run_dir,
+                    tree_path(run_dir),
+                    writer_adapter_factory=_adapter_factory(root, run_dir, prompt_dir),
+                    env=LocalEnvironment(tmp_dir=str(prompt_dir)),
+                    provider=provider,
+                    prompt_for_node=lambda node: f"do {node.id}",
+                    writer_budget=EpisodeBudget(max_duration_seconds=30),
+                )
+            )
+
+            # ...and the node passes anyway.
+            self.assertEqual(tree.nodes["a"].status, "passed")
+            self.assertEqual(len(provider.calls), 1)  # no review call: no judgment
+
+            (line,) = (
+                json.loads(l)
+                for l in manifest_path(run_dir).read_text(encoding="utf-8").splitlines()
+            )
+            self.assertEqual(line["gates"], "pass")
+            warned = line["warned_gates"]
+            self.assertEqual(len(warned), 2)
+            by_gate = {w["gate"]: w for w in warned}
+            self.assertFalse(by_gate["problems>=5"]["passed"])
+            self.assertFalse(by_gate["headers:std"]["passed"])
+
+            # The audit gate cache carries hard + warn results merged
+            # (same §11.10.11 single-evaluation discipline).
+            audit = json.loads(
+                (run_dir / "audit" / "a.json").read_text(encoding="utf-8")
+            )
+            cached = {g["gate"]: g for g in audit["gates"]}
+            self.assertTrue(cached["nonempty"]["passed"])
+            self.assertFalse(cached["problems>=5"]["passed"])
+            self.assertEqual(audit["verdict"], "pass")
+
+    def test_passing_warn_gates_are_recorded_as_passed(self) -> None:
+        with tempfile.TemporaryDirectory() as root_str:
+            root = Path(root_str)
+            run_dir = create_run_dir(root, "run-warn2")
+            prompt_dir = root / "prompts"
+            prompt_dir.mkdir(parents=True, exist_ok=True)
+
+            # `exists` always evaluates to passed — a pure record test of
+            # the passed-warn path, independent of the fake artifact text.
+            _write_tree(
+                tree_path(run_dir),
+                [
+                    {
+                        "id": "b",
+                        "brief": "recorded",
+                        "artifact": "out/b.md",
+                        "gates": ["nonempty"],
+                        "warn_gates": ["exists"],
+                    }
+                ],
+            )
+            provider = FakeProvider(
+                [{"action": "dispatch", "node_id": "b", "reason": "only node"}]
+            )
+            tree = asyncio.run(
+                run_round_loop(
+                    run_dir,
+                    tree_path(run_dir),
+                    writer_adapter_factory=_adapter_factory(root, run_dir, prompt_dir),
+                    env=LocalEnvironment(tmp_dir=str(prompt_dir)),
+                    provider=provider,
+                    prompt_for_node=lambda node: f"do {node.id}",
+                    writer_budget=EpisodeBudget(max_duration_seconds=30),
+                )
+            )
+            self.assertEqual(tree.nodes["b"].status, "passed")
+            (line,) = (
+                json.loads(l)
+                for l in manifest_path(run_dir).read_text(encoding="utf-8").splitlines()
+            )
+            self.assertEqual(line["warned_gates"][0]["gate"], "exists")
+            self.assertTrue(line["warned_gates"][0]["passed"])
+
+
 if __name__ == "__main__":
     unittest.main()

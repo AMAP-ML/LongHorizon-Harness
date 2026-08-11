@@ -86,6 +86,7 @@ nothing to get out of sync.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import time
 from pathlib import Path
@@ -138,11 +139,25 @@ async def dispatch_node(
     max_attempts: int,
     log: EventLog,
     split_handler: SplitHandler | None = None,
+    tree_lock: asyncio.Lock | None = None,
 ) -> None:
-    """One Writer episode + gate evaluation + manifest line + status
-    transition for a single node — ``run_round_loop``'s original ``dispatch``
-    closure, pulled out so ``v6/direct.py``'s T0 path can call it directly
-    against its own in-memory single-node ``TaskTree`` (module docstring)."""
+    """One Writer episode + gate evaluation (hard + warn) + manifest line +
+    status transition for a single node — ``run_round_loop``'s original
+    ``dispatch`` closure, pulled out so ``v6/direct.py``'s T0 path can call
+    it directly against its own in-memory single-node ``TaskTree`` (module
+    docstring).
+
+    §C1 (warn severity first): ``node.warn_gates`` are evaluated alongside
+    ``node.gates`` (same handlers, same single ``evaluate_gates`` call),
+    their results are merged into the audit file's gate cache and into the
+    manifest's ``warned_gates`` — but they **never participate in
+    ``all_passed``** (only ``node.gates`` does), so a failing warn-gate
+    cannot block a node from reaching ``"passed"``. The whole "ship at
+    warn severity first" semantics live entirely in this separation: no
+    new policy knob on the gate handlers themselves, no second pass, no
+    separate "send the warning to the writer" plumbing — just a second
+    ``list[str]`` evaluated alongside the first, recorded but never gating.
+    """
     run_dir = Path(run_dir)
     adapter = writer_adapter_factory(node)
     result, promotion = await run_writer_node(
@@ -156,11 +171,15 @@ async def dispatch_node(
         return
     artifact_text = _read_artifact(run_dir, node.id)
     gate_results = evaluate_gates(node.gates, artifact_text)
-    # §11.10.11: evaluated once per dispatch (deterministic), durable in
-    # the audit file for every consumer; review and the dashboard read
-    # this instead of re-evaluating.
+    # §C1: warn-severity gates — evaluated alongside hard gates, recorded
+    # alongside them in the audit cache, but a failure does NOT block the
+    # node. ``all_passed`` (called below via ``_transition_after_writer``)
+    # looks at hard gates only; the warn results are recorded so the
+    # dashboard/manifest can surface them as a signal that the semantic
+    # bar `problems>=5` etc. is firing without flipping a passing run.
+    warn_results = evaluate_gates(list(node.warn_gates), artifact_text)
     audit = ensure_audit_path(run_dir, node.id)
-    write_gate_cache(audit, gate_results)
+    write_gate_cache(audit, [*gate_results, *warn_results])
     append_manifest_line(
         manifest,
         node_id=node.id,
@@ -168,9 +187,11 @@ async def dispatch_node(
         artifact_text=artifact_text,
         gate_results=gate_results,
         promotion=promotion,
+        warn_results=warn_results,
     )
-    _transition_after_writer(
-        node, tree, tree_path, result.status == "done", gate_results, max_attempts, log
+    await _transition_after_writer(
+        node, tree, tree_path, result.status == "done", gate_results, max_attempts, log,
+        tree_lock=tree_lock,
     )
 
 
@@ -184,15 +205,30 @@ async def review_and_transition_node(
     max_attempts: int,
     log: EventLog,
     on_node_passed: NodePassedHook | None = None,
+    tree_lock: asyncio.Lock | None = None,
+    provider_semaphore: asyncio.Semaphore | None = None,
 ) -> None:
     """One Reviewer verdict + status transition for a single node —
     ``run_round_loop``'s original ``review`` closure, pulled out for the
-    same reason as ``dispatch_node`` above."""
+    same reason as ``dispatch_node`` above.
+
+    §C2: ``provider_semaphore`` bounds concurrent provider calls when
+    reviews run gathered in a parallel wave (``run_round_loop(max_parallel
+    > 1)``). Today the provider is synchronous urllib, so calls never
+    actually overlap on the single event-loop thread — the semaphore is
+    the spec'd fence that becomes load-bearing the day the provider goes
+    async or an adapter moves calls onto threads.``"""
     run_dir = Path(run_dir)
     artifact_text = _read_artifact(run_dir, node.id)
-    verdict = review_node(node, artifact_text, provider)
+    if provider_semaphore is not None:
+        async with provider_semaphore:
+            verdict = review_node(node, artifact_text, provider)
+    else:
+        verdict = review_node(node, artifact_text, provider)
     _write_audit(run_dir, node, verdict)
-    _transition_after_review(node, tree, tree_path, verdict, max_attempts, log)
+    await _transition_after_review(
+        node, tree, tree_path, verdict, max_attempts, log, tree_lock=tree_lock
+    )
     if node.status == "passed" and on_node_passed is not None:
         # PLAN.md §A8.3: this node may be the last outstanding child of a
         # split parent — see module docstring for why this is a cheap
@@ -215,12 +251,54 @@ async def run_round_loop(
     dispatch_policy: DispatchPolicy = "model",
     split_handler: SplitHandler | None = None,
     on_node_passed: NodePassedHook | None = None,
+    max_parallel: int = 1,
+    provider_concurrency: int | None = None,
 ) -> TaskTree:
-    run_dir = Path(run_dir)
+    """Drive the Orchestrator/Writer/Reviewer round loop for ``tree.json``.
+
+    PLAN.md §C2: ``max_parallel > 1`` runs each round as a **wave** — the
+    orchestrator's dispatch decision (one call, exactly as before) names
+    the first node, and the wave is filled out to ``max_parallel`` with the
+    next ready nodes in tree order, picked by code from the ready set with
+    **no additional model calls** (the orchestrator was never the
+    bottleneck, and §2 keeps its context bounded by the ready set; writer
+    throughput is the thing parallelism buys). The wave's subprocess
+    episodes run concurrently via ``asyncio.gather`` in
+    ``max_parallel``-sized chunks, then the wave's reviews run the same
+    way. ``max_parallel=1`` is the byte-identical event sequence to the
+    pre-§C2 loop: chunks of one are sequential awaits in the same order.
+
+    Concurrency guards (all inert at ``max_parallel=1``):
+    - ``EventLog`` serializes appends with its own ``threading.Lock``
+      (``v0/events.py``).
+    - every ``tree.save`` funnels through one ``asyncio.Lock``
+      (``_save_tree_locked``) — the "single-writer discipline".
+    - the state mutation + save sequences are synchronous on the single
+      event-loop thread (no awaits between them), which is the deeper
+      guarantee; the lock is the spec'd fence that holds even if that
+      changes.
+    - ``provider_concurrency`` (default: unlimited) bounds simultaneous
+      provider calls via an ``asyncio.Semaphore`` around review verdicts.
+      Inert today — the provider is synchronous urllib, so calls cannot
+      overlap on one thread — and load-bearing only once the provider
+      goes async or calls move onto threads.
+    - an assertion that no two in-flight (wave) nodes share an artifact
+      path, so a future @D0 regression (``artifact != out/<id>.md``)
+      cannot silently clobber one artifact with another's write.
+    """
     tree = TaskTree.load(tree_path)
     log = EventLog(events_path(run_dir))
     manifest = manifest_path(run_dir)
     default_budget = writer_budget or EpisodeBudget()
+    tree_lock = asyncio.Lock()
+    provider_sem = (
+        asyncio.Semaphore(provider_concurrency)
+        if provider_concurrency is not None and provider_concurrency > 0
+        else None
+    )
+
+    def chunks(nodes: list[TaskNode]) -> list[list[TaskNode]]:
+        return [nodes[i : i + max_parallel] for i in range(0, len(nodes), max_parallel)]
 
     async def dispatch(node: TaskNode) -> None:
         budget = writer_budget_for(node) if writer_budget_for is not None else default_budget
@@ -237,6 +315,7 @@ async def run_round_loop(
             max_attempts=max_attempts,
             log=log,
             split_handler=split_handler,
+            tree_lock=tree_lock,
         )
 
     async def review(node: TaskNode) -> None:
@@ -249,15 +328,19 @@ async def run_round_loop(
             max_attempts=max_attempts,
             log=log,
             on_node_passed=on_node_passed,
+            tree_lock=tree_lock,
+            provider_semaphore=provider_sem,
         )
 
-    # Resume in-flight work before asking the orchestrator for anything new.
-    for node in list(tree.nodes.values()):
-        if node.status == "dispatched":
-            await dispatch(node)
-    for node in list(tree.nodes.values()):
-        if node.status == "awaiting_review":
-            await review(node)
+    # §C2: "gather the resume scan" — nodes caught mid-flight by a crash
+    # resume in max_parallel-sized chunks instead of one big sequential
+    # pass. Chunks of one = today's exact sequence.
+    in_flight_dispatch = [n for n in tree.nodes.values() if n.status == "dispatched"]
+    for chunk in chunks(in_flight_dispatch):
+        await asyncio.gather(*(dispatch(n) for n in chunk))
+    in_flight_review = [n for n in tree.nodes.values() if n.status == "awaiting_review"]
+    for chunk in chunks(in_flight_review):
+        await asyncio.gather(*(review(n) for n in chunk))
 
     # §11.10.16: round indices continue across process runs. round_index
     # used to restart at 0 on every resume while the trace files were opened
@@ -292,33 +375,59 @@ async def run_round_loop(
             )
             break
 
-        node = tree.nodes[decision.node_id]
-        node.status = "dispatched"
-        tree.save(tree_path)
-        log.append(
-            {
-                "node_id": node.id,
-                "role": "orchestrator",
-                "round": round_index,
-                "type": "node_dispatch_decided",
-                "reason": decision.reason,
-            }
-        )
-        await dispatch(node)
-        if node.status == "awaiting_review":
-            await review(node)
+        # §C2 wave: the decided node first, then the next ready nodes in
+        # tree order up to max_parallel — code-derived, zero extra model
+        # calls, and stable under resume (the ready set is deterministic).
+        wave = [tree.nodes[decision.node_id]]
+        if max_parallel > 1:
+            picked = {wave[0].id}
+            for candidate_id in tree.ready_nodes():
+                if candidate_id in picked:
+                    continue
+                wave.append(tree.nodes[candidate_id])
+                picked.add(candidate_id)
+                if len(wave) >= max_parallel:
+                    break
+            assert len({n.artifact for n in wave}) == len(wave), (
+                f"two in-flight nodes share an artifact path: "
+                f"{[n.artifact for n in wave]}"
+            )
+
+        for node in wave:
+            node.status = "dispatched"
+            tree.save(tree_path)
+            log.append(
+                {
+                    "node_id": node.id,
+                    "role": "orchestrator",
+                    "round": round_index,
+                    "type": "node_dispatch_decided",
+                    "reason": (
+                        decision.reason
+                        if node.id == decision.node_id
+                        else f"parallel wave fill (max_parallel={max_parallel})"
+                    ),
+                }
+            )
+
+        for chunk in chunks(wave):
+            await asyncio.gather(*(dispatch(n) for n in chunk))
+        for chunk in chunks([n for n in wave if n.status == "awaiting_review"]):
+            await asyncio.gather(*(review(n) for n in chunk))
         # §11.10.5: a gate or review failure that still has attempts left is
         # a retry of the node the harness already knows it wants. Re-dispatch
         # in place instead of round-tripping the orchestrator for a call
         # whose only possible answer is "dispatch the same node again" — the
         # retry's prompt differs (last_defect is carried forward by
         # PLAN-zeromem.md §9), so this is a correction, not a resample.
-        while node.status == "pending" and node.attempts < max_attempts:
-            node.status = "dispatched"
-            tree.save(tree_path)
-            await dispatch(node)
-            if node.status == "awaiting_review":
-                await review(node)
+        for chunk in chunks(wave):
+            for node in chunk:
+                while node.status == "pending" and node.attempts < max_attempts:
+                    node.status = "dispatched"
+                    tree.save(tree_path)
+                    await dispatch(node)
+                    if node.status == "awaiting_review":
+                        await review(node)
 
     return tree
 
@@ -328,7 +437,7 @@ def _read_artifact(run_dir: Path, node_id: str) -> str:
     return path.read_text(encoding="utf-8") if path.exists() else ""
 
 
-def _transition_after_writer(
+async def _transition_after_writer(
     node: TaskNode,
     tree: TaskTree,
     tree_path: str | Path,
@@ -336,6 +445,7 @@ def _transition_after_writer(
     gate_results: list[GateResult],
     max_attempts: int,
     log: EventLog,
+    tree_lock: asyncio.Lock | None = None,
 ) -> None:
     if episode_ok and all_passed(gate_results):
         node.status = "awaiting_review"
@@ -360,16 +470,17 @@ def _transition_after_writer(
                 "unmet": [result.gate for result in gate_results if not result.passed],
             }
         )
-    tree.save(tree_path)
+    await _save_tree_locked(tree, tree_path, tree_lock)
 
 
-def _transition_after_review(
+async def _transition_after_review(
     node: TaskNode,
     tree: TaskTree,
     tree_path: str | Path,
     verdict: ReviewVerdict,
     max_attempts: int,
     log: EventLog,
+    tree_lock: asyncio.Lock | None = None,
 ) -> None:
     if verdict.verdict == "pass":
         # PLAN.md invariant 1: only the harness writes "passed", and only
@@ -390,7 +501,27 @@ def _transition_after_review(
                 "attempts": node.attempts,
             }
         )
-    tree.save(tree_path)
+    await _save_tree_locked(tree, tree_path, tree_lock)
+
+
+async def _save_tree_locked(
+    tree: TaskTree, tree_path: str | Path, tree_lock: asyncio.Lock | None
+) -> None:
+    """PLAN.md §C2's "single-writer discipline for tree.json": every
+    writer of the shared tree serializes its ``save`` through one lock.
+    On the single event-loop thread the mutation+save sequences are
+    synchronous (no awaits between them), so the discipline is technically
+    redundant today — but it is the invariant in code that a future
+    threaded caller (or a refactor that puts an await inside the
+    mutation) cannot silently break: two interleaved ``save`` calls of a
+    shared in-memory ``TaskTree`` would each serialize *their view* of
+    the whole tree, and the later writer's view could be missing another
+    task's just-committed status."""
+    if tree_lock is not None:
+        async with tree_lock:
+            tree.save(tree_path)
+    else:
+        tree.save(tree_path)
 
 
 def _defect_from_verdict(verdict: ReviewVerdict) -> str:

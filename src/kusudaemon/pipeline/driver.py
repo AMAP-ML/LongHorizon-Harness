@@ -62,12 +62,12 @@ from ..v6.work_object import WorkObject, survey_workspace, work_object_from_text
 from ..v7.split import handle_split_proposal, maybe_derive_split_parent
 from ..v0.events import EventLog
 from ..v0.run_dir import write_text_atomic
-from ..v0.run_dir import create_run_dir, ensure_node_trace_path, events_path, manifest_path, node_artifact_path, spec_path
+from ..v0.run_dir import create_run_dir, ensure_node_trace_path, events_path, glossary_path, manifest_path, node_artifact_path, spec_path
 from ..v1.provider import OpenAICompatibleProvider
 from ..v1.reviewer import ReviewVerdict
 from ..v1.round_loop import run_round_loop
 from ..v1.tree import TaskNode, TaskTree
-from ..v2.contract import ContractRule, freeze_contract
+from ..v2.contract import ContractRule, freeze_contract, render_spec_rubric_to_contract
 from ..v2.intake import GlobalRubric, IntakeObjection, IntakeQuestion, render_spec_md, run_intake
 from ..v2.pilot import (
     approve_pilot,
@@ -78,6 +78,7 @@ from ..v2.pilot import (
 from ..v2.planner import build_tree
 from ..v2.retrieval import build_chunk_index
 from ..v2.run_dir import contract_path
+from ..v6.templates import merge_template_into_tree, write_tree_glossary
 from ..v2.survey import (
     SpineUnit,
     assemble_spine,
@@ -177,6 +178,12 @@ class RunOptions:
     max_rounds: int = 100
     max_attempts: int = 3
     dispatch_policy: str = "model"
+    # PLAN.md §C2: parallel dispatch within each round-loop wave. 1 is
+    # today's exact serial behavior; >1 runs that many Writer episodes
+    # concurrently per round (wave fill is code-derived from the ready
+    # set — an orchestrator config, not extra model calls). Only operators
+    # who know their provider/workspace can tolerate it should raise it.
+    max_parallel: int = 1
     document_review: bool = False
     survey_mode: str = "model"
     inline_spans: bool = False
@@ -200,6 +207,7 @@ class RunOptions:
             "max_rounds": self.max_rounds,
             "max_attempts": self.max_attempts,
             "dispatch_policy": self.dispatch_policy,
+            "max_parallel": self.max_parallel,
             "document_review": self.document_review,
             "survey_mode": self.survey_mode,
             "inline_spans": self.inline_spans,
@@ -228,6 +236,7 @@ class RunOptions:
             max_rounds=int(data.get("max_rounds", 100)),
             max_attempts=int(data.get("max_attempts", 3)),
             dispatch_policy=str(data.get("dispatch_policy", "model")),
+            max_parallel=int(data.get("max_parallel", 1)),
             document_review=bool(data.get("document_review", False)),
             survey_mode=str(data.get("survey_mode", "model")),
             inline_spans=bool(data.get("inline_spans", False)),
@@ -874,7 +883,46 @@ class RecursiveDriver:
             log=self.log,
             unit_summary_for=self._explore_summary_for,
         )
+        # PLAN.md §C1: the planner's per-leaf ``apply_template_to_node``
+        # cannot know run_dir, so re-apply with the absolute glossary path
+        # (idempotent union — a leaf that already carries the template's
+        # gates/judgment keeps them; only `terms_defined` gets rewritten to
+        # its absolute form). The glossary itself is written once, right
+        # after the tree is saved, from the templates the tree resolved to.
+        merge_template_into_tree(tree, glossary_path=glossary_path(self.run_dir))
         tree.save(tree_path(self.run_dir))
+        if write_tree_glossary(self.run_dir, tree):
+            self._log(
+                {
+                    "node_id": "-",
+                    "role": "harness",
+                    "round": 0,
+                    "type": "glossary_written",
+                    "detail": "template glossary written to glossary.json",
+                }
+            )
+        # PLAN.md §A10: at T2 (and only T2 — T3 has a real ``pilot`` phase
+        # that derives contract.md from edit-diffs; T0/T1 have no plan phase
+        # at all, so this branch is unreachable there), write contract.md
+        # from spec.md by script. Zero model calls, no human gate, no
+        # ``awaiting_approval`` state ever entered — T2's whole reason for
+        # existing is "the operator expected this to take four minutes," and
+        # parking it on a pilot approval form would reintroduce exactly the
+        # overnight-wait failure mode §A10 was written to forbid. The script
+        # renderer (v2/contract.py) is the third and last allowed writer of
+        # contract.md, after pilot derivation and explicit user amendment.
+        tier = self._current_tier()
+        if tier == "T2" and not contract_path(self.run_dir).exists():
+            render_spec_rubric_to_contract(self.run_dir)
+            self._log(
+                {
+                    "node_id": "-",
+                    "role": "harness",
+                    "round": 0,
+                    "type": "contract_rendered_from_spec",
+                    "tier": tier,
+                }
+            )
 
     def _explore_summary_for(self, unit: SpineUnit) -> str:
         """PLAN.md §A7 point 3/§B4: reads back whatever
@@ -1020,6 +1068,8 @@ class RecursiveDriver:
             max_rounds=self.options.max_rounds,
             max_attempts=max_attempts,
             dispatch_policy=self.options.dispatch_policy,
+            # PLAN.md §C2: a config, not a redesign — see RunOptions.
+            max_parallel=self.options.max_parallel,
             split_handler=handle_split_proposal if enable_split else None,
             on_node_passed=maybe_derive_split_parent if enable_split else None,
         )
@@ -1038,6 +1088,14 @@ class RecursiveDriver:
                 # is enough — escalate() is monotone (v6/tiering.py), and
                 # once tier.json says T3 this branch's own `tier == "T2"`
                 # guard stops firing on a later resume.
+                # §A10: archive T2's spec-derived contract.md before the
+                # bump — T3's pilot phase must re-derive contract.md from
+                # a real edit-diff, which is strictly richer than the
+                # script-rendered one (and without this archive,
+                # `_phase_done("pilot")` would see the file and skip the
+                # real pilot — same shape as `_archive_tree_before_replan`
+                # above for T1 -> T2).
+                self._archive_t2_contract_before_pilot()
                 self._escalate_tier("split_accepted", node_id=split_parents[0])
                 return None
         return None if not tree.is_blocked() else False
@@ -1059,6 +1117,26 @@ class RecursiveDriver:
         if not path.exists():
             return
         archive = path.with_name(f"tree.json.pre-t1-escalation-{int(time.time())}")
+        path.rename(archive)
+
+    def _archive_t2_contract_before_pilot(self) -> None:
+        """PLAN.md §A10: T2 wrote ``contract.md`` from spec.md by script
+        (``_phase_plan``'s §A10 branch calls
+        ``v2.contract.render_spec_rubric_to_contract``). When the run
+        escalates T2 -> T3 — via ``split_accepted`` (§A4.4 row 4, below) or
+        ``majority_regenerate`` (row 3, ``_handle_document_review_triage``)
+        — T3's own ``pilot`` phase must re-derive contract.md from its
+        edit-diff, which is *strictly richer* than the script-derived one
+        (a pilot edit carries operator-style rules the script path can
+        never infer). Without this archive, ``_phase_done("pilot")``'s
+        ``contract_path(...).exists()`` check would see the T2-scripted
+        file and skip the real pilot — the same shape as
+        ``_archive_tree_before_replan`` one helper up. Renamed aside, not
+        deleted (invariant 9)."""
+        path = contract_path(self.run_dir)
+        if not path.exists():
+            return
+        archive = path.with_name(f"contract.md.pre-t2-escalation-{int(time.time())}")
         path.rename(archive)
 
     async def _phase_verify(self) -> None:
@@ -1184,6 +1262,10 @@ class RecursiveDriver:
         regenerate = counts.get("regenerate", 0)
         tier = self._current_tier()
         if tier == "T2" and total > 0 and regenerate / total >= 0.5:
+            # §A10: same as the split_accepted escalation site above —
+            # archive T2's spec-derived contract.md before T3's pilot
+            # re-derives it from an edit-diff.
+            self._archive_t2_contract_before_pilot()
             self._escalate_tier("majority_regenerate", regenerate=regenerate, total=total)
             return False
         if require_approval:

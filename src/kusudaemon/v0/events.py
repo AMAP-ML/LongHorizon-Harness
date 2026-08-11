@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 import os
+import threading
 import time
 from pathlib import Path
 from typing import Any
@@ -19,6 +20,17 @@ class EventLog:
     def __init__(self, path: str | Path) -> None:
         self.path = Path(path)
         self.path.parent.mkdir(parents=True, exist_ok=True)
+        # PLAN.md §C2: serialize appends. The round loop's parallel waves
+        # (``max_parallel > 1``) append from several asyncio tasks and —
+        # because ``dispatch_node`` awaits the writer subprocess between
+        # events — the scheduler can switch tasks mid-append. The event
+        # stream must stay one complete JSON line per write: a reader
+        # (``read_all``, ``scan``) tolerates a *torn tail*, but only one,
+        # and only the last line; interleaved appends would count as
+        # several. Threading, not asyncio: ``append`` is synchronous
+        # fsync-per-write by design (§10), so a plain sync lock is the
+        # correct tool and also protects any future cross-thread caller.
+        self._lock = threading.Lock()
 
     def append(self, event: dict[str, Any]) -> None:
         record = dict(event)
@@ -30,10 +42,11 @@ class EventLog:
         # it only moves bytes from the Python buffer to the OS page cache,
         # which a power loss or container kill can still lose; fsync() is
         # what forces them to the disk.
-        with open(self.path, "a", encoding="utf-8") as fh:
-            fh.write(line + "\n")
-            fh.flush()
-            os.fsync(fh.fileno())
+        with self._lock:
+            with open(self.path, "a", encoding="utf-8") as fh:
+                fh.write(line + "\n")
+                fh.flush()
+                os.fsync(fh.fileno())
 
     def read_all(self) -> list[dict[str, Any]]:
         if not self.path.exists():

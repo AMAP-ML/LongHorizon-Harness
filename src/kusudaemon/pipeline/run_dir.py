@@ -38,6 +38,7 @@ from pathlib import Path
 from ..v0.run_dir import (  # noqa: F401
     create_run_dir,
     events_path,
+    glossary_path,
     manifest_path,
     node_artifact_path,
     node_scratch_dir,

@@ -63,6 +63,14 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--max-rounds", type=int, default=100, help="Maximum orchestrator rounds in the execute phase.")
     parser.add_argument("--max-attempts", type=int, default=3, help="Retry limit per node before it is blocked.")
     parser.add_argument(
+        "--max-parallel",
+        type=int,
+        default=1,
+        help="Writer episodes dispatched concurrently per round (PLAN.md §C2). "
+        "1 is the exact legacy serial behavior; raise only for providers and "
+        "workspaces that tolerate concurrency.",
+    )
+    parser.add_argument(
         "--dispatch-policy",
         choices=("model", "document_order"),
         default="model",
@@ -182,6 +190,7 @@ def run_from_args(argv: list[str] | None = None, *, env: Environment | None = No
             max_rounds=args.max_rounds,
             max_attempts=args.max_attempts,
             dispatch_policy=args.dispatch_policy,
+            max_parallel=args.max_parallel,
             document_review=args.document_review,
             survey_mode=args.survey_mode,
             inline_spans=args.inline_spans,

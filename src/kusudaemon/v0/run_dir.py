@@ -70,6 +70,15 @@ def manifest_path(run_dir: str | Path) -> Path:
     return Path(run_dir) / "manifest.jsonl"
 
 
+def glossary_path(run_dir: str | Path) -> Path:
+    """§C1: ``<run_dir>/glossary.json`` — the term → defining-location index
+    the ``terms_defined`` warn-gate dereferences against (old PLAN §4.6's
+    "is every used term in glossary.json?" check, shipped at warn severity).
+    Pure getter, same convention as the siblings above: no create side
+    effect, only the driver's plan phase ever writes it."""
+    return Path(run_dir) / "glossary.json"
+
+
 def node_scratch_dir(run_dir: str | Path, node_id: str) -> Path:
     """Pure getter — §11.10.14: no mkdir side effect. Read-only surfaces
     (dashboard, checks, assembler) must be able to resolve paths in runs

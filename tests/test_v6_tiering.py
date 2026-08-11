@@ -27,6 +27,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 _REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(_REPO_ROOT / "src"))
@@ -761,5 +762,55 @@ class SplitAcceptedEscalationDriverTest(unittest.TestCase):
         asyncio.run(scenario())
 
 
-if __name__ == "__main__":
-    unittest.main()
+class MaxParallelForgingDriverTest(unittest.TestCase):
+    """PLAN.md §C2: _phase_execute forwards RunOptions.max_parallel into
+    run_round_loop's own max_parallel kwarg (a config change, not a
+    redesign — §4.5). Captured by patching run_round_loop; the tree is
+    already passed so the fake needs to do nothing else."""
+
+    def test_execute_phase_forwards_max_parallel(self) -> None:
+        from kusudaemon.pipeline.driver import run_round_loop
+
+        captured: dict = {}
+
+        async def fake_run_round_loop(*args, **kwargs):
+            captured["max_parallel"] = kwargs.get("max_parallel")
+            return None
+
+        async def scenario() -> None:
+            with tempfile.TemporaryDirectory() as root_str:
+                run_dir = Path(root_str) / "run"
+                create_run_dir(run_dir.parent, run_dir.name)
+
+                tier_path(run_dir).write_text(
+                    json.dumps(
+                        {
+                            "tier": "T2", "measured_tier": "T2", "override": None,
+                            "needs_intake": False, "needs_explore": False,
+                            "signals": {}, "estimate": {}, "ts": 0,
+                        }
+                    ),
+                    encoding="utf-8",
+                )
+
+                node = TaskNode(
+                    id="leaf", brief="do it", artifact="out/leaf.md",
+                    gates=["nonempty"], inputs=[],
+                    budget=NodeBudget(tokens=1000, calls=15), status="passed",
+                )
+                TaskTree(nodes={"leaf": node}).save(tree_path(run_dir))
+
+                driver = RecursiveDriver(
+                    run_dir,
+                    provider=FakeProvider([]),  # type: ignore[arg-type]
+                    options=RunOptions(goal="g", dispatch_policy="document_order", max_parallel=3),
+                )
+
+                with mock.patch(
+                    "kusudaemon.pipeline.driver.run_round_loop", fake_run_round_loop
+                ):
+                    await driver._phase_execute()
+
+                self.assertEqual(captured.get("max_parallel"), 3)
+
+        asyncio.run(scenario())

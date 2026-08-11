@@ -21,7 +21,13 @@ sys.path.insert(0, str(_REPO_ROOT / "tests" / "fixtures"))
 from fake_provider import FakeProvider  # noqa: E402
 from kusudaemon.pipeline import approvals as approval_store  # noqa: E402
 from kusudaemon.pipeline.driver import RecursiveDriver, RunOptions, escalate_run  # noqa: E402
-from kusudaemon.pipeline.run_dir import run_spec_path, tier_path, tree_path  # noqa: E402
+from kusudaemon.pipeline.run_dir import (
+    contract_path,
+    glossary_path,
+    run_spec_path,
+    tier_path,
+    tree_path,
+)  # noqa: E402
 from kusudaemon.v0.events import EventLog  # noqa: E402
 from kusudaemon.v0.run_dir import create_run_dir, events_path, manifest_path, node_artifact_path, spec_path  # noqa: E402
 from kusudaemon.v1.manifest import append_manifest_line  # noqa: E402
@@ -760,6 +766,45 @@ class TierOverrideArgvTest(unittest.TestCase):
         self.assertIsNone(captured["options"].tier_override)
 
 
+class RunOptionsMaxParallelTest(unittest.TestCase):
+    """PLAN.md §C2: max_parallel round-trips through to_spec/from_spec and
+    reaches RunOptions from the --max-parallel arg, mirroring
+    RunOptionsTierOverrideRoundTripTest / TierOverrideArgvTest."""
+
+    def test_max_parallel_round_trips(self) -> None:
+        from kusudaemon.pipeline.driver import RunOptions
+
+        options = RunOptions(goal="g", max_parallel=3)
+        restored = RunOptions.from_spec(options.to_spec())
+        self.assertEqual(restored.max_parallel, 3)
+
+    def test_max_parallel_defaults_to_serial_legacy(self) -> None:
+        from kusudaemon.pipeline.driver import RunOptions
+
+        options = RunOptions(goal="g")
+        spec = options.to_spec()
+        self.assertEqual(spec["max_parallel"], 1)
+        restored = RunOptions.from_spec({})
+        self.assertEqual(restored.max_parallel, 1)
+
+    def test_max_parallel_flag_reaches_run_options(self) -> None:
+        with tempfile.TemporaryDirectory() as root_str:
+            captured = TierOverrideArgvTest()._run_entry(
+                [
+                    "--runs-root", root_str, "--run-id", "r1",
+                    "--goal", "g", "--max-parallel", "4",
+                ]
+            )
+        self.assertEqual(captured["options"].max_parallel, 4)
+
+    def test_no_flag_leaves_serial_default(self) -> None:
+        with tempfile.TemporaryDirectory() as root_str:
+            captured = TierOverrideArgvTest()._run_entry(
+                ["--runs-root", root_str, "--run-id", "r1", "--goal", "g"]
+            )
+        self.assertEqual(captured["options"].max_parallel, 1)
+
+
 class CliEscalateSubcommandTest(unittest.TestCase):
     """PLAN.md §A4.4/§B2: `kusudaemon pipeline escalate <run-id>` — mirrors
     `amend`'s subcommand plumbing (pipeline/cli.py)."""
@@ -1003,6 +1048,296 @@ class MajorityRegenerateEscalationViaReviewTest(unittest.TestCase):
                 self.assertEqual(escalations[0]["trigger"], "majority_regenerate")
                 self.assertEqual(escalations[0]["from"], "T2")
                 self.assertEqual(escalations[0]["to"], "T3")
+
+        asyncio.run(scenario())
+
+
+class PhasePilotA10TieringTest(unittest.TestCase):
+    """PLAN.md §A10: pilot and contract run at T3 only. T2 gets spec.md's
+    frozen global rubric rendered into ``contract.md`` by script (zero
+    model calls, no human gate), and the ``awaiting_approval`` state is
+    never entered below T3."""
+
+    def _write_spec_md(self, run_dir: Path) -> None:
+        from kusudaemon.v2.intake import GlobalRubric, render_spec_md
+
+        rubric = GlobalRubric(
+            goal="produce two sections",
+            answers={"q1": "answer1"},
+            assumptions=["assumed a1"],
+        )
+        spec_path(run_dir).write_text(render_spec_md(rubric), encoding="utf-8")
+
+    def test_phase_plan_writes_spec_derived_contract_at_t2(self) -> None:
+        import asyncio
+
+        async def scenario() -> None:
+            with tempfile.TemporaryDirectory() as root_str:
+                run_dir = Path(root_str) / "run"
+                _ScriptedDriver(run_dir)
+                _write_tier(run_dir, "T2")
+                self._write_spec_md(run_dir)
+                # Plan needs a spine.json present or build_tree crashes.
+                from kusudaemon.v2.survey import SpineUnit, save_spine
+
+                save_spine(
+                    run_dir,
+                    [SpineUnit(id="u1", label="Unit 1", tokens=10, start_chunk=0, end_chunk=0)],
+                )
+                # Stub spine/<id>.md so unit_input_path resolves.
+                from kusudaemon.v2.run_dir import spine_unit_path
+
+                spine_unit_path(run_dir, "u1").write_text("unit body", encoding="utf-8")
+
+                # Empty partition so build_tree produces one forced leaf.
+                provider = FakeProvider([{"children": []}])
+                driver = _driver_with_provider(run_dir, provider)
+                await driver._phase_plan()
+
+                # §A10: contract.md is built by script from spec.md.
+                self.assertTrue(contract_path(run_dir).exists())
+                text = contract_path(run_dir).read_text(encoding="utf-8")
+                self.assertIn("## Global rubric", text)
+                self.assertIn("## Assumptions", text)
+                # And the event was logged.
+                events = EventLog(events_path(run_dir)).read_all()
+                contract_events = [e for e in events if e.get("type") == "contract_rendered_from_spec"]
+                self.assertEqual(len(contract_events), 1)
+                self.assertEqual(contract_events[0]["tier"], "T2")
+
+        asyncio.run(scenario())
+
+    def test_phase_plan_does_not_write_spec_contract_at_t3(self) -> None:
+        """T3 has its own `pilot` phase — leaving a script-derived contract
+        lying around at T3 would make _phase_done("pilot") true and skip the
+        real pilot. _phase_plan must not write contract.md at T3."""
+
+        import asyncio
+
+        async def scenario() -> None:
+            with tempfile.TemporaryDirectory() as root_str:
+                run_dir = Path(root_str) / "run"
+                _ScriptedDriver(run_dir)
+                _write_tier(run_dir, "T3")
+                self._write_spec_md(run_dir)
+                from kusudaemon.v2.survey import SpineUnit, save_spine
+
+                save_spine(
+                    run_dir,
+                    [SpineUnit(id="u1", label="Unit 1", tokens=10, start_chunk=0, end_chunk=0)],
+                )
+                from kusudaemon.v2.run_dir import spine_unit_path
+
+                spine_unit_path(run_dir, "u1").write_text("unit body", encoding="utf-8")
+                provider = FakeProvider([{"children": []}])
+                driver = _driver_with_provider(run_dir, provider)
+                await driver._phase_plan()
+
+                self.assertFalse(contract_path(run_dir).exists())
+
+        asyncio.run(scenario())
+
+    def test_t2_to_t3_escalation_archives_the_spec_contract(self) -> None:
+        """§A10: when split_accepted (or majority_regenerate) bumps T2 ->
+        T3, the script-derived contract.md must be archived aside so T3's
+        real pilot re-derives one from an edit-diff, not skip on the
+        script-rendered file. Same shape as _archive_tree_before_replan
+        for T1 -> T2's tree.json."""
+
+        import asyncio
+
+        async def scenario() -> None:
+            with tempfile.TemporaryDirectory() as root_str:
+                run_dir = Path(root_str) / "run"
+                _ScriptedDriver(run_dir)
+                _write_tier(run_dir, "T2")
+                self._write_spec_md(run_dir)
+                from kusudaemon.v2.contract import render_spec_rubric_to_contract
+
+                render_spec_rubric_to_contract(run_dir)
+                self.assertTrue(contract_path(run_dir).exists())
+
+                # Pretend a T2 round produced a split-status node.
+                from kusudaemon.v1.tree import NodeBudget, TaskNode, TaskTree
+
+                parent = TaskNode(
+                    id="p1",
+                    brief="b",
+                    artifact="out/p1.md",
+                    gates=["nonempty"],
+                    status="split",
+                )
+                child = TaskNode(
+                    id="p1.c1",
+                    brief="b",
+                    artifact="out/p1.c1.md",
+                    gates=["nonempty"],
+                    status="passed",
+                    parent="p1",
+                )
+                TaskTree(nodes={"p1": parent, "p1.c1": child}).save(tree_path(run_dir))
+
+                # The driver's _phase_execute escalation check: a T2 tree
+                # with any split-status node. We exercise just the archive
+                # helper directly (it's the part §A10 adds; the wiring is
+                # already covered by test_v6_tiering's split test).
+                driver = _driver_with_provider(run_dir, FakeProvider([]))
+                driver._archive_t2_contract_before_pilot()
+                self.assertFalse(contract_path(run_dir).exists())
+                # And an archive exists (renamed aside).
+                archived = [
+                    p for p in run_dir.iterdir() if p.name.startswith("contract.md.pre-t2-escalation-")
+                ]
+                self.assertEqual(len(archived), 1)
+
+        asyncio.run(scenario())
+
+
+class PhasePlanGlossaryC1Test(unittest.TestCase):
+    """PLAN.md §C1: the plan phase writes the tree's template-glossary
+    union to ``glossary.json`` (once, never clobbering), rewrites the
+    ``terms_defined`` warn gate to the run dir's absolute glossary path in
+    the saved tree, and logs a ``glossary_written`` event. With no
+    glossary content anywhere (the builtin registry's reference template
+    ships an empty glossary), nothing is written and no event fires."""
+
+    def _two_unit_spine(self, run_dir: Path) -> None:
+        from kusudaemon.v2.run_dir import spine_unit_path
+        from kusudaemon.v2.survey import SpineUnit, save_spine
+
+        save_spine(
+            run_dir,
+            [
+                SpineUnit(id="u1", label="Unit 1", tokens=10, start_chunk=0, end_chunk=0),
+                SpineUnit(id="u2", label="Unit 2", tokens=10, start_chunk=1, end_chunk=1),
+            ],
+        )
+        spine_unit_path(run_dir, "u1").write_text("unit body")
+        spine_unit_path(run_dir, "u2").write_text("unit body")
+
+    def test_phase_plan_writes_glossary_from_template_content(self) -> None:
+        import asyncio
+        from unittest import mock
+
+        from kusudaemon.v6.templates import NodeTemplate
+
+        custom = NodeTemplate(
+            name="ref",
+            shapes=("reference-dominant",),
+            warn_gates=("headers:std", "terms_defined", "refs_resolve"),
+            judgment=("every_term_defined_once",),
+            rubric={"every_term_defined_once": "define each term once"},
+            glossary={"Wave": "sec 2", "Huygens": "sec 3"},
+        )
+
+        async def scenario() -> None:
+            with tempfile.TemporaryDirectory() as root_str:
+                run_dir = Path(root_str) / "run"
+                _ScriptedDriver(run_dir)
+                _write_tier(run_dir, "T2")
+                # A two-unit spine so plan_level actually runs (a one-unit
+                # slice short-circuits to a forced leaf).
+                self._two_unit_spine(run_dir)
+                provider = FakeProvider(
+                    [
+                        {
+                            "children": [
+                                {
+                                    "id": "c1",
+                                    "brief": "glossary work",
+                                    "unit_start": 0,
+                                    "unit_end": 0,
+                                    "estimated_calls": 1,
+                                    "shape": "reference-dominant",
+                                },
+                                {
+                                    "id": "c2",
+                                    "brief": "more glossary work",
+                                    "unit_start": 1,
+                                    "unit_end": 1,
+                                    "estimated_calls": 1,
+                                    "shape": "reference-dominant",
+                                },
+                            ]
+                        }
+                    ]
+                )
+                driver = _driver_with_provider(run_dir, provider)
+                with mock.patch(
+                    "kusudaemon.v6.templates._BUILTIN_TEMPLATES",
+                    (custom, *__import__("kusudaemon.v6.templates", fromlist=["builtin_templates"]).builtin_templates()),
+                ):
+                    await driver._phase_plan()
+
+                # glossary.json exists with the template's content...
+                data = json.loads(glossary_path(run_dir.resolve()).read_text(encoding="utf-8"))
+                self.assertEqual(data, {"Wave": "sec 2", "Huygens": "sec 3"})
+                # ...the saved tree carries the absolute terms_defined path
+                # (the driver's post-build re-merge), and the template's
+                # rubric reached the leaf for review.
+                saved = json.loads(tree_path(run_dir).read_text(encoding="utf-8"))
+                node = saved[0]
+                self.assertEqual(node["shape"], "reference-dominant")
+                warn_gates = node["warn_gates"]
+                self.assertIn(
+                    f"terms_defined:{glossary_path(run_dir.resolve())}", warn_gates
+                )
+                self.assertIn("headers:std", warn_gates)
+                self.assertEqual(node["judgment"], ["every_term_defined_once"])
+                self.assertEqual(node["rubric"]["every_term_defined_once"], "define each term once")
+                # And the event was logged.
+                events = EventLog(events_path(run_dir)).read_all()
+                self.assertEqual(
+                    len([e for e in events if e.get("type") == "glossary_written"]),
+                    1,
+                )
+
+        asyncio.run(scenario())
+
+    def test_phase_plan_with_no_glossary_content_writes_nothing(self) -> None:
+        import asyncio
+
+        async def scenario() -> None:
+            with tempfile.TemporaryDirectory() as root_str:
+                run_dir = Path(root_str) / "run"
+                _ScriptedDriver(run_dir)
+                _write_tier(run_dir, "T2")
+                self._two_unit_spine(run_dir)
+                # Two prose-dominant children: the builtin registry's
+                # prose template carries no glossary content anywhere.
+                provider = FakeProvider(
+                    [
+                        {
+                            "children": [
+                                {
+                                    "id": "c1",
+                                    "brief": "b",
+                                    "unit_start": 0,
+                                    "unit_end": 0,
+                                    "estimated_calls": 1,
+                                    "shape": "prose-dominant",
+                                },
+                                {
+                                    "id": "c2",
+                                    "brief": "b",
+                                    "unit_start": 1,
+                                    "unit_end": 1,
+                                    "estimated_calls": 1,
+                                    "shape": "prose-dominant",
+                                },
+                            ]
+                        }
+                    ]
+                )
+                driver = _driver_with_provider(run_dir, provider)
+                await driver._phase_plan()
+
+                self.assertFalse(glossary_path(run_dir.resolve()).exists())
+                events = EventLog(events_path(run_dir)).read_all()
+                self.assertEqual(
+                    [e for e in events if e.get("type") == "glossary_written"],
+                    [],
+                )
 
         asyncio.run(scenario())
 
