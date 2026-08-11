@@ -37,6 +37,7 @@ from kusudaemon.v0.events import EventLog  # noqa: E402
 from kusudaemon.v0.run_dir import create_run_dir, events_path, node_artifact_path, node_scratch_dir  # noqa: E402
 from kusudaemon.v1.tree import TaskNode, TaskTree  # noqa: E402
 from kusudaemon.v1.run_dir import tree_path  # noqa: E402
+from kusudaemon.v2.run_dir import contract_path  # noqa: E402
 
 
 def _write_scripted_run(runs_root: Path, run_id: str) -> Path:
@@ -116,6 +117,19 @@ class DashboardServerTest(_ServerTestCase):
         with urllib.request.urlopen(self._url("/static/app.js")) as resp:
             self.assertEqual(resp.status, 200)
             self.assertIn("javascript", resp.headers.get("Content-Type", ""))
+
+    def test_contract_endpoint_carries_tokens_and_ceiling(self) -> None:
+        # §DASHBOARD-UX §5.3: the Doc tab's ceiling bar needs both the
+        # measured contract size and the ceiling it was frozen under.
+        contract_path(self.run_dir).write_text(
+            "# Contract\n\nCut every historical aside. Examples to three lines.", encoding="utf-8"
+        )
+        self._post("/api/attach", {"run_id": "run-a"})
+        status, payload = self._get("/api/contract")
+        self.assertEqual(status, 200)
+        self.assertIn("Cut every historical aside.", payload["text"])
+        self.assertGreater(payload["tokens"], 0)
+        self.assertEqual(payload["ceiling"], 1500)
 
     def test_static_path_traversal_is_rejected(self) -> None:
         status, payload = self._get("/static/../server.py")
@@ -259,6 +273,186 @@ class SubagentsInterjectDiffThinkingTest(_ServerTestCase):
         self.assertEqual(status, 404)
 
 
+class OperatorActionRoutesTest(_ServerTestCase):
+    """§DASHBOARD-UX §6.2/§6.3/§11: the pilot editor route, the intake
+    answers passthrough, the tier escalate action, node redispatch,
+    job cancel, the split-proposal endpoint, and the snapshot's
+    hosted-count fields — each asserted over a real HTTP round trip,
+    same shape as the rest of this file."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        self._post("/api/attach", {"run_id": "run-a"})
+
+    def _write_tier(self, tier: str) -> None:
+        from kusudaemon.pipeline.run_dir import tier_path
+
+        tier_path(self.run_dir).write_text(json.dumps({"tier": tier}), encoding="utf-8")
+
+    def test_escalate_route_raises_tier_and_409s_without_tier(self) -> None:
+        self._write_tier("T1")
+        status, payload = self._post("/api/escalate", {})
+        self.assertEqual(status, 200)
+        self.assertEqual(payload["to"], "T2")
+
+        status, snap = self._get("/api/snapshot")
+        self.assertEqual(snap["tier"], "T2")
+        self.assertEqual(len(snap["escalation_history"]), 1)
+
+        # a run whose classify phase never ran has no tier.json
+        run_dir = create_run_dir(self.runs_root, "run-b")
+        run_spec_path(run_dir).write_text(json.dumps({"goal": "g"}), encoding="utf-8")
+        self._post("/api/attach", {"run_id": "run-b"})
+        status, payload = self._post("/api/escalate", {})
+        self.assertEqual(status, 409)
+        self.assertIn("tier.json", payload["error"])
+
+    def test_pilot_save_edits_artifact_and_resolves_approval(self) -> None:
+        node_artifact_path(self.run_dir, "1").write_text("# Intro\n\nHello.", encoding="utf-8")
+        approval = approval_store.Approval.create(
+            "pilot",
+            title="Approve pilot artifact for 1",
+            message="Shape: prose-dominant.",
+            allow_input=True,
+            context={"node_id": "1", "shape": "prose-dominant"},
+        )
+        approval_store.append(self.run_dir, approval)
+
+        status, payload = self._post(
+            f"/api/approvals/{approval.approval_id}/pilot-save",
+            {"node_id": "1", "text": "# Intro\n\nHello, edited."},
+        )
+        self.assertEqual(status, 200)
+        self.assertTrue(payload["ok"])
+        self.assertEqual(
+            node_artifact_path(self.run_dir, "1").read_text(encoding="utf-8"),
+            "# Intro\n\nHello, edited.",
+        )
+        record = [a for a in approval_store.read_all(self.run_dir) if a.approval_id == approval.approval_id][0]
+        self.assertEqual(record.status, "resolved")
+        self.assertEqual(record.user_input, "# Intro\n\nHello, edited.")
+
+        status, snap = self._get("/api/snapshot")
+        remaining = [a for a in snap["pending_approvals"] if a["kind"] == "pilot"]
+        self.assertEqual(remaining, [])
+
+    def test_pilot_save_rejects_wrong_node_or_non_pilot(self) -> None:
+        node_artifact_path(self.run_dir, "1").write_text("# Intro", encoding="utf-8")
+        pilot = approval_store.Approval.create(
+            "pilot", title="p", allow_input=True, context={"node_id": "1"}
+        )
+        other = approval_store.Approval.create("intake_question", title="q", allow_input=True)
+        approval_store.append(self.run_dir, pilot)
+        approval_store.append(self.run_dir, other)
+
+        status, _ = self._post(
+            f"/api/approvals/{pilot.approval_id}/pilot-save", {"node_id": "2", "text": "x"}
+        )
+        self.assertEqual(status, 409)
+        status, _ = self._post(
+            f"/api/approvals/{other.approval_id}/pilot-save", {"node_id": "1", "text": "x"}
+        )
+        self.assertEqual(status, 409)
+        # nothing was written, nothing was resolved
+        record = [a for a in approval_store.read_all(self.run_dir) if a.approval_id == pilot.approval_id][0]
+        self.assertEqual(record.status, "pending")
+        self.assertEqual(node_artifact_path(self.run_dir, "1").read_text(encoding="utf-8"), "# Intro")
+
+    def test_intake_answers_resolve_in_one_approval(self) -> None:
+        approval = approval_store.Approval.create(
+            "intake_questions",
+            title="Intake round 1",
+            message="Two questions.",
+            allow_input=False,
+            questions=[
+                {"id": "q-audience", "text": "Who is the audience?"},
+                {"id": "q-length", "text": "Target length?", "default_assumption": "~10 pages"},
+            ],
+        )
+        approval_store.append(self.run_dir, approval)
+
+        status, payload = self._post(
+            f"/api/approvals/{approval.approval_id}/resolve",
+            {"action": "answer", "answers": {"q-audience": "engineers", "q-length": ""}},
+        )
+        self.assertEqual(status, 200)
+        self.assertTrue(payload["ok"])
+        record = [a for a in approval_store.read_all(self.run_dir) if a.approval_id == approval.approval_id][0]
+        self.assertEqual(record.status, "resolved")
+        self.assertEqual(record.answers.get("q-audience"), "engineers")
+        self.assertEqual(record.answers.get("q-length"), "")
+
+    def test_redispatch_route_creates_approval_and_apply_resets_node(self) -> None:
+        from kusudaemon.v1.run_dir import tree_path
+
+        tree = TaskTree(
+            nodes={
+                "3": TaskNode(id="3", brief="failed", artifact="out/3.md", gates=["nonempty"], status="failed", attempts=3, last_defect="max_tokens: 1000: too big"),
+            }
+        )
+        tree.save(tree_path(self.run_dir))
+
+        status, payload = self._post("/api/node/3/redispatch", {"reason": "the splitter is ready"})
+        self.assertEqual(status, 200)
+        self.assertEqual(payload["kind"], "redispatch")
+        approval_id = payload["approval_id"]
+
+        # a passed node cannot be redispatched
+        status, payload = self._post("/api/node/1/redispatch", {})
+        self.assertEqual(status, 400)
+
+        # apply the approval -- the job thread resets the node to pending
+        status, payload = self._post(f"/api/approvals/{approval_id}/resolve", {"action": "apply"})
+        self.assertEqual(status, 200)
+        deadline = 0
+        while deadline < 5:
+            tree = TaskTree.load(tree_path(self.run_dir))
+            if tree.nodes["3"].status == "pending":
+                break
+            import time
+
+            time.sleep(0.05)
+            deadline += 0.05
+        self.assertEqual(tree.nodes["3"].status, "pending")
+        self.assertEqual(tree.nodes["3"].attempts, 0)
+        self.assertIn("redispatch requested by operator", tree.nodes["3"].last_defect)
+
+    def test_job_cancel_route(self) -> None:
+        from kusudaemon.dashboard.state import _append_job
+
+        _append_job(self.run_dir, {"job_id": "job-1", "kind": "reopen", "status": "running", "ts": 1, "detail": "working"})
+        status, snap = self._get("/api/snapshot")
+        self.assertEqual([j["job_id"] for j in snap["jobs"]], ["job-1"])
+        self.assertEqual(snap["jobs"][0]["status"], "running")
+
+        status, payload = self._post("/api/jobs/job-1/cancel", {})
+        self.assertEqual(status, 200)
+        self.assertTrue(payload["ok"])
+        status, snap = self._get("/api/snapshot")
+        job = [j for j in snap["jobs"] if j["job_id"] == "job-1"][0]
+        self.assertEqual(job["status"], "cancelled")
+
+    def test_split_proposal_endpoint(self) -> None:
+        scratch = node_scratch_dir(self.run_dir, "1")
+        scratch.mkdir(parents=True, exist_ok=True)
+        (scratch / "split.json").write_text(
+            json.dumps({"reason": "inputs exceed budget", "children": [{"id": "c1"}, {"id": "c2"}]}),
+            encoding="utf-8",
+        )
+        status, payload = self._get("/api/node/1/split")
+        self.assertEqual(status, 200)
+        self.assertEqual(payload["proposal"]["reason"], "inputs exceed budget")
+
+        status, payload = self._get("/api/node/does-not-exist/split")
+        self.assertEqual(status, 404)
+
+    def test_snapshot_carries_hosted_count_and_cap(self) -> None:
+        status, snap = self._get("/api/snapshot")
+        self.assertEqual(status, 200)
+        self.assertIn("hosted_count", snap)
+        self.assertEqual(snap["max_concurrent_runs"], DEFAULT_MAX_CONCURRENT_RUNS)
+
+
 class ReadOnlyDashboardServerTest(_ServerTestCase):
     """control_enabled=False must reject every mutating route -- the server
     enforces it uniformly (RunState itself has no notion of read-only
@@ -292,6 +486,22 @@ class ReadOnlyDashboardServerTest(_ServerTestCase):
 
     def test_interject_is_forbidden(self) -> None:
         status, payload = self._post("/api/node/1/interject", {"text": "x"})
+        self.assertEqual(status, 403)
+
+    def test_escalate_is_forbidden(self) -> None:
+        status, payload = self._post("/api/escalate", {})
+        self.assertEqual(status, 403)
+
+    def test_pilot_save_is_forbidden(self) -> None:
+        status, payload = self._post("/api/approvals/x/pilot-save", {"node_id": "1", "text": "x"})
+        self.assertEqual(status, 403)
+
+    def test_redispatch_is_forbidden(self) -> None:
+        status, payload = self._post("/api/node/1/redispatch", {})
+        self.assertEqual(status, 403)
+
+    def test_job_cancel_is_forbidden(self) -> None:
+        status, payload = self._post("/api/jobs/x/cancel", {})
         self.assertEqual(status, 403)
 
 
@@ -336,6 +546,22 @@ class DashboardAuthTest(_ServerTestCase):
         status, payload, _ = self._request("/api/runs", {"Authorization": f"Bearer {self.auth_token}"})
         self.assertEqual(status, 200)
         self.assertEqual([r["id"] for r in payload["runs"]], ["run-a"])
+
+    def test_bearer_authenticated_request_plants_cookie(self) -> None:
+        # §DASHBOARD-UX §10: any Bearer-authenticated call IS the login —
+        # it must plant the cookie the SSE stream needs, not just /api/attach.
+        status, _, headers = self._request("/api/runs", {"Authorization": f"Bearer {self.auth_token}"})
+        self.assertEqual(status, 200)
+        set_cookie = headers.get("Set-Cookie", "")
+        self.assertIn(_AUTH_COOKIE_NAME, set_cookie)
+        self.assertIn("HttpOnly", set_cookie)
+        cookie = set_cookie.split(";", 1)[0]
+        conn = HTTPConnection("127.0.0.1", self.port, timeout=5)
+        conn.request("GET", "/api/stream", headers={"Cookie": cookie})
+        resp = conn.getresponse()
+        self.assertEqual(resp.status, 200)
+        self.assertEqual(resp.getheader("Content-Type"), "text/event-stream")
+        conn.close()
 
     def test_attach_sets_cookie_and_reports_token_required(self) -> None:
         data = json.dumps({"run_id": "run-a"}).encode("utf-8")

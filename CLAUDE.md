@@ -1283,16 +1283,114 @@ new dispatch pattern — structural exploration, scheduled pre-plan at T2+.**
   operator-facing updates it was always supposed to be, not raw
   `events.jsonl` type strings.
 
-  **§C4 (2026-08-11): run-header tier + escalation badges.** The run
-  selector's header row gains `renderTierBadges(snap)` (a `hdr-tier-badges`
-  span next to the phase badge): a `tier <name>` badge (tooltip names the
-  measured tier and the `--tier` override when set) and, when
-  `snap.escalation_history` is non-empty, an `escalated` badge showing the
-  count with a tooltip of the trigger trail (`from → to` per event, node id
-  included). Both fields come from `state.py`'s snapshot (`tier`,
-  `measured_tier`, `tier_override`, `escalation_history` — the latter
-  derived from `run_tier_escalated` events in log order via
-  `_tier_and_escalation`, tolerating a malformed `tier.json`).
+   **§C4 (2026-08-11): run-header tier + escalation badges.** The run
+   selector's header row gains `renderTierBadges(snap)` (a `hdr-tier-badges`
+   span next to the phase badge): a `tier <name>` badge (tooltip names the
+   measured tier and the `--tier` override when set) and, when
+   `snap.escalation_history` is non-empty, an `escalated` badge showing the
+   count with a tooltip of the trigger trail (`from → to` per event, node id
+   included). Both fields come from `state.py`'s snapshot (`tier`,
+   `measured_tier`, `tier_override`, `escalation_history` — the latter
+   derived from `run_tier_escalated` events in log order via
+   `_tier_and_escalation`, tolerating a malformed `tier.json`).
+
+   **§DASHBOARD-UX (2026-08-11): the control-surface gaps in DASHBOARD-UX.md
+   §11, all closed in one pass.** Design doc: `DASHBOARD-UX.md` (kept in the
+   repo root next to PLAN.md). What landed:
+   - **`POST /api/escalate`** — the §B2 operator intervention from the
+     browser: `state.escalate()` calls `pipeline/driver.py:escalate_run`
+     directly (same read-modify-write as the CLI, no provider call); the
+     rail tier chip gains a `⇡ escalate` button (confirm-gated, hidden at
+     T3). Snapshot's `max_concurrent_runs` is stitched in server-side (the
+     §C4 cap is known only at `make_server` time, not to `RunState`) and a
+     `hosted n/max` chip sits next to the tier badges so "my second run
+     never started" is visible without waiting for a 429.
+   - **Pilot edit + approve in the browser** (`POST /api/approvals/<id>/
+     pilot-save`): the Node tab on a node with a pending `pilot` approval
+     renders a two-pane editor — the frozen `pilot_original`
+     (`out/.versions/<id>/pilot-original.md`) beside an editable textarea —
+     and "Save & approve edit" writes the edited text back to the artifact
+     and resolves the approval with it as `user_input`, so the driver's
+     `edited = approval.user_input.strip() or artifact` line picks it up
+     verbatim and `approve_pilot` derives contract rules from the diff
+     exactly as if the operator had edited on disk and run `approve
+     --file`. "Approve as-is" stays the blank-`user_input` zero-model-call
+     path. Edits live in `state.pilotDrafts` (full-teardown render rule).
+   - **Intake answers as one approval** (§6.3): a pending approval with a
+     `questions` list renders one input per question; "Submit Answers"
+     resolves once with an `answers` map. `state.resolve_approval` gained
+     the `answers` passthrough (`record.resolve(..., answers=...)`), and
+     `driver._ask_intake_round` now records `default_assumption` per
+     question plus the round's `objections` in the approval context — the
+     driver's intake loop reads them back off the resolved record.
+   - **Redispatch** (`POST /api/node/<id>/redispatch`): a confirm approval
+     (like reopen) whose apply half runs `_run_redispatch_job` — pure tree
+     bookkeeping, no provider call: sets `status="pending"`, `attempts=0`,
+     records the operator's reason in `last_defect` and a
+     `node_redispatch_requested` event, so the round loop's orchestrator
+     offers the node up again with a fresh attempt budget. Refuses
+     passed/split/dispatched/awaiting_review nodes (those go through
+     reopen).
+   - **Split proposals are operator-legible**: `node_detail` already
+     carried the parsed `scratch/<id>/split.json`; the Overview tab on a
+     `"split"`-status node now renders a proposal card (reason + children
+     ids + per-child status derived from `snap.tree` rows whose `parent`
+     matches) and `GET /api/node/<id>/split` exposes it as its own route.
+   - **Job cancel** (`POST /api/jobs/<id>/cancel`): `cancel_job` sets the
+     thread's cancel event and appends a `cancelled` record (jobs.jsonl's
+     latest-record-wins merge drops it out of the running set); the
+     `_job_thread` wrapper now checks the event both before starting and
+     after the target returns — a mid-provider-call job can't be
+     interrupted, but `cancelled` must be the final record, never clobbered
+     by the target's own `done`/`failed` write. The run stream renders a
+     Background-jobs strip for running amend/triage/reopen/redispatch jobs
+     with a per-job cancel button.
+   - **New-run modal is the full RunOptions surface**: workspace path
+     (measured via `measure_workspace`, bad path 400s with the message),
+     tier floor, dispatch policy, survey mode, max rounds, document
+     review, inline spans — `_options_from_body` no longer drops anything.
+   - **Read-only parity**: every new mutating route (escalate,
+     pilot-save, redispatch, job-cancel) 403s under `--no-control`.
+   Tests: `test_dashboard_server.py` +12 (`OperatorActionRoutesTest` over
+   real HTTP round trips — escalate raises the tier and 409s without
+   tier.json, pilot-save writes the artifact + resolves with the edit and
+   rejects wrong-node/non-pilot, intake answers land on the resolved
+   record, redispatch apply resets a failed node to pending with attempts
+   0, job cancel flips the record, split endpoint, snapshot's
+   hosted/cap fields, plus the four read-only 403s). JS syntax checked
+   with `node --check`; no build step, per §12.
+
+   **DASHBOARD-UX §13 (2026-08-11, same day — the missing keyboard-and-
+   command-bar workstream, in one pass).** Rewrote `static/app.js` (1909
+   lines, `node --check` green) and appended the layout CSS; the backend
+   was untouched, and every dashboard test still passes. What §13 of
+   `DASHBOARD-UX.md` now records as shipped: a five-region chrome —
+   **rail** (34px phase strip + hosted counter + live/polling indicator +
+   elapsed) → **run header row** (run id = run-switcher trigger, goal,
+   status, escalate/halt/resume buttons, tier + escalation badges) →
+   three-pane workspace (nav / stream / inspector) → **command bar**. The
+   command bar is the delete-key-gap-haircut: mode chips `💬 A` (message,
+   auto-following a live subagent until a manual pick — the old
+   drop-down's dead-target bug is gone), `> ⌥` (command mode, live
+   suggestions, Tab to fill, ↑/↓ + Enter to run), `✏️ m` (amend: first 3
+   words of the rule), `🔁 r` (reopen the inspector's selected node). The
+   `⌘K` palette, a `?`/`⌘K` keymap overlay, and the g-prefix set
+   (`g r/t/p/a`) cover the rest of §7; `j/k`+Enter navigate the task tree
+   (§5.1 is now the inspector's default tab — dot-hierarchical grouping,
+   per-row glyph/shape/gate-pips/tokens, right-click context menus for
+   nodes and runs, `● live` subagent pill → chat). The pilot editor (§6.2)
+   doubles as a takeover of the inspector while its approval is pending;
+   intake (§6.3) renders per-question inputs with `default_assumption`
+   placeholders and one `Submit Answers`; objections render as amber
+   `{claim, why, options[]}`; triage (§6.4) is three expandable count
+   chips; the jobs strip (§8.4) gets per-job cancel; new-run is the full
+   `RunOptions` form; 401s raise a token overlay whose Bearer handshake
+   plants the §C4 cookie so SSE authenticates. Sections 1, 3, 5.2, and 6 of
+   the old app.js history above describe UI machinery that no longer exists
+   (the tab-toggle thinking widgets, the separate agent tabs, the old
+   prompt bar) — superseded by this pass; deviating scope cuts from the
+   spec are itemized at the end of `DASHBOARD-UX.md` §13 rather than
+   silently dropped.
 
 ## v6 — the work object (v6/)
 
@@ -1979,7 +2077,7 @@ Stdlib `unittest`. No pytest, no network, no agent binary, no API key.
 python3 -m unittest discover -s tests -p "test_*.py" -v
 ```
 
-**669 tests, ~30s, all passing.** History: 387 after 2026-08-10's
+**683 tests, ~35s, all passing.** History: 387 after 2026-08-10's
 §D0b/§D0/§D1/§D2/§D4/§D5/§D6/§D7/§D10/§D0c defect-fix session → 410 after
 §B1 (the v6 work object: new `test_v6_work_object.py` (23), plus additions
 to `test_pipeline_backends.py`/`test_driver_phases.py`) → 461 after §B2
@@ -1997,7 +2095,12 @@ review fan-out: new `test_v1_reviewer_fanout.py` (9), plus 4 more
 `test_v4_probe_planner.py` (14), plus 5 more across
 `test_v4_probes.py`/`test_driver_phases.py`) → 654 after §C4 (dashboard
 hardening: `test_dashboard_server.py` +15, `test_dashboard_state.py` +5)
-→ **669 after §C5** (the eval harness: new `test_eval_harness.py` (15)).
+→ **669 after §C5** (the eval harness: new `test_eval_harness.py` (15)) →
+**681 after §DASHBOARD-UX** (the control-surface pass: `test_dashboard_server.py`
++12 — `OperatorActionRoutesTest`'s 8 route tests plus 4 read-only 403s) →
+**683 (the §13 frontend rewrite, same day — JS/CSS only, zero new tests;
+the +2 over 681 is drift in the earlier sessions' recorded counts, not new
+coverage).**
 
 **Every test file starts with `sys.path.insert(0, str(_REPO_ROOT / "src"))`.
 This is load-bearing, not boilerplate.** Stale `_editable_impl_*.pth` files
@@ -2024,7 +2127,7 @@ guard into any new test file.
 | `test_v4_probes.py` | 21 | §B4: `workspace` probe gets no write/shell tool, `max_explorers_for` enforced (more units than the cap still dispatches ≤ the cap), 300-token finding cap regardless of input, cached-finding idempotency (no re-dispatch), `plan_level`'s prompt includes explorer summaries and no source content |
 | `test_v4_probe_planner.py` | 14 | §C3: `needs_probe` filter boundaries (8-word brief floor, shape markers, URL/doc lookup markers), windowed one-call-per-60-candidates (call count flat in candidate count), out-of-window ids dropped + logged, per-window cap, per-node dedup + slug disambiguation, driver integration (auto plan from candidates, no explicit research_plan needed) |
 | `test_workspace_read_tool.py` | 9 | §B4: `list_dir`/`grep` confined to a root, `../..` escape attempts rejected in code (`_resolve_within_root`), importable outside a real gptme process |
-| `test_dashboard_state.py` / `_server.py` | 25/22 | `RunState` directly (no port), then HTTP over a real loopback `ThreadingHTTPServer` incl. traversal rejection and `--no-control` 403s; §11.10.14 read-only poll leaves runs unmutated; §11.10.15 bounded cache + 8-thread hammer. §C4: tier/escalation snapshot fields, hosted-count cap; auth via Bearer/cookie over loopback (anonymous 401, wrong token 401, cookie 403 for SSE without it), non-loopback refusal without token, 429 at `--max-concurrent-runs` |
+| `test_dashboard_state.py` / `_server.py` | 25/34 | `RunState` directly (no port), then HTTP over a real loopback `ThreadingHTTPServer` incl. traversal rejection and `--no-control` 403s; §11.10.14 read-only poll leaves runs unmutated; §11.10.15 bounded cache + 8-thread hammer. §C4: tier/escalation snapshot fields, hosted-count cap; auth via Bearer/cookie over loopback (anonymous 401, wrong token 401, cookie 403 for SSE without it), non-loopback refusal without token, 429 at `--max-concurrent-runs`. §DASHBOARD-UX: `OperatorActionRoutesTest` — escalate route (raises tier, 409 without tier.json), pilot-save (writes artifact, resolves with the edit, rejects wrong-node/non-pilot), intake answers resolve as one approval, redispatch (route → approval → apply resets node to pending), job cancel, split-proposal endpoint, snapshot hosted/cap fields, and the four new read-only 403s |
 | `test_dashboard_rendering.py` | 14 | `parse_trace`: `<think>`/`<thinking>` tag extraction incl. the Anthropic think-sig comment, `save`/`append`/`patch` code-fence → `tool_call` + `diff` entries, per-path diff continuity across turns (not "whole file added" every time), `error` vs routine `system` classification | 
 | `test_pipeline_prompts.py` / `_backends.py` / `test_driver_phases.py` | 18/11/34 | byte-identical default prompt (now including §D0's absolute artifact-path line and §D1's goal block), §D2's out/scratch carve-out (hidden but excepted, not dropped), adapter wiring incl. §B1's workspace-mode `run_dir` branches and §B4's probe-kind allowlists, phase detail preservation, §D4's corpus-less-raises, §11.10.15 contract-cache bound, §B1's default-writer-factory and `--workspace` CLI wiring, §B2's `_phase_done("classify"/"explore")`, `tier_override` spec round-trip, `escalate_run`, `--tier`/`escalate` CLI wiring, §B3's adaptive-intake driver integration, §B4's T2/T3 structural-exploration dispatch, §B5's `split_accepted` escalation end-to-end, §B6's T2-unconditional/T3-still-flag-gated document review split | 
 | `test_v6_work_object.py` | 15 | §B1: measurement excludes binaries/`.git`/`node_modules`/lockfiles/oversized files, gitignore respected, `top_dirs` grouping; `kind="text"`/`kind="none"` constructors; `survey_workspace`'s members resolve to real files and respect a token ceiling; the run dir is hidden as one subtree when nested inside `work.root`; ship gate via a real subprocess fixture (not gptme) proving cwd=work.root and the artifact still lands under run_dir |

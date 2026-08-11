@@ -661,8 +661,21 @@ class RecursiveDriver:
             "intake_questions",
             title=f"Intake round {round_index}",
             message="\n".join(lines),
-            context={"round": round_index},
-            questions=[{"id": question.id, "text": question.text} for question in questions],
+            context={
+                "round": round_index,
+                "objections": [
+                    {"claim": o.claim, "why": o.why, "options": list(o.options)}
+                    for o in objections
+                ],
+            },
+            questions=[
+                {
+                    "id": question.id,
+                    "text": question.text,
+                    "default_assumption": question.default_assumption,
+                }
+                for question in questions
+            ],
         )
         return dict(approval.answers)
 

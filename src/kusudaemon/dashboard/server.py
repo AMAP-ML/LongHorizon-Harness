@@ -119,9 +119,13 @@ _ROUTES: list[tuple[str, "re.Pattern[str]", _Handler]] = []
 def _get_snapshot(handler: "DashboardRequestHandler", match: Any, body: dict) -> tuple[int, Any]:
     # control_enabled lives on the handler, not RunState (see module
     # docstring) -- stitched into the payload here so the frontend can grey
-    # out mutating controls without a second round trip.
+    # out mutating controls without a second round trip. Same for
+    # max_concurrent_runs (the §C4 cap, known only at make_server time) --
+    # the rail's concurrency-counter state (§10) needs it without waiting
+    # for a 429 to learn the cap.
     snap = handler.state.snapshot()
     snap["control_enabled"] = handler.control_enabled
+    snap["max_concurrent_runs"] = handler.max_concurrent_runs
     return 200, snap
 
 
@@ -206,9 +210,70 @@ def _post_resolve(handler: "DashboardRequestHandler", match: Any, body: dict) ->
     handler.require_control()
     approval_id = unquote(match.group(1))
     ok = handler.state.resolve_approval(
-        approval_id, action=str(body.get("action", "")), user_input=str(body.get("user_input", ""))
+        approval_id,
+        action=str(body.get("action", "")),
+        user_input=str(body.get("user_input", "")),
+        # §DASHBOARD-UX §6.3: batch-form approvals (intake rounds) resolve
+        # per question, keyed by question id.
+        answers=body.get("answers"),
     )
     return (200, {"ok": True}) if ok else (409, {"ok": False, "error": "not pending or no attached run"})
+
+
+@_route("POST", r"^/api/approvals/([^/]+)/pilot-save$")
+def _post_pilot_save(handler: "DashboardRequestHandler", match: Any, body: dict) -> tuple[int, Any]:
+    """§DASHBOARD-UX §6.2: pilot edit + approve in one browser action —
+    writes the edited text back to the pilot artifact and resolves the
+    pending pilot approval with the edit as ``user_input``, so the driver's
+    ``approve_pilot`` derives contract rules from the diff exactly as if
+    the operator had edited the file on disk and run ``approve --file``."""
+    handler.require_control()
+    approval_id = unquote(match.group(1))
+    ok = handler.state.pilot_save(
+        approval_id, str(body.get("node_id", "")), str(body.get("text", ""))
+    )
+    return (200, {"ok": True}) if ok else (409, {"ok": False, "error": "not a pending pilot approval for this node"})
+
+
+@_route("POST", r"^/api/escalate$")
+def _post_escalate(handler: "DashboardRequestHandler", match: Any, body: dict) -> tuple[int, Any]:
+    """§DASHBOARD-UX §11: the rail tier chip's escalate action — one tier
+    up, invariant 9 (tiers only rise), same read-modify-write as the CLI's
+    ``pipeline escalate``."""
+    handler.require_control()
+    try:
+        result = handler.state.escalate()
+    except (FileNotFoundError, ValueError) as exc:
+        return 409, {"error": str(exc)}
+    return 200, result
+
+
+@_route("POST", r"^/api/node/([^/]+)/redispatch$")
+def _post_redispatch(handler: "DashboardRequestHandler", match: Any, body: dict) -> tuple[int, Any]:
+    """§DASHBOARD-UX §11: re-dispatch one failed/blocked/stale node — a
+    confirm approval whose apply half resets the node to pending with a
+    fresh attempt budget."""
+    handler.require_control()
+    approval = handler.state.request_redispatch(unquote(match.group(1)), str(body.get("reason", "")))
+    return (200, approval) if approval else (400, {"error": "not a redispatchable node, or no attached run"})
+
+
+@_route("GET", r"^/api/node/([^/]+)/split$")
+def _get_node_split(handler: "DashboardRequestHandler", match: Any, body: dict) -> tuple[int, Any]:
+    """§DASHBOARD-UX §11: a v7 split proposal (``scratch/<id>/split.json``)
+    made operator-legible — the Node tab on a "split" parent shows what
+    was proposed and why the harness accepted it."""
+    detail = handler.state.node_detail(unquote(match.group(1)))
+    return (200, {"proposal": detail.get("split_proposal")}) if detail is not None else (404, {"error": "not found"})
+
+
+@_route("POST", r"^/api/jobs/([^/]+)/cancel$")
+def _post_job_cancel(handler: "DashboardRequestHandler", match: Any, body: dict) -> tuple[int, Any]:
+    """§DASHBOARD-UX §11: cancel a dashboard background job (amend/triage/
+    reopen/redispatch) — the jobs.jsonl record is the authority."""
+    handler.require_control()
+    ok = handler.state.cancel_job(unquote(match.group(1)))
+    return (200, {"ok": True}) if ok else (409, {"ok": False, "error": "no attached run"})
 
 
 @_route("POST", r"^/api/amend$")
@@ -295,7 +360,15 @@ def _get_spec(handler: "DashboardRequestHandler", match: Any, body: dict) -> tup
 
 @_route("GET", r"^/api/contract$")
 def _get_contract(handler: "DashboardRequestHandler", match: Any, body: dict) -> tuple[int, Any]:
-    return 200, {"text": handler.state.contract_text()}
+    # §DASHBOARD-UX §5.3: the Doc tab's token-ceiling bar needs the contract's
+    # measured size AND the ceiling it was frozen under — neither is derivable
+    # client-side (the ceiling lives in v2/contract.py, the measurement in
+    # v1/gates.py). Lazy imports keep this module's import surface flat.
+    from ..v1.gates import estimate_tokens
+    from ..v2.contract import DEFAULT_TOKEN_CEILING
+
+    text = handler.state.contract_text()
+    return 200, {"text": text, "tokens": estimate_tokens(text), "ceiling": DEFAULT_TOKEN_CEILING}
 
 
 @_route("GET", r"^/api/spine$")
@@ -453,6 +526,13 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
         if auth_header.lower().startswith("bearer "):
             bearer = auth_header[7:].strip()
             if bearer and hmac.compare_digest(bearer, self.auth_token):
+                # §DASHBOARD-UX §10: a Bearer-authenticated request IS the
+                # login — plant the cookie right here so the very first
+                # authenticated call (not just /api/attach) turns on the
+                # cookie path that EventSource needs. The login overlay's
+                # "validate token" call therefore also seeds the session.
+                if not self._pending_set_cookie:
+                    self._set_auth_cookie()
                 return True
         return False
 
@@ -502,6 +582,7 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
             while True:
                 snap = self.state.snapshot()
                 snap["control_enabled"] = self.control_enabled
+                snap["max_concurrent_runs"] = self.max_concurrent_runs
                 payload = json.dumps(snap)
                 self.wfile.write(f"event: snapshot\ndata: {payload}\n\n".encode("utf-8"))
                 self.wfile.flush()

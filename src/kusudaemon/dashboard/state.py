@@ -67,6 +67,7 @@ from ..pipeline.run_dir import (
     resolve_stored,
     run_spec_path,
     tier_path,
+    tree_path,
 )
 from . import gptme_queue
 
@@ -97,6 +98,12 @@ class RunState:
         self._cache_lock = threading.Lock()
         self._attached: str | None = None
         self._hosts: dict[str, threading.Thread] = {}
+        # §DASHBOARD-UX: per-job cancel events. A running job's thread may
+        # be mid-provider-call (uninterruptible), but the cancel *record*
+        # must land regardless — jobs.jsonl's latest-record-wins merge is
+        # the UI's authority, and the event stops the thread's own final
+        # status from clobbering the cancel.
+        self._job_cancel_events: dict[str, threading.Event] = {}
         # Parse-on-change cache for the per-snapshot file reads: keyed by
         # path, value is (stat stamp, parsed result). Depends on the
         # append-only invariant — see _cached_read. Bounded (§11.10.15) and
@@ -173,6 +180,10 @@ class RunState:
                 continue
             phase = _read_json(phase_path(entry)) or {}
             spec = _read_json(run_spec_path(entry)) or {}
+            # §DASHBOARD-UX §3: a run waiting on the operator must read as
+            # one at a glance from the rail's run chips — count pending
+            # approvals per run (cached like every other per-snapshot read).
+            approvals = self._cached_approvals(entry)
             runs.append(
                 {
                     "id": entry.name,
@@ -183,6 +194,7 @@ class RunState:
                     "mtime": _dir_mtime(entry),
                     "attached": entry.name == self._attached,
                     "hosted": self.is_hosted(entry.name),
+                    "pending_approvals": sum(1 for item in approvals if item.status == "pending"),
                 }
             )
         runs.sort(key=lambda item: item["mtime"], reverse=True)
@@ -286,8 +298,10 @@ class RunState:
             "tier_override": tier_record.get("override"),
             "escalation_history": escalation_history,
             "phases": _phase_map(events),
-            "tree": _tree_summary(run_dir, tree),
+            "tree": _tree_summary(run_dir, tree, cached_read=self._cached_read),
             "tree_counts": _count_statuses(tree),
+            "elapsed": (_now() - (events[0].get("ts") or _now())) if events else 0.0,
+            "hosted_count": self.hosted_count(),
             "approvals": [item.to_dict() for item in approvals],
             "pending_approvals": [item.to_dict() for item in approvals if item.status == "pending"],
             "events": [e for e in events[-200:]],
@@ -451,7 +465,10 @@ class RunState:
             if not run_id:
                 run_id = f"{_DEFAULT_RUN_ID_PREFIX}{int(_now())}{uuid.uuid4().hex[:6]}"
             run_dir = self.runs_root / run_id
-            options = self._options_from_body(body, goal)
+            try:
+                options = self._options_from_body(body, goal)
+            except (ValueError, OSError) as exc:
+                return None, str(exc)
         from ..v0.run_dir import create_run_dir
 
         create_run_dir(self.runs_root, run_id)
@@ -468,17 +485,43 @@ class RunState:
 
     @staticmethod
     def _options_from_body(body: dict[str, Any], goal: str) -> RunOptions:
+        """§DASHBOARD-UX §11: the new-run form is now the full RunOptions
+        surface — every option ``pipeline run`` accepts on the CLI, plus
+        ``workspace`` (PLAN.md §A3 kind="workspace": a real directory the
+        Writer edits directly) and ``tier_override`` (the §A4.4 floor, never
+        a ceiling). A bad ``workspace`` path or a non-T0..T3
+        ``tier_override`` raises — the route surfaces the message."""
         from ..pipeline.run import _read_text_arg
+        from ..v6.work_object import measure_workspace
+
+        work_object = None
+        workspace = str(body.get("workspace") or "").strip()
+        if workspace:
+            root = Path(workspace).expanduser().resolve()
+            if not root.is_dir():
+                raise ValueError(f"workspace path is not a directory: {workspace}")
+            work_object = measure_workspace(root)
+        tier_override = str(body.get("tier_override") or "").strip().upper() or None
+        if tier_override not in (None, "T0", "T1", "T2", "T3"):
+            raise ValueError(f"invalid tier_override: {tier_override!r} (want T0-T3 or blank)")
 
         return RunOptions(
             goal=_read_text_arg(goal),
             backend=str(body.get("backend") or _default_backend()),
             model=body.get("model") or None,
             source_text=_read_text_arg(str(body.get("source", ""))),
+            work_object=work_object,
             compile_command=body.get("compile_command") or None,
             research_plan=_parse_plan_payload(body.get("research_plan")),
             max_rounds=int(body.get("max_rounds", 100)),
             max_attempts=int(body.get("max_attempts", 3)),
+            dispatch_policy=str(body.get("dispatch_policy") or "model"),
+            max_parallel=int(body.get("max_parallel", 1)),
+            document_review=bool(body.get("document_review", False)),
+            survey_mode=str(body.get("survey_mode") or "model"),
+            inline_spans=bool(body.get("inline_spans", False)),
+            tier_override=tier_override,
+            auto_probe_plan=bool(body.get("auto_probe_plan", True)),
         )
 
     def _default_driver(self, run_dir: Path, options: RunOptions) -> RecursiveDriver:
@@ -516,14 +559,26 @@ class RunState:
     # ------------------------------------------------------------------
     # Approval protocol (the disk file is the authority)
     # ------------------------------------------------------------------
-    def resolve_approval(self, approval_id: str, *, action: str = "", user_input: str = "") -> bool:
+    def resolve_approval(
+        self,
+        approval_id: str,
+        *,
+        action: str = "",
+        user_input: str = "",
+        answers: dict[str, str] | None = None,
+    ) -> bool:
         run_dir = self._attached_dir()
         if run_dir is None:
             return False
         record = _find_approval(run_dir, approval_id)
         if record is None or record.status == "resolved":
             return False
-        resolved = record.resolve(action=action, user_input=user_input)
+        # §DASHBOARD-UX §6.3: a batch-form approval (intake rounds, PLAN.md
+        # §A5/§B3) is answered per question — the operator's answers ride
+        # in ``answers``, keyed by question id, and the driver reads them
+        # back off the resolved record. Every other kind ignores the field
+        # exactly the way the CLI's approve path does.
+        resolved = record.resolve(action=action, user_input=user_input, answers=answers)
         approval_store.append(run_dir, resolved)
         if action == "apply":
             self._dispatch_resolved_job(run_dir, resolved)
@@ -537,13 +592,38 @@ class RunState:
             self._spawn_job(run_dir, "triage", _run_triage_job, approval.approval_id, approval_id=approval.approval_id)
         elif kind == "reopen":
             self._spawn_job(run_dir, "reopen", _run_reopen_job, approval.approval_id, approval_id=approval.approval_id)
+        elif kind == "redispatch":
+            self._spawn_job(run_dir, "redispatch", _run_redispatch_job, approval.approval_id, approval_id=approval.approval_id)
 
     def _spawn_job(self, run_dir: Path, kind: str, target: Any, job_id: str, **kwargs: Any) -> None:
         _append_job(run_dir, {"job_id": job_id, "kind": kind, "status": "running", "ts": _now(), "detail": ""})
+        cancel_event = threading.Event()
+        with self._lock:
+            self._job_cancel_events[job_id] = cancel_event
         thread = threading.Thread(
-            target=_job_thread, args=(run_dir, kind, job_id, target), kwargs=kwargs, daemon=True
+            target=_job_thread, args=(run_dir, kind, job_id, target),
+            kwargs={**kwargs, "cancel_event": cancel_event}, daemon=True,
         )
         thread.start()
+
+    def cancel_job(self, job_id: str) -> bool:
+        """§DASHBOARD-UX §11: cancel a running dashboard job (amend/triage/
+        reopen/redispatch). Jobs are daemon threads that may be mid-provider-
+        call, so the *record* is the authority: a ``cancelled`` line in
+        jobs.jsonl (latest record per job_id wins) and an event flag that
+        stops the thread's own final status from clobbering it."""
+        run_dir = self._attached_dir()
+        if run_dir is None or not job_id:
+            return False
+        with self._lock:
+            event = self._job_cancel_events.get(job_id)
+        if event is not None:
+            event.set()
+        _append_job(
+            run_dir,
+            {"job_id": job_id, "kind": "", "status": "cancelled", "ts": _now(), "detail": "cancelled by operator"},
+        )
+        return True
 
     # ------------------------------------------------------------------
     # Operator actions that *create* approvals (never run jobs directly)
@@ -602,6 +682,75 @@ class RunState:
         approval_store.append(run_dir, approval)
         return approval.to_dict()
 
+    def escalate(self) -> dict[str, Any]:
+        """§DASHBOARD-UX §11: the rail tier chip's escalate action — §B2's
+        operator intervention, one tier up (invariant 9: tiers only rise),
+        the same read-modify-write ``pipeline/escalate`` performs. Raises
+        FileNotFoundError/ValueError for the route to surface."""
+        run_dir = self._attached_dir()
+        if run_dir is None:
+            raise FileNotFoundError("no attached run")
+        from ..pipeline.driver import escalate_run
+
+        return escalate_run(run_dir)
+
+    def pilot_save(self, approval_id: str, node_id: str, text: str) -> bool:
+        """§DASHBOARD-UX §6.2: pilot edit + approve in one browser action.
+        Writes the edited text back to the pilot's artifact path (exactly
+        what ``approve_pilot`` does anyway) and resolves the pending pilot
+        approval carrying the edit as ``user_input`` — the driver's
+        ``edited = approval.user_input.strip() or artifact`` line picks it
+        up verbatim and derives contract rules from the diff. ``approve
+        as-is`` stays the blank-``user_input`` zero-model-call path."""
+        run_dir = self._attached_dir()
+        if run_dir is None:
+            return False
+        record = _find_approval(run_dir, approval_id)
+        if record is None or record.status == "resolved" or record.kind != "pilot":
+            return False
+        context_node = str(record.context.get("node_id", ""))
+        if context_node and context_node != node_id:
+            return False
+        if not _safe_node_id(node_id):
+            return False
+        text = str(text or "")
+        node_artifact_path(run_dir, node_id).write_text(text, encoding="utf-8")
+        resolved = record.resolve(action="save", user_input=text)
+        approval_store.append(run_dir, resolved)
+        return True
+
+    def request_redispatch(self, node_id: str, reason: str = "") -> dict[str, Any] | None:
+        """§DASHBOARD-UX §11: re-dispatch a single node that never made it —
+        failed/blocked/stale. Approval-gated (a redispatch costs a Writer
+        episode, same as reopen); on apply the tree is reset so the round
+        loop picks the node up again with a fresh attempt budget. Passed
+        nodes go through reopen instead (a redispatch can't touch them)."""
+        run_dir = self._attached_dir()
+        if run_dir is None or not _safe_node_id(node_id):
+            return None
+        tree = _load_tree(run_dir)
+        node = tree.nodes.get(node_id)
+        if node is None:
+            return None
+        if node.status in ("passed", "split", "dispatched", "awaiting_review"):
+            return None
+        approval = approval_store.Approval.create(
+            "redispatch",
+            title=f"Redispatch {node_id}",
+            message=(
+                f"Status: {node.status} (attempts {node.attempts}). "
+                f"Reason: {reason.strip() or '(none given)'}"
+            ),
+            options=[
+                {"value": "apply", "label": "Redispatch", "style": "primary"},
+                {"value": "cancel", "label": "Cancel"},
+            ],
+            allow_input=False,
+            context={"node_id": node_id, "reason": reason.strip()},
+        )
+        approval_store.append(run_dir, approval)
+        return approval.to_dict()
+
     # ------------------------------------------------------------------
     # Per-node view
     # ------------------------------------------------------------------
@@ -633,6 +782,13 @@ class RunState:
         ]
         versions = _list_versions(run_dir, node_id)
         promotion = _read_json(node_scratch_dir(run_dir, node_id) / "promotion.json") or {}
+        # §DASHBOARD-UX §11: a split proposal (scratch/<id>/split.json, v7)
+        # is operator-legible state — the Node tab on a "split" parent must
+        # be able to show what was proposed and why it was accepted.
+        split_proposal = _read_json(node_scratch_dir(run_dir, node_id) / "split.json")
+        # §DASHBOARD-UX §6.2: the pilot editor's frozen "original" pane —
+        # the Writer's pre-edit output under out/.versions/<id>/.
+        pilot_original = _read_text(versions_dir(run_dir, node_id) / "pilot-original.md")
         inputs = [
             {
                 "ref": item,
@@ -657,9 +813,12 @@ class RunState:
             "artifact": artifact,
             "artifact_tokens": estimate_tokens(artifact),
             "audit": audit,
+            "truncated": bool(isinstance(audit, dict) and audit.get("truncated", False)),
             "manifest": manifest_lines[-1] if manifest_lines else None,
             "versions": versions,
             "promotion": promotion.get("promotion", ""),
+            "split_proposal": split_proposal,
+            "pilot_original": pilot_original,
         }
 
     def artifact(self, node_id: str) -> str | None:
@@ -834,6 +993,42 @@ def _run_reopen_job(run_dir: Path, approval_id: str) -> None:
         _finish_job(run_dir, approval_id, "reopen", "failed", str(exc))
 
 
+def _run_redispatch_job(run_dir: Path, approval_id: str) -> None:
+    """§DASHBOARD-UX §11: apply an approved redispatch — mark the node
+    ``pending`` with a fresh attempt budget and a last_defect recording the
+    operator's reason, so the round loop's orchestrator offers it up again.
+    Pure tree bookkeeping: no provider call, no writer dispatch."""
+    approval = _find_approval(run_dir, approval_id)
+    if approval is None:
+        _finish_job(run_dir, approval_id, "redispatch", "failed", "approval record missing")
+        return
+    context = approval.context or {}
+    node_id = str(context.get("node_id", ""))
+    try:
+        tree = TaskTree.load(tree_path(run_dir))
+        node = tree.nodes.get(node_id)
+        if node is None:
+            raise KeyError(f"unknown node: {node_id!r}")
+        if node.status in ("passed", "split", "dispatched", "awaiting_review"):
+            raise ValueError(f"node {node_id!r} is {node.status!r} — not redispatchable")
+        node.status = "pending"
+        node.attempts = 0
+        node.last_defect = f"redispatch requested by operator: {context.get('reason') or '(no reason)'}"
+        tree.save(tree_path(run_dir))
+        EventLog(events_path(run_dir)).append(
+            {
+                "node_id": node_id,
+                "role": "operator",
+                "round": 0,
+                "type": "node_redispatch_requested",
+                "reason": context.get("reason", ""),
+            }
+        )
+        _finish_job(run_dir, approval_id, "redispatch", "done", f"node {node_id} reset to pending")
+    except Exception as exc:  # noqa: BLE001
+        _finish_job(run_dir, approval_id, "redispatch", "failed", str(exc))
+
+
 def _runtime_for(run_dir: Path):
     from ..environment.local import LocalEnvironment
     from ..v1.provider import OpenAICompatibleProvider
@@ -859,11 +1054,26 @@ def asyncio_run(coro: Any) -> Any:
     return asyncio.run(coro)
 
 
-def _job_thread(run_dir: Path, kind: str, job_id: str, target: Any, **kwargs: Any) -> None:
+def _job_thread(
+    run_dir: Path, kind: str, job_id: str, target: Any,
+    cancel_event: threading.Event | None = None, **kwargs: Any,
+) -> None:
+    """§DASHBOARD-UX §11: a job's thread honours its cancel event both
+    before starting and after the target returns — a mid-provider-call job
+    can't be interrupted, but once the call lands, ``cancelled`` must be
+    the final record, not the target's own ``done``/``failed`` write."""
     try:
+        if cancel_event is not None and cancel_event.is_set():
+            _finish_job(run_dir, job_id, kind, "cancelled", "cancelled by operator before start")
+            return
         target(run_dir, **kwargs)
+        if cancel_event is not None and cancel_event.is_set():
+            _finish_job(run_dir, job_id, kind, "cancelled", "cancelled by operator")
     except Exception as exc:  # noqa: BLE001
-        _finish_job(run_dir, job_id, kind, "failed", str(exc))
+        if cancel_event is not None and cancel_event.is_set():
+            _finish_job(run_dir, job_id, kind, "cancelled", "cancelled by operator")
+        else:
+            _finish_job(run_dir, job_id, kind, "failed", str(exc))
 
 
 def _finish_job(run_dir: Path, job_id: str, kind: str, status: str, detail: str) -> None:
@@ -904,22 +1114,40 @@ def _load_tree(run_dir: Path) -> TaskTree:
         return TaskTree(nodes={})
 
 
-def _tree_summary(run_dir: Path, tree: TaskTree) -> list[dict[str, Any]]:
-    return [
-        {
-            "id": node.id,
-            "brief": node.brief,
-            "status": node.status,
-            "shape": node.shape,
-            "artifact": node.artifact,
-            "judgment": len(node.judgment),
-            "gates": len(node.gates),
-            "attempts": node.attempts,
-            "depends_on": node.depends_on,
-            "artifact_count": _artifact_count(run_dir, node.id),
-        }
-        for node in tree.nodes.values()
-    ]
+def _tree_summary(run_dir: Path, tree: TaskTree, *, cached_read: Callable[[Path, Callable[[], Any]], Any] | None = None) -> list[dict[str, Any]]:
+    """One row per tree node for the inspector's Tree tab (§DASHBOARD-UX
+    §5.1). ``gate_results`` (the gate pip strip) is read from the cached
+    dispatch-time evaluation in ``audit/<node>.json`` via ``cached_read``
+    when provided (the snapshot hot path), else live from disk — same
+    "gates evaluated once, at dispatch" rule as ``node_detail``."""
+    read = cached_read or (lambda path, loader: loader())
+    rows: list[dict[str, Any]] = []
+    for node in tree.nodes.values():
+        audit_file = run_dir / "audit" / f"{node.id}.json"
+        gate_results = read(audit_file, lambda p=audit_file: _read_gate_cache_any(p))
+        artifact_file = node_artifact_path(run_dir, node.id)
+        artifact_tokens = read(
+            artifact_file,
+            lambda p=artifact_file: estimate_tokens(_read_text(p) or ""),
+        )
+        rows.append(
+            {
+                "id": node.id,
+                "brief": node.brief,
+                "status": node.status,
+                "shape": node.shape,
+                "artifact": node.artifact,
+                "judgment": len(node.judgment),
+                "gates": len(node.gates),
+                "gate_results": gate_results,
+                "attempts": node.attempts,
+                "depends_on": node.depends_on,
+                "artifact_count": _artifact_count(run_dir, node.id),
+                "artifact_tokens": artifact_tokens,
+                "parent": node.parent,
+            }
+        )
+    return rows
 
 
 def _artifact_count(run_dir: Path, node_id: str) -> int:
@@ -1062,6 +1290,18 @@ def _read_json(path: Path) -> Any:
         return json.loads(raw)
     except json.JSONDecodeError:
         return None
+
+
+def _read_gate_cache_any(path: Path) -> list[dict[str, Any]]:
+    """§DASHBOARD-UX §5.1: the tree's gate-pip strip comes from the
+    dispatch-time gate cache (``audit/<node>.json``) when a dispatch has
+    written one; ``None`` (never dispatched) renders as all-dim pips
+    client-side, so an undispatched node and a node whose gates all failed
+    stay visually distinct."""
+    from ..v1.gates import read_gate_cache
+
+    cached = read_gate_cache(path)
+    return cached if cached is not None else []
 
 
 def _read_jsonl(path: Path) -> list[dict[str, Any]]:

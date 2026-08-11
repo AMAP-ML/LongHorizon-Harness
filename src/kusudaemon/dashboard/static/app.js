@@ -1,55 +1,130 @@
-// Kusudaemon web dashboard.
-// Preserves every backend API hook the old 3-pane view had (/api/snapshot,
-// /api/runs, /api/halt, /api/amend, /api/approvals) and adds the surface
-// the (now-deleted) Textual TUI had on top of it: a Subagents view over
-// every dispatched Writer/repair/research episode, a right-workbench Agent
-// tab (Overview/Artifact/Diff/Chat) for a specific node or subagent's own
-// detail, live mid-episode interject, and per-node reopen. Left sidebar is
-// navigation only (Runs/Subagents/Phases); every detail view -- including
-// the Task Tree -- opens on the right, never a floating overlay.
+// Kusudaemon web dashboard — DASHBOARD-UX.md implementation.
+// Layout: RAIL (34px) / NAV(220px)+STREAM+INSPECTOR(drag-resize 380-840) /
+// COMMAND BAR (38px). Design doc sections cited inline as §N references.
+// Preserves every backend API hook and the battle-tested mechanics of the
+// earlier views (full-teardown render rule §9.4, draft maps in `state`,
+// focus/scroll restore, SSE-then-polling, per-node gates/review from
+// audit/<node>.json). No build step, no framework — vanilla JS, `node --check`
+// is the syntax gate.
 
-const PHASES = ["intake", "survey", "plan", "pilot", "research", "execute", "assemble"];
+/* ========================= PART A ========================= */
+
+const PHASES_ALL = ["classify", "intake", "explore", "survey", "plan", "pilot", "research", "execute", "review", "assemble", "verify"];
+
+// §8 status vocabulary — one glyph per state, same glyph in rail, nav,
+// tree, and agent list. Color is never the only signal.
+const NODE_GLYPH = {
+  pending: "·",
+  ready: "○",
+  dispatched: "◐",
+  awaiting_review: "◑",
+  passed: "●",
+  failed: "✕",
+  blocked: "⊘",
+  stale: "◌",
+  split: "⑂",
+};
+const PHASE_GLYPH = {
+  in_progress: "▶",
+  done: "✓",
+  failed: "✕",
+  error: "✕",
+  awaiting_approval: "⏸",
+  halted: "⏸",
+  escalated: "⇡",
+  stalled: "☠",
+  pending: "·",
+  created: "·",
+};
+const SUB_GLYPH = { pending: "·", running: "◐", done: "✓", error: "✕", timeout: "⏱" };
+const SHAPE2 = {
+  "prose-dominant": "pr",
+  "derivation-dominant": "de",
+  "problem-set-dominant": "ps",
+  "reference-dominant": "re",
+};
+
+const GATE_PIP_PASS = "▪";
+const GATE_PIP_FAIL = "▫";
 
 const state = {
   snapshot: { attached: false, runs: [], control_enabled: true },
-  sidebarTab: "sessions", // 'sessions' | 'subagents' | 'phases' -- navigation only; all detail views open in the right-side workbench (see workbenchTab)
-  workbenchTab: "tree",   // 'tree' | 'code' | 'agent' | 'contract' | 'spec' | 'spine' | 'assembly' | 'terminal' -- Task Tree is the default view
+  workbenchTab: "tree",   // 'tree' | 'node' | 'doc' | 'asm' | 'term' — inspector tabs (glyph+word)
   selectedNode: null,
   nodeDetail: null,
   nodeSubagent: null,
   nodeDetailLoading: false,
-  agentTab: "overview", // 'overview' | 'artifact' | 'artifacts' | 'diff' | 'chat' -- sub-tabs within the right workbench's Agent tab
-  nodeDiff: null,        // [{tag, lines}] once loaded, keyed to selectedNode
-  nodeThinking: null,    // [{role, text}] once loaded, keyed to selectedNode -- also the live chat feed for whichever agent is open, kept fresh by applySnapshot's isLive(selectedNode) refresh
-  artifactsDetail: null,      // owner node's /api/node/<id> detail (artifact + versions), keyed to artifactsOwnerId(selectedNode)
-  selectedArtifactTag: undefined, // undefined = not yet loaded/picked; null = "current" artifact; a version tag string otherwise
+  agentTab: "overview",   // node sub-tabs: 'overview' | 'chat' | 'gates' | 'artifact' | 'versions' | 'diff'
+  nodeDiff: null,
+  nodeThinking: null,
+  artifactsDetail: null,
+  selectedArtifactTag: undefined,
   selectedArtifactText: null,
-  mainAgentThinking: null, // {id, label, entries, live} -- "what's running right now," shown livestreamed in the main chat; see loadMainAgentThinking(). Independent of a specific subagent opened in the right panel's Agent tab, which keeps its own history regardless of what's currently live.
+  mainAgentThinking: null,
   newRunOpen: false,
   busy: false,
   toast: null,
-  contractText: "",
+  contractData: { text: "", tokens: 0, ceiling: 1500 },
   specText: "",
   spineText: "",
+  manifestLines: null,
   assembly: null,
-  promptText: "",
-  promptMode: "msg_agent", // 'msg_agent' | 'auto' | 'amend' | 'reopen'
+  promptText: "",          // command-bar text (msg target, amend rule, reopen spec)
+  promptMode: "msg_agent", // 'msg_agent' | 'command' | 'amend' | 'reopen' — 'command' when text starts with ">"
   targetAgentId: "main",
-  targetAgentManual: false, // true once the operator picks a target by hand; see renderPromptBar
-  newRun: { runId: "", goal: "", source: "", model: "", compile: "" },
-  interjectDrafts: {}, // nodeId -> text
-  reopenDrafts: {},    // nodeId -> text
-  approvalDrafts: {},  // approvalId -> text
+  targetAgentManual: false,
+  interjectDrafts: {},
+  reopenDrafts: {},
+  redispatchDrafts: {},
+  approvalDrafts: {},
+  approvalAnswerDrafts: {},
+  pilotDrafts: {},
+  newRun: { runId: "", goal: "", source: "", model: "", compile: "", workspace: "", tier: "", dispatch_policy: "model", survey_mode: "model", max_rounds: 100, max_attempts: 3, document_review: false, inline_spans: false },
+  // §3/§6/§7/§10 additions
+  sseLive: true,
+  authRequired: false,
+  authToken: "",
+  authDraft: "",
+  runSwitcherOpen: false,
+  navCollapsed: {},
+  navFocus: "runs",        // keyboard-targeted nav section
+  treeFilter: "",
+  treeFilterActive: false,
+  treeCursor: null,        // focused visible row id (j/k)
+  treeCollapsed: {},       // folder segment -> collapsed
+  contextMenu: null,       // {x, y, nodeId|runId}
+  approvalTakeover: false,
+  takeoverFor: "",         // approval id the takeover is (or was) for
+  triageOpen: {},          // approvalId -> 'clean'|'patchable'|'regenerate' (expanded chip)
+  paletteOpen: false,
+  paletteQuery: "",
+  paletteCursor: 0,
+  keymapOpen: false,
+  inspectorWidth: 480,
+  docTab: "contract",      // 'spec' | 'contract' | 'spine' | 'manifest'
+  terminalFilter: "all",
+  lastCliCommand: "",      // §5.5 copyable CLI equivalent of the last UI action
+  escalationFlash: false,
+  gPrefix: false,          // 'g' pressed, awaiting r/t/a/p
 };
 
 const root = document.getElementById("app");
 
-// ---------------------------------------------------------------------
-// API Transport
-// ---------------------------------------------------------------------
-async function apiGet(path) {
-  const res = await fetch(path);
+/* ------------------------- API transport ------------------------- */
+function authHeaders(extra) {
+  const h = Object.assign({}, extra || {});
+  if (state.authToken) h["Authorization"] = `Bearer ${state.authToken}`;
+  return h;
+}
+
+async function apiGet(path, opts) {
+  const res = await fetch(path, { headers: authHeaders() });
   const data = await res.json().catch(() => ({}));
+  if (res.status === 401 && !(opts && opts.allowAuthPrompt)) {
+    state.authRequired = true;
+    render();
+    throw new Error(data.error || "authentication required");
+  }
   if (!res.ok) throw new Error(data.error || `${res.status} ${res.statusText}`);
   return data;
 }
@@ -60,10 +135,15 @@ async function apiPost(path, body = {}) {
   try {
     const res = await fetch(path, {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      headers: authHeaders({ "Content-Type": "application/json" }),
       body: JSON.stringify(body),
     });
     const data = await res.json().catch(() => ({}));
+    if (res.status === 401) {
+      state.authRequired = true;
+      render();
+      throw new Error(data.error || "authentication required");
+    }
     if (!res.ok) throw new Error(data.error || `${res.status} ${res.statusText}`);
     return data;
   } finally {
@@ -94,14 +174,8 @@ async function guarded(fn) {
   }
 }
 
-// ---------------------------------------------------------------------
-// Live SSE Stream / Polling
-// ---------------------------------------------------------------------
+/* ------------------- live SSE stream / polling ------------------- */
 function snapshotFingerprint(snap) {
-  // server_time is stamped fresh on every /api/snapshot call and /api/stream
-  // tick regardless of whether anything actually changed; comparing it along
-  // with the rest of the payload would make every tick look "changed" and
-  // defeat the whole point of this comparison.
   const { server_time, ...rest } = snap || {};
   return JSON.stringify(rest);
 }
@@ -110,13 +184,6 @@ function loadMainAgentThinking() {
   const snap = state.snapshot;
   const subagents = (snap && snap.subagents) || [];
   const liveSub = subagents.find((s) => s.live);
-  // Follow whichever episode is actually live, or -- once it's no longer
-  // live -- the most recently dispatched one (RunState.subagents() returns
-  // dispatch order): gptme runs each turn synchronously, no token-level
-  // streaming (_gptme_worker.py's `stream=False`), so a fast episode can
-  // dispatch, produce its one message, and complete inside a single ~1.5s
-  // polling gap, and `live` may never be observed true for it. Falls back
-  // to "main" itself only once nothing has ever been dispatched.
   const targetId = liveSub ? liveSub.id : (subagents.length ? subagents[subagents.length - 1].id : "main");
   apiGet(`/api/node/${encodeURIComponent(targetId)}/thinking`)
     .then((d) => {
@@ -131,21 +198,51 @@ function loadMainAgentThinking() {
 }
 
 function applySnapshot(snap) {
+  if (snap) {
+    if (snap.control_enabled === undefined) snap.control_enabled = true;
+    if (snap.max_concurrent_runs === undefined) snap.max_concurrent_runs = 4;
+  }
   if (snap && snap.attached && !snap.goal && state.snapshot && state.snapshot.run_id === snap.run_id && state.snapshot.goal) {
     snap.goal = state.snapshot.goal;
   }
   const unchanged = snapshotFingerprint(snap) === snapshotFingerprint(state.snapshot);
+  const prevEsc = (state.snapshot.escalation_history || []).length;
+  const prevPending = (state.snapshot.pending_approvals || []).map((a) => a.approval_id);
+  const nextPending = (snap.pending_approvals || []).map((a) => a.approval_id);
   state.snapshot = snap;
+  // §6.1: a fresh pending approval takes the inspector over; once
+  // dismissed for an id, stay dismissed for that id.
+  if (nextPending.length && nextPending[0] !== state.takeoverFor) {
+    state.approvalTakeover = true;
+  }
+  if (!nextPending.length) {
+    state.approvalTakeover = false;
+    state.takeoverFor = "";
+  }
+  // §10: escalation fired → rail tier chip flashes once.
+  const esc = (snap.escalation_history || []).length;
+  if (esc > prevEsc && !state.escalationFlash) {
+    state.escalationFlash = true;
+    setTimeout(() => { state.escalationFlash = false; render(); }, 1800);
+  }
+  state.sseLive = true;
+  updateChrome(nextPending.length > 0);
   if (snap && snap.attached) loadMainAgentThinking();
-  // Keeps whichever agent is currently open (right workbench's Agent tab)
-  // streaming live while it's actually running, independent of whatever
-  // loadMainAgentThinking() above is following for the main chat -- an
-  // explicitly-opened subagent keeps showing *its own* chat even after
-  // something else becomes "live."
   if (state.selectedNode && isLive(state.selectedNode)) {
     loadThinkingIfNeeded(true);
   }
   if (!unchanged) render();
+}
+
+function updateChrome(hasPending) {
+  const icon = document.querySelector("link[rel='icon']");
+  if (hasPending) {
+    document.title = "⏸ kusudaemon";
+    if (icon) icon.href = RED_FAVICON;
+  } else {
+    document.title = "Kusudaemon";
+    if (icon) icon.href = DEFAULT_FAVICON;
+  }
 }
 
 function startLive() {
@@ -168,14 +265,13 @@ function startLive() {
 }
 
 function startPolling() {
+  state.sseLive = false; // §10: rail shows ⟳ — stream dropped, polling
   const tick = () => apiGet("/api/snapshot").then(applySnapshot).catch(() => {});
   tick();
   setInterval(tick, 2000);
 }
 
-// ---------------------------------------------------------------------
-// DOM Helpers
-// ---------------------------------------------------------------------
+/* --------------------------- DOM helpers --------------------------- */
 function el(tag, attrs, children) {
   const node = document.createElement(tag);
   for (const [k, v] of Object.entries(attrs || {})) {
@@ -199,15 +295,32 @@ function fmtTime(ts) {
   return new Date(ts * 1000).toLocaleTimeString();
 }
 
+function fmtDur(secs) {
+  if (!secs || secs < 0) return "-";
+  secs = Math.round(secs);
+  if (secs < 60) return `${secs}s`;
+  const m = Math.floor(secs / 60);
+  const s = secs % 60;
+  if (m < 60) return `${m}m${String(s).padStart(2, "0")}s`;
+  const h = Math.floor(m / 60);
+  return `${h}h${String(m % 60).padStart(2, "0")}m`;
+}
+
+// §4 left-truncated ids: run-…a4f — the distinguishing END stays visible.
+function ltrunc(text, n) {
+  if (!text) return "";
+  return text.length <= n ? text : "…" + text.slice(text.length - n + 1);
+}
+
 function truncate(text, n) {
   if (!text) return "";
   return text.length > n ? text.slice(0, n) + "\n…[truncated]" : text;
 }
 
-// A "diff" entry's text is a plain unified diff (rendering.py's
-// format_diff_plain) -- classify each line by its leading character so it
-// gets the same add/remove/hunk/header coloring as the dedicated Diff tab,
-// rather than dumping raw +/- text.
+function words(text) {
+  return (text || "").trim() ? String(text).trim().split(/\s+/).length : 0;
+}
+
 function diffLineKind(line) {
   if (line.startsWith("+++") || line.startsWith("---")) return "header";
   if (line.startsWith("@@")) return "hunk";
@@ -216,14 +329,6 @@ function diffLineKind(line) {
   return "context";
 }
 
-// Turns one trace entry (rendering.parse_trace on the backend, served by
-// every /api/node/<id>/thinking call) into a normal item in a chat feed --
-// no bounding box of its own, no separate scroll region. Shared by the
-// main chat's live "what's running right now" stream and the right
-// workbench's per-agent Chat tab, so both read as the same chat interface:
-// a thought, then the tool call it led to, then the next thought below
-// it, each one just another entry in the history instead of everything
-// dumped into a fixed-height side widget.
 const _CHAT_ROLE_LABEL = {
   assistant: "🤖 Agent",
   thinking: "💭 Thinking",
@@ -255,16 +360,6 @@ function renderAgentChatEntry(e) {
   ]);
 }
 
-// Renders one events.jsonl record for the chat feed. `phase_failed` (and
-// its "escalated" cousins) used to get a second, separately-styled copy
-// pinned to a fixed position derived from the *current* snapshot status
-// rather than from when the failure actually happened -- see
-// renderCenterStream's history-merge comment for the ordering bug that
-// caused. Styling it here instead means it's still visually distinct, but
-// sits at its real place in history.
-// Friendlier author label for the run's lifecycle events -- "updates like
-// phase completed, phase started, subagent spawned" per the operator's ask,
-// rather than the raw events.jsonl `type` string.
 const _EVENT_LABEL = {
   phase_started: "▶️ Phase started",
   phase_done: "✅ Phase completed",
@@ -272,11 +367,27 @@ const _EVENT_LABEL = {
   node_redispatched: "🔁 Subagent re-dispatched",
   session_captured: "🔗 Subagent session attached",
   episode_completed: "🏁 Subagent finished",
+  run_tier_escalated: "⇡ Tier escalated",
+  node_split: "⑂ Node split",
+  split_proposal: "⑂ Split proposed",
 };
 
 function renderEventEntry(ev) {
   const isAutoResume = ev.type === "phase_auto_resuming";
   const isFailure = ev.type === "phase_failed" || ev.type === "run_escalated" || (ev.type === "phase_done" && ev.status === "escalated");
+  // §10: escalation fired → inline feed marker at its own timestamp:
+  // `T2 → T3 · split_accepted · node-04`, amber, never re-pinned.
+  if (ev.type === "run_tier_escalated") {
+    const from = ev.from || "-", to = ev.to || "-";
+    const tail = [ev.trigger ? `trigger: ${ev.trigger}` : null, ev.node_id ? `node: ${ev.node_id}` : null].filter(Boolean).join(" · ");
+    return el("div", { class: "stream-msg agent" }, [
+      el("div", { class: "msg-hdr" }, [
+        el("span", { class: "author", style: "color:var(--accent-amber); font-weight:700;" }, `⇡ Tier escalated`),
+        el("span", null, fmtTime(ev.ts)),
+      ]),
+      el("div", { class: "msg-body", style: "color:var(--accent-amber); font-weight:500;" }, `${from} → ${to}${tail ? " · " + tail : ""}`),
+    ]);
+  }
   if (isFailure) {
     return el("div", { class: "stream-card phase-error-card" }, [
       el("div", { class: "card-title" }, [
@@ -303,32 +414,102 @@ function renderEventEntry(ev) {
   ]);
 }
 
-// Renders one approval record (pending question or resolved answer) for
-// the chat feed. Split out of renderCenterStream so the same markup can
-// be used both for resolved approvals (interleaved into chronological
-// history) and pending ones (pinned at the bottom) -- see that function.
-function renderApprovalEntry(a, snap) {
+// §6.3: intake objections — amber, {claim, why, options[]} intact. An
+// objection is the model pushing back; it reads differently from a question.
+function renderObjections(ctx) {
+  const objections = (ctx && ctx.objections) || [];
+  if (!objections.length) return null;
+  return el("div", { class: "approval-objections" }, objections.map((o) =>
+    el("div", { class: "approval-objection" }, [
+      el("div", { style: "font-weight:700; color:var(--accent-amber);" }, `⚠ objection: ${o.claim || ""}`),
+      o.why ? el("div", { class: "dim", style: "font-size:12px; margin-top:2px;" }, o.why) : null,
+      (o.options || []).length ? el("div", { class: "dim", style: "font-size:11px; margin-top:2px;" }, `options: ${o.options.join(" · ")}`) : null,
+    ])
+  ));
+}
+
+// §6.4: amend-triage → three stacked count chips, each expanding to its
+// node list, each node clickable through to §5.2 before you approve.
+function renderTriageChips(a) {
+  const ctx = a.context || {};
+  const counts = ctx.counts || {};
+  const triage = ctx.triage || {};
+  const classes = [["clean", "gate-pass"], ["patchable", "gate-amber"], ["regenerate", "gate-fail"]];
+  const chips = classes.filter(([c]) => counts[c] !== undefined).map(([cls, cssClass]) => {
+    const num = counts[cls] || 0;
+    const open = state.triageOpen[a.approval_id] === cls;
+    const nodes = Object.entries(triage)
+      .filter(([, rec]) => (rec.classification || rec.class || "regenerate") === cls)
+      .map(([id]) => id);
+    return el("div", { class: "triage-chip " + cssClass, onclick: () => { state.triageOpen[a.approval_id] = open ? "" : cls; render(); } }, [
+      el("span", { class: "triage-chip-count" }, String(num)),
+      el("span", null, cls),
+      open
+        ? el("div", { class: "triage-node-list", onclick: (e) => e.stopPropagation() },
+            nodes.length ? nodes.map((id) => el("div", { class: "node-link", onclick: () => openNode(id) }, id)) : el("div", { class: "dim" }, "(none)"))
+        : null,
+    ]);
+  });
+  return chips.length ? el("div", { class: "triage-chips" }, chips) : null;
+}
+
+// Renders one approval record — chronological feed, pinned pending section,
+// and the §6.1 takeover. Options get [n] number-key bindings; Enter picks
+// the primary one.
+function renderApprovalEntry(a, snap, isTakeover) {
   const isPending = a.status === "pending";
   const parts = [
     el("div", { class: "card-title" }, [
-      el("span", { style: isPending ? "color:var(--accent-amber); font-weight:700;" : "" }, `⚡ ${isPending ? "ACTION REQUIRED" : a.kind.toUpperCase()}: ${a.title}`),
+      el("span", { style: isPending ? "color:var(--accent-red); font-weight:700;" : "color:var(--accent-amber); font-weight:700;" }, `⏸ ${isPending ? "APPROVAL" : a.kind.toUpperCase()}: ${a.title}`),
       badge(a.status),
     ]),
   ];
   if (a.message) parts.push(el("div", { class: "card-text", style: isPending ? "font-size:14px; font-weight:500;" : "" }, a.message));
 
+  const objections = isPending ? renderObjections(a.context) : null;
+  if (objections) parts.push(objections);
+  const triage = isPending && a.kind === "triage" ? renderTriageChips(a) : null;
+  if (triage) parts.push(triage);
+
   if (isPending && snap.control_enabled) {
     const actionBtns = [];
     if ((a.options || []).length) {
-      a.options.forEach((opt) => {
+      a.options.forEach((opt, i) => {
         actionBtns.push(
           el("button", {
             class: opt.style === "primary" ? "primary" : "",
             disabled: state.busy ? "" : null,
             onclick: () => guarded(() => apiPost(`/api/approvals/${encodeURIComponent(a.approval_id)}/resolve`, { action: opt.value }).then(() => showToast("Approval resolved"))),
-          }, opt.label)
+          }, `[${i + 1}] ${opt.label}`)
         );
       });
+    }
+    const questions = a.questions || [];
+    if (questions.length) {
+      parts.push(
+        el("div", { class: "approval-questions" }, questions.map((q) => {
+          const row = el("div", { class: "approval-question" }, [
+            el("label", { style: "font-size:12px; font-weight:600; color:var(--text-bright);" }, q.text || q.id),
+          ]);
+          const inputEl = el("input", { type: "text", "data-key": `approval-q-${a.approval_id}-${q.id}`, placeholder: (q.default_assumption ? `accept default: ${q.default_assumption}` : "answer…"), style: "margin-top:4px;" });
+          const draftKey = `${a.approval_id}::${q.id}`;
+          inputEl.value = state.approvalAnswerDrafts[draftKey] || "";
+          inputEl.addEventListener("input", () => { state.approvalAnswerDrafts[draftKey] = inputEl.value; });
+          row.appendChild(inputEl);
+          return row;
+        }))
+      );
+      actionBtns.push(
+        el("button", { class: "primary", disabled: state.busy ? "" : null, onclick: () => guarded(async () => {
+          const answers = {};
+          questions.forEach((q) => {
+            answers[q.id] = (state.approvalAnswerDrafts[`${a.approval_id}::${q.id}`] || "").trim();
+            delete state.approvalAnswerDrafts[`${a.approval_id}::${q.id}`];
+          });
+          await apiPost(`/api/approvals/${encodeURIComponent(a.approval_id)}/resolve`, { action: "answer", answers });
+          showToast("Answers submitted");
+        }) }, "Submit Answers")
+      );
     }
     if (a.allow_input) {
       const inputEl = el("input", { type: "text", "data-key": `approval-input-${a.approval_id}`, placeholder: a.input_label || "Provide response details or leave blank for default...", style: "margin-top:8px;" });
@@ -351,14 +532,32 @@ function renderApprovalEntry(a, snap) {
         }) }, "Use Default")
       );
     }
+    if (a.kind === "pilot" && a.context && a.context.node_id) {
+      actionBtns.push(
+        el("button", { onclick: () => openNode(a.context.node_id, "overview") }, "✏️ Open pilot editor")
+      );
+    }
+    if (isTakeover) {
+      actionBtns.push(
+        el("button", { class: "xs-btn", title: "read the run, come back — any key re-arms the takeover", onclick: () => dismissTakeover(a) }, "⌫ dismiss (keys)")
+      );
+    }
     parts.push(el("div", { class: "approval-actions" }, actionBtns));
   } else if (a.status === "resolved") {
     const answerDisplay = a.user_input ? `Answer given: "${a.user_input}"` : `Resolved via action: ${a.action || "completed"}`;
     parts.push(el("div", { style: "font-size:12px; color:var(--text-bright); font-weight:500; margin-top:6px; background:var(--bg-tertiary); padding:6px 10px; border-radius:4px;" }, answerDisplay));
   }
 
-  const cardStyle = isPending ? "border:1.5px solid var(--accent-amber); background:rgba(245, 158, 11, 0.08);" : "";
+  const cardStyle = isPending
+    ? "border:1.5px solid var(--accent-red); background:rgba(244, 63, 94, 0.07);"
+    : "border:1.5px solid var(--accent-amber); background:rgba(245, 158, 11, 0.06);";
   return el("div", { class: "stream-card approval" + (isPending ? " pending" : ""), style: cardStyle }, parts);
+}
+
+function dismissTakeover(a) {
+  state.approvalTakeover = false;
+  state.takeoverFor = a.approval_id;
+  render();
 }
 
 function liveMap() {
@@ -366,1093 +565,1384 @@ function liveMap() {
   for (const s of state.snapshot.subagents || []) m[s.id] = s;
   return m;
 }
+/* ========================= PART B ========================= */
 
-// ---------------------------------------------------------------------
-// Header Component
-// ---------------------------------------------------------------------
-// §C4: the tier + escalation history belong in the run header — a tier is a
-// cost claim (PLAN.md §A4: "the entire claim of §A4 is a cost claim"), so
-// the operator should see which tier is paying for this run without opening
-// tier.json, and an escalation is the one visible symptom of the classifier
-// being wrong, so its trail deserves a badge of its own. The tier badge
-// carries measured/override detail in its tooltip; the escalation badge
-// carries the trigger trail ("size_defect_retry: T1 → T2 · node …").
-function renderTierBadges(snap) {
-  if (!snap.tier) return null;
-  const notes = [];
-  if (snap.measured_tier && snap.measured_tier !== snap.tier) notes.push(`measured ${snap.measured_tier}`);
-  if (snap.tier_override && String(snap.tier_override) !== snap.tier) notes.push(`override ${snap.tier_override}`);
-  const title = `tier ${snap.tier}` + (notes.length ? ` · ${notes.join(" · ")}` : "");
-  const badges = [el("span", { class: "badge", title: title }, `tier ${snap.tier}`)];
-  const esc = snap.escalation_history || [];
-  if (esc.length) {
-    const trail = esc
-      .map((e) => `${e.trigger}: ${e.from || "-"} → ${e.to || "-"}` + (e.node_id ? ` · node ${e.node_id}` : ""))
-      .join("\n");
-    badges.push(
-      el("span", { class: "badge", "data-status": "escalated", title: `escalations:\n${trail}` }, `⇡ ${esc.length}`)
-    );
-  }
-  return el("span", { class: "hdr-tier-badges" }, badges);
-}
-
-function renderHeader() {
+// §3 rail: left cluster = one segment per phase (glyph+VALUE), in the
+// order the driver ran them; current phase gets bold+active styling.
+// Right: hosted counter │ live-or-polling indicator │ clock pseudo-CNY.
+function renderRail() {
   const snap = state.snapshot;
-  const brand = el("div", { class: "brand" }, [
-    el("div", { class: "logo-icon" }, "⚡"),
-    el("span", null, "Kusudaemon"),
-    el("span", { class: "brand-tag" }, "Recursive Harness"),
-  ]);
-
-  const children = [brand];
-
-  if (snap.attached) {
-    children.push(
-      el("div", { class: "run-selector-badge" }, [
-        el("span", { style: "color:var(--text-muted);" }, "Run:"),
-        el("span", { style: "font-weight:600;" }, snap.run_id),
-        badge(snap.phase_status || "running"),
-        renderTierBadges(snap),
-        (snap.pending_approvals || []).length ? el("span", { class: "badge", "data-status": "waiting_for_approval" }, "⚡ ACTION REQUIRED") : null,
-        snap.halted ? badge("halted") : null,
-        // §D0c: "in_progress" forever is indistinguishable from mid-call
-        // unless something says so -- this is that something.
-        snap.stalled
-          ? el("span", { class: "badge", "data-status": "error", title: snap.stalled_reason || "" }, "☠ STALLED")
-          : null,
-      ])
-    );
-  } else {
-    children.push(el("div", { class: "run-selector-badge" }, "No Attached Run"));
-  }
-
-  children.push(el("span", { class: "spacer" }));
-
-  if (!snap.control_enabled) {
-    children.push(el("span", { class: "badge" }, "Read-Only"));
-  }
-
-  const actions = [];
-  if (snap.attached && snap.control_enabled) {
-    const isStoppedOrHalted = snap.halted || snap.phase_status === "error" || snap.phase_status === "paused" || snap.phase_status === "escalated" || snap.phase_status === "halted";
-    if (isStoppedOrHalted) {
-      actions.push(
-        el("button", { class: "primary", disabled: state.busy ? "" : null, onclick: () => guarded(resumeAttached) }, "▶ Resume / Continue")
-      );
-    } else {
-      actions.push(
-        el("button", { class: "danger", disabled: state.busy ? "" : null, onclick: () => guarded(async () => {
-          await apiPost("/api/halt", { value: true });
-          showToast("Halt signal sent");
-        }) }, "⏸ Halt")
-      );
-    }
-  }
-
-  actions.push(
-    el("button", { class: "primary", disabled: snap.control_enabled ? null : "", onclick: () => { state.newRunOpen = true; render(); } }, "+ New Run")
-  );
-
-  children.push(el("div", { class: "hdr-actions" }, actions));
-  return el("header", { class: "hdr" }, children);
-}
-
-async function resumeAttached() {
-  const runId = state.snapshot.run_id;
-  await apiPost("/api/halt", { value: false });
-  await apiPost("/api/runs", { run_id: runId });
-  showToast(`Resumed run ${runId}`);
-}
-
-// ---------------------------------------------------------------------
-// Left Sidebar Component
-// ---------------------------------------------------------------------
-function renderSidebar() {
-  const snap = state.snapshot;
-  // Navigation only -- every detail view (task tree, a specific node or
-  // subagent's chat, artifacts, ...) opens in the right-side workbench
-  // instead (renderRightWorkbench), never here.
-  const tabs = [
-    ["sessions", "Runs"],
-    ["subagents", "Subagents"],
-    ["phases", "Phases"],
-  ];
-  const navTabs = el("div", { class: "sidebar-nav-tabs" }, tabs.map(([id, label]) =>
-    el("div", { class: "nav-tab" + (state.sidebarTab === id ? " active" : ""), onclick: () => { state.sidebarTab = id; render(); } }, label)
-  ));
-
-  let content = null;
-  if (state.sidebarTab === "sessions") {
-    const runs = snap.runs || [];
-    const items = runs.length
-      ? runs.map((r) =>
-          el("li", {
-            class: "run-item" + (r.attached ? " active" : ""),
-            onclick: () => guarded(() => {
-              state.targetAgentManual = false; // resume auto-following the live subagent in the new run
-              state.selectedNode = null;
-              state.workbenchTab = "tree"; // Task Tree is the default view for whichever run is attached
-              return apiPost("/api/attach", { run_id: r.id });
-            }),
-          }, [
-            el("div", { style: "display:flex; justify-content:space-between; align-items:flex-start; gap:8px;" }, [
-              el("div", { class: "goal" }, r.goal || r.id),
-              snap.control_enabled ? el("button", {
-                class: "icon-btn delete-btn",
-                title: "Delete Run",
-                onclick: (e) => {
-                  e.stopPropagation();
-                  guarded(async () => {
-                    if (confirm(`Delete run "${r.id}"? This action cannot be undone.`)) {
-                      await apiPost("/api/runs/delete", { run_id: r.id });
-                      showToast(`Deleted run ${r.id}`);
-                    }
-                  });
-                }
-              }, "🗑️") : null,
-            ]),
-            el("div", { class: "meta" }, [badge(r.status || r.phase || "-"), el("span", null, r.id)]),
-          ])
-        )
-      : [el("div", { class: "empty-state" }, "No runs found.")];
-    content = el("ul", { class: "run-list" }, items);
-  } else if (state.sidebarTab === "subagents") {
-    const subs = snap.subagents || [];
-    if (!subs.length) {
-      content = el("div", { class: "empty-state" }, "No subagents dispatched yet.");
-    } else {
-      content = el("div", { class: "node-tree-list" }, subs.map((s) =>
-        el("div", { class: "node-card" + (s.id === state.selectedNode ? " active" : ""), onclick: () => openNode(s.id) }, [
-          el("div", { class: "node-hdr" }, [
-            el("span", null, `${s.live ? "● " : ""}[${s.id}]`),
-            badge(s.status),
-          ]),
-          el("div", { class: "brief" }, `${s.kind} · ${s.role} · attempts=${s.attempts}${s.duration_ms ? ` · ${s.duration_ms}ms` : ""}`),
-          snap.control_enabled ? el("div", { style: "margin-top:6px; display:flex; justify-content:flex-end;" }, [
-            el("button", {
-              class: "xs-btn",
-              onclick: (e) => {
-                e.stopPropagation();
-                state.promptMode = "msg_agent";
-                state.targetAgentId = s.id;
-                state.targetAgentManual = true;
-                render();
-              }
-            }, "💬 Message Agent")
-          ]) : null,
-        ])
-      ));
-    }
-  } else if (state.sidebarTab === "phases") {
-    content = el("div", { class: "phase-pipeline" }, PHASES.map((p) => {
-      const status = (snap.phases || {})[p] || "pending";
-      const isCurrent = snap.phase === p;
-      return el("div", { class: "phase-step", "data-status": status }, [
-        el("span", { class: "indicator" }),
-        el("span", { style: isCurrent ? "font-weight:600; color:var(--text-bright);" : "" }, p.toUpperCase() + (isCurrent ? " (Active)" : "")),
-        el("span", { class: "spacer" }),
-        badge(status),
-      ]);
-    }));
-  }
-
-  return el("aside", { class: "sidebar-nav" }, [
-    el("div", { class: "sidebar-header" }, [
-      el("h3", null, "Workspace"),
-      el("button", { class: "icon-btn", onclick: () => { state.newRunOpen = true; render(); } }, "+ New"),
-    ]),
-    navTabs,
-    el("div", { class: "sidebar-content" }, content),
-  ]);
-}
-
-// ---------------------------------------------------------------------
-// Center Chat & Interactive Stream Component
-// ---------------------------------------------------------------------
-function renderCenterStream() {
-  const snap = state.snapshot;
-  const feed = el("div", { class: "chat-feed", id: "chat-feed-scroll" });
-
   if (!snap.attached) {
-    feed.appendChild(
-      el("div", { class: "empty-state" }, [
-        el("h3", { style: "color:var(--text-bright); margin-bottom:8px;" }, "Welcome to Kusudaemon"),
-        el("p", null, "Start a new run or pick an existing one from the sidebar to begin."),
-      ])
-    );
-    return el("main", { class: "chat-stream-panel" }, [
-      el("div", { class: "chat-header" }, [
-        el("div", { class: "title" }, ["💬 Run Stream"]),
-      ]),
-      feed,
-      renderPromptBar(),
+    return el("div", { class: "rail" }, [
+      el("div", { class: "rail-left" }, [el("span", { class: "rail-title" }, "KUSUDAEMON")]),
+      el("div", { class: "rail-right" }, [el("span", { class: "rail-a40" }, "no run attached")]),
     ]);
   }
-
-  // Pinned Header Section at top (Goal & Phase stay fixed at top when scrolling)
-  const pinnedHeader = el("div", { class: "pinned-run-header" }, [
-    el("div", { class: "stream-msg user pinned-goal" }, [
-      el("div", { class: "msg-hdr" }, [el("span", { class: "author" }, "Goal"), el("span", null, "Run Spec")]),
-      el("div", { class: "msg-body" }, snap.goal || "(no goal recorded)"),
+  const segClass = {
+    done: "seg-passed pass", in_progress: "seg-running run", failed: "seg-fail fail",
+    error: "seg-fail fail", awaiting_approval: "seg-paused paused", escalated: "seg-escalated esc",
+    halted: "seg-paused paused", stalled: "seg-stalled stalled", pending: "pass", created: "pass",
+  };
+  const segs = PHASES_ALL.filter((p) => (snap.phases || {})[p]).map((p) => {
+    const st = (snap.phases || {})[p];
+    const label = { in_progress: "RUN", done: "DONE", failed: "FAIL", error: "ERR", awaiting_approval: "WAIT", escalated: "ESC", halted: "HLT", stalled: "STALL", pending: "PEND", created: "" }[st] || st.toUpperCase();
+    return el("div", { class: "rail-seg " + (segClass[st] || ""), title: `${p} — ${st}` }, [
+      el("span", { class: "segglyph" }, PHASE_GLYPH[st] || "·"),
+      el("span", { class: "segval" }, label),
+    ]);
+  });
+  const liveNow = (snap.hosted || snap.phase_status === "in_progress");
+  return el("div", { class: "rail" }, [
+    el("div", { class: "rail-left" }, segs.length ? segs : [el("span", { class: "rail-no-phase" }, "—")]),
+    el("div", { class: "rail-right" }, [
+      el("span", { class: "rail-hosted", title: `${snap.hosted_count || 0} runs hosted · cap ${snap.max_concurrent_runs}` }, `${snap.hosted_count || 0}/${snap.max_concurrent_runs}`),
+      el("span", { class: "rail-live" + (state.sseLive ? " on" : ""), title: state.sseLive ? "SSE live" : "SSE dropped — 2s polling" }, state.sseLive ? "🟢 LIVE" : "🔄 ⟳"),
+      el("span", { class: "rail-a40" }, snap.elapsed ? fmtDur(snap.elapsed) : "—"),
     ]),
-    snap.phase ? el("div", { class: "stream-card pinned-phase" }, [
-      el("div", { class: "card-title" }, [
-        el("span", null, `🤖 Phase: ${snap.phase.toUpperCase()}`),
-        badge(snap.phase_status || "running"),
+  ]);
+}
+
+// Run header row (below rail): run id + goal + phase/status/"whole run"
+// provenance summary + tier badge + escalation badge + control buttons.
+function renderHeaderRow() {
+  const snap = state.snapshot;
+  if (!snap.attached) return null;
+  const tier = snap.tier ? (snap.tier_override ? `T${snap.tier_override} (floor)` : snap.tier) : null;
+  const esc = snap.escalation_history || [];
+  const escChip = esc.length ? el("span", {
+    class: "hdr-tier-badge hdr-esc-badge" + (state.escalationFlash ? " flash" : ""),
+    title: esc.map((e) => `${e.from} → ${e.to} · ${e.trigger}${e.node_id ? " · " + e.node_id : ""}`).join("\n"),
+  }, `⇡${esc.length}`) : null;
+  const tierChip = tier ? el("span", { class: "hdr-tier-badge", title: `measured ${snap.measured_tier}${snap.tier_override ? ` · --tier ${snap.tier_override}` : ""}` }, tier) : null;
+  return el("div", { class: "hdr-run" }, [
+    el("div", { class: "hdr-run-id" }, [
+      el("span", { class: "runId", style: "cursor:pointer;", title: "switch run", onclick: () => { state.runSwitcherOpen = true; render(); } }, snap.run_id),
+      tierChip, escChip,
+      snap.halted ? el("span", { class: "hdr-tier-badge hdr-halt-badge" }, "⏸ halted") : null,
+    ]),
+    el("div", { class: "hdr-goal", title: snap.goal }, snap.goal || "—"),
+    el("div", { class: "hdr-status" }, [
+      badge(snap.phase_status || (snap.halted ? "halted" : "created")),
+      el("span", { class: "dim" }, snap.phase_detail || ""),
+    ]),
+    el("div", { class: "hdr-buttons" }, [
+      snap.control_enabled && tier !== "T3" ? el("button", { class: "btn-tiny", onclick: () => { if (confirm("Escalate tier (+1, T3 max)?") ) guarded(() => apiPost("/api/escalate", {}).then(() => showToast("Tier escalated"))); } }, "⇡ escalate") : null,
+      snap.control_enabled && (snap.phase_status === "error" || snap.halted || snap.phase_status === "failed" || snap.phase_status === "escalated" || snap.phase_status === "blocked" || snap.phase_status === "paused")
+        ? el("button", { class: "btn-tiny", onclick: () => guarded(() => apiPost("/api/halt", { value: false }).then(() => showToast("Resume requested"))) }, "▶ Resume")
+        : null,
+      snap.control_enabled ? el("button", { class: "btn-tiny", onclick: () => guarded(() => apiPost("/api/halt", { value: snap.halted ? false : true }).then(() => showToast(snap.halted ? "Resume requested" : "Halting after current phase"))) }, snap.halted ? "▶" : "⏸") : null,
+    ]),
+  ]);
+}
+
+// Run switcher overlay — newest-first, ✅ = attached, ⏸ before count = pending.
+function renderRunSwitcher() {
+  if (!state.runSwitcherOpen) return null;
+  const snap = state.snapshot;
+  const rows = (snap.runs || []).map((r) =>
+    el("div", { class: "runrow" + (r.attached ? " active" : ""), onclick: () => { attachRun(r.id); state.runSwitcherOpen = false; } }, [
+      el("span", { class: "rr-glyph" }, r.attached ? "✅" : r.hosted ? "●" : "·"),
+      el("span", { class: "rr-id" }, r.id),
+      el("span", { class: "rr-pip" }, r.pending_approvals ? `⏸ ${r.pending_approvals}` : ""),
+      el("span", { class: "rr-phase" }, PHASE_GLYPH[r.status] || "·"),
+      el("span", { class: "rr-goal" }, r.goal || ""),
+    ])
+  );
+  return el("div", { class: "overlay", onclick: (e) => { if (e.target === e.currentTarget) { state.runSwitcherOpen = false; render(); } } }, [
+    el("div", { class: "panel run-switcher" }, [
+      el("div", { class: "panel-hdr" }, "Switch run"),
+      el("div", { class: "panel-body" }, rows),
+      el("div", { class: "panel-foot" }, [
+        el("button", { class: "primary", onclick: () => { state.runSwitcherOpen = false; state.newRunOpen = true; render(); } }, "＋ New Run…"),
+        el("button", { onclick: () => { state.runSwitcherOpen = false; render(); } }, "Close"),
       ]),
-      snap.phase_detail ? el("div", { style: "color:var(--accent-amber); font-size:12px; margin-top:4px;" }, snap.phase_detail) : null,
-    ]) : null,
+    ]),
+  ]);
+}
+
+function renderNavSection(key, title, rows) {
+  const collapsed = state.navCollapsed[key];
+  return el("section", { class: "nav-section" + (state.navFocus === key ? " focused" : ""), "data-section": key }, [
+    el("div", { class: "nav-head", onclick: () => { state.navCollapsed[key] = !collapsed; render(); } }, [
+      el("span", { class: "nav-caret" }, collapsed ? "▸" : "▾"),
+      el("span", { class: "nav-title" }, title),
+      el("span", { class: "nav-count" }, rows.length),
+    ]),
+    collapsed ? null : el("div", { class: "nav-body" }, rows),
+  ]);
+}
+
+// §3 nav — right column. keyboard: j/k moves, ↩ attaches the focused run.
+function renderNav() {
+  const snap = state.snapshot;
+  const runRows = (snap.runs || []).map((r) => el("div", {
+    class: "nav-row run" + (r.attached ? " active" : ""),
+    onclick: () => attachRun(r.id),
+    oncontextmenu: (e) => { e.preventDefault(); openRunMenu(e, r.id); },
+  }, [
+    el("span", { class: "row-glyph" }, r.attached ? "✅" : "·"),
+    el("span", { class: "row-id" }, r.id),
+    el("span", { class: "row-pip" }, r.pending_approvals ? `⏸${r.pending_approvals}` : (r.hosted ? "●" : "")),
+    el("span", { class: "row-status" }, PHASE_GLYPH[r.status] || "·"),
+  ]));
+  const subs = (snap.subagents || []).slice().reverse();
+  const subRows = subs.map((s) => el("div", {
+    class: "nav-row sub" + (state.selectedNode === s.id ? " active" : ""),
+    onclick: () => openNode(s.id, "chat"),
+  }, [
+    el("span", { class: "row-glyph" }, SUB_GLYPH[s.status] || "·"),
+    el("span", { class: "row-id" }, s.id),
+    el("span", { class: "row-pip" }, s.live ? "●" : ""),
+  ]));
+  const phaseRows = Object.entries(snap.phases || {}).map(([p, st]) => el("div", { class: "nav-row" }, [
+    el("span", { class: "row-glyph" }, PHASE_GLYPH[st] || "·"),
+    el("span", { class: "row-id" }, p),
+    el("span", { class: "row-status" }, st),
+  ]));
+  return el("div", { class: "sidebar-nav" }, [
+    el("div", { class: "nav-section-group" }, [
+      renderNavSection("runs", "RUNS", runRows),
+      renderNavSection("subagents", "SUBAGENTS", subRows),
+      renderNavSection("phases", "PHASES", phaseRows),
+    ]),
+  ]);
+}
+
+/* ------------------------- center stream ------------------------- */
+
+function renderCenterStream() {
+  const snap = state.snapshot;
+  const feedEntries = [];
+  const evList = snap.events || [];
+  const lastEvents = evList.slice(-20).map((ev, i) => ({ sort: ev.ts || 0, node: renderEventEntry(ev) }));
+  feedEntries.push(...lastEvents);
+  const resolvedApprovals = (snap.approvals || []).filter((a) => a.status !== "pending").map((a) => ({ sort: a.updated_at || a.created_at || 0, node: renderApprovalEntry(a, snap, false) })).sort((a, b) => a.sort - b.sort);
+  feedEntries.push(...resolvedApprovals);
+  feedEntries.sort((a, b) => a.sort - b.sort);
+
+  const pinnedHeader = el("div", { class: "pinned-hdr" }, [
+    snap.has_contract ? el("span", { class: "hdr-pill" }, "📜 contract ✓") : null,
+    snap.has_spec ? el("span", { class: "hdr-pill" }, "spec ✓") : null,
+    snap.has_assembly ? el("span", { class: "hdr-pill" }, "assembly ✓") : null,
+    snap.phase_status === "in_progress" && state.mainAgentThinking ? el("span", { class: "hdr-pill", style: "color:var(--accent-purple);" }, `🤖 ${state.mainAgentThinking.id}…`) : null,
+    el("span", { class: "hdr-pill dim" }, `${snap.events_count || 0} events`),
   ]);
 
-  // 1. Chronological history: events and already-resolved approvals,
-  // strictly interleaved by when they actually happened (oldest first,
-  // newest at the bottom). This used to be split into fixed sections --
-  // events, then a "phase error" card pinned by *current* snapshot
-  // status, then approvals last -- so a phase failure that happened
-  // after the operator had already answered some intake questions
-  // rendered above those already-answered questions instead of below
-  // them. Still-pending approvals are held out and rendered separately at
-  // the very bottom (see the end of this function) regardless of when
-  // they were created, so an operator scrolled to the bottom still never
-  // has to scroll back up to find one.
-  const approvals = snap.approvals || [];
-  const pendingApprovals = approvals.filter((a) => a.status === "pending");
-  const resolvedApprovals = approvals.filter((a) => a.status !== "pending");
-  const historyItems = [
-    ...(snap.events || []).slice(-20).map((ev) => ({ ts: ev.ts || 0, node: renderEventEntry(ev) })),
-    ...resolvedApprovals.map((a) => ({ ts: a.created_at || 0, node: renderApprovalEntry(a, snap) })),
-  ];
-  historyItems.sort((x, y) => x.ts - y.ts);
-  historyItems.forEach((item) => feed.appendChild(item.node));
-
-  // 2. Live "what's running right now" stream, following whichever
-  // episode is actually live (or most-recently dispatched -- see
-  // loadMainAgentThinking()). Each trace entry renders as a plain item
-  // directly in this same feed -- a thought, then the tool call it led
-  // to, then the next thought below it -- growing as the episode
-  // progresses, not boxed into a separate fixed-height widget. A
-  // subagent the operator explicitly opens gets its *own* full history in
-  // the right workbench's Agent tab (renderAgentTab), independent of
-  // whatever this section is currently following.
-  const mainAgent = state.mainAgentThinking;
-  if (snap.attached && mainAgent) {
-    feed.appendChild(
-      el("div", { class: "live-agent-divider" }, [
-        el("span", null, `🤖 ${mainAgent.label}`),
-        mainAgent.live ? el("span", { class: "badge", "data-status": "running" }, "live") : null,
-        el("span", { class: "divider-line" }),
-        el("span", { class: "node-link", onclick: () => openNode(mainAgent.id, "chat") }, "open in Agent tab"),
-        el("span", { class: "node-link", onclick: () => openNode(mainAgent.id, "artifacts") }, "📁 Artifacts"),
-      ])
-    );
-    const entries = mainAgent.entries || [];
-    if (entries.length) {
-      entries.forEach((e) => feed.appendChild(renderAgentChatEntry(e)));
-    } else {
-      feed.appendChild(el("div", { class: "empty-state" }, `Waiting for trace from ${mainAgent.label}...`));
-    }
-  }
-
-  // 3. Resume Status Card -- persistent call-to-action tied to the
-  // *current* run status, not a point-in-time history entry, so it stays
-  // pinned here rather than joining the chronological merge above.
-  const isStoppedOrHalted = snap.halted || snap.phase_status === "error" || snap.phase_status === "paused" || snap.phase_status === "escalated";
-  if (isStoppedOrHalted && snap.control_enabled) {
-    feed.appendChild(
-      el("div", { class: "stream-card resume-banner" }, [
-        el("div", { class: "card-title" }, [
-          el("span", { style: "color:var(--accent-amber); font-weight:600;" }, `▶ Resume Run (Status: ${snap.phase_status || (snap.halted ? "halted" : "stopped")})`),
-          el("button", { class: "primary", disabled: state.busy ? "" : null, onclick: () => guarded(resumeAttached) }, "▶ Resume / Continue Run"),
-        ]),
-        el("div", { style: "font-size:12px; color:var(--text-muted); margin-top:4px;" }, "Click Resume / Continue to re-trigger execution from the last saved checkpoint."),
-      ])
-    );
-  }
-
-  // 4. Pending approvals -- always last, right above the prompt bar; see
-  // this function's opening comment for why they're held out of the
-  // chronological merge above.
-  pendingApprovals.forEach((a) => feed.appendChild(renderApprovalEntry(a, snap)));
-
-  const promptBar = renderPromptBar();
+  const approvalFeed = (snap.pending_approvals || []).map((a) => renderApprovalEntry(a, snap, false));
 
   return el("main", { class: "chat-stream-panel" }, [
     el("div", { class: "chat-header" }, [
       el("div", { class: "title" }, ["💬 Run Stream", snap.halted ? badge("halted") : null]),
-      el("span", { style: "font-size:11px; color:var(--text-muted);" }, snap.attached ? `${snap.events_count || 0} events` : ""),
+      el("button", { class: "btn-tiny", onclick: () => { loadMainAgentThinking(); render(); } }, "refresh"),
     ]),
     pinnedHeader,
-    feed,
-    promptBar,
+    el("div", { class: "chat-feed", id: "chat-feed" }, feedEntries.map((e) => e.node)),
+    approvalFeed.length ? el("div", { class: "pending-approvals-block" }, [
+      el("div", { class: "pending-hdr" }, `⏸ PENDING APPROVALS (${approvalFeed.length})`),
+      ...approvalFeed,
+    ]) : null,
   ]);
-}
+}/* ========================= PART C ========================= */
 
-function renderPromptBar() {
-  const snap = state.snapshot;
-  const disabled = !snap.control_enabled || state.busy;
-
-  const modeSelector = el("div", { class: "prompt-mode-selector" }, [
-    el("button", { class: "mode-btn" + (state.promptMode === "msg_agent" ? " active" : ""), onclick: () => { state.promptMode = "msg_agent"; render(); } }, "💬 Message Agent"),
-    el("button", { class: "mode-btn" + (state.promptMode === "auto" ? " active" : ""), onclick: () => { state.promptMode = "auto"; render(); } }, "New Run"),
-    el("button", { class: "mode-btn" + (state.promptMode === "amend" ? " active" : ""), onclick: () => { state.promptMode = "amend"; render(); } }, "Amend Contract"),
-    el("button", { class: "mode-btn" + (state.promptMode === "reopen" ? " active" : ""), onclick: () => { state.promptMode = "reopen"; render(); } }, "Reopen Node"),
-  ]);
-
-  let targetSelector = null;
-  let msgTargetIsLive = true; // only meaningful in msg_agent mode; see below
-  if (state.promptMode === "msg_agent") {
-    const subagents = snap.subagents || [];
-    const anyLive = subagents.some((s) => s.live);
-
-    // Auto-follow whichever subagent is actually live instead of leaving
-    // the selection pinned to "main" (which -- outside a lucky fallback
-    // scan on the backend -- almost never has a live gptme session of its
-    // own) or to a previous target whose episode has since finished.
-    // Interjecting into a dead session always 409s ("no live session
-    // found for this node"); repeatedly hitting Send against a stale
-    // selection is exactly that. Once the operator manually picks a
-    // target, respect it until they attach a new run.
-    if (!state.targetAgentManual) {
-      const liveSub = subagents.find((s) => s.live);
-      state.targetAgentId = liveSub ? liveSub.id : "main";
-    }
-
-    const mainOpt = el("option", { value: "main", selected: (!state.targetAgentId || state.targetAgentId === "main") ? "selected" : null }, "🤖 Main Agent (Current Phase)");
-    const subOpts = subagents.map((s) => el("option", { value: s.id, selected: state.targetAgentId === s.id ? "selected" : null }, `[${s.id}] ${s.kind} (${s.status}${s.live ? ", live" : ""})`));
-    const options = [mainOpt, ...subOpts];
-
-    const selectEl = el("select", {
-      class: "agent-target-select",
-      onchange: (e) => { state.targetAgentManual = true; state.targetAgentId = e.target.value; render(); },
-    }, options);
-
-    // "main" can still route to a live subagent via the backend's own
-    // fallback scan (RunState.node_gptme_logdir), so only treat it as
-    // definitely-dead when nothing at all is live.
-    msgTargetIsLive = state.targetAgentId === "main" ? anyLive : !!subagents.find((s) => s.id === state.targetAgentId && s.live);
-
-    targetSelector = el("div", { class: "agent-target-picker" }, [
-      el("label", { style: "font-size:11px; font-weight:600; color:var(--accent-purple);" }, "Target:"),
-      selectEl,
-      !msgTargetIsLive
-        ? el("span", { style: "font-size:11px; color:var(--text-muted); margin-left:8px;" }, "not currently running -- nothing to message")
-        : null,
-    ]);
-  }
-
-  const msgBlocked = state.promptMode === "msg_agent" && !msgTargetIsLive;
-  const ta = el("textarea", {
-    class: "prompt-textarea",
-    "data-key": "prompt-textarea",
-    placeholder:
-      state.promptMode === "amend" ? "Enter contract amendment rule to append..." :
-      state.promptMode === "reopen" ? "Node ID and defect description..." :
-      msgBlocked ? "No live agent to message right now -- pick a different target or wait for one to start." :
-      state.promptMode === "msg_agent" ? "Type a direct message to send to the main agent or subagent mid-episode..." :
-      "Type a run goal (or @path/to/file)...",
-    rows: 1,
-    disabled: (disabled || msgBlocked) ? "" : null,
+// §7.2 command bar. `>` → command mode with live suggestions (Ctrl/Cmd-K also
+// opens the same list as a palette). Modes: msg_agent (default)/command/
+// amend/reopen. Drawn once per render, re-rendered on input via full-teardown
+// render(); focus + caret restored from state.
+function renderCommandBar() {
+  const isCommand = state.promptText.trim().startsWith(">");
+  const nodeId = state.selectedNode;
+  const placeholder = state.promptMode === "amend"
+    ? "bold_rule text with no citation numbers (e.g. Deliberately exclude historical asides)" + (nodeId ? "" : " — open a node first")
+    : state.promptMode === "reopen"
+      ? "reason to reopen this node (starts a repair)" + (nodeId ? "" : " — open a node first")
+      : isCommand
+        ? "e.g. >runs …"
+        : (nodeId ? `message ${nodeId} …` : "message main agent (e.g. much more important to prioritize examples like the Friday fleet)");
+  const modeChip = (mode, label, glyph, title) => el("button", {
+    class: "mode-chip " + (state.promptMode === mode ? "active" : ""),
+    title, onclick: () => { state.promptMode = mode; render(); },
+  }, glyph + label);
+  const suggestionList = isCommand ? commandSuggestions() : null;
+  const textEl = el("textarea", { class: "cmd-input" + (state.promptMode !== "msg_agent" && state.promptMode !== "command" ? " mode-" + state.promptMode : ""), rows: "2", placeholder, "data-key": "promptText" });
+  textEl.value = state.promptText;
+  textEl.addEventListener("input", () => {
+    state.promptText = textEl.value;
+    if (textEl.value.startsWith(">")) state.promptMode = "command";
+    else if (state.promptMode === "command" && !textEl.value.startsWith(">")) state.promptMode = "msg_agent";
+    render();
   });
-  ta.value = state.promptText;
-  ta.addEventListener("input", () => { state.promptText = ta.value; });
-
-  const sendBtn = el("button", { class: "primary", disabled: (disabled || msgBlocked) ? "" : null, onclick: () => guarded(() => handlePromptSubmit()) }, "Send ↵");
-
-  ta.addEventListener("keydown", (e) => {
+  textEl.addEventListener("keydown", (e) => {
     if (e.key === "Enter" && !e.shiftKey) {
       e.preventDefault();
-      handlePromptSubmit();
+      handlePromptSubmit(e);
+    } else if (e.key === "ArrowUp" && isCommand && suggestionList && suggestionList.length && document.activeElement === textEl && (e.target.selectionStart === 0 || state.promptText.startsWith(">"))) {
+      e.preventDefault();
+      state.paletteCursor = (state.paletteCursor + suggestionList.length - 1) % suggestionList.length;
+      render();
+      focusPrompt();
+    } else if (e.key === "ArrowDown" && isCommand && suggestionList && suggestionList.length) {
+      e.preventDefault();
+      state.paletteCursor = (state.paletteCursor + 1) % suggestionList.length;
+      render();
+      focusPrompt();
+    } else if (e.key === "Tab" && isCommand && suggestionList && suggestionList.length) {
+      e.preventDefault();
+      const sel = suggestionList[state.paletteCursor % suggestionList.length];
+      state.promptText = sel.usage.replace(/^>/, "").trim();
+      render();
+      focusPrompt();
     }
   });
 
-  return el("div", { class: "prompt-container" }, [
-    el("div", { class: "prompt-controls" }, [
-      modeSelector,
-      targetSelector,
-      el("span", { style: "font-size:11px; color:var(--text-muted);" }, "Press Enter to submit"),
-    ]),
-    el("div", { class: "prompt-input-wrapper" }, [ta, sendBtn]),
+  const subs = state.snapshot.subagents || [];
+  const anyLive = subs.some((s) => s.live);
+  const targetSelect = el("select", { class: "target-select", title: "message target — auto-follows the live agent unless you pick one", onchange: (e) => { state.targetAgentId = e.target.value; state.targetAgentManual = true; render(); } }, [
+    el("option", { value: "main", selected: ((!state.targetAgentManual && anyLive) || state.targetAgentId === "main") ? "selected" : null }, anyLive ? "🤖 main (live)" : "🤖 main"),
+    ...subs.map((s) => el("option", { value: s.id, selected: (state.targetAgentManual && state.targetAgentId === s.id) ? "selected" : null }, `${s.live ? "● " : ""}${s.id}`)),
+  ]);
+  const row = el("div", { class: "cmd-buttons" }, [
+    targetSelect,
+    modeChip("msg_agent", "A", "💬 ", "message agent"),
+    modeChip("command", "⌥", ">", "command mode"),
+    modeChip("amend", "m", "✏️ ", "amend contract (whole run)"),
+    modeChip("reopen", "r", "🔁 ", "reopen node (repair)"),
+  ]);
+
+  return el("div", { class: "cmdbar" }, [
+    row,
+    el("div", { class: "cmd-row" }, [textEl]),
+    suggestionList ? el("div", { class: "cmd-suggestions" }, suggestionList) : null,
   ]);
 }
 
-async function handlePromptSubmit() {
-  const text = state.promptText.trim();
+async function handlePromptSubmit(e) {
+  const mode = state.promptMode;
+  const raw = state.promptText;
+  const text = raw.trim();
   if (!text) return;
-
-  if (state.promptMode === "amend") {
-    await apiPost("/api/amend", { text, reason: "web amendment" });
-    state.promptText = "";
-    showToast("Contract amendment queued");
-    fetchWorkbenchData("contract");
-  } else if (state.promptMode === "reopen") {
-    const parts = text.split(" ");
-    const nodeId = parts[0];
-    const defect = parts.slice(1).join(" ") || "Defect requested via prompt";
-    await apiPost("/api/reopen", { node_id: nodeId, defect });
-    state.promptText = "";
-    showToast(`Reopen requested for node ${nodeId}`);
-  } else if (state.promptMode === "msg_agent") {
-    const targetId = state.targetAgentId || "main";
-    const subagents = state.snapshot.subagents || [];
-    const targetIsLive = targetId === "main" ? subagents.some((s) => s.live) : !!subagents.find((s) => s.id === targetId && s.live);
-    if (!targetIsLive) {
-      // The Send button/textarea are already disabled for this case, but
-      // Enter-to-submit bypasses that (its keydown handler doesn't check
-      // `disabled`) -- catch it here too instead of firing a POST that
-      // can only 409 with "no live session found for this node".
-      showToast(`${targetId === "main" ? "No agent" : targetId} is not currently running -- nothing to message`, true);
+  if (mode === "command" && text.startsWith(">")) {
+    const q = text.slice(1).trim();
+    const suggestions = commandSuggestions();
+    const exact = suggestions.find((s) => s.key === q || s.trigger === q);
+    if (exact) { state.promptMode = "msg_agent"; state.promptText = ""; render(); await guarded(exact.run); return; }
+    const match = suggestions.find((s) => s.pattern.test(q));
+    if (match && match.fromQuery) {
+      state.promptMode = "msg_agent"; state.promptText = ""; render();
+      await guarded(() => match.fromQuery(q));
       return;
     }
-    await apiPost(`/api/node/${encodeURIComponent(targetId)}/interject`, { text });
+    state.promptMode = "msg_agent"; state.promptText = ""; render();
+    await guarded(cmdHelp);
+    return;
+  }
+  if (mode === "amend") {
+    const target = state.targetAgentManual ? state.targetAgentId : "main";
+    const c = findCommand("amend");
+    state.promptMode = "msg_agent";
     state.promptText = "";
-    showToast(`Message queued for agent ${targetId}`);
-  } else {
-    const res = await apiPost("/api/runs", { goal: text });
+    render();
+    await guarded(() => c.run(text, target));
+    return;
+  }
+  if (mode === "reopen") {
+    if (!state.selectedNode) { showToast("Open a node first (click one in the tree to reopen it)", true); return; }
+    const c = findCommand("reopen");
+    state.promptMode = "msg_agent";
     state.promptText = "";
-    state.selectedNode = null;
-    state.workbenchTab = "tree";
-    showToast(`Started run ${res.run_id}`);
+    render();
+    await guarded(() => c.run(text, state.selectedNode));
+    return;
+  }
+  // default: message a live agent
+  const target = state.targetAgentManual ? state.targetAgentId : (liveSubId() || "main");
+  state.targetAgentId = target;
+  if (!target) { showToast("No live agent to message", true); return; }
+  state.promptText = "";
+  await guarded(async () => {
+    await apiPost(`/api/node/${encodeURIComponent(target)}/interject`, { content: text });
+    showToast(`message sent to ${target}`);
+    loadThinkingIfNeeded(true);
+  });
+}
+
+function liveSubId() {
+  const subs = state.snapshot.subagents || [];
+  const live = subs.find((s) => s.live);
+  return live ? live.id : null;
+}
+
+/* ------------------------- commands / palette ------------------------- */
+function findCommand(key) {
+  return COMMANDS[key];
+}
+
+let COMMANDS = null;
+
+function _memo(lazy) {
+  if (!COMMANDS) COMMANDS = lazy();
+  return COMMANDS;
+}
+
+async function cmdResume() {
+  const c = COMMANDS && COMMANDS.resume;
+  if (c) await c.run();
+  else if (state.snapshot.attached) await apiPost("/api/halt", { value: false });
+}
+async function cmdHelp() {
+  state.keymapOpen = true;
+  render();
+}
+async function cmdNewRun() {
+  state.newRunOpen = true;
+  render();
+}
+async function cmdRuns() {
+  state.runSwitcherOpen = true;
+  render();
+}
+async function cmdEscalate() {
+  if (confirm("Escalate tier (+1, T3 max)?")) {
+    await apiPost("/api/escalate", {});
+    showToast("Tier escalated");
+  }
+}
+async function cmdTaskTree() {
+  state.workbenchTab = "tree";
+  render();
+}
+async function cmdDoc() {
+  state.workbenchTab = "doc";
+  state.docTab = "contract";
+  fetchWorkbenchData("contract");
+  render();
+}
+async function cmdAsm() {
+  state.workbenchTab = "asm";
+  fetchWorkbenchData("asm");
+  render();
+}
+async function cmdTerm() {
+  state.workbenchTab = "term";
+  fetchWorkbenchData("asm");
+  render();
+}
+async function cmdToggleControl() { /* control flag is server-side */ }
+
+async function _redispatchAction(nodeId) {
+  await apiPost(`/api/node/${encodeURIComponent(nodeId)}/redispatch`, {});
+  showToast("Redispatch approval queued");
+}
+
+function buildCommands() {
+  const commands = {
+    resume: { key: "resume", trigger: "resume", label: "Resume", usage: "> resume", timeout: 20, run: (async () => {
+      if (!state.snapshot.attached) { showToast("No run attached", true); return; }
+      await apiPost("/api/resume", {}).then((d) => showToast(d.status || d.detail || "Resume requested"));
+    }) },
+    "task-tree": { key: "task-tree", trigger: "tree", label: "Task tree", usage: "> tree", timeout: 20, run: cmdTaskTree },
+    doc: { key: "doc", trigger: "doc", label: "Documents", usage: "> doc", timeout: 20, run: cmdDoc },
+    asm: { key: "asm", trigger: "asm", label: "assembly", usage: "> asm", timeout: 20, run: cmdAsm },
+    term: { key: "term", trigger: "term", label: "Terminal", usage: "> term", timeout: 20, run: cmdTerm },
+    new: { key: "new", trigger: "new", label: "New run", usage: "> new", timeout: 20, run: cmdNewRun },
+    runs: { key: "runs", trigger: "runs", label: "Switch run", usage: "> runs", timeout: 20, run: cmdRuns },
+    escalate: { key: "escalate", trigger: "esc", label: "Escalate tier", usage: "> escalate", timeout: 20, run: cmdEscalate },
+    help: { key: "help", trigger: "help", label: "Keyboard shortcuts", usage: "> help", timeout: 20, run: cmdHelp },
+    amend: { key: "amend", trigger: "amend", label: "Amend contract", usage: "> amend <rule> [node]", timeout: 20, run: async (text) => {
+      if (!state.snapshot.attached) { showToast("No run attached", true); return; }
+      if (!text) { showToast("amend requires a rule text", true); return; }
+      const split = text.split(/\s+/);
+      const rule = split.slice(0, 3).join(" ");
+      const nodeArg = split[3] ? split.slice(3).join(" ") : "";
+      const target = state.targetAgentManual ? state.targetAgentId : "main";
+      const resp = await apiPost("/api/amend", { text: rule + (nodeArg ? " " + nodeArg : ""), reason: "web amendment", target });
+      showToast(resp.detail || "Contract amendment queued");
+    } },
+    reopen: { key: "reopen", trigger: "reopen", label: "Reopen node", usage: "> reopen <reason> <node>", timeout: 20, run: async (text) => {
+      if (!state.snapshot.attached) { showToast("No run attached", true); return; }
+      const split = text.split(/\s+/);
+      const maybeNode = split[split.length - 1] || "";
+      const isTreeNode = maybeNode && (state.snapshot.tree || []).some((n) => n && n.id === maybeNode);
+      const nodeArg = isTreeNode ? maybeNode : state.selectedNode;
+      const reason = isTreeNode ? split.slice(0, -1).join(" ") : text;
+      if (!nodeArg) { showToast("reopen needs a node id (select a node first)", true); return; }
+      await apiPost("/api/reopen", { node_id: nodeArg, defect: reason, is_manual: true });
+      showToast("Node reopened");
+    } },
+    interject: { key: "interject", trigger: "interject", label: "Message agent", usage: "> interject <text> or just type below", timeout: 20, run: async (text) => {
+      const target = state.targetAgentManual ? state.targetAgentId : (liveSubId() || "main");
+      if (!target) { showToast("No live agent", true); return; }
+      await apiPost(`/api/node/${encodeURIComponent(target)}/interject`, { content: text });
+      showToast("Message sent");
+      loadThinkingIfNeeded(true);
+    } },
+    redispatch: { key: "redispatch", trigger: "redispatch", label: "Restart agent", usage: "> redispatch <node>", timeout: 20, run: async (text) => {
+      const nodeArg = text || state.selectedNode;
+      if (!nodeArg) { showToast("redispatch needs a node", true); return; }
+      await _redispatchAction(nodeArg);
+    } },
+  };
+  // fromQuery: pattern-matching for `>` queries
+  for (const [key, c] of Object.entries(commands)) {
+    c.key = key;
+    c.pattern = new RegExp("^" + (c.trigger || key) + "(\\s+|$)");
+    c.fromQuery = c.run;
+  }
+  return commands;
+}
+
+async function runCommand(c) {
+  await guarded(() => c.run());
+}
+
+function commandSuggestions() {
+  const cmds = _memo(buildCommands);
+  const q = state.promptText.replace(/^\s*>/, "").trim();
+  const list = Object.values(cmds);
+  if (!q) return list.map((c) => suggestionRow(c));
+  const matches = list.filter((c) => c.usage.includes(q) || (c.label || "").toLowerCase().includes(q.toLowerCase()) || (c.trigger || "").startsWith(q));
+  const out = matches.length ? matches : list;
+  return out.slice(0, 8).map((c) => suggestionRow(c));
+}
+
+function suggestionRow(c) {
+  return el("div", { class: "cmd-suggestion", onclick: () => { state.promptMode = "msg_agent"; state.promptText = c.usage.replace(/^>/, "").trim(); render(); focusPrompt(); } }, [
+    el("span", { class: "sug-usage" }, c.usage),
+    el("span", { class: "sug-timeout" }, `timeout ${c.timeout}s`),
+  ]);
+}
+
+function renderPalette() {
+  if (!state.paletteOpen) return null;
+  const cmds = _memo(buildCommands);
+  const q = state.paletteQuery.replace(/^\s*>/, "").trim();
+  const list = Object.values(cmds);
+  const matches = q ? list.filter((c) => c.usage.includes(q)) : list;
+  const rows = matches.slice(0, 12).map((c, i) => el("div", { class: "pal-row" + (i === state.paletteCursor ? " active" : ""), onclick: () => { state.paletteOpen = false; state.paletteQuery = ""; render(); runCommand(c); } }, [
+    el("span", { class: "pal-usage" }, c.usage),
+    el("span", { class: "pal-timeout" }, `${c.timeout}s`),
+  ]));
+  const input = el("input", { "data-key": "paletteQuery", placeholder: "filter commands…", style: "width:100%" });
+  input.value = state.paletteQuery;
+  input.addEventListener("input", () => { state.paletteQuery = input.value; render(); });
+  return el("div", { class: "overlay", onclick: (e) => { if (e.target === e.currentTarget) closePalette(); } }, [
+    el("div", { class: "panel palette-panel" }, [
+      el("div", { class: "panel-hdr" }, "Commands"),
+      el("div", { class: "panel-body" }, [input, el("div", { class: "pal-list" }, rows)]),
+      el("div", { class: "panel-foot dim" }, "↑/↓ move · ↵ run · esc close"),
+    ]),
+  ]);
+}
+
+function renderKeymap() {
+  if (!state.keymapOpen) return null;
+  const groups = [
+    { title: "Global", keys: [["ctrl/cmd+K", "command palette"], ["g then r / p / t / a", "reopen / pilot / tree / approve (g-key prefixes)"], ["esc", "close palette/menu/takeover/prompt-mode"], ["?  or  >help", "this"] ] },
+    { title: "Focus move", keys: [["⌘+1..9", "workbench tabs 1-8 (click area first)"], ["⌘+L", "command bar"], ["ctrl+]  /  [", "cycle workbench tabs"], ["j / k", "move in task tree"], ["h / l", "tree row: collapse/expand"], ["Enter", "open focused tree row"]] },
+    { title: "Run", keys: [["g r", "reopen selected node"], ["g t", "workbench tree tab"], ["g p", "cycle doc tabs"], ["g a", "approve (first option)"] ] },
+  ];
+  const rows = groups.map((g) => el("section", { class: "keymap-group" }, [
+    el("div", { class: "nav-title", style: "padding:6px 10px; color:var(--text-muted); font-weight:700; font-size:11px;" }, g.title.toUpperCase()),
+    g.keys.map(([k, v]) => el("div", { class: "key-row" }, [el("span", { class: "keycap" }, k), el("span", { class: "key-desc" }, v)])),
+  ]));
+  return el("div", { class: "overlay", onclick: (e) => { if (e.target === e.currentTarget) { state.keymapOpen = false; render(); } } }, [
+    el("div", { class: "panel keymap-panel" }, [
+      el("div", { class: "panel-hdr" }, "Keyboard shortcuts"),
+      el("div", { class: "panel-body" }, rows),
+      el("div", { class: "panel-foot" }, el("button", { onclick: () => { state.keymapOpen = false; render(); } }, "Close")),
+    ]),
+  ]);
+}
+
+/* ------------------------- key handling ------------------------- */
+const NAV_KEYS = new Set(["ctrl+]", "ctrl+[", "⌘+1", "⌘+2", "⌘+3", "⌘+4", "⌘+5", "⌘+6", "⌘+7", "⌘+8", "⌘+9", "⌘+0"]);
+
+function isLive(nodeId) {
+  if (nodeId === "main") return false;
+  const s = state.snapshot.subagents || [];
+  const match = s.find((x) => x.id === nodeId);
+  return match ? !!(match.live) : false;
+}
+
+function loadThinkingIfNeeded(force) {
+  if (!state.nodeDetail) return;
+  const nodeId = state.selectedNode;
+  if (!nodeId) return;
+  if (state.nodeThinking && !force) return;
+  apiGet(`/api/node/${encodeURIComponent(nodeId)}/thinking`)
+    .then((d) => { state.nodeThinking = d; render(); })
+    .catch(() => { state.nodeThinking = { entries: [] }; render(); });
+}
+
+function currentDocTab() {
+  return state.docTab || "contract";
+}
+
+function cycleInspectorDir(dir) {
+  const tabs = ["tree", "doc", "asm", "term", "node"];
+  const idx = tabs.indexOf(state.workbenchTab);
+  state.workbenchTab = tabs[(idx + dir + tabs.length) % tabs.length];
+  if (state.workbenchTab === "doc") state.docTab = "contract";
+  if (state.workbenchTab === "asm" || state.workbenchTab === "term") fetchWorkbenchData("asm");
+  render();
+}
+
+function focusPrompt() {
+  const el2 = document.querySelector("[data-key=promptText]");
+  if (el2) {
+    el2.focus();
+    try { el2.setSelectionRange(el2.value.length, el2.value.length); } catch (e) {}
   }
 }
 
-// ---------------------------------------------------------------------
-// Right Workbench Component (Code, Spec, Logs, Assembly)
-// ---------------------------------------------------------------------
-function renderRightWorkbench() {
-  const wbTabs = [
-    ["tree", "🌳 Task Tree"],
-    ["agent", "🤖 Agent"],
-    ["code", "💻 Code & Artifacts"],
-    ["contract", "📜 Contract"],
-    ["spec", "📋 Spec"],
-    ["spine", "🦴 Spine"],
-    ["assembly", "🧩 Assembly"],
-    ["terminal", "🖥️ Events Log"],
-  ];
+function closePalette() {
+  state.paletteOpen = false;
+  state.paletteQuery = "";
+  render();
+}
 
-  const header = el("div", { class: "workbench-tabs" }, wbTabs.map(([id, label]) =>
-    el("div", {
-      class: "wb-tab" + (state.workbenchTab === id ? " active" : ""),
-      onclick: () => { state.workbenchTab = id; fetchWorkbenchData(id); render(); },
-    }, label)
-  ));
+function onGlobalKey(e) {
+  if (!state.snapshot.attached) {
+    if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === "k") { e.preventDefault(); state.paletteOpen = true; state.paletteCursor = 0; render(); }
+    return;
+  }
+  const k = e.key.toLowerCase();
+  const isTyping = ["INPUT", "TEXTAREA"].includes((document.activeElement || {}).tagName);
 
-  let body = null;
-  const snap = state.snapshot;
+  if ((e.metaKey || e.ctrlKey) && k === "k") {
+    e.preventDefault();
+    state.paletteOpen = true;
+    state.paletteCursor = 0;
+    state.paletteQuery = "";
+    render();
+    return;
+  }
+  if (isTyping) return;
 
-  if (state.workbenchTab === "code") {
-    body = el("div", { class: "code-container" }, [
-      el("div", { class: "code-header" }, [
-        el("span", null, state.nodeDetail ? `Node Artifact: ${state.nodeDetail.id}` : "Assembled Output"),
-        el("button", { class: "icon-btn", onclick: () => navigator.clipboard.writeText((state.nodeDetail && state.nodeDetail.artifact) || (state.assembly && state.assembly.output) || "") }, "📋 Copy"),
-      ]),
-      el("pre", { class: "blob" }, (state.nodeDetail && state.nodeDetail.artifact) || (state.assembly && state.assembly.output) || "(No active artifact selected. Click a node in the Task Tree tab to view it.)"),
-    ]);
-  } else if (state.workbenchTab === "tree") {
-    body = renderTaskTreeTab();
-  } else if (state.workbenchTab === "agent") {
-    body = renderAgentTab();
-  } else if (state.workbenchTab === "contract") {
-    body = el("pre", { class: "blob" }, state.contractText || "(No contract frozen yet)");
-  } else if (state.workbenchTab === "spec") {
-    body = el("pre", { class: "blob" }, state.specText || "(No spec generated yet)");
-  } else if (state.workbenchTab === "spine") {
-    body = el("pre", { class: "blob" }, state.spineText || "(No spine generated yet)");
-  } else if (state.workbenchTab === "assembly") {
-    const a = state.assembly || {};
-    body = el("div", null, [
-      el("h3", { style: "color:var(--text-bright); margin-bottom:8px;" }, "Compilation & Cross-Checks"),
-      a.checks && Object.keys(a.checks).length ? el("pre", { class: "blob" }, JSON.stringify(a.checks, null, 2)) : null,
-      el("pre", { class: "blob" }, a.compile_log || "(No compile logs available)"),
-      el("h3", { style: "color:var(--text-bright); margin-top:16px; margin-bottom:8px;" }, "Assembly Output"),
-      el("pre", { class: "blob" }, a.output || "(Not assembled yet)"),
-    ]);
-  } else if (state.workbenchTab === "terminal") {
-    const events = (snap.events || []).slice().reverse();
-    body = el("table", { class: "tree" }, [
-      el("thead", null, el("tr", null, ["Time", "Node", "Type / Description"].map((h) => el("th", null, h)))),
-      el("tbody", null, events.map((e) => el("tr", null, [
-        el("td", { style: "font-family:var(--font-mono); font-size:11px;" }, fmtTime(e.ts)),
-        el("td", null, e.node_id || "-"),
-        el("td", null, `${e.type} ${e.phase ? `[${e.phase}]` : ""} ${e.status || ""}`),
-      ]))),
-    ]);
+  if (e.key === "Escape") {
+    if (state.contextMenu) { state.contextMenu = null; render(); return; }
+    if (state.runSwitcherOpen) { state.runSwitcherOpen = false; render(); return; }
+    if (state.paletteOpen) { closePalette(); return; }
+    if (state.keymapOpen) { state.keymapOpen = false; render(); return; }
+    if (state.approvalTakeover) {
+      const a = (state.snapshot.pending_approvals || [])[0];
+      if (a) dismissTakeover(a);
+      return;
+    }
+    if (state.promptMode !== "msg_agent") { state.promptMode = "msg_agent"; render(); return; }
+    if (state.newRunOpen) { state.newRunOpen = false; render(); return; }
+    if (state.workbenchTab !== "tree") { state.workbenchTab = "tree"; render(); }
+    return;
+  }
+  if (k === "?") { state.keymapOpen = true; render(); return; }
+  if ((e.ctrlKey || e.metaKey) && k === "]") { cycleInspectorDir(1); return; }
+  if ((e.ctrlKey || e.metaKey) && k === "[") { cycleInspectorDir(-1); return; }
+  if (k === "g" && !e.metaKey && !e.ctrlKey) {
+    state.gPrefix = true;
+    setTimeout(() => { state.gPrefix = false; }, 1200);
+    render();
+    return;
+  }
+  if (state.gPrefix) {
+    const p = k;
+    state.gPrefix = false;
+    if (p === "r" && state.selectedNode) { state.promptMode = "reopen"; render(); focusPrompt(); return; }
+    if (p === "t") { state.workbenchTab = "tree"; render(); return; }
+    if (p === "p") { cycleDocTab(); render(); return; }
+    if (p === "a" && (state.snapshot.pending_approvals || []).length) { return; }
+    render();
+    return;
+  }
+  if (state.paletteOpen) {
+    if (k === "arrowdown") { state.paletteCursor = (state.paletteCursor + 1) % 12; render(); return; }
+    if (k === "arrowup") { state.paletteCursor = (state.paletteCursor + 11) % 12; render(); return; }
+    if (e.key === "Enter") {
+      const cmds = _memo(buildCommands);
+      let i = 0;
+      const list = Object.values(cmds).filter((c) => state.paletteQuery ? c.usage.includes(state.paletteQuery) : true);
+      const c = list[state.paletteCursor] || list[0];
+      if (c) { closePalette(); runCommand(c); }
+      return;
+    }
+  }
+  if (state.contextMenu) {
+    if (k === "arrowdown") { state.contextMenu.y += 20; render(); return; }
+    if (k === "arrowup") { state.contextMenu.y -= 20; render(); return; }
+    return;
   }
 
-  return el("section", { class: "workbench-panel" }, [header, el("div", { class: "workbench-content" }, body)]);
+  if (state.approvalTakeover && (state.snapshot.pending_approvals || []).length) {
+    const a = state.snapshot.pending_approvals[0];
+    if (k >= "1" && k <= "9") {
+      const opt = (a.options || [])[Number(k) - 1];
+      if (opt) { guarded(() => apiPost(`/api/approvals/${encodeURIComponent(a.approval_id)}/resolve`, { action: opt.value }).then(() => showToast("Approval resolved"))); }
+      return;
+    }
+    if (e.key === "Enter" && (a.options || []).length) {
+      const opt = a.options[0];
+      guarded(() => apiPost(`/api/approvals/${encodeURIComponent(a.approval_id)}/resolve`, { action: opt.value }).then(() => showToast("Approval resolved")));
+      return;
+    }
+  }
+
+  // j/k move + Enter open, scoped to the task tree's visible rows.
+  if (!isTyping && state.workbenchTab === "tree" && (k === "j" || k === "k" || e.key === "Enter")) {
+    const list = state.treeCursorList || [];
+    if (!list.length) return;
+    if (k === "j" || k === "k") {
+      const idx = list.indexOf(state.treeCursor);
+      const next = Math.min(list.length - 1, Math.max(0, idx + (k === "j" ? 1 : -1)));
+      state.treeCursor = list[next];
+      render();
+      return;
+    }
+    if (e.key === "Enter" && state.treeCursor) {
+      const entry = buildNodeTreeIndex().index[state.treeCursor];
+      if (entry && entry.node) { openNode(state.treeCursor, "overview"); return; }
+      if (entry) { state.treeCollapsed[state.treeCursor] = !state.treeCollapsed[state.treeCursor]; render(); return; }
+    }
+  }
+}
+/* ========================= PART D ========================= */
+
+const WORKBENCH_TABS = [
+  { id: "tree", glyph: "⊞", label: "TASK TREE" },
+  { id: "node", glyph: "◆", label: "NODE" },
+  { id: "doc", glyph: "☰", label: "DOC" },
+  { id: "asm", glyph: "▤", label: "ASM" },
+  { id: "term", glyph: "⌁", label: "TERM" },
+];
+
+function attachRun(runId) {
+  apiPost("/api/attach", { run_id: runId })
+    .then(() => {
+      state.selectedNode = null;
+      state.workbenchTab = "tree";
+      state.approvalTakeover = true;
+      state.takeoverFor = "";
+      state.treeFilter = "";
+      state.treeCursor = null;
+      apiGet("/api/snapshot").then(applySnapshot).catch(() => {});
+    })
+    .catch((err) => showToast(String(err.message || err), true));
+}
+
+function deleteRun(runId) {
+  apiPost("/api/runs/delete", { run_id: runId })
+    .then(() => apiGet("/api/snapshot").then(applySnapshot).catch(() => {}))
+    .catch((err) => showToast(String(err.message || err), true));
+}
+
+function openRunMenu(e, runId) {
+  e.preventDefault();
+  state.contextMenu = { x: e.clientX, y: e.clientY, runId };
+  render();
+}
+
+function renderContextMenu() {
+  if (!state.contextMenu) return null;
+  const m = state.contextMenu;
+  const items = [];
+  if (m.runId !== undefined) {
+    items.push(el("div", { class: "ctx-item", onclick: () => { state.contextMenu = null; attachRun(m.runId); render(); } }, "attach"));
+    items.push(el("div", { class: "ctx-item danger", onclick: () => { state.contextMenu = null; render(); if (confirm(`Delete run ${m.runId}?`)) deleteRun(m.runId); } }, "delete run"));
+  } else if (m.nodeId !== undefined) {
+    items.push(el("div", { class: "ctx-item", onclick: () => { state.contextMenu = null; openNode(m.nodeId, "overview"); render(); } }, "node overview"));
+    items.push(el("div", { class: "ctx-item", onclick: () => { state.contextMenu = null; openReopen(m.nodeId); render(); } }, "reopen (repair)"));
+    items.push(el("div", { class: "ctx-item", onclick: () => { state.contextMenu = null; render(); guarded(() => apiPost(`/api/node/${encodeURIComponent(m.nodeId)}/redispatch`, {}).then(() => showToast("Redispatch approval queued"))); } }, "redispatch"));
+    items.push(el("div", { class: "ctx-item", onclick: () => { state.contextMenu = null; render(); navigator.clipboard && navigator.clipboard.writeText(m.nodeId).then(() => showToast("copied id")); } }, "copy id"));
+  }
+  return el("div", { class: "overlay ctx-overlay", onclick: () => { state.contextMenu = null; render(); } }, [
+    el("div", { class: "ctx-menu", style: `left:${m.x}px; top:${m.y}px;` }, items),
+  ]);
+}
+
+function cycleDocTab() {
+  const order = ["contract", "spec", "spine", "manifest"];
+  const i = order.indexOf(state.docTab || "contract");
+  state.docTab = order[(i + 1) % order.length];
+  fetchWorkbenchData(state.docTab);
+}
+
+function isPreviewTab(t) {
+  return ["tree", "doc", "asm", "term"].includes(state.workbenchTab) && !["overview", "artifact", "gates", "diff", "versions", "chat"].includes(t);
 }
 
 function fetchWorkbenchData(id) {
-  if (!state.snapshot.attached) return;
-  if (id === "contract") apiGet("/api/contract").then((d) => { state.contractText = d.text; render(); }).catch(() => {});
-  if (id === "spec") apiGet("/api/spec").then((d) => { state.specText = d.text; render(); }).catch(() => {});
-  if (id === "spine") apiGet("/api/spine").then((d) => { state.spineText = d.text; render(); }).catch(() => {});
-  if (id === "assembly") apiGet("/api/assembly").then((d) => { state.assembly = d; render(); }).catch(() => {});
+  if (id === "contract") apiGet("/api/contract").then((d) => { state.contractData = d; render(); }).catch(() => {});
+  if (id === "spec") apiGet("/api/spec").then((d) => { state.specText = d.text || ""; render(); }).catch(() => {});
+  if (id === "spine") apiGet("/api/spine").then((d) => { state.spineText = d.text || ""; render(); }).catch(() => {});
+  if (id === "manifest") apiGet("/api/manifest").then((d) => { state.manifestLines = d.lines || []; render(); }).catch(() => {});
+  if (id === "asm") apiGet("/api/assembly").then((d) => { state.assembly = d; render(); }).catch(() => {});
 }
 
-// ---------------------------------------------------------------------
-// Node / Subagent Detail Drawer
-// ---------------------------------------------------------------------
-function openNode(id, tab) {
-  state.selectedNode = id;
-  state.nodeDetail = null;
-  state.nodeSubagent = null;
-  state.nodeDiff = null;
-  state.nodeThinking = null;
-  state.nodeDetailLoading = true;
-  state.agentTab = tab || "overview";
-  state.artifactsDetail = null;
-  state.selectedArtifactTag = undefined;
-  state.selectedArtifactText = null;
-  state.workbenchTab = "agent"; // every detail view opens on the right, never a floating overlay
+function loadArtifactsIfNeeded() {
+  if (state.artifactsDetail || !state.nodeDetail) return;
+  const id = state.selectedNode;
+  if (!id) return;
+  apiGet(`/api/node/${encodeURIComponent(id)}/artifact`)
+    .then((d) => { state.artifactsDetail = { tag: "current", text: d.text || "" }; render(); })
+    .catch(() => {});
+}
+
+function openReopen(nodeId) {
+  state.selectedNode = nodeId;
+  state.workbenchTab = "node";
+  state.agentTab = "overview";
+  state.promptMode = "reopen";
+  loadNodeDetail(nodeId);
   render();
-  apiGet(`/api/node/${encodeURIComponent(id)}`)
-    .then((d) => { state.nodeDetail = d; state.nodeDetailLoading = false; render(); })
-    .catch(() => {
-      state.nodeSubagent = (state.snapshot.subagents || []).find((s) => s.id === id) || null;
-      state.nodeDetailLoading = false;
-      render();
-    });
+}
+
+function openNode(id, subTab) {
+  state.selectedNode = id;
+  state.workbenchTab = "node";
+  if (subTab) state.agentTab = subTab;
+  loadNodeDetail(id);
+  if (subTab === "chat" || state.agentTab === "chat") loadThinkingIfNeeded(true);
+  render();
 }
 
 function closeNode() {
   state.selectedNode = null;
   state.nodeDetail = null;
-  state.nodeSubagent = null;
-  state.workbenchTab = "tree"; // Task Tree is the default/resting view of the right column
+  state.agentTab = "overview";
+  state.workbenchTab = "tree";
   render();
 }
 
-// A repair/research subagent's derived id ("<node>~repair1", "<node>~research~slug")
-// doesn't own its own artifact -- repairs land on the same real out/<node>.md
-// as their parent tree node once they pass, and pre-repair snapshots live
-// under out/.versions/<node>/ keyed by that same parent id. So "this agent's
-// artifacts" always resolves through the owning tree node's id.
-function artifactsOwnerId(id) {
-  const idx = (id || "").indexOf("~");
-  return idx === -1 ? id : id.slice(0, idx);
-}
-
-function isLive(id) {
-  const sub = liveMap()[id];
-  return !!(sub && sub.live);
-}
-
-function loadDiffIfNeeded() {
-  if (state.nodeDiff !== null) return;
-  const id = state.selectedNode;
-  const versions = (state.nodeDetail && state.nodeDetail.versions) || [];
-  if (!versions.length) {
-    state.nodeDiff = [];
-    render();
-    return;
-  }
-  state.nodeDiff = "loading";
-  render();
-  Promise.all(
-    versions.slice().reverse().map((tag) =>
-      apiGet(`/api/node/${encodeURIComponent(id)}/diff/${encodeURIComponent(tag)}`).then((d) => ({ tag, lines: d.lines }))
-    )
-  ).then((results) => { state.nodeDiff = results; render(); }).catch(() => { state.nodeDiff = []; render(); });
-}
-
-function loadThinkingIfNeeded(force = false) {
-  if (state.nodeThinking !== null && !force && state.nodeThinking !== "loading") return;
-  const id = state.selectedNode;
+function loadNodeDetail(id) {
   if (!id) return;
-  if (state.nodeThinking === null) state.nodeThinking = "loading";
-  apiGet(`/api/node/${encodeURIComponent(id)}/thinking`)
-    .then((d) => { state.nodeThinking = d.entries || []; render(); })
-    .catch(() => { if (state.nodeThinking === "loading") state.nodeThinking = []; });
+  state.nodeDetailLoading = true;
+  render();
+  apiGet(`/api/node/${encodeURIComponent(id)}`)
+    .then((d) => {
+      state.nodeDetail = d;
+      state.nodeDetailLoading = false;
+      if (state.agentTab === "artifact" || state.agentTab === "versions") loadArtifactsIfNeeded();
+      render();
+    })
+    .catch((err) => {
+      state.nodeDetailLoading = false;
+      showToast(String(err.message || err), true);
+      render();
+    });
 }
+
+function renderRightWorkbench() {
+  const tab = state.workbenchTab;
+  const tabs = WORKBENCH_TABS.map((t) =>
+    el("button", {
+      class: "wb-tab" + (tab === t.id ? " active" : ""),
+      title: `${t.glyph} ${t.label}${t.id === "node" && state.selectedNode ? " — " + state.selectedNode : ""}`,
+      onclick: () => {
+        state.workbenchTab = t.id;
+        if (t.id === "doc") fetchWorkbenchData(state.docTab || "contract");
+        if (t.id === "asm" || t.id === "term") fetchWorkbenchData("asm");
+        if (t.id === "tree") { state.treeFilter = ""; state.treeCursor = null; }
+        render();
+      },
+    }, [el("span", { class: "wb-glyph" }, t.glyph), el("span", { class: "wb-label" }, t.label)])
+  );
+  let body;
+  const pendingPilot = (state.snapshot.pending_approvals || []).find((x) => x.kind === "pilot");
+  if (state.approvalTakeover && pendingPilot && state.snapshot.control_enabled) {
+    const pid = pendingPilot.context && pendingPilot.context.node_id;
+    body = pid ? renderTakeoverPilot(pid) : renderApprovalEntry(pendingPilot, state.snapshot, true);
+  } else if (tab === "tree") body = renderTaskTreeTab();
+  else if (tab === "node") body = state.selectedNode ? renderAgentTab() : el("div", { class: "placeholder" }, "◆ select a node — tasks on the left, artifacts for repairs behind ◆ click through or press ↑/↓ + enter");
+  else if (tab === "doc") body = renderDocTab();
+  else if (tab === "asm") body = renderAsmTab();
+  else if (tab === "term") body = renderTermTab();
+  return el("div", { class: "workbench-panel" }, [
+    el("div", { class: "workbench-tabs", ref: null }, tabs),
+    el("div", { class: "workbench-content" }, body),
+  ]);
+}
+
+/* ------------------------- node sub-tabs ------------------------- */
 
 function renderOverview() {
   const d = state.nodeDetail;
-  if (d) {
-    const parts = [
-      el("div", { style: "display:flex; gap:12px; align-items:center; margin-bottom:12px;" }, [
-        badge(d.status),
-        el("span", null, `shape: ${d.shape || "-"}`),
-        el("span", null, `attempts: ${d.attempts}`),
-      ]),
-    ];
-    if (d.brief) parts.push(el("p", { style: "margin-bottom:12px;" }, d.brief));
-
-    parts.push(el("h4", { class: "detail-h" }, "Gates"));
-    const gateResults = d.gate_results || [];
-    if (gateResults.length) {
-      parts.push(el("ul", { class: "gate-list" }, gateResults.map((g) =>
-        el("li", { class: g.passed ? "gate-pass" : "gate-fail" }, `${g.passed ? "✓" : "✗"} ${g.gate}${g.detail ? " — " + g.detail : ""}`)
-      )));
-    } else {
-      parts.push(el("div", { class: "dim" }, "(none)"));
-    }
-
-    if (d.judgment && d.judgment.length) {
-      parts.push(el("h4", { class: "detail-h" }, "Judgment"));
-      parts.push(el("ul", { class: "gate-list" }, d.judgment.map((jid) =>
-        el("li", null, `${jid}: ${(d.rubric || {})[jid] || ""}`)
-      )));
-    }
-
-    if (d.manifest) {
-      parts.push(el("h4", { class: "detail-h" }, "Reviewer verdict"));
-      parts.push(el("div", null, String(d.manifest.verdict || d.manifest.gates || "")));
-      if (d.manifest.promotion) {
-        parts.push(el("div", { style: "margin-top:6px;" }, [el("b", null, "promotion: "), d.manifest.promotion]));
-      }
-    }
-
-    if (d.inputs && d.inputs.length) {
-      parts.push(el("h4", { class: "detail-h" }, "Inputs"));
-      parts.push(el("ul", { class: "gate-list" }, d.inputs.map((item) =>
-        el("li", { class: item.exists ? "gate-pass" : "gate-fail" }, `${item.exists ? "✓" : "✗"} ${item.ref} (${item.tokens || 0} tok)`)
-      )));
-    }
-
-    if (d.depends_on && d.depends_on.length) {
-      parts.push(el("div", { style: "margin-top:8px;" }, [el("b", null, "depends on: "), d.depends_on.join(", ")]));
-    }
-    parts.push(el("div", { style: "margin-top:8px; color:var(--text-muted); font-size:11px;" }, [
-      `budget: ${(d.budget || {}).tokens} tokens, ${(d.budget || {}).calls} calls · artifact tokens: ${d.artifact_tokens || 0}`,
-      d.versions && d.versions.length ? ` · versions: ${d.versions.join(", ")}` : "",
-    ].join("")));
-    return el("div", null, parts);
-  }
-
-  const s = state.nodeSubagent;
-  if (!s) return el("div", { class: "empty-state" }, "(no record yet for this id)");
-  const parts = [
-    el("div", { style: "display:flex; gap:12px; align-items:center; margin-bottom:8px;" }, [badge(s.status), el("span", null, `kind: ${s.kind}`), el("span", null, `role: ${s.role}`)]),
-    el("div", { style: "color:var(--text-muted); font-size:12px;" }, `attempts: ${s.attempts}   duration: ${s.duration_ms || 0}ms`),
+  if (!d) return el("div", { class: "placeholder" }, "loading…");
+  const snap = state.snapshot;
+  const audit = d.audit || {};
+  const items = audit.items || [];
+  const rows = [
+    ["status", el("span", null, [badge(d.status), d.attempts ? el("span", { class: "dim", style: "margin-left:6px;" }, `attempts ${d.attempts}`) : null, d.shape ? el("span", { class: "dim", style: "margin-left:6px;" }, SHAPE2[d.shape] || d.shape) : null])],
+    ["inputs", d.inputs && d.inputs.length ? el("div", {}, d.inputs.map((i) => el("div", { class: "inp" + (i.exists ? "" : " missing"), title: i.ref }, [el("span", { class: "dim" }, i.exists ? "" : "⚠ "), i.ref, el("span", { class: "dim", style: "float:right;" }, `≈${i.tokens}t`)]))) : el("span", { class: "dim" }, "(none)")],
+    ["budget", el("span", null, [`≈${(d.budget && d.budget.tokens) || "?"}t / ${(d.budget && d.budget.calls) || "?"} calls`])],
+    ["contract rubrics", Object.values(d.rubric || {}).length ? el("div", null, Object.values(d.rubric).map((r) => el("div", { class: "rub" }, r))) : el("span", { class: "dim" }, "(none)")],
   ];
-  if (s.live) {
-    parts.push(el("div", { style: "color:var(--accent-amber); margin-top:8px; font-weight:600;" }, "● live — send it a message below"));
-  } else if (s.role === "explorer") {
-    // survey's optional large-corpus explorer subagent (driver.py's
-    // _phase_survey) wraps a plain, non-agentic model call: its status can
-    // say "running" while that call is in flight, but it never has a
-    // gptme session behind it, so it can never be live/messageable --
-    // spell that out instead of leaving "RUNNING" up top contradict a
-    // generic "not currently running" on the message box below.
-    parts.push(el("div", { class: "dim", style: "margin-top:8px;" }, "This step wraps a plain model call, not an interactive session — there's nothing to message, even while its status says \"running.\""));
-  }
-  if (s.error) parts.push(el("div", { style: "color:var(--accent-red); margin-top:8px;" }, `error: ${s.error}`));
-  parts.push(el("div", { class: "dim", style: "margin-top:12px;" }, "Not a tree node — see its parent tree node for artifact/diff history."));
-  return el("div", null, parts);
+  if (d.promotion) rows.push(["promotion", el("div", { class: "promo-text" }, d.promotion)]);
+  if (d.last_defect) rows.push(["last defect", el("div", { class: "dim", style: "color:var(--accent-red);" }, d.last_defect)]);
+  if (d.parent) rows.push(["parent", el("span", { class: "node-link", onclick: () => openNode(d.parent, "overview") }, d.parent)]);
+  const splitNote = d.status === "split" && d.split_proposal
+    ? el("div", { class: "split-card" }, [
+        el("div", { style: "font-weight:700; color:var(--accent-amber);" }, `⑂ split — ${d.split_proposal.reason || "no reason stated"}`),
+        el("div", { class: "dim", style: "font-size:12px;" }, "children: " + ((d.split_proposal.children || []).map((c) => typeof c === "string" ? c : (c && c.id)).filter(Boolean).join(", ") || "none")),
+      ])
+    : null;
+  return el("div", { class: "node-overview" }, [
+    el("div", { class: "ov-brief" }, d.brief || ""),
+    splitNote,
+    ...rows.map(([k, v]) => el("div", { class: "ov-row" }, [el("span", { class: "ov-key" }, k), el("div", { class: "ov-val" }, v)])),
+    el("div", { class: "ov-row" }, [
+      el("span", { class: "ov-key" }, "verdict"),
+      el("div", { class: "ov-val" }, [
+        el("span", { class: audit.verdict === "pass" ? "gate-pass" : "gate-amber" }, audit.verdict || "(no verdict yet)"),
+        audit.truncated ? el("span", { title: "artifact was over the input cap — a group was truncated for review" }, " ⚠ truncated") : null,
+      ]),
+    ]),
+    el("div", { class: "ov-row" }, [
+      el("span", { class: "ov-key" }, "artifact"),
+      el("div", { class: "ov-val" }, [
+        el("span", { class: "dim" }, `≈${d.artifact_tokens || 0}t`),
+        el("button", { class: "btn-tiny", onclick: () => { state.agentTab = "artifact"; loadArtifactsIfNeeded(); render(); } }, "open"),
+      ]),
+    ]),
+  ]);
 }
 
-function renderArtifactTab() {
+function renderGatesTab() {
   const d = state.nodeDetail;
-  if (!d) return el("div", { class: "empty-state" }, "(not a tree node — no standalone artifact)");
-  return el("pre", { class: "blob" }, d.artifact || "(empty)");
-}
-
-// "Artifacts" — every artifact file this agent's owning tree node has ever
-// produced: the current out/<node>.md plus each pre-repair snapshot,
-// picked from a list and viewed right here in the right column.
-function loadArtifactsIfNeeded() {
-  if (state.artifactsDetail !== null) return;
-  const ownerId = artifactsOwnerId(state.selectedNode);
-  state.artifactsDetail = "loading";
-  apiGet(`/api/node/${encodeURIComponent(ownerId)}`)
-    .then((d) => { state.artifactsDetail = d; render(); })
-    .catch(() => { state.artifactsDetail = {}; render(); });
-}
-
-function loadArtifactText(ownerId, tag) {
-  state.selectedArtifactTag = tag;
-  state.selectedArtifactText = "loading";
-  render();
-  const req = tag
-    ? apiGet(`/api/node/${encodeURIComponent(ownerId)}/version/${encodeURIComponent(tag)}`)
-    : apiGet(`/api/node/${encodeURIComponent(ownerId)}/artifact`);
-  req
-    .then((d) => { state.selectedArtifactText = d.text || "(empty)"; render(); })
-    .catch(() => { state.selectedArtifactText = "(failed to load)"; render(); });
-}
-
-function renderArtifactsTab() {
-  loadArtifactsIfNeeded();
-  const d = state.artifactsDetail;
-  if (d === "loading" || d === null) return el("div", { class: "empty-state" }, "Loading artifacts…");
-  const ownerId = artifactsOwnerId(state.selectedNode);
-  const items = [];
-  if (d.artifact) items.push({ tag: null, label: "current", meta: `${d.artifact_tokens || 0} tok` });
-  (d.versions || []).slice().reverse().forEach((v) => items.push({ tag: v, label: v, meta: "pre-repair snapshot" }));
-  if (!items.length) return el("div", { class: "empty-state" }, "(no artifacts generated yet)");
-
-  const list = el("div", { class: "artifacts-list" }, items.map((it) =>
-    el("div", {
-      class: "artifact-item" + (state.selectedArtifactTag === it.tag ? " active" : ""),
-      onclick: () => loadArtifactText(ownerId, it.tag),
-    }, [
-      el("span", null, it.label),
-      el("span", { class: "dim" }, it.meta),
-    ])
-  ));
-  const viewer = el(
-    "div",
-    { class: "artifact-viewer" },
-    state.selectedArtifactTag === undefined
-      ? el("div", { class: "empty-state" }, "Select an artifact on the left to view its content.")
-      : el("pre", { class: "blob" }, state.selectedArtifactText === "loading" ? "Loading…" : state.selectedArtifactText)
-  );
-  return el("div", { class: "artifacts-pane" }, [list, viewer]);
+  if (!d) return el("div", { class: "placeholder" }, "loading…");
+  const gates = d.gate_results || [];
+  const audit = d.audit || {};
+  const items = audit.items || [];
+  const gateRows = gates.length ? gates.map((g, i) => el("div", { class: "gate-row" }, [
+    el("span", { class: g.passed ? "gate-pass" : "gate-fail" }, (g.passed ? "✓" : "✕") + " " + g.gate),
+    el("span", { class: "dim", style: "margin-left:auto;" }, g.detail || ""),
+  ])) : el("div", { class: "dim" }, "(no cached gate results)");
+  const itemRows = items.length ? items.map((it) => el("div", { class: "gate-row" + (it.pass ? "" : " fail-row") }, [
+    el("span", { class: it.pass ? "gate-pass" : "gate-fail" }, it.pass ? "✓" : "✕"),
+    el("span", { class: "item-id" }, it.id),
+    it.node_ids && it.node_ids.length ? el("span", { class: "node-link dim", onclick: () => it.node_ids.length === 1 ? openNode(it.node_ids[0], "overview") : null }, `→ ${it.node_ids.join(", ")}`) : null,
+    el("span", { class: "dim", style: "margin-left:auto; font-size:11px;" }, it.class || ""),
+  ].concat(it.defect ? [el("div", { class: "defect", style: "grid-column:1/-1;" }, it.defect)] : []))) : el("div", { class: "dim" }, "(no review items)");
+  return el("div", { class: "gates-tab" }, [
+    el("div", { class: "sub-hdr" }, "GATES (machine, cached at dispatch)"),
+    ...gateRows,
+    el("div", { class: "sub-hdr", style: "margin-top:14px;" }, "REVIEW ITEMS"),
+    ...itemRows,
+  ]);
 }
 
 function renderDiffTab() {
-  loadDiffIfNeeded();
-  if (state.nodeDiff === "loading" || state.nodeDiff === null) return el("div", { class: "empty-state" }, "Loading diff…");
-  if (!state.nodeDiff.length) return el("div", { class: "empty-state" }, "(no prior versions — nothing to diff yet)");
-  const blocks = state.nodeDiff.map(({ tag, lines }) =>
-    el("div", { class: "diff-block" }, [
-      el("div", { class: "diff-block-title" }, `${tag} → current`),
-      el("pre", { class: "diff-pre" }, lines.map((line) => el("div", { class: `diff-line diff-${line.kind}` }, line.text))),
-    ])
-  );
-  return el("div", null, blocks);
+  const d = state.nodeDiff;
+  if (!d) return el("div", { class: "placeholder" }, "loading diff…");
+  const lines = (d.diff || d.text || "").split("\n");
+  return el("pre", { class: "diff-pre" }, lines.map((l) => el("div", { class: `diff-line diff-${diffLineKind(l)}` }, l)));
 }
 
-// Chat sub-view within the Agent tab -- the same renderAgentChatEntry used
-// by the main chat's live "what's running right now" stream, so an
-// explicitly-opened subagent reads as the same interface as the main
-// agent, just scoped to its own history (loadThinkingIfNeeded keeps this
-// fresh while the opened node is live -- see applySnapshot).
-function renderAgentChatTab() {
-  loadThinkingIfNeeded();
-  const artifactsBar = el("div", { class: "chat-artifacts-bar" }, [
-    el("button", { class: "xs-btn", onclick: () => { state.agentTab = "artifacts"; render(); } }, "📁 Artifacts"),
+function renderVersionsTab() {
+  const d = state.nodeDetail;
+  if (!d) return el("div", { class: "placeholder" }, "loading…");
+  const versions = d.versions || [];
+  const currentBtn = el("button", { class: (state.selectedArtifactTag === undefined ? "v-active" : ""), onclick: () => { state.selectedArtifactTag = undefined; loadArtifactsIfNeeded(); render(); } }, "current");
+  const versionBtns = versions.map((v) => el("button", { class: state.selectedArtifactTag === v ? "v-active" : "", onclick: () => { state.selectedArtifactTag = v; loadArtifactsIfNeeded(); render(); } }, v));
+  const body = state.artifactsDetail ? el("pre", { class: "artifact-pre" }, state.artifactsDetail.text) : el("div", { class: "placeholder" }, "select a version");
+  return el("div", { class: "versions-tab" }, [
+    el("div", { class: "sub-hdr" }, "VERSIONS (pre-repair snapshots)"),
+    el("div", { class: "v-btns" }, [currentBtn, ...versionBtns]),
+    body,
   ]);
-  if (state.nodeThinking === "loading" || state.nodeThinking === null) return el("div", null, [artifactsBar, el("div", { class: "empty-state" }, "Loading chat…")]);
-  if (!state.nodeThinking.length) return el("div", null, [artifactsBar, el("div", { class: "empty-state" }, "(no messages yet)")]);
-  return el("div", null, [artifactsBar, el("div", { class: "agent-chat-log" }, state.nodeThinking.map(renderAgentChatEntry))]);
 }
 
-// The right workbench's Agent tab: a specific node or subagent's full
-// detail (Overview/Artifact/Diff/Chat) plus interject/reopen -- embedded
-// in the workbench instead of a floating overlay, so it opens on the
-// right side alongside Code/Tree/Contract/etc rather than covering the
-// whole screen. Replaces the old renderNodeDrawer.
+function renderArtifactsTab() {
+  const d = state.nodeDetail;
+  if (!d) return el("div", { class: "placeholder" }, "loading…");
+  if (!state.artifactsDetail) return el("div", { class: "placeholder" }, "loading artifact…");
+  return el("pre", { class: "artifact-pre" }, state.artifactsDetail.text);
+}
+
 function renderAgentTab() {
-  if (!state.selectedNode) {
-    return el("div", { class: "empty-state" }, "Select a node from the Task Tree tab, or a subagent from the left sidebar, to open its chat here.");
-  }
   const id = state.selectedNode;
+  const d = state.nodeDetail;
+  const sub = (state.snapshot.subagents || []).find((s) => s.id === id);
+  if (!d && !state.nodeDetailLoading) { loadNodeDetail(id); return el("div", { class: "placeholder" }, "loading…"); }
   const tabs = [
     ["overview", "Overview"],
-    ["artifact", "Artifact"],
-    ["artifacts", "📁 Artifacts"],
-    ["diff", "Diff"],
     ["chat", "Chat"],
+    ["gates", "Gates"],
+    ["artifact", "Artifact"],
+    ["versions", "Versions"],
+    ["diff", "Diff"],
   ];
-
-  const tabBar = el("div", { class: "agent-tabs" }, tabs.map(([tid, label]) =>
-    el("div", { class: "agent-tab" + (state.agentTab === tid ? " active" : ""), onclick: () => { state.agentTab = tid; render(); } }, label)
+  const subBadge = sub ? el("span", { class: "badge", "data-status": sub.status }, sub.status) : null;
+  const liveBadge = sub && sub.live ? el("span", { class: "badge live-badge" }, "● live") : null;
+  const hdr = el("div", { class: "agent-panel-hdr" }, [
+    el("span", { class: "agent-id" }, id),
+    subBadge, liveBadge,
+    el("span", { style: "margin-left:auto;" }, [
+      el("button", { class: "btn-tiny", title: "go back to task tree", onclick: closeNode }, "✕"),
+    ]),
+  ]);
+  const tabBar = el("div", { class: "agent-tabs" }, tabs.map(([k, label]) =>
+    el("button", { class: "agent-tab" + (state.agentTab === k ? " active" : ""), onclick: () => {
+      state.agentTab = k;
+      if (k === "chat") loadThinkingIfNeeded(true);
+      if (k === "artifact" || k === "versions") loadArtifactsIfNeeded();
+      if (k === "diff") apiGet(`/api/node/${encodeURIComponent(id)}/diff/current`).then((r) => { state.nodeDiff = r; render(); }).catch(() => {});
+      render();
+    } }, label)
   ));
-
   let body;
-  if (state.nodeDetailLoading) {
-    body = el("div", { class: "empty-state" }, "Loading…");
-  } else if (state.agentTab === "overview") body = renderOverview();
-  else if (state.agentTab === "artifact") body = renderArtifactTab();
-  else if (state.agentTab === "artifacts") body = renderArtifactsTab();
+  if (state.agentTab === "overview") {
+    const pilotA = (state.snapshot.pending_approvals || []).find((x) => x.kind === "pilot" && (x.context || {}).node_id === id);
+    body = (pilotA && d && d.pilot_original) ? renderPilotEditor() : renderOverview();
+  }
+  else if (state.agentTab === "chat") {
+    const entries = (state.nodeThinking && state.nodeThinking.entries) ? state.nodeThinking.entries : [];
+    body = el("div", { class: "chat-feed node-chat", "data-scroll-key": `node-chat-${id}` }, entries.map(renderAgentChatEntry));
+  } else if (state.agentTab === "gates") body = renderGatesTab();
+  else if (state.agentTab === "artifact") body = renderArtifactsTab();
+  else if (state.agentTab === "versions") body = renderVersionsTab();
   else if (state.agentTab === "diff") body = renderDiffTab();
-  else body = renderAgentChatTab();
+  return el("div", { class: "agent-panel" }, [hdr, tabBar, el("div", { class: "agent-body" }, body)]);
+}
 
-  const live = isLive(id);
-  const isExplorer = !!(state.nodeSubagent && state.nodeSubagent.role === "explorer");
-  const interjectPlaceholder = live
-    ? "Message the running agent…"
-    : isExplorer
-      ? "(this step wraps a plain model call — no interactive session to message)"
-      : "(not currently running)";
-  const interjectInput = el("input", { type: "text", "data-key": `interject-${id}`, placeholder: interjectPlaceholder, disabled: live ? null : "" });
-  interjectInput.value = state.interjectDrafts[id] || "";
-  interjectInput.addEventListener("input", () => { state.interjectDrafts[id] = interjectInput.value; });
-  const interjectBtn = el("button", { class: "primary", disabled: live && !state.busy ? null : "", onclick: () => guarded(async () => {
-    const text = (state.interjectDrafts[id] || "").trim();
-    if (!text) return;
-    const ok = await apiPost(`/api/node/${encodeURIComponent(id)}/interject`, { text }).then(() => true).catch((e) => { showToast(String(e.message || e), true); return false; });
-    if (ok) { state.interjectDrafts[id] = ""; showToast(`queued for ${id}`); }
-  }) }, "Send");
-  interjectInput.addEventListener("keydown", (e) => { if (e.key === "Enter") interjectBtn.click(); });
+/* ------------------------- pilot editor + takeover ------------------------- */
 
-  const reopenable = !!(state.nodeDetail && state.nodeDetail.status === "passed");
-  const reopenInput = el("input", { type: "text", "data-key": `reopen-${id}`, placeholder: reopenable ? "describe what's wrong…" : "(only for passed nodes)", disabled: reopenable ? null : "" });
-  reopenInput.value = state.reopenDrafts[id] || "";
-  reopenInput.addEventListener("input", () => { state.reopenDrafts[id] = reopenInput.value; });
-  const reopenBtn = el("button", { disabled: reopenable && !state.busy ? null : "", onclick: () => guarded(async () => {
-    const text = (state.reopenDrafts[id] || "").trim();
-    if (!text) return;
-    await apiPost("/api/reopen", { node_id: id, defect: text });
-    state.reopenDrafts[id] = "";
-    showToast("reopen queued — approve it in the run stream");
-  }) }, "Reopen");
-  reopenInput.addEventListener("keydown", (e) => { if (e.key === "Enter") reopenBtn.click(); });
-
-  return el("div", { class: "agent-panel" }, [
-    el("div", { class: "agent-panel-hdr" }, [el("h3", null, id), el("button", { class: "xs-btn", onclick: closeNode }, "✕ Close")]),
-    tabBar,
-    el("div", { class: "agent-body" }, body),
-    el("div", { class: "agent-bar" }, [
-      el("label", { class: "bar-label" }, "Message the running agent (mid-episode)"),
-      el("div", { class: "bar-row" }, [interjectInput, interjectBtn]),
+function renderPilotEditor() {
+  const a = (state.snapshot.pending_approvals || []).find((x) => x.kind === "pilot");
+  const d = state.nodeDetail;
+  if (!a || !d || !d.pilot_original) {
+    return el("div", { class: "placeholder" }, "no pilot approval pending for this node");
+  }
+  const draftKey = a.approval_id;
+  if (state.pilotDrafts[draftKey] === undefined) state.pilotDrafts[draftKey] = d.artifact || "";
+  const originalLines = d.pilot_original.split("\n");
+  const editedLines = (state.pilotDrafts[draftKey] || "").split("\n");
+  const saveBtn = el("button", { class: "primary", disabled: state.busy ? "" : null, onclick: () => guarded(async () => {
+    await apiPost(`/api/approvals/${encodeURIComponent(a.approval_id)}/pilot-save`, { text: state.pilotDrafts[draftKey] || "" });
+    showToast("Pilot edit saved & approval resolved");
+  }) }, "Save & approve edit");
+  const asIsBtn = el("button", { disabled: state.busy ? "" : null, onclick: () => guarded(async () => {
+    if (confirm("Approve this pilot as-is (accepts the Writer's output without changes)?")) {
+      await apiPost(`/api/approvals/${encodeURIComponent(a.approval_id)}/resolve`, { action: "approve" });
+      showToast("Approved as-is");
+    }
+  }) }, "Approve as-is");
+  const editor = el("textarea", { class: "pilot-editor", "data-key": `pilot-${draftKey}`, rows: "10" });
+  editor.value = state.pilotDrafts[draftKey] || "";
+  editor.addEventListener("input", () => { state.pilotDrafts[draftKey] = editor.value; });
+  return el("div", null, [
+    el("div", { class: "sub-hdr" }, "✏️ PILOT EDIT — frozen original (left) vs your edit (right)"),
+    el("div", { class: "pilot-editor-panes" }, [
+      el("pre", { class: "pilot-original-pre" }, originalLines.map((l) => el("div", null, l))),
+      editor,
     ]),
-    el("div", { class: "agent-bar" }, [
-      el("label", { class: "bar-label" }, "Reopen (passed nodes only): defect to fix"),
-      el("div", { class: "bar-row" }, [reopenInput, reopenBtn]),
-    ]),
+    el("div", { class: "pilot-editor-actions" }, [saveBtn, asIsBtn]),
+    el("div", { class: "dim", style: "font-size:11px; margin-top:6px;" }, "The diff between your edit and the frozen original becomes the contract rules — cut historical asides, shrink examples to three lines, anything generalizable."),
   ]);
 }
 
-// Task Tree tab: node ids are dot-hierarchical (planner.py's
-// `f"{path}.{candidate.id}"` when recursing into a slice), so grouping by
-// that path builds a real parent/child tree instead of the flat list the
-// left sidebar used to show. Intermediate path segments that aren't
-// themselves a dispatched leaf (a planning-level grouping, not a node in
-// tree.json) render as plain folders -- only real leaves get a status
-// badge and are clickable.
-function buildNodeTreeIndex(nodes) {
-  const root = { children: new Map(), node: null };
-  nodes.forEach((n) => {
-    let cur = root;
-    String(n.id).split(".").forEach((part) => {
-      if (!cur.children.has(part)) cur.children.set(part, { children: new Map(), node: null });
-      cur = cur.children.get(part);
-    });
-    cur.node = n;
-  });
-  return root;
-}
+function renderPendingPilotNote() { return null; }
 
-// Every subagent episode dispatched under a tree node's id -- the node
-// itself (a Writer dispatch, id === node.id) plus any repair/research
-// children (derived ids "<node>~repair1", "<node>~research~slug").
-function findAttachedSubagents(nodeId) {
-  const subs = state.snapshot.subagents || [];
-  // §C4: match the node's own id (its Writer), any ``~repair``/``~research~``
-  // derived id carrying this node as a prefix (those live under this node),
-  // and any dot-hierarchical split child — ``parent.child1`` — the v7 split
-  // mechanism grafts (its Writer is its own dispatch, but it lives under
-  // this parent in the tree so the live badge still belongs here).
-  return subs.filter(
-    (s) =>
-      s.id === nodeId ||
-      s.id.startsWith(nodeId + "~") ||
-      s.id.startsWith(nodeId + ".")
-  );
-}
-
-function liveBadge() {
-  // Reuses the "running" badge color (see style.css's data-status rules)
-  // under a more literal "live" label for the tree's attached-subagent dot.
-  return el("span", { class: "badge", "data-status": "running" }, "● live");
-}
-
-function renderTreeBranch(branch, depth) {
-  const rows = [];
-  for (const [part, child] of branch.children) {
-    const n = child.node;
-    const hasKids = child.children.size > 0;
-    const attached = n ? findAttachedSubagents(n.id) : [];
-    const liveSub = attached.find((s) => s.live);
-    const lastSub = attached.length ? attached[attached.length - 1] : null;
-    rows.push(
-      el(
-        "div",
-        {
-          class: "tree-row" + (n && n.id === state.selectedNode ? " active" : "") + (n ? "" : " tree-row-folder"),
-          style: `padding-left:${depth * 18 + 10}px;`,
-          onclick: n ? () => openNode(n.id) : null,
-        },
-        [
-          el("span", { class: "tree-glyph" }, hasKids ? "▾" : n ? "·" : " "),
-          el("span", { class: "tree-label" }, part),
-          n ? badge(n.status) : null,
-          n && n.shape ? el("span", { class: "dim", style: "font-size:11px; margin-left:6px;" }, n.shape) : null,
-          liveSub
-            ? el("span", {
-                onclick: (e) => { e.stopPropagation(); openNode(liveSub.id, "chat"); },
-                title: `subagent ${liveSub.id} is running -- click to open its chat`,
-              }, liveBadge())
-            : lastSub
-              ? el("span", { title: `subagent ${lastSub.id}: ${lastSub.status}` }, badge(lastSub.status))
-              : null,
-          n && n.artifact_count
-            ? el("span", { class: "dim tree-artifact-count", title: "artifacts generated" }, `📄 ${n.artifact_count}`)
-            : null,
-        ]
-      )
-    );
-    if (hasKids) rows.push(...renderTreeBranch(child, depth + 1));
+function renderTakeoverPilot(nodeId) {
+  const a = (state.snapshot.pending_approvals || []).find((x) => x.kind === "pilot");
+  if (!a) return el("div", { class: "placeholder" }, "no pilot pending");
+  const d = state.nodeDetail;
+  if (!d || d.id !== nodeId) {
+    loadNodeDetail(nodeId);
+    return el("div", { class: "placeholder" }, "loading pilot node…");
   }
-  return rows;
+  const dismissBtn = el("button", { class: "btn-tiny", onclick: () => dismissTakeover(a) }, "⌫ dismiss (any key re-arms)");
+  return el("div", { class: "takeover-pilot" }, [
+    el("div", { class: "sub-hdr" }, `⏸ PILOT · ${a.context && a.context.node_id ? a.context.node_id : nodeId} · awaiting your edit`),
+    renderPilotEditor(),
+    el("div", { style: "margin-top:10px;" }, dismissBtn),
+  ]);
+}
+
+/* ------------------------- task tree tab ------------------------- */
+
+function buildNodeTreeIndex() {
+  const tree = state.snapshot.tree || [];
+  const rows = Array.isArray(tree) ? tree : (tree.nodes || []);
+  const index = {};
+  const order = [];
+  for (const n of rows) {
+    if (!n || typeof n.id !== "string") continue;
+    const parts = n.id.split(".");
+    let key = "";
+    for (let i = 1; i <= parts.length; i++) {
+      key = parts.slice(0, i).join(".");
+      if (!(key in index)) { index[key] = { id: key, children: [], node: null }; order.push(key); }
+    }
+    index[key].node = n;
+    const parentKey = parts.slice(0, -1).join(".");
+    if (parentKey && index[parentKey]) index[parentKey].children.push(key);
+  }
+  // top-level = no parent claim
+  const tops = order.filter((k) => !k.includes(".") || !index[k.split(".").slice(0, -1).join(".")]);
+  return { index, tops };
+}
+
+function treeRowClass(key, n) {
+  const cls = ["tree-row"];
+  if (state.treeCursor === key) cls.push("cursor");
+  if (!n) cls.push("tree-row-folder");
+  return cls.join(" ");
+}
+
+function renderTreeBranch(key, depth, visible) {
+  const { index } = buildNodeTreeIndex();
+  const entry = index[key];
+  if (!entry) return null;
+  const n = entry.node;
+  visible.push(key);
+  const glyph = n ? (NODE_GLYPH[n.status] || "·") : (state.treeCollapsed[key] ? "▸" : "▾");
+  const segClass = {
+    passed: "pass", split: "esc", failed: "fail", blocked: "fail", stale: "paused",
+    dispatched: "run", awaiting_review: "run", pending: "", ready: "",
+  }[n ? n.status : ""] || "";
+  const gatePips = (n && Array.isArray(n.gate_results)) ? n.gate_results.map((g) => el("span", { class: "gate-pip " + (g.passed ? "on" : "off"), title: `${g.gate}: ${g.detail || (g.passed ? "ok" : "fail")}` }, g.passed ? GATE_PIP_PASS : GATE_PIP_FAIL)) : null;
+  const shape = n ? (SHAPE2[n.shape] || (n.shape ? n.shape.slice(0, 2) : "")) : "";
+  const attrs = {};
+  if (n && n.artifact_tokens !== undefined) attrs["data-tokens"] = n.artifact_tokens;
+  const rowAttrs = Object.assign({ class: treeRowClass(key, n), style: `padding-left:${8 + depth * 14}px;` }, attrs);
+  if (n) rowAttrs.onclick = () => openNode(n.id, "overview");
+  else rowAttrs.onclick = () => { state.treeCollapsed[key] = !state.treeCollapsed[key]; render(); };
+  if (n) rowAttrs.oncontextmenu = (e) => { e.preventDefault(); state.contextMenu = { x: e.clientX, y: e.clientY, nodeId: n.id }; render(); };
+  const row = el("div", rowAttrs, [
+    el("span", { class: "row-glyph tree-glyph" }, glyph),
+    el("span", { class: "row-id" }, key),
+    shape ? el("span", { class: "dim", style: "font-size:10px; margin:0 6px;" }, shape) : null,
+    el("span", { class: "gate-pips" }, gatePips),
+    el("span", { class: "dim", style: "font-size:10px; margin-left:auto;" }, n ? `${(n.artifact_tokens !== undefined ? `≈${n.artifact_tokens}t` : "")}${n.versions ? " 📁" + n.versions.length : ""}` : ""),
+  ]);
+  const kids = entry.children.filter((c) => {
+    if (state.treeFilter) return c.includes(state.treeFilter);
+    return !state.treeCollapsed[key];
+  });
+  return [row].concat(kids.map((c) => renderTreeBranch(c, depth + 1, visible)));
+}
+
+function visibleTreeRows() {
+  const { tops } = buildNodeTreeIndex();
+  const visible = [];
+  for (const t of tops) renderTreeBranch(t, 0, visible);
+  return visible;
 }
 
 function renderTaskTreeTab() {
-  const nodes = state.snapshot.tree || [];
-  if (!nodes.length) return el("div", { class: "empty-state" }, "No plan tree generated yet.");
-  return el("div", { class: "task-tree-view" }, renderTreeBranch(buildNodeTreeIndex(nodes), 0));
+  const { tops } = buildNodeTreeIndex();
+  const counts = state.snapshot.tree_counts || {};
+  const filterInput = el("input", { "data-key": "tree-filter", type: "text", placeholder: "filter node ids…", style: "width:100%;" });
+  filterInput.value = state.treeFilter;
+  filterInput.addEventListener("input", () => { state.treeFilter = filterInput.value; state.treeCursor = null; render(); });
+  filterInput.addEventListener("keydown", (e) => {
+    if (e.key === "Escape") { state.treeFilter = ""; state.treeCursor = null; render(); }
+  });
+  const visible = [];
+  const rows = tops.map((t) => renderTreeBranch(t, 0, visible));
+  state.treeCursorList = visible;
+  return el("div", { class: "tree-tab" }, [
+    el("div", { class: "tree-hdr" }, [
+      el("span", { class: "sub-hdr" }, `TASK TREE — ${counts.passed || 0}/${(counts.passed || 0) + (counts.failed || 0) + (counts.blocked || 0) + (counts.pending || 0) + (counts.ready || 0) + (counts.dispatched || 0) + (counts.awaiting_review || 0) + (counts.stale || 0) + (counts.split || 0)}`),
+      el("button", { class: "btn-tiny", onclick: () => { state.promptMode = "command"; state.promptText = "> redispatch "; render(); focusPrompt(); } }, "redispatch"),
+    ]),
+    el("div", { class: "tree-filter" }, filterInput),
+    el("div", { class: "tree-list" }, rows),
+  ]);
 }
 
-// ---------------------------------------------------------------------
-// New Run Modal
-// ---------------------------------------------------------------------
-function resetNewRunDraft() {
-  state.newRun = { runId: "", goal: "", source: "", model: "", compile: "" };
+/* ------------------------- doc / asm / term tabs ------------------------- */
+
+function renderDocTab() {
+  const tabs = ["contract", "spec", "spine", "manifest"];
+  const labels = { contract: "📜 Contract", spec: "spec", spine: "spine", manifest: "manifest" };
+  const bar = el("div", { class: "agent-tabs" }, tabs.map((t) =>
+    el("button", { class: "agent-tab" + (state.docTab === t ? " active" : ""), onclick: () => { state.docTab = t; fetchWorkbenchData(t); render(); } }, labels[t])
+  ));
+  let body;
+  if (state.docTab === "contract") {
+    const c = state.contractData || { text: "", tokens: 0, ceiling: 1500 };
+    const pct = c.ceiling ? Math.min(100, Math.round((c.tokens / c.ceiling) * 100)) : 0;
+    body = el("div", { class: "doc-body" }, [
+      el("div", { class: "contract-meter" }, [
+        el("span", { class: "dim" }, `${c.tokens}t / ceiling ${c.ceiling}t`),
+        el("div", { class: "meter", style: `width:${pct}%;` + (pct > 90 ? "background:var(--accent-red);" : "") }),
+      ]),
+      el("pre", { class: "doc-pre" }, c.text),
+    ]);
+  } else if (state.docTab === "spec") body = el("pre", { class: "doc-pre" }, state.specText || "");
+  else if (state.docTab === "spine") body = el("pre", { class: "doc-pre" }, state.spineText || "");
+  else {
+    const lines = state.manifestLines || [];
+    body = el("div", { class: "manifest-body" }, lines.length ? lines.map((l) => el("div", { class: "gate-row" }, [
+      el("span", { class: "dim" }, l.node || ""),
+      el("span", { class: "dim", style: "margin-left:auto;" }, `${l.tokens || "?"}t`),
+    ])) : el("div", { class: "dim" }, "(no manifest lines yet)"));
+  }
+  return el("div", { class: "workbench-doc" }, [bar, body]);
 }
+
+function renderAsmTab() {
+  const a = state.assembly;
+  if (!a) return el("div", { class: "placeholder" }, "loading assembly…");
+  const checksArr = a.checks || {};
+  const checks = Array.isArray(checksArr) ? checksArr : (checksArr.checks || []);
+  const rows = checks.length ? checks.map((c) => el("div", { class: "gate-row" }, [
+    el("span", { class: c.passed ? "gate-pass" : "gate-fail" }, (c.passed ? "✓" : "✕") + " " + (c.name || c.id || "")),
+    el("span", { class: "dim" }, c.detail || ""),
+  ])) : el("div", { class: "dim" }, "(no checks recorded)");
+  return el("div", { class: "asm-body" }, [
+    el("div", { class: "sub-hdr" }, "CROSS-CUTTING CHECKS"),
+    ...rows,
+    el("div", { class: "sub-hdr", style: "margin-top:14px;" }, "COMPILE LOG"),
+    el("pre", { class: "doc-pre log-pre" }, a.compile_log || "(no compile log)"),
+    el("div", { class: "sub-hdr", style: "margin-top:14px;" }, "INDEX"),
+    el("pre", { class: "doc-pre" }, a.index || "(no index)"),
+  ]);
+}
+
+function renderTermTab() {
+  const a = state.assembly;
+  const counts = state.snapshot.tree_counts || {};
+  const phaseMap = state.snapshot.phases || {};
+  const progressRows = Object.entries(phaseMap).map(([p, st]) => el("div", { class: "gate-row" }, [
+    el("span", { class: "term-glyph" }, PHASE_GLYPH[st] || "·"),
+    el("span", null, p),
+    el("span", { class: "dim", style: "margin-left:auto;" }, st),
+  ]));
+  const treeTable = el("table", { class: "term-table" }, [
+    el("thead", null, el("tr", null, ["status", "id", "gate", "tokens", "parent"].map((h) => el("th", null, h)))),
+    el("tbody", null, (Array.isArray(state.snapshot.tree) ? state.snapshot.tree : Object.values(state.snapshot.tree || {})).map((n) => el("tr", { class: "term-row" + (n.status === "failed" ? " err" : "") }, [
+      el("td", null, el("span", { class: "term-glyph" }, NODE_GLYPH[n.status] || "·")),
+      el("td", null, el("span", { class: "node-link", onclick: () => openNode(n.id, "overview") }, n.id)),
+      el("td", null, String(n.gates || []).slice(0, 40)),
+      el("td", null, String(n.artifact_tokens !== undefined ? n.artifact_tokens : "-")),
+      el("td", null, n.parent || ""),
+    ]))),
+  ]);
+  return el("div", { class: "term-body" }, [
+    el("div", { class: "sub-hdr" }, "PROGRESS"),
+    ...progressRows,
+    el("div", { class: "sub-hdr", style: "margin-top:14px;" }, `TREE (${counts.passed || 0} passed / ${counts.pending || 0} pending / ${counts.failed || 0} failed / ${counts.split || 0} split)`),
+    treeTable,
+  ]);
+}
+
+/* ------------------------- new run modal ------------------------- */
 
 function renderNewRunModal() {
   if (!state.newRunOpen) return null;
-  const nr = state.newRun;
-
-  const runIdInput = el("input", { type: "text", "data-key": "new-run-run-id", placeholder: "leave blank to generate" });
-  runIdInput.value = nr.runId;
-  runIdInput.addEventListener("input", () => { nr.runId = runIdInput.value; });
-
-  const goalInput = el("textarea", { "data-key": "new-run-goal", placeholder: "Goal (or @path/to/file)...", rows: 3 });
-  goalInput.value = nr.goal;
-  goalInput.addEventListener("input", () => { nr.goal = goalInput.value; });
-
-  const sourceInput = el("textarea", { "data-key": "new-run-source", placeholder: "Source: text, @path, or blank", rows: 2 });
-  sourceInput.value = nr.source;
-  sourceInput.addEventListener("input", () => { nr.source = sourceInput.value; });
-
-  const modelInput = el("input", { type: "text", "data-key": "new-run-model", placeholder: "Model (blank = provider default)" });
-  modelInput.value = nr.model;
-  modelInput.addEventListener("input", () => { nr.model = modelInput.value; });
-
-  const compileInput = el("input", { type: "text", "data-key": "new-run-compile", placeholder: "Compile command (optional)" });
-  compileInput.value = nr.compile;
-  compileInput.addEventListener("input", () => { nr.compile = compileInput.value; });
-
-  const submit = el("button", { class: "primary", disabled: state.busy ? "" : null, onclick: () => guarded(async () => {
-    const goal = nr.goal.trim();
-    if (!goal) return;
-    const res = await apiPost("/api/runs", {
-      run_id: nr.runId.trim(),
-      goal,
-      source: nr.source.trim(),
-      model: nr.model.trim() || null,
-      compile_command: nr.compile.trim() || null,
-    });
-    state.newRunOpen = false;
-    resetNewRunDraft();
-    state.selectedNode = null;
-    state.workbenchTab = "tree";
-    showToast(`Started run ${res.run_id}`);
-  }) }, "Start Run");
-
-  const cancel = el("button", { onclick: () => { state.newRunOpen = false; resetNewRunDraft(); render(); } }, "Cancel");
-
-  const panel = el("div", { class: "panel" }, [
-    el("div", { class: "panel-hdr" }, [el("h2", null, "New run (or resume: reuse an existing run id)"), el("button", { onclick: () => { state.newRunOpen = false; resetNewRunDraft(); render(); } }, "Close")]),
-    el("div", { class: "form-grid" }, [
-      el("label", null, "Run id"), runIdInput,
-      el("label", null, "Goal"), goalInput,
-      el("label", null, "Source"), sourceInput,
-      el("label", null, "Model"), modelInput,
-      el("label", null, "Compile command"), compileInput,
-    ]),
-    el("div", { style: "padding:16px; display:flex; gap:8px;" }, [submit, cancel]),
+  const f = (key, label, type, fieldCh) => el("label", { class: "form-field" }, [
+    el("span", { class: "form-label" }, label),
+    fieldCh,
   ]);
-
-  return el("div", { class: "overlay", onclick: (e) => { if (e.target.classList.contains("overlay")) { state.newRunOpen = false; resetNewRunDraft(); render(); } } }, panel);
-}
-
-// ---------------------------------------------------------------------
-// Root Render
-// ---------------------------------------------------------------------
-// render() rebuilds the whole DOM tree from scratch on every call (no
-// diffing), and it's called on every live snapshot tick (SSE ~1.5s /
-// polling 2s). Plain <input>/<textarea> elements hold their in-progress
-// value only in the DOM node itself, so a naive rebuild would wipe
-// whatever the operator is mid-typing on every tick. Capture the focused
-// field's value/selection (keyed by its stable data-key) and the feed's
-// scroll position before tearing down, then restore both afterward.
-function captureFocusState() {
-  const active = document.activeElement;
-  if (!active || !root.contains(active)) return null;
-  const key = active.getAttribute("data-key");
-  if (!key) return null;
-  return {
-    key,
-    value: active.value,
-    selectionStart: active.selectionStart,
-    selectionEnd: active.selectionEnd,
+  const set = (k, v) => { state.newRun[k] = v; render(); };
+  const input = (key, type, ph) => {
+    const el2 = el("input", { type: type || "text", placeholder: ph, "data-key": "newrun-" + key });
+    el2.value = state.newRun[key] || "";
+    el2.addEventListener("input", () => set(key, el2.value));
+    return el2;
   };
+  const form = el("div", { class: "form-grid" }, [
+    f("run_id", "Run id", input("runId", "text", "e.g. monads-01")),
+    f("goal", "Goal", input("goal", "text", "the one-sentence goal")),
+    f("source", "source.txt path or @path", input("source", "text", "@/path/to/corpus.txt or leave empty (workspace)")),
+    f("workspace", "workspace root (optional, overrides source)", input("workspace", "text", "@/path/to/repo")),
+    f("model", "model", input("model", "text", "provider model id")),
+    f("compile", "compile command", input("compile", "text", "e.g. python3 -m unittest")),
+    f("tier", "tier floor (0-3)", input("tier", "text", "")),
+    f("dispatch", "dispatch policy",
+      el("select", { onchange: (e) => set("dispatch_policy", e.target.value) },
+        ["model", "deterministic"].map((v) => el("option", { value: v, selected: state.newRun.dispatch_policy === v ? "selected" : null }, v)))),
+    f("survey", "survey mode",
+      el("select", { onchange: (e) => set("survey_mode", e.target.value) },
+        ["model", "deterministic"].map((v) => el("option", { value: v, selected: state.newRun.survey_mode === v ? "selected" : null }, v)))),
+    f("max_rounds", "max rounds", input("max_rounds", "number", "100")),
+    f("max_attempts", "max attempts", input("max_attempts", "number", "3")),
+  ]);
+  const flag = (key, label) => el("label", { class: "form-flag" }, [
+    el("input", { type: "checkbox", checked: state.newRun[key] ? "checked" : null, onchange: (e) => set(key, e.target.checked) }),
+    el("span", null, label),
+  ]);
+  return el("div", { class: "overlay", onclick: (e) => { if (e.target === e.currentTarget) { state.newRunOpen = false; render(); } } }, [
+    el("div", { class: "panel newrun-panel" }, [
+      el("div", { class: "panel-hdr" }, "＋ New run"),
+      el("div", { class: "panel-body" }, [
+        form,
+        el("div", { class: "form-flags" }, [flag("document_review", "document review"), flag("inline_spans", "inline spans")]),
+      ]),
+      el("div", { class: "panel-foot" }, [
+        el("button", { class: "primary", disabled: state.busy ? "" : null, onclick: () => guarded(async () => {
+          const r = await apiPost("/api/runs", {
+            run_id: state.newRun.runId || undefined,
+            goal: state.newRun.goal,
+            source: state.newRun.source || undefined,
+            compile_command: state.newRun.compile || undefined,
+            workspace: state.newRun.workspace || undefined,
+            model: state.newRun.model || undefined,
+            tier_floor: state.newRun.tier || undefined,
+            dispatch_policy: state.newRun.dispatch_policy,
+            survey_mode: state.newRun.survey_mode,
+            max_rounds: parseInt(state.newRun.max_rounds, 10) || undefined,
+            max_attempts: parseInt(state.newRun.max_attempts, 10) || undefined,
+            document_review: state.newRun.document_review,
+            inline_spans: state.newRun.inline_spans,
+          });
+          state.newRun = Object.assign({}, state.newRun, { runId: "", goal: "", source: "", compile: "", workspace: "", model: "", tier: "" });
+          state.newRunOpen = false;
+          if (r && r.run_id) await attachRun(r.run_id);
+          else apiGet("/api/snapshot").then(applySnapshot).catch(() => {});
+        }) }, "Start run…"),
+        el("button", { onclick: () => { state.newRunOpen = false; render(); } }, "Close"),
+      ]),
+    ]),
+  ]);
 }
 
-function restoreFocusState(saved) {
-  if (!saved) return;
-  const field = root.querySelector(`[data-key="${CSS.escape(saved.key)}"]`);
-  if (!field) return;
-  field.value = saved.value;
-  try {
-    field.focus({ preventScroll: true });
-  } catch (e) {
-    field.focus();
-  }
-  if (typeof saved.selectionStart === "number") {
-    try { field.setSelectionRange(saved.selectionStart, saved.selectionEnd); } catch (e) {}
-  }
+/* ------------------------- auth overlay ------------------------- */
+
+function renderAuthOverlay() {
+  if (!state.authRequired) return null;
+  const input = el("input", { type: "password", "data-key": "authDraft", placeholder: "dashboard auth token", style: "width:100%;" });
+  input.value = state.authDraft || "";
+  input.addEventListener("input", () => { state.authDraft = input.value; });
+  input.addEventListener("keydown", (e) => { if (e.key === "Enter") { e.preventDefault(); submitAuth(); } });
+  return el("div", { class: "overlay auth-overlay" }, [
+    el("div", { class: "panel auth-panel" }, [
+      el("div", { class: "panel-hdr" }, "🔐 Dashboard auth required"),
+      el("div", { class: "panel-body" }, [
+        el("div", { class: "dim", style: "margin-bottom:10px;" }, "This dashboard is protected by an auth token (the SSE live stream needs the cookie the first authenticated request sets)."),
+        input,
+      ]),
+      el("div", { class: "panel-foot" }, el("button", { class: "primary", disabled: state.busy ? "" : null, onclick: () => guarded(submitAuth) }, "Unlock…")),
+    ]),
+  ]);
 }
+
+async function submitAuth() {
+  const token = (state.authDraft || "").trim();
+  if (!token) { showToast("enter the token", true); return; }
+  state.authToken = token;
+  const ok = await apiGet("/api/runs", { allowAuthPrompt: true }).catch(() => null);
+  if (ok) {
+    state.authRequired = false;
+    state.authDraft = "";
+    startLive();
+    apiGet("/api/snapshot").then(applySnapshot).catch(() => {});
+    showToast("unlocked");
+  } else {
+    state.authToken = "";
+    showToast("wrong token", true);
+  }
+  render();
+}
+
+/* ------------------------- root render ------------------------- */
 
 function captureScrollStates() {
-  const map = new Map();
-  const selectors = ["#chat-feed-scroll", ".sidebar-content", ".workbench-content"];
-  selectors.forEach((sel) => {
-    const el = root.querySelector(sel);
-    if (el) {
-      const atBottom = el.scrollHeight - el.scrollTop - el.clientHeight < 60;
-      map.set(sel, { scrollTop: el.scrollTop, atBottom });
-    }
+  state._scrolls = {};
+  document.querySelectorAll("[data-scroll-key]").forEach((el2) => {
+    state._scrolls[el2.getAttribute("data-scroll-key")] = el2.scrollTop;
   });
-  return map;
 }
 
-function restoreScrollStates(savedMap) {
-  if (!savedMap) return;
-  savedMap.forEach((pos, sel) => {
-    const el = root.querySelector(sel);
-    if (el) {
-      if (sel === "#chat-feed-scroll" && pos.atBottom) {
-        el.scrollTop = el.scrollHeight;
-      } else {
-        el.scrollTop = pos.scrollTop;
-      }
+function restoreScrollStates() {
+  setTimeout(() => {
+    document.querySelectorAll("[data-scroll-key]").forEach((el2) => {
+      const k = el2.getAttribute("data-scroll-key");
+      if (state._scrolls && state._scrolls[k] !== undefined) el2.scrollTop = state._scrolls[k];
+    });
+    const feed = document.querySelector("#chat-feed");
+    if (feed && !state._chatPinned) {
+      try { feed.scrollTop = feed.scrollHeight; } catch (e) {}
     }
-  });
+  }, 0);
+}
+
+// Full-teardown render rule: every input that must keep the operator's
+// typing carries a data-key; after the DOM is rebuilt, refocus the fresh
+// node and restore the caret.
+function restoreFocus() {
+  const active = document.activeElement;
+  if (!active || !active.hasAttribute || !active.hasAttribute("data-key")) return;
+  const key = active.getAttribute("data-key");
+  const fresh = document.querySelector(`[data-key="${CSS.escape(key)}"]`);
+  if (!fresh || fresh === active) return;
+  let selStart = -1, selEnd = -1;
+  try { selStart = active.selectionStart; selEnd = active.selectionEnd; } catch (e) {}
+  fresh.focus();
+  if (selStart >= 0) { try { fresh.setSelectionRange(selStart, selEnd); } catch (e) {} }
 }
 
 function render() {
-  const focusState = captureFocusState();
-  const scrollStates = captureScrollStates();
-
-  const frag = document.createDocumentFragment();
-  frag.appendChild(renderHeader());
-
-  const workspace = el("div", { class: "kd-workspace" }, [
-    renderSidebar(),
-    renderCenterStream(),
-    renderRightWorkbench(),
-  ]);
-  frag.appendChild(workspace);
-
-  const newRunModal = renderNewRunModal();
-  if (newRunModal) frag.appendChild(newRunModal);
-
-  if (state.toast) {
-    frag.appendChild(el("div", { class: "toast" + (state.toast.isError ? " err" : "") }, state.toast.message));
-  }
-
-  root.innerHTML = "";
-  root.appendChild(frag);
-
-  restoreScrollStates(scrollStates);
-  restoreFocusState(focusState);
+  const snap = state.snapshot;
+  if (!snap) return;
+  captureScrollStates();
+  const children = [
+    renderRail(),
+    renderHeaderRow(),
+    el("div", { class: "kd-workspace" }, [
+      renderNav(),
+      renderCenterStream(),
+      renderRightWorkbench(),
+    ]),
+    renderCommandBar(),
+    renderContextMenu(),
+    renderPalette(),
+    renderKeymap(),
+    renderRunSwitcher(),
+    renderNewRunModal(),
+    renderAuthOverlay(),
+  ];
+  const jobStrip = (state.snapshot.jobs || []).filter((j) => j.status === "running" || j.status === "queued").length
+    ? el("div", { class: "jobs-strip" }, (state.snapshot.jobs || []).filter((j) => j.status === "running" || j.status === "queued").map((j) =>
+        el("div", { class: "job-chip" }, [
+          el("span", null, `${j.kind || "job"} ${j.job_id || ""}`),
+          el("button", { class: "btn-tiny", disabled: !snap.control_enabled ? "" : null, onclick: () => guarded(() => apiPost(`/api/jobs/${encodeURIComponent(j.job_id || "")}/cancel`, {}).then(() => showToast("job cancel requested"))) }, "✕"),
+        ])
+      ))
+    : null;
+  root.replaceChildren(el("div", { class: "app-root" }, [
+    el("div", { class: "chrome-frame" }, children),
+    jobStrip,
+    state.toast ? el("div", { class: "toast" + (state.toast.isError ? " err" : ""), onclick: () => { state.toast = null; render(); } }, state.toast.message) : null,
+  ]));
+  restoreScrollStates();
+  restoreFocus();
 }
 
-render();
-startLive();
+/* ------------------------- boot ------------------------- */
+
+window.addEventListener("keydown", onGlobalKey);
+
+const DEFAULT_FAVICON = "data:image/svg+xml;utf8," + encodeURIComponent('<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16"><circle cx="8" cy="8" r="6" fill="%236366f1"/></svg>');
+const RED_FAVICON = "data:image/svg+xml;utf8," + encodeURIComponent('<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16"><circle cx="8" cy="8" r="6" fill="%23f43f5e"/></svg>');
+
+document.addEventListener("DOMContentLoaded", () => {
+  const icon = document.createElement("link");
+  icon.rel = "icon";
+  icon.href = DEFAULT_FAVICON;
+  document.head.appendChild(icon);
+  apiGet("/api/runs", { allowAuthPrompt: true })
+    .then((d) => {
+      state.authRequired = false;
+      const runs = d.runs || [];
+      if (state.snapshot && state.snapshot.attached) {
+        startLive();
+      } else if (runs.length) {
+        attachRun(runs[0].id);
+      } else {
+        startLive();
+      }
+    })
+    .catch((err) => {
+      state.authRequired = true;
+      render();
+    });
+  render();
+  setInterval(() => {
+    const now = new Date();
+    const clock = document.querySelector(".rail-a40");
+    if (clock && Math.abs(state.snapshot.elapsed || 0) > 0) {
+      clock.textContent = fmtDur((state.snapshot.elapsed || 0) + 0.5);
+    }
+    if (!state.sseLive || now.getSeconds() % 10 === 0) loadMainAgentThinking();
+  }, 5000);
+});
