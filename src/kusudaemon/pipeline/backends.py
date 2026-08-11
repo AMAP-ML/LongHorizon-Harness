@@ -30,10 +30,15 @@ context) is now the Writer's own token budget to manage
 (``node.budget.tokens``, default 24k) rather than something the harness
 prevents structurally.
 
-The workspace is always the run directory itself: the writer sees
-``source.txt``, ``contract.md``, ``out/``, ``scratch/``, and its own
-artifacts — the entire corpus a leaf needs — with every other run directory
-path already out of its sight by construction.
+In corpus mode (``kind="text"``, unchanged) the workspace is the run
+directory itself: the writer sees ``source.txt``, ``contract.md``, ``out/``,
+``scratch/``, and its own artifacts — the entire corpus a leaf needs — with
+every other run directory path already out of its sight by construction. In
+workspace mode (``kind="workspace"``, PLAN.md §A3/§B1) the workspace is the
+real repo (``work.root``) instead, and the run directory — wherever it
+happens to be nested, by default ``<root>/.kusudaemon/runs`` — is hidden as
+one subtree rather than by individual filename (see
+``_hidden_paths_and_exceptions_for``).
 """
 
 from __future__ import annotations
@@ -78,6 +83,52 @@ def _hidden_path_exceptions_for(node: TaskNode) -> tuple[str, ...]:
     return (f"out/{node.id}.md", f"scratch/{node.id}")
 
 
+def _hidden_paths_and_exceptions_for(
+    node: TaskNode, run_dir: Path, workspace_root: Path
+) -> tuple[tuple[str, ...], tuple[str, ...]]:
+    """PLAN.md §A3/§B1: in corpus mode ``workspace_path`` (the Writer's cwd)
+    *is* ``run_dir``, so ``_hidden_paths_for``'s relative names ("out/",
+    "scratch/", ...) already point at the right place — this branch
+    reproduces that exactly, byte-for-byte, so a caller that never mentions
+    workspace mode sees no behavior change.
+
+    In workspace mode ``workspace_path`` is ``work.root``, a real repo the
+    run dir merely happens to be nested inside (the default
+    ``--workspace`` ``runs_root``, ``<root>/.kusudaemon/runs``). The
+    corpus-mode per-file names would resolve to nonexistent paths relative
+    to that cwd ("out/" isn't a directory in the repo root); worse, doing
+    nothing would leave the ENTIRE run directory readable from the
+    Writer's cwd — every other node's artifact, scratch notes, and audit
+    verdicts, not just its own (§2 invariant 6). So this hides the run
+    directory as one subtree, relative to the Writer's actual cwd, with the
+    same two-path carve-out expressed the same way.
+
+    A ``run_dir`` outside ``workspace_root`` entirely (a custom
+    ``--runs-root`` that isn't nested in the workspace) needs no entry at
+    all: nothing of the harness's bookkeeping sits inside the Writer's cwd
+    to begin with.
+    """
+    if node is None:
+        return (), ()
+    try:
+        run_dir_resolved = run_dir.resolve()
+        workspace_resolved = workspace_root.resolve()
+    except OSError:
+        run_dir_resolved, workspace_resolved = run_dir, workspace_root
+    if run_dir_resolved == workspace_resolved:
+        return _hidden_paths_for(node), _hidden_path_exceptions_for(node)
+    try:
+        run_dir_rel = run_dir_resolved.relative_to(workspace_resolved)
+    except ValueError:
+        return (), ()
+    hidden = (f"{run_dir_rel.as_posix()}/",)
+    exceptions = (
+        (run_dir_rel / "out" / f"{node.id}.md").as_posix(),
+        (run_dir_rel / "scratch" / node.id).as_posix(),
+    )
+    return hidden, exceptions
+
+
 def build_writer_adapter(
     backend: str,
     *,
@@ -86,15 +137,25 @@ def build_writer_adapter(
     node: TaskNode | None = None,
     model: str | None = None,
     mcp_config: str | None = None,
+    run_dir: str | Path | None = None,
 ) -> AgentAdapter:
     """A Writer adapter for one node. ``node.tools`` narrows the tool set
     (the adapter's ``tool_allowlist``) the same way v1's round loop does —
     web search is layered on top of that narrowed (or default) set
     unconditionally, so even a node scoped down via ``node.tools`` keeps
     search access; only ``node.tools`` itself can narrow shell/read/save/
-    patch."""
+    patch.
+
+    ``run_dir`` defaults to ``workspace_path`` — today's corpus-mode
+    invariant, where the Writer's cwd *is* the run directory. A caller
+    dispatching ``kind="workspace"`` (PLAN.md §A3) passes ``workspace_path``
+    as ``work.root`` and ``run_dir`` as the actual run directory, which may
+    live nested inside it; see ``_hidden_paths_and_exceptions_for``.
+    """
     workspace = str(workspace_path)
     prompts = str(prompt_dir)
+    run_dir_path = Path(run_dir) if run_dir is not None else Path(workspace_path)
+    workspace_root_path = Path(workspace_path)
     if backend == "gptme":
         kwargs: dict[str, Any] = dict(
             model=model, workspace_path=workspace, prompt_dir=prompts
@@ -109,11 +170,12 @@ def build_writer_adapter(
             # validated by leaf_gate) becomes the episode's OpenAI-compatible
             # context length instead of the adapter's own default.
             kwargs["context_length"] = node.budget.tokens
-            # PLAN.md §D2: hide the run's own bookkeeping in the episode
-            # prompt, with an explicit carve-out for the node's own
+            # PLAN.md §D2/§A3: hide the run's own bookkeeping in the
+            # episode prompt, with an explicit carve-out for the node's own
             # artifact/scratch paths (not a silent drop from the list).
-            kwargs["hidden_paths"] = _hidden_paths_for(node)
-            kwargs["hidden_path_exceptions"] = _hidden_path_exceptions_for(node)
+            hidden, exceptions = _hidden_paths_and_exceptions_for(node, run_dir_path, workspace_root_path)
+            kwargs["hidden_paths"] = hidden
+            kwargs["hidden_path_exceptions"] = exceptions
         return GptmeAdapter(**kwargs)
     raise ValueError(f"unknown backend: {backend!r}")
 

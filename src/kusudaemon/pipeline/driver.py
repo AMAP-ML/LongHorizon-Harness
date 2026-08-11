@@ -40,6 +40,24 @@ from typing import Any, Callable
 from ..adapters.base import AgentAdapter
 from ..environment.base import Environment
 from ..types import EpisodeBudget
+from ..v6.direct import (
+    DIRECT_MAX_ATTEMPTS,
+    SINGLE_NODE_ID,
+    build_single_node_tree,
+    is_size_defect,
+    run_direct_episode,
+)
+from ..v6.tiering import (
+    ScopeEstimate,
+    Tier,
+    classify,
+    escalate,
+    estimate_scope,
+    measure_signals,
+    phases_for,
+    tier_max,
+)
+from ..v6.work_object import WorkObject, survey_workspace, work_object_from_text, work_object_none
 from ..v0.events import EventLog
 from ..v0.run_dir import write_text_atomic
 from ..v0.run_dir import create_run_dir, ensure_node_trace_path, events_path, manifest_path, node_artifact_path, spec_path
@@ -48,7 +66,7 @@ from ..v1.reviewer import ReviewVerdict
 from ..v1.round_loop import run_round_loop
 from ..v1.tree import TaskNode, TaskTree
 from ..v2.contract import ContractRule, freeze_contract
-from ..v2.intake import run_intake
+from ..v2.intake import GlobalRubric, render_spec_md, run_intake
 from ..v2.pilot import (
     approve_pilot,
     run_pilot,
@@ -76,9 +94,25 @@ from . import approvals as approval_store
 from .backends import parse_research_plan
 from .liveness import record_driver_start
 from .prompts import build_node_prompt
-from .run_dir import halt_path, phase_path, run_spec_path, source_path, tree_path
+from .run_dir import halt_path, phase_path, run_spec_path, source_path, tier_path, tree_path
 
+# Legacy static phase list (pre-§B2). Kept only as a backward-compatible
+# re-export (``pipeline/__init__.py`` still exports it, and
+# ``dashboard/rendering.py``/``static/app.js`` carry their own independent
+# copies of the same seven names for progress-bar rendering — untouched by
+# this workstream, §C4's job). The driver itself no longer iterates this:
+# ``run()`` below computes its phase list per round from
+# ``v6.tiering.phases_for(tier)`` instead (PLAN.md §A2 invariant 8/§B2).
 PHASES = ("intake", "survey", "plan", "pilot", "research", "execute", "assemble")
+
+# PLAN.md §B2: phase *names* are reused across tiers ("execute" means "one
+# direct episode" for T0, "the round loop over a real tree.json" for
+# T1-3), so a phase already run under one tier must not be mistaken for
+# "done" once the tier has risen and the same name means something
+# different against fresh state. These are exactly the phases whose
+# ``_phase_done`` is "idempotent, always re-run" (never a durable-artifact
+# check) — see ``run()``'s ``_ran_key``.
+_TIER_SCOPED_PHASES = {"execute", "review", "research", "assemble", "verify"}
 
 _HALTED = "halted"
 _IN_PROGRESS = "in_progress"
@@ -124,6 +158,16 @@ class RunOptions:
     backend: str = "gptme"
     model: str | None = None
     source_text: str = ""
+    # PLAN.md §A3/§B1: the work object a run's Writers dispatch against.
+    # Like source_text, a constructor input only — never round-tripped
+    # through to_spec/from_spec (see the comment on "source" below): a
+    # kind="workspace" WorkObject's `root` is a live filesystem reference,
+    # not something to freeze into JSON across a resume. A caller resuming
+    # a workspace-mode run re-supplies --workspace, which reconstructs this
+    # fresh via v6.work_object.measure_workspace (pipeline/run.py) — the
+    # same "disk is authoritative, argv just re-points at it" shape
+    # source_text already has via source.txt.
+    work_object: WorkObject | None = None
     compile_command: str | None = None
     research_plan: dict[str, list[ResearchQuery]] = field(default_factory=dict)
     max_rounds: int = 100
@@ -132,6 +176,11 @@ class RunOptions:
     document_review: bool = False
     survey_mode: str = "model"
     inline_spans: bool = False
+    # PLAN.md §A4.4/§B2: a floor, never a ceiling (invariant 9) — the
+    # classifier still runs and still measures a real tier; the tier
+    # actually used for phases_for() is max(measured, tier_override).
+    # One of "T0"/"T1"/"T2"/"T3", or None for "no forced floor".
+    tier_override: str | None = None
 
     def to_spec(self) -> dict[str, Any]:
         spec = {
@@ -150,6 +199,7 @@ class RunOptions:
             "document_review": self.document_review,
             "survey_mode": self.survey_mode,
             "inline_spans": self.inline_spans,
+            "tier_override": self.tier_override,
         }
         # §11.10.7: the corpus lives once, in source.txt. Embedding
         # source_text here duplicated the run's largest file into a JSON
@@ -177,6 +227,7 @@ class RunOptions:
             document_review=bool(data.get("document_review", False)),
             survey_mode=str(data.get("survey_mode", "model")),
             inline_spans=bool(data.get("inline_spans", False)),
+            tier_override=data.get("tier_override"),
         )
 
 
@@ -259,17 +310,46 @@ class RecursiveDriver:
     # Entry
     # ------------------------------------------------------------------
     async def run(self) -> RunReport:
-        report: RunReport | None = None
-        for index, phase in enumerate(PHASES):
-            if self._halted():
-                self._set_phase(_HALTED, detail=f"halted before {phase}")
-                self._log({"node_id": "-", "role": "harness", "round": index, "type": "halting"})
-                report = RunReport(status="halted", phase=phase, detail="halted by operator")
-                break
-            report = await self._run_phase(phase, round_index=index)
-            if report.status != "done":
-                break
-        report = report or RunReport(status="done", phase=PHASES[-1])
+        """PLAN.md §A2 invariants 8/9, §B2: ``classify`` always runs first
+        (phase index 0, through the same ``_run_phase`` machinery as every
+        other phase — it just happens to be the one that decides the rest).
+        Once it's done, the remaining phase list is recomputed from
+        ``tier.json`` on **every** iteration of the loop below, not just
+        once — a phase that bumps the tier mid-run (an escalation trigger
+        firing inside ``_phase_execute``/``_phase_assemble``) makes the very
+        next iteration see the grown list and pick up whatever it now
+        requires that hasn't run yet, in the table's order. Because tiers
+        only ever rise (invariant 9) and nothing already-done is discarded,
+        this is safe: a phase already completed under the old tier is never
+        revisited by name alone — see ``_ran_key`` for why a name like
+        "execute" must be tracked per-tier rather than once ever (it means
+        something structurally different at T0 than at T2)."""
+        report = await self._run_phase("classify", round_index=0)
+        ran: set[str] = {"classify"}
+        round_index = 1
+        if report.status == "done":
+            while True:
+                tier = self._current_tier()
+                next_phase: str | None = None
+                next_key: str | None = None
+                for candidate in phases_for(tier):
+                    key = self._ran_key(candidate, tier)
+                    if key not in ran:
+                        next_phase, next_key = candidate, key
+                        break
+                if next_phase is None:
+                    break
+                if self._halted():
+                    self._set_phase(_HALTED, detail=f"halted before {next_phase}")
+                    self._log({"node_id": "-", "role": "harness", "round": round_index, "type": "halting"})
+                    report = RunReport(status="halted", phase=next_phase, detail="halted by operator")
+                    break
+                report = await self._run_phase(next_phase, round_index=round_index)
+                round_index += 1
+                ran.add(next_key)
+                if report.status != "done":
+                    break
+        report = report or RunReport(status="done", phase=phases_for(self._current_tier())[-1])
         report.tree_counts = _count_statuses(self._load_tree())
         # §11.9: run_completed is a claim about the run's outcome — logging
         # it after a halt/escalate/error made the event log disagree with
@@ -277,6 +357,19 @@ class RecursiveDriver:
         if report.status == "done":
             self._log({"node_id": "-", "role": "harness", "round": 0, "type": "run_completed"})
         return report
+
+    @staticmethod
+    def _ran_key(phase: str, tier: str) -> str:
+        """§B2: most phase names are "run once, ever, for this run" —
+        their own ``_phase_done`` already guards that (spec.md/spine.json/
+        tree.json/contract.md existing is tier-independent: a tree.json
+        built by T2's planner is still a valid tree.json once escalated to
+        T3, no need to rebuild it). The handful in ``_TIER_SCOPED_PHASES``
+        mean something different depending on which tier ran them (T0's
+        "execute" is one direct episode with no tree.json at all; T2's is a
+        multi-node round loop) and are always safe to re-run (idempotent by
+        construction), so they're tracked per-tier instead of once."""
+        return f"{phase}@{tier}" if phase in _TIER_SCOPED_PHASES else phase
 
     async def _run_phase(self, phase: str, *, round_index: int) -> RunReport:
         if self._phase_done(phase):
@@ -338,11 +431,163 @@ class RecursiveDriver:
     # ------------------------------------------------------------------
     # Phases
     # ------------------------------------------------------------------
+    async def _phase_classify(self) -> None:
+        """PLAN.md §A4/§B2: the one advisory model call that decides how
+        much of the rest of the pipeline this run actually needs. Writes
+        ``tier.json``; ``run()`` re-reads it every iteration of its phase
+        loop, and every escalation trigger (below) rewrites just its
+        ``tier`` field via ``_write_tier_record``.
+
+        ``--tier`` is a floor, never a ceiling (invariant 9): the estimate
+        call still runs (so the record is honest about what the harness
+        would have chosen on its own) *unless* the floor is already T3 —
+        T3 already runs every phase the estimate could have gated, so
+        spending a call whose verdict is guaranteed to be overridden is
+        pure waste. Any other forced floor (T0/T1/T2) still measures for
+        real, because ``max(measured, floor)`` can still come out higher
+        than the floor itself.
+        """
+        work = self._effective_work_object()
+        goal = self.options.goal.strip()
+        if not goal:
+            raise ValueError("goal is required")
+        signals = measure_signals(goal, work)
+        override = (self.options.tier_override or "").upper() or None
+        if override == "T3":
+            estimate = ScopeEstimate()
+            measured: Tier = "T3"
+        else:
+            estimate = estimate_scope(goal, work, self.provider)
+            measured = classify(signals, estimate)
+        tier: Tier = tier_max(measured, override) if override else measured
+        payload = {
+            "tier": tier,
+            "measured_tier": measured,
+            "override": override,
+            "signals": asdict(signals),
+            "estimate": asdict(estimate),
+            "needs_intake": bool(estimate.ambiguities or estimate.objections),
+            "needs_explore": not estimate.answerable_without_exploration,
+            "ts": time.time(),
+        }
+        write_text_atomic(
+            tier_path(self.run_dir),
+            json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+        )
+        self._log(
+            {
+                "node_id": "-",
+                "role": "harness",
+                "round": 0,
+                "type": "tier_classified",
+                "tier": tier,
+                "measured_tier": measured,
+                "override": override,
+            }
+        )
+
+    def _effective_work_object(self) -> WorkObject:
+        """PLAN.md §A3: every run has *some* WorkObject by classify time,
+        even one that never passed ``--workspace`` — today's default
+        (``RunOptions.work_object is None``) falls back to the
+        ``source_text``/``kind="none"`` construction §A3 describes as the
+        "deprecated alias" path v6/work_object.py's own docstring
+        promises."""
+        if self.options.work_object is not None:
+            return self.options.work_object
+        text = self.options.source_text.strip()
+        if text:
+            return work_object_from_text(self.options.source_text)
+        return work_object_none()
+
+    def _read_tier_record(self) -> dict[str, Any]:
+        try:
+            payload = json.loads(tier_path(self.run_dir).read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return {}
+        return payload if isinstance(payload, dict) else {}
+
+    def _current_tier(self) -> Tier:
+        tier = self._read_tier_record().get("tier")
+        if tier not in ("T0", "T1", "T2", "T3"):
+            raise RuntimeError(
+                "tier.json is missing or invalid — the classify phase must "
+                "run before any tier-dependent phase can"
+            )
+        return tier  # type: ignore[return-value]
+
+    def _write_tier_record(self, **updates: Any) -> None:
+        """Read-modify-write over ``tier.json`` — every escalation trigger
+        routes through this so ``signals``/``estimate``/``needs_intake``/
+        ``needs_explore`` (all decided once, at classify time) survive a
+        tier bump untouched; only the fields an escalation actually changes
+        (``tier``, plus ``ts``) get overwritten."""
+        record = self._read_tier_record()
+        record.update(updates)
+        record["ts"] = time.time()
+        write_text_atomic(
+            tier_path(self.run_dir),
+            json.dumps(record, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+        )
+
+    def _escalate_tier(self, trigger: str, *, node_id: str = "-", **extra: Any) -> Tier:
+        current = self._current_tier()
+        new_tier = escalate(current, trigger)
+        self._write_tier_record(tier=new_tier)
+        self._log(
+            {
+                "node_id": node_id,
+                "role": "harness",
+                "round": 0,
+                "type": "run_tier_escalated",
+                "trigger": trigger,
+                "from": current,
+                "to": new_tier,
+                **extra,
+            }
+        )
+        return new_tier
+
     async def _phase_intake(self) -> None:
         goal = self.options.goal.strip()
         if not goal:
             raise ValueError("goal is required")
+        needs_intake = bool(self._read_tier_record().get("needs_intake", True))
+        if not needs_intake:
+            # PLAN.md §A4.3: "intake? fires only when ambiguities or
+            # objections is non-empty" — the classify call already
+            # established there were none, so re-running the full
+            # CLAUDE.md §4.1 interview here would be spending calls to ask
+            # questions the estimator already said didn't need asking.
+            # spec.md still has to exist with a "## Goal" section (both for
+            # _phase_done("intake") and because build_node_prompt's
+            # _goal_and_rubric_block reads it), so it's written directly —
+            # zero provider calls either way.
+            self._log(
+                {
+                    "node_id": "-",
+                    "role": "harness",
+                    "round": 0,
+                    "type": "phase_skipped",
+                    "phase": "intake",
+                    "reason": "estimate reported no ambiguities or objections",
+                }
+            )
+            self._write_minimal_spec(goal)
+            return
         run_intake(self.run_dir, goal, self.provider, self._answer_intake)
+
+    def _write_minimal_spec(self, goal: str) -> None:
+        rubric = GlobalRubric(
+            goal=goal,
+            answers={},
+            assumptions=[
+                "Intake was skipped: the PLAN.md §A4.2 scope estimate "
+                "reported no ambiguities or objections, so no clarifying "
+                "questions were asked (§B2)."
+            ],
+        )
+        spec_path(self.run_dir).write_text(render_spec_md(rubric), encoding="utf-8")
 
     def _answer_intake(self, question: str, dimension: str) -> str:
         """§11.9: the approval is keyed on the rubric dimension, so a resume
@@ -361,6 +606,21 @@ class RecursiveDriver:
     async def _phase_survey(self) -> None:
         from ..v2.embeddings import embeddings_available
         from ..v2.survey import survey_chunks_deterministic
+
+        work = self.options.work_object
+        if work is not None and work.kind == "workspace":
+            # PLAN.md §A3 point 2 / §B2: a workspace is never copied into
+            # the run dir and has no chunk-range structure to vote
+            # boundaries over — survey_workspace (v6/work_object.py, §B1)
+            # already does the model-free "gitignore-aware walk, group by
+            # directory" SpineUnit construction; there is nothing here for
+            # the model-driven boundary voting below to do. This is the
+            # gap PLAN.md's own §B1 results log named explicitly:
+            # "_phase_survey still requires source_text unconditionally —
+            # that's §B2's job."
+            units = survey_workspace(work)
+            save_spine(self.run_dir, units)
+            return
 
         source = source_path(self.run_dir).read_text(encoding="utf-8").strip()
         if not source:
@@ -435,6 +695,50 @@ class RecursiveDriver:
             build_chunk_index(self.run_dir, chunks, units)
         save_spine(self.run_dir, units)
 
+    async def _phase_explore(self) -> None:
+        """PLAN.md §A4.3: "explore" is the v6 phase-vocabulary name over
+        what §4.2/today's ``_phase_survey`` does — discovering a work
+        object's structure into ``spine.json``, the same operation whether
+        the work object is a corpus or a workspace (§B1's
+        ``survey_workspace``). Kept as its own method rather than a rename
+        of ``_phase_survey`` for two reasons: (1) pre-existing tests call
+        ``_phase_survey`` directly by name (§D4's corpus-less-raises test,
+        the explorer-reasoning test) and stay correct unmodified; (2) a
+        caller reading ``tier.json``'s phase list sees the name §A4.3's
+        table actually uses.
+
+        §A4.3's "explore? fires only when ``answerable_without_exploration``
+        is false" is written for real agentic probes (PLAN.md §B4 —
+        *not built yet*, a separate, not-yet-started workstream). Until
+        those exist, producing ``spine.json`` is not optional — "plan"
+        needs it unconditionally, at every tier that has a plan phase — so
+        this method always ensures it exists. ``needs_explore`` instead
+        gates the one *additional* thing this harness can currently do that
+        resembles exploration: running v4's research loop early (only when
+        the operator supplied an explicit ``research_plan`` — same gate
+        ``_phase_research`` already uses). This is an honest, documented
+        approximation of "probe episodes," not a claim that §B4 is done —
+        the ≤2/≤6 "explorers" caps in §A4.3's table are not enforced here
+        because nothing dispatches a bounded number of probe episodes yet.
+        """
+        if not (self.run_dir / "spine.json").exists():
+            await self._phase_survey()
+        needs_explore = bool(self._read_tier_record().get("needs_explore", True))
+        if not needs_explore:
+            self._log(
+                {
+                    "node_id": "-",
+                    "role": "harness",
+                    "round": 0,
+                    "type": "phase_skipped",
+                    "phase": "explore_research",
+                    "reason": "estimate reported answerable_without_exploration",
+                }
+            )
+            return
+        if self.options.research_plan:
+            await self._phase_research()
+
     async def _phase_plan(self) -> None:
         tree = build_tree(
             load_spine(self.run_dir),
@@ -502,6 +806,46 @@ class RecursiveDriver:
             self._set_phase("research", "done", detail=f"skipped: {exc}")
 
     async def _phase_execute(self) -> None:
+        """Tier-branched (PLAN.md §A4.3/§B2):
+
+        - **T0** — one direct episode, no ``tree.json`` at all
+          (``v6/direct.py:run_direct_episode``). Always returns "done";
+          ``_phase_verify`` (T0's own next phase) is what decides
+          pass/escalate — folding that into this method too would make
+          "execute" spend a call that "verify" is supposed to own.
+        - **T1** — no "plan" phase exists to build its one node, so it's
+          built directly from the goal, by code
+          (``v6/direct.py:build_single_node_tree``), the first time this
+          phase runs; then flows through the *unmodified* round loop below.
+          Uses a lower ``max_attempts`` than T2/T3 (§A4.4: "T0/T1 node fails
+          gates twice with a size defect -> promote to T2") — see
+          ``v6/direct.py:DIRECT_MAX_ATTEMPTS``'s docstring for why 2, not 3.
+        - **T2/T3** — unchanged from pre-§B2 behavior: the round loop over
+          whatever ``tree.json`` planning already produced.
+
+        The size-defect escalation check only applies to T1 (T0's own
+        check lives in ``_phase_verify``, since T0 never touches
+        ``tree.json``/``TaskTree.is_blocked()`` at all).
+        """
+        tier = self._current_tier()
+        if tier == "T0":
+            await run_direct_episode(
+                self.run_dir,
+                self.options.goal.strip(),
+                self.provider,
+                writer_adapter_factory=self.writer_adapter_factory,
+                env=self.env,
+                prompt_for_node=lambda node: build_node_prompt(node, self.run_dir),
+                budget=EpisodeBudget(),
+                log=self.log,
+                max_attempts=DIRECT_MAX_ATTEMPTS,
+            )
+            return None
+
+        if tier == "T1" and not tree_path(self.run_dir).exists():
+            build_single_node_tree(self.options.goal.strip()).save(tree_path(self.run_dir))
+
+        max_attempts = DIRECT_MAX_ATTEMPTS if tier == "T1" else self.options.max_attempts
         await run_round_loop(
             self.run_dir,
             tree_path(self.run_dir),
@@ -515,9 +859,78 @@ class RecursiveDriver:
                 max_duration_seconds=_budget_seconds(node)
             ),
             max_rounds=self.options.max_rounds,
-            max_attempts=self.options.max_attempts,
+            max_attempts=max_attempts,
             dispatch_policy=self.options.dispatch_policy,
         )
+        tree = self._load_tree()
+        if tier == "T1" and tree.is_blocked():
+            node = tree.nodes.get(SINGLE_NODE_ID)
+            if node is not None and is_size_defect(node.last_defect):
+                self._archive_tree_before_replan()
+                self._escalate_tier("size_defect_retry", node_id=node.id)
+                return None
+        return None if not tree.is_blocked() else False
+
+    def _archive_tree_before_replan(self) -> None:
+        """PLAN.md §A4.4: "T0/T1 node fails gates twice with a size defect
+        -> promote to T2, **plan the node's own inputs**." T1's
+        ``tree.json`` is one node built directly by code
+        (``v6/direct.py:build_single_node_tree``), never the output of a
+        real Planner call — but ``_phase_done("plan")`` keys off
+        ``tree.json``'s mere *existence*. Escalating without clearing it
+        would make T2's "plan" phase believe planning already happened and
+        skip straight to re-executing the same stale one-node tree, which
+        is exactly the tree whose one node just got escalated away from.
+        Renamed aside, not deleted — nothing is discarded (invariant 9) —
+        so a real "plan" call can build the actual multi-node tree this
+        trigger promises."""
+        path = tree_path(self.run_dir)
+        if not path.exists():
+            return
+        archive = path.with_name(f"tree.json.pre-t1-escalation-{int(time.time())}")
+        path.rename(archive)
+
+    async def _phase_verify(self) -> None:
+        """T0's dedicated finalize step (PLAN.md §A4.3: T0's phase list is
+        ``classify -> execute -> verify``, distinct from T1-3's "review").
+        By the time this runs, ``_phase_execute`` already drove the node's
+        one Writer episode and its one Reviewer verdict (free — zero
+        provider calls — when the node declares no judgment items, exactly
+        like every other leaf today) to a terminal status, so the common
+        case here is a pure status check with no further dispatch. The only
+        case that does real work is resume: a crash between dispatch and
+        review leaves the node mid-flight, and ``run_direct_episode`` is
+        idempotent/resumable the same way the round loop is, so calling it
+        again here safely continues from wherever it stopped.
+        """
+        node = await run_direct_episode(
+            self.run_dir,
+            self.options.goal.strip(),
+            self.provider,
+            writer_adapter_factory=self.writer_adapter_factory,
+            env=self.env,
+            prompt_for_node=lambda node: build_node_prompt(node, self.run_dir),
+            budget=EpisodeBudget(),
+            log=self.log,
+            max_attempts=DIRECT_MAX_ATTEMPTS,
+        )
+        if node.status == "passed":
+            return None
+        if node.status == "blocked" and is_size_defect(node.last_defect):
+            self._escalate_tier("size_defect_retry", node_id=node.id)
+            return None
+        return False
+
+    async def _phase_review(self) -> None:
+        """T1-3's named "review" checkpoint (PLAN.md §A4.3's phase table).
+        Per-node review already happened *inside* ``_phase_execute`` —
+        ``v1/round_loop.py``'s dispatch and review are coupled per node (a
+        node cannot be reviewed before its own gates pass, and splitting
+        that into two fully separate global passes over the whole tree is a
+        larger restructuring than this workstream's scope). This phase is
+        the confirmation checkpoint the table's phase name promises: it
+        spends nothing further, it just reports whether the tree that
+        execute produced is blocked."""
         tree = self._load_tree()
         return None if not tree.is_blocked() else False
 
@@ -542,6 +955,37 @@ class RecursiveDriver:
             return False
         if result.review is not None and result.review.triage:
             counts = summarize_triage(result.review.triage)
+            # PLAN.md §A4.4: "Reviewer returns class: regenerate on >= half
+            # of a T2 plan's leaves -> promote to T3, re-pilot." Checked
+            # here, not inside v3/document_review.py itself, for the same
+            # reason the size-defect check lives in the driver rather than
+            # v1/round_loop.py — document_review is tier-agnostic and used
+            # by T3 too, where this trigger must never fire (T3 is already
+            # the ceiling). Escalating supersedes this pass's own
+            # repair-approval flow entirely: once tier.json says T3, the
+            # next iteration of run()'s phase loop picks up "pilot" (T2
+            # never ran it) and re-enters execute/review/assemble under the
+            # freshly-frozen contract, so asking approval for a T2-scoped
+            # repair here would just be discarded work.
+            #
+            # Known gap, documented rather than silently glossed over: this
+            # escalates and re-pilots, but does not itself retroactively
+            # re-validate T2's already-"passed" leaves against the new
+            # contract (that is the existing §10 amend/re-validate
+            # machinery, a separate intervention this trigger does not
+            # invoke). The trigger fires and the tier rises correctly; full
+            # retroactive contract enforcement on old leaves is not part of
+            # what §B2 wires.
+            total = sum(counts.values())
+            regenerate = counts.get("regenerate", 0)
+            tier = self._current_tier()
+            if tier == "T2" and total > 0 and regenerate / total >= 0.5:
+                self._escalate_tier(
+                    "majority_regenerate",
+                    regenerate=regenerate,
+                    total=total,
+                )
+                return None
             summary = ", ".join(f"{kind}={count}" for kind, count in counts.items())
             sample = "; ".join(
                 f"{node_id} ({triage.classification})"
@@ -643,18 +1087,20 @@ class RecursiveDriver:
     def _phase_done(self, phase: str) -> bool:
         if not self._has_run_dir():
             return False
+        if phase == "classify":
+            return tier_path(self.run_dir).exists()
         if phase == "intake":
             try:
                 return "## Goal" in spec_path(self.run_dir).read_text(encoding="utf-8")
             except OSError:
                 return False
-        if phase == "survey":
+        if phase in ("survey", "explore"):
             return (self.run_dir / "spine.json").exists()
         if phase == "plan":
             return tree_path(self.run_dir).exists()
         if phase == "pilot":
             return contract_path(self.run_dir).exists()
-        return False  # research/execute/assemble: idempotent, so always re-run
+        return False  # execute/verify/review/research/assemble: idempotent, always re-run
 
     def _has_run_dir(self) -> bool:
         return self.run_dir.exists() and (self.run_dir / "events.jsonl").exists()
@@ -711,12 +1157,25 @@ class RecursiveDriver:
         def factory(node: TaskNode) -> AgentAdapter:
             from .backends import build_writer_adapter
 
+            work = self.options.work_object
+            # PLAN.md §A3 point 1: kind="workspace" means the Writer's cwd
+            # becomes the real repo, not the run directory — the change
+            # that makes coding tasks reachable at all. Run-dir bookkeeping
+            # (prompt_dir, out/, scratch/, trace.jsonl) all stay anchored to
+            # self.run_dir (already absolute, §D0b) regardless of this
+            # branch; only the adapter's cwd moves.
+            workspace_path = (
+                work.root
+                if work is not None and work.kind == "workspace" and work.root is not None
+                else self.run_dir
+            )
             return build_writer_adapter(
                 self.options.backend,
-                workspace_path=self.run_dir,
+                workspace_path=workspace_path,
                 prompt_dir=self.run_dir / "tmp" / "prompts",
                 node=node,
                 model=self.options.model,
+                run_dir=self.run_dir,
             )
 
         return factory
@@ -760,6 +1219,45 @@ def _count_statuses(tree: TaskTree) -> dict[str, int]:
     for node in tree.nodes.values():
         counts[node.status] = counts.get(node.status, 0) + 1
     return counts
+
+
+def escalate_run(run_dir: str | Path) -> dict[str, Any]:
+    """PLAN.md §A4.4 "Operator escalate intervention -> promote one tier."
+    §B2's third (of four) wired escalation trigger — the CLI's ``escalate``
+    subcommand (``pipeline/cli.py``) is its only caller today. Mirrors
+    ``amend_contract_and_estimate``'s shape: a pure, synchronous
+    read-modify-write over the run directory, no provider call, no writer
+    dispatch. The phase loop picks up the grown phase list the next time
+    ``RecursiveDriver.run()`` executes (invariant 9: tiers only rise, so
+    this composes with resume for free — there is no separate "apply the
+    escalation" step)."""
+    run_dir = Path(run_dir)
+    path = tier_path(run_dir)
+    try:
+        record = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise FileNotFoundError(
+            f"no tier.json at {path} — has the classify phase run yet?"
+        ) from exc
+    if not isinstance(record, dict) or record.get("tier") not in ("T0", "T1", "T2", "T3"):
+        raise ValueError(f"tier.json at {path} has no valid tier: {record!r}")
+    current: Tier = record["tier"]
+    new_tier = escalate(current, "operator")
+    record["tier"] = new_tier
+    record["ts"] = time.time()
+    write_text_atomic(path, json.dumps(record, ensure_ascii=False, indent=2, sort_keys=True) + "\n")
+    EventLog(events_path(run_dir)).append(
+        {
+            "node_id": "-",
+            "role": "operator",
+            "round": 0,
+            "type": "run_tier_escalated",
+            "trigger": "operator",
+            "from": current,
+            "to": new_tier,
+        }
+    )
+    return {"from": current, "to": new_tier}
 
 
 # ----------------------------------------------------------------------

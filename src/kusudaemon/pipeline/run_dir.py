@@ -73,6 +73,15 @@ def phase_path(run_dir: str | Path) -> Path:
     return Path(run_dir) / "phase.json"
 
 
+def tier_path(run_dir: str | Path) -> Path:
+    """PLAN.md §A4/§B2: ``{tier, signals, estimate, needs_intake,
+    needs_explore, override, ts}`` — the durable record of the classify
+    phase's decision. ``_phase_done("classify")`` keys off this file's
+    existence exactly the way ``_phase_done("plan")`` keys off
+    ``tree.json``."""
+    return Path(run_dir) / "tier.json"
+
+
 def approvals_path(run_dir: str | Path) -> Path:
     return Path(run_dir) / "approvals.jsonl"
 

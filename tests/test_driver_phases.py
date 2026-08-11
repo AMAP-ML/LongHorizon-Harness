@@ -17,8 +17,38 @@ from pathlib import Path
 _REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(_REPO_ROOT / "src"))
 
-from kusudaemon.pipeline.driver import RecursiveDriver, RunOptions  # noqa: E402
-from kusudaemon.pipeline.run_dir import run_spec_path  # noqa: E402
+from kusudaemon.pipeline.driver import RecursiveDriver, RunOptions, escalate_run  # noqa: E402
+from kusudaemon.pipeline.run_dir import run_spec_path, tier_path  # noqa: E402
+from kusudaemon.v1.tree import TaskNode  # noqa: E402
+from kusudaemon.v6.work_object import measure_workspace  # noqa: E402
+
+_PROVIDER_ENV_KEYS = (
+    "KUSUDAEMON_PROVIDER_BASE_URL", "KUSUDAEMON_PROVIDER_API_KEY",
+    "KUSUDAEMON_PROVIDER_MODEL", "KUSUDAEMON_PROVIDER_CONFIG",
+    "OPENAI_API_KEY", "OPENAI_BASE_URL", "OPENAI_MODEL", "KUSUDAEMON_PROVIDER",
+)
+
+
+class _ProviderEnvGuard:
+    """Same fixture as test_pipeline_backends.py's _EnvGuard -- GptmeAdapter
+    construction resolves provider config, so a test that builds one (even
+    without ever running it) needs deterministic env, not whatever the
+    ambient shell happens to have set."""
+
+    def __enter__(self) -> "_ProviderEnvGuard":
+        self._backup = {key: os.environ.pop(key, None) for key in _PROVIDER_ENV_KEYS}
+        os.environ["KUSUDAEMON_PROVIDER_CONFIG"] = "/nonexistent/provider.json"
+        os.environ["OPENAI_API_KEY"] = "test-key"
+        os.environ["OPENAI_BASE_URL"] = "https://test.example.com/v1"
+        os.environ["OPENAI_MODEL"] = "test-model"
+        return self
+
+    def __exit__(self, *exc_info: object) -> None:
+        for key, value in self._backup.items():
+            if value is not None:
+                os.environ[key] = value
+            else:
+                os.environ.pop(key, None)
 
 
 class _ScriptedDriver(RecursiveDriver):
@@ -357,6 +387,318 @@ class CorruptTreeResumeTest(unittest.TestCase):
                 self.assertTrue(driver._phase_done("plan"))
 
         asyncio.run(scenario())
+
+
+class WorkspaceCliDefaultRunsRootTest(unittest.TestCase):
+    """PLAN.md §A3 point 1 / §B1: `--workspace <path>` on run.py's CLI
+    entry point measures a WorkObject and, absent an explicit
+    --runs-root, defaults the run directory to
+    <workspace>/.kusudaemon/runs/<run-id> -- so a workspace-mode run's
+    bookkeeping lands inside the project it was launched from."""
+
+    def _run_entry(self, argv: list[str]) -> dict:
+        from types import SimpleNamespace
+        from unittest import mock
+
+        from kusudaemon.pipeline.run import run_from_args
+
+        captured: dict = {}
+
+        class _CaptureProvider:
+            def __init__(self, **kwargs) -> None:
+                captured["provider_model"] = kwargs.get("model")
+
+        class _StubDriver:
+            def __init__(self, run_dir, provider=None, options=None, env=None) -> None:
+                captured["run_dir"] = run_dir
+                captured["options"] = options
+
+            async def run(self):
+                return SimpleNamespace(status="done", phase="assemble", tree_counts={}, detail=None)
+
+        with (
+            mock.patch("kusudaemon.pipeline.run.OpenAICompatibleProvider", _CaptureProvider),
+            mock.patch("kusudaemon.pipeline.run.RecursiveDriver", _StubDriver),
+        ):
+            rc = run_from_args(argv)
+        self.assertEqual(rc, 0)
+        return captured
+
+    def test_workspace_flag_defaults_runs_root_inside_the_workspace(self) -> None:
+        with tempfile.TemporaryDirectory() as workspace_str:
+            workspace_root = Path(workspace_str).resolve()
+            (workspace_root / "app.py").write_text("print(1)\n", encoding="utf-8")
+            captured = self._run_entry(
+                ["--run-id", "r1", "--goal", "fix the bug", "--workspace", str(workspace_root)]
+            )
+        self.assertEqual(captured["run_dir"], workspace_root / ".kusudaemon" / "runs" / "r1")
+        work = captured["options"].work_object
+        self.assertIsNotNone(work)
+        self.assertEqual(work.kind, "workspace")
+        self.assertEqual(work.root, workspace_root)
+        self.assertEqual(work.files, 1)
+
+    def test_explicit_runs_root_overrides_the_workspace_default(self) -> None:
+        with (
+            tempfile.TemporaryDirectory() as workspace_str,
+            tempfile.TemporaryDirectory() as runs_str,
+        ):
+            workspace_root = Path(workspace_str).resolve()
+            runs_root = Path(runs_str).resolve()
+            captured = self._run_entry(
+                [
+                    "--run-id", "r1", "--goal", "fix the bug",
+                    "--workspace", str(workspace_root),
+                    "--runs-root", str(runs_root),
+                ]
+            )
+        self.assertEqual(captured["run_dir"], runs_root / "r1")
+
+    def test_no_workspace_keeps_todays_default_runs_root(self) -> None:
+        cwd = Path.cwd()
+        with tempfile.TemporaryDirectory() as cwd_str:
+            try:
+                os.chdir(cwd_str)
+                captured = self._run_entry(["--run-id", "r1", "--goal", "summarize this"])
+            finally:
+                os.chdir(cwd)
+        self.assertEqual(captured["run_dir"], Path(cwd_str).resolve() / ".kusudaemon" / "runs" / "r1")
+        self.assertIsNone(captured["options"].work_object)
+
+
+class DefaultWriterFactoryWorkspaceTest(unittest.TestCase):
+    """PLAN.md §A3/§B1: the default writer factory must point a
+    kind="workspace" node's adapter at work.root, and a kind="text"
+    (today's default, work_object=None) node's adapter at run_dir exactly
+    as before -- no behavior change for a run that never mentions
+    workspace mode (PLAN.md Part III rule 1)."""
+
+    def _node(self) -> TaskNode:
+        return TaskNode(id="n1", brief="b", artifact="out/n1.md", gates=["nonempty"])
+
+    def test_workspace_mode_points_the_adapter_at_work_root(self) -> None:
+        with tempfile.TemporaryDirectory() as workspace_str, tempfile.TemporaryDirectory() as runs_str:
+            workspace_root = Path(workspace_str).resolve()
+            (workspace_root / "app.py").write_text("print(1)\n", encoding="utf-8")
+            work = measure_workspace(workspace_root)
+            run_dir = Path(runs_str) / "r1"
+
+            with _ProviderEnvGuard():
+                driver = RecursiveDriver(
+                    run_dir,
+                    provider=None,  # type: ignore[arg-type]
+                    options=RunOptions(goal="test", work_object=work),
+                    research_adapter_factory=lambda node, query: (_ for _ in ()).throw(
+                        AssertionError("no research dispatch expected")
+                    ),
+                )
+                adapter = driver.writer_adapter_factory(self._node())
+
+            self.assertEqual(adapter.workspace_path, str(workspace_root))
+            self.assertNotEqual(adapter.workspace_path, str(driver.run_dir))
+
+    def test_default_no_work_object_points_the_adapter_at_run_dir(self) -> None:
+        with tempfile.TemporaryDirectory() as runs_str:
+            run_dir = Path(runs_str) / "r1"
+
+            with _ProviderEnvGuard():
+                driver = RecursiveDriver(
+                    run_dir,
+                    provider=None,  # type: ignore[arg-type]
+                    options=RunOptions(goal="test"),
+                    research_adapter_factory=lambda node, query: (_ for _ in ()).throw(
+                        AssertionError("no research dispatch expected")
+                    ),
+                )
+                adapter = driver.writer_adapter_factory(self._node())
+
+            self.assertEqual(adapter.workspace_path, str(driver.run_dir))
+
+
+class PhaseDoneClassifyExploreTest(unittest.TestCase):
+    """PLAN.md §B2: `_phase_done` gains "classify" (tier.json) and treats
+    "explore" the same way "survey" always was (spine.json) -- the driver's
+    resume-skip idiom extended to the two new phase names, not a new
+    mechanism."""
+
+    def test_classify_done_keyed_on_tier_json(self) -> None:
+        with tempfile.TemporaryDirectory() as root_str:
+            driver = _ScriptedDriver(Path(root_str) / "run")
+            self.assertFalse(driver._phase_done("classify"))
+            tier_path(driver.run_dir).write_text(
+                json.dumps({"tier": "T2", "ts": 0}), encoding="utf-8"
+            )
+            self.assertTrue(driver._phase_done("classify"))
+
+    def test_explore_done_keyed_on_spine_json_same_as_survey(self) -> None:
+        with tempfile.TemporaryDirectory() as root_str:
+            driver = _ScriptedDriver(Path(root_str) / "run")
+            self.assertFalse(driver._phase_done("explore"))
+            self.assertFalse(driver._phase_done("survey"))
+            (driver.run_dir / "spine.json").write_text("[]", encoding="utf-8")
+            self.assertTrue(driver._phase_done("explore"))
+            self.assertTrue(driver._phase_done("survey"))
+
+
+class RunOptionsTierOverrideRoundTripTest(unittest.TestCase):
+    """PLAN.md §B2: tier_override round-trips through to_spec/from_spec —
+    a --tier floor set at run start must survive a resume the same way
+    every other RunOptions field does."""
+
+    def test_tier_override_round_trips(self) -> None:
+        options = RunOptions(goal="g", tier_override="T2")
+        restored = RunOptions.from_spec(options.to_spec())
+        self.assertEqual(restored.tier_override, "T2")
+
+    def test_no_override_round_trips_as_none(self) -> None:
+        options = RunOptions(goal="g")
+        restored = RunOptions.from_spec(options.to_spec())
+        self.assertIsNone(restored.tier_override)
+
+
+class EscalateRunFunctionTest(unittest.TestCase):
+    """PLAN.md §A4.4 "operator escalate" intervention — pipeline/driver.py's
+    escalate_run, the third (of four) wired escalation trigger."""
+
+    def test_escalate_run_promotes_one_tier_and_logs_an_event(self) -> None:
+        from kusudaemon.v0.events import EventLog
+        from kusudaemon.pipeline.run_dir import events_path
+
+        with tempfile.TemporaryDirectory() as root_str:
+            run_dir = Path(root_str) / "run"
+            _ScriptedDriver(run_dir)  # creates the run dir + events.jsonl
+            tier_path(run_dir).write_text(
+                json.dumps({"tier": "T1", "measured_tier": "T1", "ts": 0}), encoding="utf-8"
+            )
+            result = escalate_run(run_dir)
+            self.assertEqual(result, {"from": "T1", "to": "T2"})
+            record = json.loads(tier_path(run_dir).read_text(encoding="utf-8"))
+            self.assertEqual(record["tier"], "T2")
+            # Unrelated fields survive the read-modify-write.
+            self.assertEqual(record["measured_tier"], "T1")
+            events = EventLog(events_path(run_dir)).read_all()
+            escalations = [e for e in events if e.get("type") == "run_tier_escalated"]
+            self.assertEqual(len(escalations), 1)
+            self.assertEqual(escalations[0]["trigger"], "operator")
+            self.assertEqual(escalations[0]["from"], "T1")
+            self.assertEqual(escalations[0]["to"], "T2")
+
+    def test_escalate_run_is_a_no_op_ceiling_at_t3(self) -> None:
+        with tempfile.TemporaryDirectory() as root_str:
+            run_dir = Path(root_str) / "run"
+            _ScriptedDriver(run_dir)
+            tier_path(run_dir).write_text(json.dumps({"tier": "T3", "ts": 0}), encoding="utf-8")
+            result = escalate_run(run_dir)
+            self.assertEqual(result, {"from": "T3", "to": "T3"})
+
+    def test_escalate_run_raises_without_a_classify_result(self) -> None:
+        with tempfile.TemporaryDirectory() as root_str:
+            run_dir = Path(root_str) / "run"
+            _ScriptedDriver(run_dir)
+            with self.assertRaises(FileNotFoundError):
+                escalate_run(run_dir)
+
+
+class TierOverrideArgvTest(unittest.TestCase):
+    """PLAN.md §B2: --tier reaches RunOptions.tier_override on a fresh run,
+    mirroring ResumeModelFromSpecTest's / WorkspaceCliDefaultRunsRootTest's
+    own _StubDriver-capture pattern above."""
+
+    def _run_entry(self, argv: list[str]) -> dict:
+        from types import SimpleNamespace
+        from unittest import mock
+
+        from kusudaemon.pipeline.run import run_from_args
+
+        captured: dict = {}
+
+        class _CaptureProvider:
+            def __init__(self, **kwargs) -> None:
+                captured["provider_model"] = kwargs.get("model")
+
+        class _StubDriver:
+            def __init__(self, run_dir, provider=None, options=None, env=None) -> None:
+                captured["options"] = options
+
+            async def run(self):
+                return SimpleNamespace(status="done", phase="assemble", tree_counts={}, detail=None)
+
+        with (
+            mock.patch("kusudaemon.pipeline.run.OpenAICompatibleProvider", _CaptureProvider),
+            mock.patch("kusudaemon.pipeline.run.RecursiveDriver", _StubDriver),
+        ):
+            rc = run_from_args(argv)
+        self.assertEqual(rc, 0)
+        return captured
+
+    def test_tier_flag_reaches_run_options(self) -> None:
+        with tempfile.TemporaryDirectory() as root_str:
+            captured = self._run_entry(
+                [
+                    "--runs-root", root_str, "--run-id", "r1",
+                    "--goal", "g", "--tier", "T3",
+                ]
+            )
+        self.assertEqual(captured["options"].tier_override, "T3")
+
+    def test_no_tier_flag_leaves_override_none(self) -> None:
+        with tempfile.TemporaryDirectory() as root_str:
+            captured = self._run_entry(
+                ["--runs-root", root_str, "--run-id", "r1", "--goal", "g"]
+            )
+        self.assertIsNone(captured["options"].tier_override)
+
+
+class CliEscalateSubcommandTest(unittest.TestCase):
+    """PLAN.md §A4.4/§B2: `kusudaemon pipeline escalate <run-id>` — mirrors
+    `amend`'s subcommand plumbing (pipeline/cli.py)."""
+
+    def test_escalate_subcommand_promotes_and_prints(self) -> None:
+        import io
+        from contextlib import redirect_stdout
+        from argparse import Namespace
+
+        from kusudaemon.pipeline import cli
+
+        with tempfile.TemporaryDirectory() as root_str:
+            root = Path(root_str)
+            run_dir = root / "r1"
+            _ScriptedDriver(run_dir)
+            tier_path(run_dir).write_text(json.dumps({"tier": "T0", "ts": 0}), encoding="utf-8")
+
+            argv = Namespace(run_id="r1", runs_root=str(root))
+            buf = io.StringIO()
+            with redirect_stdout(buf):
+                rc = cli.dispatch(Namespace(pipeline_command="escalate", **vars(argv)))
+            self.assertEqual(rc, 0)
+            self.assertIn("T0 -> T1", buf.getvalue())
+            record = json.loads(tier_path(run_dir).read_text(encoding="utf-8"))
+            self.assertEqual(record["tier"], "T1")
+
+    def test_escalate_subcommand_rejects_missing_run(self) -> None:
+        from argparse import Namespace
+
+        from kusudaemon.pipeline import cli
+
+        with tempfile.TemporaryDirectory() as root_str:
+            argv = Namespace(pipeline_command="escalate", run_id="does-not-exist", runs_root=root_str)
+            rc = cli.dispatch(argv)
+            self.assertEqual(rc, 1)
+
+    def test_tier_flag_parsed_by_run_subparser(self) -> None:
+        from kusudaemon.pipeline import cli
+
+        parser = cli.build_pipeline_parser()
+        args = parser.parse_args(["run", "--goal", "g", "--tier", "T2"])
+        self.assertEqual(args.tier, "T2")
+
+    def test_escalate_subcommand_parsed(self) -> None:
+        from kusudaemon.pipeline import cli
+
+        parser = cli.build_pipeline_parser()
+        args = parser.parse_args(["escalate", "some-run-id"])
+        self.assertEqual(args.pipeline_command, "escalate")
+        self.assertEqual(args.run_id, "some-run-id")
 
 
 if __name__ == "__main__":

@@ -1059,24 +1059,68 @@ nothing else. Fixed by §A10's tiering.
         each other otherwise)
     [x] correct CLAUDE.md §11.10.17's claim about who writes out/<node>.md
 
-[ ] §B1  v6 work object                       — unblocks everything — NOT STARTED
-    [ ] v6/work_object.py + measurement
-    [ ] adapter workspace_path = work.root; run-dir paths absolute
-    [ ] SpineUnit.members + workspace survey
-    [ ] --workspace in cli.py AND run.py; RunOptions.work_object
-    [ ] tests + ship gate: a Writer patches a real repo file
+[x] §B1  v6 work object                       — unblocks everything — SHIPPED 2026-08-10
+    [x] v6/work_object.py + measurement (WorkObject, measure_workspace,
+        work_object_from_text, work_object_none — deterministic, model-free,
+        minimal gitignore matcher, builtin deny lists, size ceiling)
+    [x] adapter workspace_path = work.root; run-dir paths absolute
+        (pipeline/backends.py's build_writer_adapter gained `run_dir`;
+        driver.py's _default_writer_factory branches on
+        options.work_object.kind; hidden_paths hides the run dir as one
+        subtree when nested inside work.root, per-file names otherwise)
+    [x] SpineUnit.members + workspace survey (v2/survey.py additive field,
+        load_spine tuple-coerces it; v6/work_object.py's survey_workspace
+        groups by top-level dir, splits over-ceiling groups, sentinel
+        start_chunk=end_chunk=-1)
+    [x] --workspace in cli.py AND run.py; RunOptions.work_object (both
+        pipeline/cli.py's `run` subparser and pipeline/run.py's own parser;
+        --runs-root defaults to <workspace>/.kusudaemon/runs when
+        --workspace is given and --runs-root is omitted)
+    [x] tests + ship gate — with one honest caveat: **the ship gate is
+        demonstrated via a real subprocess fixture
+        (tests/fixtures/fake_workspace_writer.py), not a real gptme
+        episode** — no gptme install/API key in this sandbox (CLAUDE.md
+        Part III). It proves CommandAgentAdapter's cwd is genuinely
+        work.root and that out/<node>.md still resolves under run_dir
+        regardless — the same plumbing a real gptme dispatch goes through
+        — but does not prove a real gptme agent's save/patch tool calls
+        behave identically pointed outside a run directory. Also NOT
+        wired in this workstream (deliberately out of scope, per §B1's own
+        text and confirmed against driver.py before starting): full phase
+        routing for kind="workspace" (_phase_survey still requires
+        source_text and still raises on an empty corpus per §D4 even in
+        workspace mode) — that's §B2's job, not §B1's. 410 tests total (23
+        new), all green.
 
 [x] §D1 + §D7                                 — fix alongside §D0, cheap
     [x] goal + global rubric in build_node_prompt
     [x] catch OSError in write_remote_text cleanup
     [x] one failing-first test per defect
 
-[ ] §B2  tier classification                  — the cost claim — NOT STARTED
-    [ ] v6/tiering.py: signals, estimate, table, escalate
-    [ ] phases_for(tier) replaces PHASES; tier.json; --tier floor
+[x] §B2  tier classification                  — the cost claim — SHIPPED 2026-08-10
+    [x] v6/tiering.py: signals, estimate, table, escalate
+    [x] phases_for(tier) replaces PHASES; tier.json; --tier floor
+        (phases_for returns the *maximal* list per tier, with
+        needs_intake/needs_explore short-circuiting at runtime -- see
+        CLAUDE.md's "v6 -- tier classification" section for why this
+        reading of §A4.3's table was chosen over its literal short tuples)
     [x] §D4: corpus-less run raises instead of faking success (done early,
         out of order — cheap and independent of the rest of §B2)
-    [ ] ship gate: T0 goal completes in <=3 model calls
+    [x] ship gate: T0 goal completes in <=3 model calls (sandbox-honest:
+        FakeProvider-driven, no real LLM available -- see CLAUDE.md)
+    [x] escalation triggers: 3 of 4 wired (T0/T1 size-defect-twice -> T2,
+        operator intervention -> +1 tier via `kusudaemon pipeline escalate`,
+        T2 majority-regenerate -> T3/re-pilot); the 4th (a node's accepted
+        split proposal -> T3) is correct in v6/tiering.py's escalate() and
+        tested directly but has no call site — runtime split is §B5,
+        not started. majority_regenerate's known gap: it escalates and
+        re-pilots but does not retroactively re-validate T2's already-
+        passed leaves against the new contract (that's the existing §10
+        amend/re-validate machinery, not invoked by this trigger).
+    [x] _phase_survey now branches on WorkObject.kind=="workspace" (the
+        gap §B1's own results log flagged: "that's §B2's job")
+    [x] 51 new tests (test_v6_tiering.py + test_driver_phases.py
+        additions); 461 total, all green
 
 [ ] §B3  adaptive intake                      (§D8) — NOT STARTED
 [ ] §A10 pilot/contract tiered to T3          (§D9) — NOT STARTED
@@ -1136,6 +1180,38 @@ gate was unreachable before this session: the artifact path was never in
 any prompt, and a relative run_dir made every path resolution wrong the
 moment the workspace stopped being the run directory itself.
 
+**2026-08-10, follow-up session: §B1 (the v6 work object) shipped.**
+`v6/work_object.py` (new package), `SpineUnit.members`, the
+`build_writer_adapter`/`_default_writer_factory` workspace-cwd branch, and
+`--workspace` on both CLI entry points — see `CLAUDE.md`'s new "v6 — the
+work object" section for the file-by-file breakdown and the ship gate's
+exact rigor (a real-subprocess fixture standing in for gptme, not a real
+episode — no provider available in this sandbox). §B2 (tier classification
+and phase routing) remains not started: `_phase_survey` and the rest of
+`RecursiveDriver`'s phase machinery do not yet branch on
+`WorkObject.kind`, so a full pipeline run against `kind="workspace"` does
+not yet do anything sensible end to end — only the dispatch plumbing this
+workstream's own ship gate targets is proven. 410 tests, ~23s, all green
+(up from 387 earlier the same day).
+
+**2026-08-10, third session: §B2 (tier classification and phase routing)
+shipped.** `v6/tiering.py` (signals, estimate, classify, phases_for,
+escalate) and `v6/direct.py` (T0's tree-less direct episode, T1's
+code-built single-node tree) are new packages; `pipeline/driver.py`'s
+`run()` is tier-driven now, and `_phase_survey` finally does branch on
+`WorkObject.kind` — the exact gap the paragraph above named as still open.
+Three of four §A4.4 escalation triggers are wired end to end; the fourth
+(a node's accepted split proposal) is a correct, tested, but uncalled
+function pending §B5 (runtime split doesn't exist yet). See `CLAUDE.md`'s
+new "v6 — tier classification and phase routing" section for the
+file-by-file breakdown, including the one genuine design ambiguity this
+session had to resolve on its own judgment (`phases_for` returning the
+*maximal* per-tier phase list rather than §A4.3's literal short tuples —
+documented there with the reasoning). Ship gate demonstrated the same
+sandbox-honest way §B1's was: `FakeProvider` standing in for the one real
+`estimate_scope` call, not a real LLM. 461 tests, ~23s, all green (up from
+410 earlier the same day).
+
 **Why this order.** §B1 before everything because a harness that cannot reach
 a repo cannot be evaluated on the use case that motivates the redesign. §B2
 second because it is the cost claim, and every later workstream's ship gate is
@@ -1164,3 +1240,9 @@ number actually was.
 | 2026-08-10 | §D7 remote_files cleanup | `write_remote_text`'s `finally` now catches `OSError`, not just `FileNotFoundError`. |
 | 2026-08-10 | §D6/§D10 cleanup | Duplicated `return merged` in `v2/survey.py` removed; `_hidden_paths_for` docstring corrected (part of §D2); `load_spine` docstring re-checked, already accurate. |
 | 2026-08-10 | Test suite | 370 → 387 tests (17 new: 2 new files — `test_pipeline_liveness.py`, `test_environment_remote_files.py` — plus additions to `test_pipeline_prompts.py`, `test_v0_resume.py`, `test_v1_units.py`, `test_v1_round_loop.py`, `test_pipeline_backends.py`, `test_driver_phases.py`). All green, ~23s. |
+| 2026-08-10 | §B1 v6 work object | `v6/work_object.py` added: `WorkObject`, `measure_workspace` (deterministic, gitignore-aware, builtin deny lists incl. `.kusudaemon` itself, 1MB/file ceiling), `work_object_from_text`/`work_object_none`, `survey_workspace` (groups by top-level dir, splits over-8k-token groups, `SpineUnit.members` populated with `start_chunk=end_chunk=-1` sentinels). `SpineUnit.members` is additive (`load_spine` tuple-coerces it; every existing `spine.json` loads unchanged). `RunOptions.work_object` (constructor input, not persisted — same treatment as `source_text`). `_default_writer_factory` picks `workspace_path=work.root` for `kind="workspace"`; `build_writer_adapter` gained `run_dir` and hides the run directory as one subtree (with a per-node carve-out) when it's nested inside `work.root`, vs. today's per-file names when it isn't. `--workspace <path>` added to both `pipeline/cli.py` and `pipeline/run.py`, defaulting `--runs-root` to `<workspace>/.kusudaemon/runs`. |
+| 2026-08-10 | §B1 ship gate | Demonstrated via a real subprocess fixture (`tests/fixtures/fake_workspace_writer.py`) run through the real `CommandAgentAdapter`, not a mock and not a real gptme episode (no provider available in this sandbox): confirmed the adapter's cwd is genuinely `work.root` (a marker file written into that cwd) and that `out/<node>.md` still resolves under `run_dir` regardless, via the same absolute-path prompt instruction (`_artifact_instruction`) a real Writer reads. Full phase routing for `kind="workspace"` (§B2) is not wired — `_phase_survey` still requires `source_text` unconditionally. |
+| 2026-08-10 | Test suite | 387 → 410 tests (23 new: `test_v6_work_object.py` (15), plus additions to `test_pipeline_backends.py` (+3) and `test_driver_phases.py` (+5)). All green, ~23s. |
+| 2026-08-10 | §B2 tier classification | `v6/tiering.py` added: `Signals`/`measure_signals` (free, word-boundary marker counts, coarse `named_paths` from `top_dirs`), `ScopeEstimate`/`estimate_scope` (one `complete_json` call, content-free digest via `work_object.iter_workspace_paths`), `classify` (§A4.3's table + the `unknown`-forces-≥T2 override), `phases_for` (maximal per-tier phase list — a deliberate reading of §A4.3's table over its literal short tuples, see CLAUDE.md), `escalate`/`tier_max`. `v6/direct.py` added: T0's tree-less `run_direct_episode` (persists to `direct_node.json`, never `tree.json`) and T1's code-built `build_single_node_tree`, both reusing `v1/round_loop.py`'s newly-extracted `dispatch_node`/`review_and_transition_node` (pulled out of `run_round_loop`'s inline closures, purely mechanical, no behavior change). `pipeline/driver.py`: new `_phase_classify`/`_phase_verify`/`_phase_review`/`_phase_explore`; `_phase_survey` now branches on `work_object.kind=="workspace"`; `_phase_intake` skips the full interview when the estimate reported no ambiguities/objections; `run()` is tier-driven (re-reads `tier.json` every loop iteration, `_ran_key` tracks tier-scoped phase names like `"execute@T1"` separately from tier-independent ones). Three of four §A4.4 escalation triggers wired end to end (size-defect-twice, operator, majority-regenerate); the fourth (split-accepted) is a correct, tested, uncalled function pending §B5. `--tier` floor and `kusudaemon pipeline escalate` added to both CLI entry points. |
+| 2026-08-10 | §B2 ship gate | Sandbox-honest (no LLM/API key available, same constraint as §B1): `test_v6_tiering.py::ShipGateThreeGoalsTest` builds one real small repo and three goal strings shaped like the spec's own one-line-edit/three-file-feature/repo-wide-refactor examples, scripts `estimate_scope`'s one call with `FakeProvider`, and asserts `classify()` returns T0-or-T1/T2/T3 respectively. `T0ShipGateCallCountTest` drives a full fake-provider-and-fake-writer `RecursiveDriver.run()` for a T0 goal and asserts total provider calls ≤3 (measured: exactly 1 — `classify`; review is free since the direct node declares no judgment items). `TierOverrideFloorTest` confirms `--tier T3` on a trivial goal still runs every T3 phase. `ResumeAfterEscalationTest` confirms a live T1→T2 escalation (caught mid-run by a fresh `RecursiveDriver` construction, simulating process resume) correctly re-enters at `plan`/`execute` under the new tier rather than re-visiting the archived T1 tree — this test caught a real bug during development (T1's code-built `tree.json` was making `_phase_done("plan")` falsely report done post-escalation; fixed by archiving it aside before the tier bump). |
+| 2026-08-10 | Test suite | 410 → 461 tests (51 new: `test_v6_tiering.py` (38), plus 13 additions to `test_driver_phases.py`). All green, ~23s. |

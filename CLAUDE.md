@@ -1075,6 +1075,389 @@ prompt, not that node's own handoff).
   operator-facing updates it was always supposed to be, not raw
   `events.jsonl` type strings.
 
+## v6 — the work object (v6/)
+
+PLAN.md §A3/§B1: the single input abstraction that replaces
+`source.txt`-only, and the first workstream of the v6 redesign (unblocks
+everything after it — a harness that cannot reach a repo cannot be
+evaluated on the use case that motivates the redesign). This lands the
+plumbing only: `WorkObject`, its measurement/survey, and the adapter/CLI
+wiring to dispatch a Writer with `kind="workspace"`. §B2's tier
+classification and phase routing (which phases actually run for which
+`WorkObject.kind`) is still unbuilt — see `PLAN.md`.
+
+- `v6/work_object.py` — `WorkObject` (frozen dataclass, exactly PLAN.md
+  §A3's schema), `measure_workspace`, `work_object_from_text`,
+  `work_object_none`, `survey_workspace`. Measurement is pure filesystem +
+  stdlib (no tokenizer, no model call, reuses `v1/gates.estimate_tokens`
+  like every other token count in this repo) — this is the *only* input to
+  the cheap half of tier classification (§A4, unbuilt), so it must never
+  read further than deciding what counts.
+  **Gitignore support is deliberately minimal**, not a spec
+  implementation: `fnmatch` patterns, trailing `/` for directory-only,
+  anchored-vs-any-depth by whether the pattern has an internal `/`, and
+  `!` negation lines recognized but skipped rather than honored — a false
+  exclude here just means one more denylist entry than git itself would
+  apply, the safe direction for a harness deciding what a Writer may read.
+  The builtin directory denylist includes `.kusudaemon` itself: the
+  default `--workspace` `runs_root` is `<root>/.kusudaemon/runs`, so
+  without this a workspace walk would descend into the run's own
+  bookkeeping (every other node's artifacts included) and count it as
+  task content.
+  **`top_dirs` groups by first path segment only**, not two levels — one
+  level is enough signal for tier classification's "where are the
+  tokens" question and keeps cardinality bounded by a repo's top-level
+  layout rather than by every nested package. `survey_workspace` reuses
+  the same grouping for its `SpineUnit`s (§B1: "group by directory,
+  respect a size ceiling") and splits any group whose combined tokens
+  exceed `DEFAULT_UNIT_MAX_TOKENS` (8k) by greedy bin-packing over its
+  sorted member list, so no leaf's `inputs` can overflow its own token
+  budget before a Writer even opens them. Units get
+  `start_chunk=end_chunk=-1` — corpus mode's only two consumers of those
+  fields (`assemble_spine`/`materialize_units`) are a parallel path
+  (§A3 point 2: a workspace is never copied into the run dir, or it would
+  double a repo on disk and immediately desynchronize from it) and must
+  never be called on these units; -1 is a sentinel precisely because it
+  can never be a valid chunk index, so a caller that mixes the two paths
+  up gets an out-of-range crash, not a silently wrong slice. `members` are
+  POSIX paths relative to `work.root`, not absolute — the natural form for
+  a Writer whose cwd *is* `work.root` to open directly.
+- `v2/survey.py` — `SpineUnit` gained `members: tuple[str, ...] = ()`,
+  additive with a default so every existing `spine.json` (which has no
+  `"members"` key) loads unchanged. `load_spine` now coerces a loaded
+  `members` list back to a tuple (json round-trips a tuple as a list) —
+  the one field in this dataclass where that distinction is actually
+  checked anywhere downstream (`survey_workspace`'s own construction, and
+  parity with every other tuple field in this package staying a tuple
+  after a save/load cycle).
+- `pipeline/driver.py` — `RunOptions.work_object: WorkObject | None`,
+  same treatment as `source_text`: a constructor input, never round-tripped
+  through `to_spec`/`from_spec`. A `kind="workspace"` object's `root` is a
+  live filesystem reference, not something to freeze into JSON across a
+  resume; a caller resuming a workspace-mode run re-supplies `--workspace`,
+  which reconstructs it fresh via `measure_workspace` at driver-construction
+  time (`pipeline/run.py`), the same "disk is authoritative, argv just
+  re-points at it" shape `source_text` already has via `source.txt`. This
+  is a known gap versus corpus mode, not an oversight: unlike the corpus
+  (materialized once into `source.txt` and never re-read), a workspace's
+  `root` genuinely can't be recovered from anything the run directory
+  itself holds.
+  `_default_writer_factory` picks `workspace_path = work.root` when
+  `options.work_object.kind == "workspace"`, else `self.run_dir` exactly as
+  before (§A3 point 1: this is *the* change that makes coding tasks
+  reachable — a Writer's cwd becomes the real repo, not the run
+  directory). `prompt_dir`/`out/`/`scratch/`/`trace.jsonl` all stay
+  anchored to `self.run_dir` (already absolute, §D0b) regardless of this
+  branch — only the adapter's cwd moves. **The driver's phase machinery
+  itself was untouched by §B1**: `_phase_survey` required `source_text`
+  unconditionally and raised on an empty corpus (§D4) even when
+  `work_object.kind == "workspace"` — routing phases by `WorkObject.kind`
+  was named explicitly as §B2's job, not §B1's; §B1 only proved the
+  dispatch plumbing works (see the ship gate below), not that a full
+  pipeline run against a repo did anything sensible end to end. **§B2
+  closed this gap**: `_phase_survey` now branches on
+  `work_object.kind == "workspace"` first, calling `survey_workspace`
+  directly (zero model calls, same as it always was) instead of falling
+  through to the corpus-only `source_text` check — see the new "v6 — tier
+  classification and phase routing" section below.
+- `v6/work_object.py` also gained `iter_workspace_paths` (§B2): a bounded,
+  content-free `os.walk` over a `kind="workspace"` object's files — unlike
+  `_iter_included_files`, it never reads a file's bytes, since its only
+  consumer (`v6/tiering.py`'s scope-estimate digest) needs paths for a
+  prompt outline, not per-file token counts. Respects only the builtin
+  deny-dirs/filenames, not `.gitignore`/`include`/`exclude` — a coarse
+  outline, not a second source of truth for "what counts as workspace
+  content."
+- `pipeline/backends.py` — `build_writer_adapter` gained a `run_dir` kwarg,
+  defaulting to `workspace_path` (today's corpus-mode invariant — the
+  Writer's cwd *is* the run directory — reproduced byte-for-byte when the
+  new parameter is omitted). `_hidden_paths_and_exceptions_for` has three
+  branches: `run_dir == workspace_path` (corpus mode, unchanged — the old
+  per-file names `"out/"`/`"scratch/"`); `run_dir` nested inside
+  `workspace_path` (the default `--workspace` `runs_root`) hides the run
+  directory as **one subtree**, relative to the Writer's actual cwd, with
+  the node's own `out/<id>.md`/`scratch/<id>` carved back out the same
+  way — the corpus-mode per-file names would resolve to nonexistent paths
+  relative to `work.root`, and doing nothing would leave every other
+  node's artifact and scratch notes readable from the Writer's cwd (§2
+  invariant 6); `run_dir` outside `workspace_path` entirely (a custom
+  `--runs-root`) needs no hidden entry at all — nothing of the harness's
+  bookkeeping sits inside that cwd to begin with. `hidden_paths` /
+  `hidden_path_exceptions` are prompt text only (`cli_agent.py`'s
+  `_hidden_paths_notice`), not a filesystem sandbox — there is no code
+  preventing a Writer from reading a hidden path, only an instruction not
+  to.
+- `pipeline/run.py` / `pipeline/cli.py` — `--workspace <path>` on the `run`
+  subcommand of both entry points (`kusudaemon pipeline run` and the
+  `--detach` child process's own parser). `--runs-root` defaults changed
+  from a fixed string to `None`, resolved at call time: `<workspace>/
+  .kusudaemon/runs` when `--workspace` is given (§A3 point 1: the run dir
+  stays inside the project it was launched from, `types.py`'s existing
+  rule), else today's `./.kusudaemon/runs` — an explicit `--runs-root`
+  still wins either way. Omitting `--workspace` entirely is
+  byte-identical to before this workstream, argument-parsing default and
+  all.
+
+**Ship gate, as actually demonstrated (2026-08-10):** no gptme install or
+API key is available in this sandbox (`CLAUDE.md` Part III: "no network, no
+agent binary, no API key"), so the gate — "a gptme Writer dispatched with
+`kind="workspace"` can read and patch a file in a real repo, and its
+`out/<node>.md` still lands in the run dir" — is demonstrated with a real
+subprocess standing in for the agent (`tests/fixtures/fake_workspace_writer.py`,
+run through the actual `CommandAgentAdapter`/`cd {workspace_path} && ...`
+machinery, not a mock), not a real LLM-driven gptme episode:
+`test_v6_work_object.py::WorkspaceShipGateTest` asserts the subprocess's
+cwd was genuinely `work.root` (it writes a marker file into its own cwd)
+and that the artifact it wrote to the absolute path named in
+`build_node_prompt`'s own instruction (`pipeline/prompts.py`'s
+`_artifact_instruction`) lands under the run directory regardless. This is
+the same rigor level as `test_v0_resume.py`'s real-subprocess tests, but it
+is *not* proof that a real gptme agent's `save`/`patch` tool calls behave
+the same way inside a repo it wasn't designed to be pointed at outside a
+run directory — that remains unverified pending an actual provider.
+
+## v6 — tier classification and phase routing (v6/)
+
+PLAN.md §A4/§B2: the cost claim behind the whole v6 redesign — a run's
+phase list is computed by code from a *tier*, never fixed at seven and
+never chosen by a model (§A2 invariant 8), and a tier once assigned only
+ever rises (invariant 9). This is what makes a one-line edit cost one
+episode instead of intake+survey+plan+pilot+execute+assemble.
+
+- `v6/tiering.py` — the whole classification/routing table, pure code plus
+  one advisory model call:
+  - `Signals`/`measure_signals` (§A4.1) — free, no model call, no file
+    reads beyond what `WorkObject` already measured at construction.
+    `breadth_markers`/`output_markers` are word-boundary regex counts (not
+    presence checks — "refactor every module across the codebase" counts
+    3, and "we reached an overall conclusion" correctly counts 0: `each`/
+    `all` must not match inside `reached`/`overall`). `named_paths` is
+    deliberately coarse — it checks only whether a workspace's *top-level
+    directory names* (already on `WorkObject.top_dirs`, zero extra I/O)
+    appear in the goal text, not individual filenames; a full re-walk to
+    match filenames would double `measure_workspace`'s own I/O cost on a
+    large repo just to compute one advisory signal, and §B4's real probes
+    are the intended fix once they exist.
+  - `ScopeEstimate`/`estimate_scope` (§A4.2) — exactly one `complete_json`
+    call, same shape as `v2/planner.py:plan_level`/`v2/intake.py`'s
+    question calls: system prompt + one user message, schema-capped
+    output (`ambiguities`/`objections` each `maxItems: 8`, `maxLength: 200`
+    per item — `v1/json_schema.py`'s validator doesn't enforce `maxItems`,
+    so this is descriptive-only, same as `PARTITION_SCHEMA`/`VERDICT_SCHEMA`
+    elsewhere use `maxLength` for what the validator *does* enforce). The
+    digest sent is `top_dirs` plus `work_object.iter_workspace_paths`'
+    content-free file listing — never file contents, the same rule §3
+    states for the Planner.
+  - `classify(signals, estimate) -> Tier` — §A4.3's table, first-match-wins
+    via early returns. `unknown` in `files_touched` is applied as an
+    *override* on top of the table's own verdict (not folded into the
+    table itself), forcing at least T2 — "an estimator that cannot tell is
+    exactly the case that needs exploration" — and never *downgrades* an
+    already-higher raw verdict.
+  - `phases_for(tier) -> tuple[str, ...]` — **returns the maximal phase
+    list per tier**, not the literal short tuples PLAN.md's own §A4.3 table
+    shows for T1/T2 (which omit conditionally-run phases like `intake`/
+    `explore` entirely). This was a deliberate resolution of an ambiguity
+    in the spec, not an oversight: the spec's prose for the table
+    explicitly flags `intake`/`explore` as conditional ("intake? fires
+    only when...") but the table's own tuples don't show that
+    conditionality — so `phases_for` always includes them, and
+    `pipeline/driver.py`'s `_phase_intake`/`_phase_explore` read
+    `needs_intake`/`needs_explore` back out of `tier.json` and
+    short-circuit to a logged no-op when the trigger isn't met. This
+    mirrors the *existing* `_phase_done` idiom (a phase always appears in
+    the machinery; whether it does real work is a disk-backed runtime
+    decision) instead of inventing a second skip mechanism. Concretely:
+    `T0 = (classify, execute, verify)`; `T1 = (classify, intake, explore,
+    execute, review)`; `T2 = (classify, intake, explore, plan, execute,
+    review, assemble)`; `T3` adds `pilot`/`research` in the CLAUDE.md §4
+    order. **"explore" is not a new mechanism** — until §B4's real probes
+    exist, it's the v6-vocabulary name for what `_phase_survey` already
+    does (see `pipeline/driver.py` below); **"review"** is a named
+    checkpoint after "execute", not a second dispatch pass — per-node
+    review already happens *inside* `_phase_execute` via
+    `v1/round_loop.py`'s coupled dispatch+review (a node can't be reviewed
+    before its own gates pass), so `_phase_review` just confirms the tree
+    isn't blocked.
+  - `escalate(current, trigger) -> Tier` — invariant 9 enforced in one
+    place: never returns lower than `current`, for every trigger,
+    including `"split_accepted"` (§B5, not built — see below). `"operator"`
+    is the one relative trigger (+1 tier, clamped at T3); every other
+    trigger names its own floor tier directly (`size_defect_retry` → T2,
+    `majority_regenerate`/`split_accepted` → T3). An unknown trigger name
+    raises rather than silently no-op-ing.
+  - `tier_max(a, b)` — the ordering `--tier`'s floor-not-ceiling override
+    needs (`pipeline/driver.py`: `tier = tier_max(measured, override)`).
+- `v6/direct.py` — T0's whole "no `tree.json`" execution path, plus T1's
+  code-built single-node tree:
+  - `run_direct_episode` reuses `v1/round_loop.py`'s per-node
+    `dispatch_node`/`review_and_transition_node` (see the round_loop entry
+    below) against an in-memory, single-node `TaskTree` persisted to
+    **`direct_node.json`** — deliberately never `tree.json`, which is what
+    "T0 has no tree file" actually protects: a resuming driver must never
+    mistake T0's one-node bookkeeping for `_phase_done("plan")` having run.
+    Idempotent/resumable the same way the round loop is: a node already
+    `"passed"`/`"blocked"` short-circuits immediately (zero calls, zero
+    dispatch) on a re-entry.
+  - `build_single_node_tree` is T1's whole "plan" phase, run entirely by
+    code — T1's phase list has no `plan` phase to skip, and a Planner call
+    for a case that's guaranteed to produce exactly one node would be pure
+    waste (the entire point of tiering).
+  - `DIRECT_MAX_ATTEMPTS = 2`, not `round_loop`'s usual 3 — T0/T1 exist for
+    goals small enough that "give it three tries and hope" is the wrong
+    instinct; either the node lands in ~2 attempts, or the estimate was
+    wrong and it should escalate to real planning rather than burn a third
+    attempt at the same size. This is what makes §A4.4's "fails gates
+    *twice*" literal rather than approximate.
+  - `is_size_defect(last_defect)` — a gate result's `.gate` string is the
+    raw gate spec (`"max_tokens:24000"`), and `_transition_after_writer`
+    joins `f"{gate}: {detail}"` into `last_defect`, so a size-class
+    failure's defect text always contains `"max_tokens:"`. No runtime
+    "calls exceeded" gate exists today (`NodeBudget.calls` stays
+    deliberately unwired — see the `_budget_seconds` docstring), so
+    `max_tokens` is the only size-class defect a T0/T1 dispatch can
+    actually produce.
+- `v1/round_loop.py` — `dispatch_node`/`review_and_transition_node` are the
+  original `dispatch`/`review` inner closures, pulled out to module level
+  with their closed-over state made explicit as parameters. Purely
+  mechanical — `run_round_loop`'s own behavior and every existing test of
+  it are unchanged — done so `v6/direct.py`'s T0 path can reuse the exact
+  same gate-cache-write/manifest-line/status-transition machinery a real
+  round-loop dispatch gets, instead of a tree-less special case
+  reimplementing it.
+- `pipeline/driver.py` — the phase machinery itself, tier-driven:
+  - `_phase_classify` — the one `estimate_scope` call, writing `tier.json`
+    (`{tier, measured_tier, override, signals, estimate, needs_intake,
+    needs_explore, ts}`). **Skips the call entirely when `--tier T3` is the
+    floor** (T3 already runs every phase the estimate could have gated, so
+    spending a call whose verdict is guaranteed to be overridden is pure
+    waste); any other forced floor (T0/T1/T2) still measures for real,
+    since `max(measured, floor)` can still come out higher than the floor.
+  - `run()` is now tier-driven, not a fixed `for phase in PHASES` loop
+    (`PHASES` itself is kept, unused internally, as a backward-compatible
+    re-export — `pipeline/__init__.py` and `dashboard/rendering.py`/
+    `static/app.js` still reference the old flat 7-name list for
+    unrelated reasons, §C4's job to touch). `classify` always runs first,
+    through the same `_run_phase` machinery as everything else. After
+    that, every loop iteration **re-reads the tier fresh** and picks the
+    first phase in `phases_for(tier)` not yet run this call — so a phase
+    that bumps the tier mid-run (an escalation trigger firing inside
+    `_phase_execute`/`_phase_assemble`) makes the very next iteration see
+    the grown list and pick up whatever it now requires, in table order.
+    Because tiers only rise and nothing already-done is discarded, this
+    composes with resume for free. **`_ran_key`** is why this doesn't
+    infinite-loop or skip real work: most phase names (`classify`,
+    `intake`, `explore`, `plan`, `pilot`) are "run once, ever" — their own
+    `_phase_done` already makes that idempotent-and-cheap across tiers,
+    because a `tree.json` a T2 planner built is still valid once escalated
+    to T3. The handful in `_TIER_SCOPED_PHASES` (`execute`, `review`,
+    `research`, `assemble`, `verify`) *mean something structurally
+    different* depending on which tier ran them — T0's "execute" is one
+    direct episode with no `tree.json` at all; T2's is a multi-node round
+    loop — so they're tracked per-tier (`"execute@T1"` vs `"execute@T2"`)
+    instead of once, and safely re-run under the new tier.
+  - `_phase_intake` — skips CLAUDE.md §4.1's full interview and writes a
+    minimal `spec.md` (goal + one assumption line explaining the skip)
+    directly, zero calls, whenever `tier.json`'s `needs_intake` is false
+    (the classify estimate reported no ambiguities/objections). This is
+    *not* §B3's adaptive intake (question-set + approval form) — that
+    workstream is still unstarted; this is only the on/off gate §A4.3
+    itself describes, reusing today's all-or-nothing interview when it
+    does fire.
+  - `_phase_survey` — gained a `work_object.kind == "workspace"` branch at
+    the top, calling `survey_workspace` directly instead of falling
+    through to the corpus-only `source_text` check. This is the fix for
+    the gap the §B1 results log named explicitly ("`_phase_survey` still
+    requires `source_text` unconditionally... that's §B2's job").
+  - `_phase_explore` — the v6-vocabulary name §A4.3's table uses for
+    structure discovery; kept as its own method (not a rename of
+    `_phase_survey`) so pre-existing tests calling `_phase_survey` by name
+    (§D4's corpus-less-raises test, the explorer-reasoning test) stay
+    correct unmodified. **It is not real agentic probing** — §B4 (`Probe`,
+    generalized from `v4/research.py`) is a separate, not-yet-started
+    workstream; until it lands, `_phase_explore` always ensures
+    `spine.json` exists (delegating to `_phase_survey`, since "plan" needs
+    it unconditionally at every tier that has a plan phase) and, only when
+    `needs_explore` is true, additionally runs the existing v4 research
+    loop if the operator supplied an explicit `research_plan`. This is an
+    honestly-documented approximation, not a claim that §B4 is done — the
+    §A4.3 table's "≤2/≤6 explorers" caps are not enforced anywhere because
+    nothing dispatches a bounded number of probe episodes yet.
+  - `_phase_execute`/`_phase_verify`/`_phase_review` — tier-branched.
+    T0 dispatches via `v6/direct.py:run_direct_episode` and always reports
+    "done" from `_phase_execute` itself; `_phase_verify` (T0's dedicated
+    next phase) is what actually decides pass vs. escalate, so "execute"
+    never spends the call "verify" is supposed to own. T1 builds its one
+    node by code the first time `_phase_execute` runs (no `plan` phase to
+    do it), then flows through the *unmodified* round loop with
+    `DIRECT_MAX_ATTEMPTS` instead of the usual 3. T2/T3 are byte-identical
+    to pre-§B2 behavior.
+  - **Escalation, three of four §A4.4 triggers wired**:
+    1. *T0/T1 size-defect-after-two-attempts → T2.* Checked in
+       `_phase_verify` (T0) and `_phase_execute` (T1, after
+       `run_round_loop` returns and `tree.is_blocked()`) — both live in
+       the driver, not `v1/round_loop.py` itself, which stays
+       tier-agnostic (T2/T3 use it too). **T1's escalation also archives
+       its own `tree.json`** (renamed to
+       `tree.json.pre-t1-escalation-<ts>`, never deleted) before bumping
+       the tier — without this, `_phase_done("plan")` would see T1's
+       code-built one-node `tree.json` already existing and believe T2's
+       real planner call already ran, silently skipping "plan the node's
+       own inputs" (§A4.4's own phrase) and re-executing the same
+       already-failed single node under the new tier instead. This was
+       caught by `test_v6_tiering.py`'s resume-after-escalation test, not
+       designed in up front.
+    2. *Operator `escalate` intervention → +1 tier.* `escalate_run(run_dir)`
+       — a pure read-modify-write over `tier.json`, no provider call, no
+       writer dispatch, same shape as `amend_contract_and_estimate`. Wired
+       to `kusudaemon pipeline escalate <run-id>` (`pipeline/cli.py`,
+       mirroring `amend`'s subcommand plumbing).
+    3. *Document-review `regenerate` on ≥half a T2 plan's leaves → T3,
+       re-pilot.* Checked in `_phase_assemble` right after
+       `summarize_triage` — only when `tier == "T2"` (T3 is already the
+       ceiling this trigger targets) and only when `--document-review` was
+       enabled (triage only exists when it was). Escalating supersedes
+       that pass's own repair-approval prompt entirely: once `tier.json`
+       says T3, the next loop iteration picks up `pilot` (T2 never ran it)
+       and re-enters execute/review/assemble under the freshly-frozen
+       contract. **Known, documented gap**: this does not itself
+       retroactively re-validate T2's already-`"passed"` leaves against
+       the new contract — that is the existing §10 amend/re-validate
+       machinery, a separate intervention this trigger does not invoke.
+       The trigger fires and the tier rises correctly; full retroactive
+       contract enforcement on old leaves is not part of what §B2 wires.
+    4. *A node's accepted split proposal → T2 → T3* (§A8/§B5) — **not
+       wired to any call site**. `escalate(tier, "split_accepted")` exists
+       and is correct in isolation (tested directly in
+       `test_v6_tiering.py`), but runtime split (§B5) doesn't exist yet —
+       wiring a call site for a mechanism that isn't built would be fake,
+       not deferred honestly.
+  - `--tier` (`pipeline/cli.py`'s `run` subparser, `pipeline/run.py`'s own
+    parser) → `RunOptions.tier_override`, round-tripped through
+    `to_spec`/`from_spec` like every other option. A floor, never a
+    ceiling (invariant 9): `_phase_classify` always computes
+    `tier_max(measured, override)`.
+
+**Ship gate, as actually demonstrated (2026-08-10):** no gptme install or
+API key is available in this sandbox (same constraint as §B1), so "on three
+hand-written goals against one real repo... the classifier returns
+T0/T1, T2, T3 respectively, and the T0 run completes in one episode with
+≤3 total model calls" is demonstrated with `FakeProvider` (validates every
+canned response against the schema it was asked for) standing in for the
+one real model call `classify` needs, not a real LLM:
+`test_v6_tiering.py::ShipGateThreeGoalsTest` builds one small real
+temp-directory repo and three goal strings shaped like the spec's own
+examples, feeds `estimate_scope` a canned response shaped the way a real
+model would plausibly answer each, and asserts `classify()` returns
+T0-or-T1/T2/T3 respectively (pure code from that point on — this is
+`classify`'s own decision under test, not `estimate_scope`'s call
+mechanics, which have their own separate test). Separately,
+`T0ShipGateCallCountTest` drives a full `RecursiveDriver.run()` for a T0
+goal end to end (fake writer adapter, no subprocess) and asserts the fake
+provider's total call count stays ≤3 — in practice exactly 1 (`classify`;
+T0's review call is free, zero calls, because the direct node declares no
+judgment items, identically to every other leaf today).
+
 ## Adapters (gptme-only)
 
 - `cli_agent.py` — `CommandAgentAdapter`, the shared base: builds a command
@@ -1147,11 +1530,13 @@ Stdlib `unittest`. No pytest, no network, no agent binary, no API key.
 python3 -m unittest discover -s tests -p "test_*.py" -v
 ```
 
-**387 tests, ~23s, all passing** (2026-08-10, later the same day — PLAN.md
-§D0b/§D0/§D1/§D2/§D4/§D5/§D6/§D7/§D10/§D0c fixes added 17 tests: two new
-files below, plus additions to `test_pipeline_prompts.py`, `test_v0_resume.py`,
-`test_v1_units.py`, `test_v1_round_loop.py`, `test_pipeline_backends.py`,
-`test_driver_phases.py`).
+**461 tests, ~23s, all passing** (2026-08-10: 387 after that day's
+§D0b/§D0/§D1/§D2/§D4/§D5/§D6/§D7/§D10/§D0c defect-fix session, then §B1 —
+the v6 work object — added 23 more (410 total: a new
+`test_v6_work_object.py`, plus additions to `test_pipeline_backends.py` and
+`test_driver_phases.py`), then §B2 — tier classification and phase
+routing — added 51 more: a new `test_v6_tiering.py` (38), plus 13 more
+additions to `test_driver_phases.py`).
 
 **Every test file starts with `sys.path.insert(0, str(_REPO_ROOT / "src"))`.
 This is load-bearing, not boilerplate.** Stale `_editable_impl_*.pth` files
@@ -1176,7 +1561,9 @@ guard into any new test file.
 | `test_v4_*.py` | 2/2/5 | allowlist, derived-id dispatch + cache hit, finding attachment |
 | `test_dashboard_state.py` / `_server.py` | 25/22 | `RunState` directly (no port), then HTTP over a real loopback `ThreadingHTTPServer` incl. traversal rejection and `--no-control` 403s; §11.10.14 read-only poll leaves runs unmutated; §11.10.15 bounded cache + 8-thread hammer |
 | `test_dashboard_rendering.py` | 14 | `parse_trace`: `<think>`/`<thinking>` tag extraction incl. the Anthropic think-sig comment, `save`/`append`/`patch` code-fence → `tool_call` + `diff` entries, per-path diff continuity across turns (not "whole file added" every time), `error` vs routine `system` classification | 
-| `test_pipeline_prompts.py` / `_backends.py` / `test_driver_phases.py` | 18/8/10 | byte-identical default prompt (now including §D0's absolute artifact-path line and §D1's goal block), §D2's out/scratch carve-out (hidden but excepted, not dropped), adapter wiring, phase detail preservation, §D4's corpus-less-raises, §11.10.15 contract-cache bound | 
+| `test_pipeline_prompts.py` / `_backends.py` / `test_driver_phases.py` | 18/11/28 | byte-identical default prompt (now including §D0's absolute artifact-path line and §D1's goal block), §D2's out/scratch carve-out (hidden but excepted, not dropped), adapter wiring incl. §B1's workspace-mode `run_dir` branches, phase detail preservation, §D4's corpus-less-raises, §11.10.15 contract-cache bound, §B1's default-writer-factory and `--workspace` CLI wiring, §B2's `_phase_done("classify"/"explore")`, `tier_override` spec round-trip, `escalate_run`, `--tier`/`escalate` CLI wiring | 
+| `test_v6_work_object.py` | 15 | §B1: measurement excludes binaries/`.git`/`node_modules`/lockfiles/oversized files, gitignore respected, `top_dirs` grouping; `kind="text"`/`kind="none"` constructors; `survey_workspace`'s members resolve to real files and respect a token ceiling; the run dir is hidden as one subtree when nested inside `work.root`; ship gate via a real subprocess fixture (not gptme) proving cwd=work.root and the artifact still lands under run_dir |
+| `test_v6_tiering.py` | 38 | §B2: `Signals`/`measure_signals` word-boundary marker counts, `estimate_scope`'s digest never leaks file content, `classify`'s four table triggers + the `unknown`-forces-≥T2 override, `phases_for` per tier, `escalate` monotone under every trigger incl. the uncalled split trigger, the three-goals/one-repo ship gate, T0's ≤3-provider-call full-driver run, `--tier T3` floor running every T3 phase on a trivial goal, resume after a live T1→T2 escalation continuing from the freshly-planned tree |
 | `test_pipeline_approvals.py` | 4 | §11.10.12 incremental approvals scanning: each record parsed once across polls, torn tail re-read, cross-thread wait/resolve |
 | `test_pipeline_liveness.py` | 5 | §D0c: dead pid → stalled, live pid → not stalled, non-`in_progress` phase never stalled, no-pid-record falls back to phase-age threshold |
 | `test_environment_remote_files.py` | 2 | §D7: `write_remote_text`'s cleanup tolerates `PermissionError` (not just `FileNotFoundError`) on unlink without failing the write |

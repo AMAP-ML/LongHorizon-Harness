@@ -326,6 +326,13 @@ class SpineUnit:
     start_chunk: int
     end_chunk: int
     tokens: int
+    # PLAN.md §A3/§B1: workspace mode's unit content -- real file paths,
+    # relative to a WorkObject's `root` (v6/work_object.py:survey_workspace).
+    # Corpus mode keeps start_chunk/end_chunk as-is and leaves this empty;
+    # exactly one of {members, start_chunk/end_chunk} is meaningful per unit.
+    # Additive with a default so every existing spine.json (which has no
+    # "members" key) loads unchanged -- see load_spine below.
+    members: tuple[str, ...] = ()
 
 
 def assemble_spine(
@@ -410,10 +417,17 @@ def load_spine(run_dir: str | Path) -> list[SpineUnit]:
     # materialized units, and unit_input_path already falls back to the
     # bare id in that case.
     known = {field.name for field in fields(SpineUnit)}
-    return [
-        SpineUnit(**{key: value for key, value in item.items() if key in known})
-        for item in raw
-    ]
+    units = []
+    for item in raw:
+        kwargs = {key: value for key, value in item.items() if key in known}
+        # json round-trips a tuple as a list; SpineUnit.members is typed
+        # tuple[str, ...] (frozen-adjacent convention this module follows
+        # elsewhere -- SpineUnit itself isn't frozen, but every other tuple
+        # field in this package stays a tuple after a load/save cycle).
+        if "members" in kwargs:
+            kwargs["members"] = tuple(kwargs["members"])
+        units.append(SpineUnit(**kwargs))
+    return units
 
 
 def materialize_units(
