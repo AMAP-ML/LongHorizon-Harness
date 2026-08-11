@@ -21,7 +21,7 @@ from ..environment.base import Environment
 from ..v1.provider import OpenAICompatibleProvider
 from .backends import parse_research_plan
 from .driver import RunOptions, RecursiveDriver
-from .run_dir import run_spec_path
+from .run_dir import resolve_runs_root, run_spec_path
 
 _RUNS_ROOT_DEFAULT = "./.kusudaemon/runs"
 
@@ -109,7 +109,12 @@ def run_from_args(argv: list[str] | None = None, *, env: Environment | None = No
     load_env_file()
     args = build_parser().parse_args(argv)
     run_id = args.run_id or f"{time.strftime('%Y%m%dT%H%M%SZ', time.gmtime())}_{uuid.uuid4().hex[:8]}"
-    run_dir = Path(args.runs_root).expanduser() / run_id
+    # §D0b: resolve once, here, against the *root* — resolving only the
+    # run_dir/spec join (as the driver's own .resolve() does) still leaves
+    # a relative runs_root anchored to whatever cwd this process happened
+    # to be launched from.
+    run_dir = resolve_runs_root(args.runs_root) / run_id
+    print(f"run dir: {run_dir}")
 
     spec = run_spec_path(run_dir)
     if spec.exists():

@@ -30,7 +30,14 @@ async def write_remote_text(env: Environment, remote_path: str, content: str, mo
         if tmp_path is not None:
             try:
                 Path(tmp_path).unlink()
-            except FileNotFoundError:
+            except OSError:
+                # PLAN.md §D7: a bind mount or some network/container mounts
+                # can raise PermissionError (or another OSError) here even
+                # though this process created the file moments earlier —
+                # catching only FileNotFoundError let that escape the
+                # cleanup path and fail the whole episode after the prompt
+                # had already uploaded successfully. A leaked temp file is
+                # cosmetic; a failed episode is not.
                 pass
 
     result = await env.exec(f"chmod {shlex.quote(mode)} {shlex.quote(remote_path)}", timeout=300)

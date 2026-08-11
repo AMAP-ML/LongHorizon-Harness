@@ -29,7 +29,11 @@ where the rule moved. When a workstream ships, its §A-section is folded into
 # Part 0 — Where things stand
 
 Built and green: v0–v5 plus Zero-Mem §§1–11 and audit batches §11.1–§11.11.
-**370 tests, ~23s** (one environment-dependent error, see §D7).
+**387 tests, ~23s, all passing** — up from 370 (see Part VII: §D0b, §D0,
+§D1, §D2, §D4, §D5 interim, §D6, §D7 fixed 2026-08-10; §D7's
+environment-dependent unlink error is now caught rather than escaping the
+cleanup path, so that flake is gone too). §B1–§B6 and §C1–§C5 below are
+still entirely unstarted.
 
 What today's harness genuinely does well, and which this plan does not touch:
 
@@ -671,7 +675,7 @@ reachable input; **P2** = cost, correctness-of-record, or ergonomics.
 Every one of these needs a test that fails against today's `HEAD` first. A fix
 without that demonstration is indistinguishable from a fix that does nothing.
 
-### §D0 The Writer is never told where to write its artifact (P0 — this is the empty-artifact bug)
+### §D0 The Writer is never told where to write its artifact (P0 — this is the empty-artifact bug) — FIXED 2026-08-10
 
 **Reported symptom:** the dashboard's Artifact tab is empty.
 
@@ -755,7 +759,7 @@ Case B is the reported symptom. Case C is worse, because it is silent.
 assistant message leaves the node failed rather than passed-with-a-sentence;
 `TaskTree.load` rejects `artifact != out/<id>.md`.
 
-### §D0b Relative paths are anchored to the invoking cwd, not the run directory (P0)
+### §D0b Relative paths are anchored to the invoking cwd, not the run directory (P0) — FIXED 2026-08-10
 
 The doubled-prefix bug `CLAUDE.md` records for 2026-08-10 was fixed **at one
 call site** (`driver.__init__`'s `Path(run_dir).resolve()`) rather than at the
@@ -861,7 +865,7 @@ the absolute equivalent; `_input_tokens` is non-zero for a relative input
 that exists; a node prompt built with `run_dir` relative contains an absolute
 artifact path.
 
-### §D0c A dead run is indistinguishable from a working one (P1)
+### §D0c A dead run is indistinguishable from a working one (P1) — FIXED 2026-08-10
 
 Found while diagnosing §D0 against a real run dir in this repo
 (`.kusudaemon/runs/rec178639262834c67c`, goal `"Create a tutorial"`). Its
@@ -900,7 +904,7 @@ between the operator and any work at all (§D8), on a run that §D1/§D4 would
 then have reduced to one node briefed `"Produce the artifact for The
 goal"` regardless.
 
-### §D1 The user's goal never reaches any Writer (P0)
+### §D1 The user's goal never reaches any Writer (P0) — FIXED 2026-08-10
 
 `pipeline/prompts.py:build_node_prompt` assembles `node.brief` + contract +
 inputs + promotions + retry block. **`spec.md` and `RunOptions.goal` appear
@@ -921,7 +925,7 @@ Fix: `build_node_prompt` renders the goal and the global rubric from
 contract (most-stable-first, `CLAUDE.md` §8). Test: a node prompt built in a
 run whose `spec.md` carries goal G contains G.
 
-### §D2 Writers can read every other leaf's output (P0)
+### §D2 Writers can read every other leaf's output (P0) — FIXED 2026-08-10
 
 `pipeline/backends.py:_hidden_paths_for` returns
 `('events.jsonl', 'approvals.jsonl', 'audit/')` for every node — verified by
@@ -965,7 +969,7 @@ This is §A3/§B1 rather than a patch, and it is listed here because it is the
 concrete reason the stated goal ("excel at long horizon coding tasks") is
 currently unreachable, not merely inconvenient.
 
-### §D4 The corpus-less tree is one meaningless node (P1)
+### §D4 The corpus-less tree is one meaningless node (P1) — FIXED 2026-08-10 (raises now; kind="none" real support is still §A3/§B1)
 
 Consequence of §D1's synthesized spine: `build_tree` on a one-unit spine takes
 the `len(slice_units) <= 1` branch, emits one `forced_leaf`, and the run
@@ -974,7 +978,7 @@ the `len(slice_units) <= 1` branch, emits one `forced_leaf`, and the run
 `kind="none"` plus §A4's T0/T1 routing; until then, a corpus-less run should
 raise rather than converge on a fake success.
 
-### §D5 An over-cap artifact gets a whole-artifact verdict on a fragment (P1)
+### §D5 An over-cap artifact gets a whole-artifact verdict on a fragment (P1) — INTERIM FIX 2026-08-10 (truncated flag stamped; fan-out is still §B6)
 
 `reviewer.review_node` calls `cap_artifact_text(artifact_text, 8k)`, which
 truncates with an explicit marker — honest at the prompt level. But the
@@ -984,13 +988,13 @@ cut cannot be found, and `node.status = "passed"` is written on that basis.
 Fix: §B6's fan-out. Interim: stamp `truncated: true` into `audit/<node>.json`
 so at least the record is honest.
 
-### §D6 Dead code: duplicated `return` (P2)
+### §D6 Dead code: duplicated `return` (P2) — FIXED 2026-08-10
 
 `v2/survey.py:_merge_small_segments` ends with `return merged` twice (lines
 101–102); the second is unreachable. Harmless, and precisely the kind of
 residue that makes a reader doubt the surrounding logic.
 
-### §D7 `write_remote_text` cleanup can fail an entire episode (P2)
+### §D7 `write_remote_text` cleanup can fail an entire episode (P2) — FIXED 2026-08-10
 
 `environment/remote_files.py` unlinks its staging temp file in a `finally`
 that catches only `FileNotFoundError`. On a filesystem where the process
@@ -1019,7 +1023,7 @@ forty-chapter book; for a three-file change it means a run started at 5pm is
 still sitting there in the morning having spent one pilot episode and done
 nothing else. Fixed by §A10's tiering.
 
-### §D10 Docstring corrections carried forward (P2)
+### §D10 Docstring corrections carried forward (P2) — FIXED 2026-08-10 (both items re-checked)
 
 - `v2/survey.py:load_spine` claims to tolerate a legacy `spine.json` missing a
   field "as long as that field carries a default" — `SpineUnit` has no
@@ -1033,53 +1037,104 @@ nothing else. Fixed by §A10's tiering.
 # Part VI — Sequencing
 
 ```
-[ ] §D0b path anchoring                       — DO THIS FIRST; §D0 depends on it
-    [ ] one resolve_runs_root helper; used by _run_dir, run.py, RunState
-    [ ] status/approve/amend/resume error instead of creating an empty run
-    [ ] print the absolute run dir on run / serve / status
-    [ ] resolve_stored(run_dir, ref); delete _input_tokens' is_absolute()->0
-    [ ] tests: same path from any cwd; dashboard and driver agree
+[x] §D0b path anchoring                       — DO THIS FIRST; §D0 depends on it
+    [x] one resolve_runs_root helper; used by _run_dir, run.py, RunState
+    [x] status/approve/amend/resume error instead of creating an empty run
+    [x] print the absolute run dir on run / serve / status
+    [x] resolve_stored(run_dir, ref); delete _input_tokens' is_absolute()->0
+        (lives in v0/run_dir.py, re-exported from pipeline/run_dir.py, so
+        v3/document_review.py can use it without inverting the v0-v3 →
+        pipeline dependency direction)
+    [x] tests: same path from any cwd; dashboard and driver agree
 
-[ ] §D0  artifact path in the writer prompt   — after §D0b, it is small
-    [ ] build_node_prompt states node.artifact imperatively
-    [ ] drop "your last message becomes the artifact" from writer.py
-    [ ] node.artifact becomes the single source; assert at tree load
-    [ ] gptme: empty artifact fails the gate, no chat-message fallback
-    [ ] land §D2's out/ carve-out in the same commit (they contradict
+[x] §D0  artifact path in the writer prompt   — after §D0b, it is small
+    [x] build_node_prompt states node.artifact imperatively
+    [x] drop "your last message becomes the artifact" from writer.py
+    [x] node.artifact becomes the single source; assert at tree load
+    [x] gptme: empty artifact fails the gate, no chat-message fallback
+        (adapters gained a has_file_tools flag; v0/runner.py only skips
+        the chat-message fallback for adapters that set it — test-fixture
+        adapters with no file tools keep today's fallback unchanged)
+    [x] land §D2's out/ carve-out in the same commit (they contradict
         each other otherwise)
-    [ ] correct CLAUDE.md §11.10.17's claim about who writes out/<node>.md
+    [x] correct CLAUDE.md §11.10.17's claim about who writes out/<node>.md
 
-[ ] §B1  v6 work object                       — unblocks everything
+[ ] §B1  v6 work object                       — unblocks everything — NOT STARTED
     [ ] v6/work_object.py + measurement
     [ ] adapter workspace_path = work.root; run-dir paths absolute
     [ ] SpineUnit.members + workspace survey
     [ ] --workspace in cli.py AND run.py; RunOptions.work_object
     [ ] tests + ship gate: a Writer patches a real repo file
 
-[ ] §D1 + §D7                                 — fix alongside §D0, cheap
-    [ ] goal + global rubric in build_node_prompt
-    [ ] catch OSError in write_remote_text cleanup
-    [ ] one failing-first test per defect
+[x] §D1 + §D7                                 — fix alongside §D0, cheap
+    [x] goal + global rubric in build_node_prompt
+    [x] catch OSError in write_remote_text cleanup
+    [x] one failing-first test per defect
 
-[ ] §B2  tier classification                  — the cost claim
+[ ] §B2  tier classification                  — the cost claim — NOT STARTED
     [ ] v6/tiering.py: signals, estimate, table, escalate
     [ ] phases_for(tier) replaces PHASES; tier.json; --tier floor
-    [ ] §D4: corpus-less run raises instead of faking success
+    [x] §D4: corpus-less run raises instead of faking success (done early,
+        out of order — cheap and independent of the rest of §B2)
     [ ] ship gate: T0 goal completes in <=3 model calls
 
-[ ] §B3  adaptive intake                      (§D8)
-[ ] §A10 pilot/contract tiered to T3          (§D9)
-[ ] §B4  probes / delegated exploration
-[ ] §B5  runtime split                        (v7)
-[ ] §B6  tiered review + fan-out              (§D5)
+[ ] §B3  adaptive intake                      (§D8) — NOT STARTED
+[ ] §A10 pilot/contract tiered to T3          (§D9) — NOT STARTED
+[ ] §B4  probes / delegated exploration                — NOT STARTED
+[ ] §B5  runtime split                        (v7)      — NOT STARTED
+[ ] §B6  tiered review + fan-out              (§D5)      — NOT STARTED; interim
+    [x] §D5 interim: audit/<node>.json carries `truncated: true` on a
+        verdict reached over a cap_artifact_text-truncated artifact — the
+        fan-out itself (splitting an over-cap artifact by heading into
+        multiple review_node calls) is still open.
 
-[ ] §C1  node-type templates                  — the semantic bar
-[ ] §C2  parallel dispatch                    — now correctness, not throughput
-[ ] §C3  probe planner
-[ ] §C4  dashboard hardening (auth first)
-[ ] §C5  eval harness: calls-by-tier and escalation precision first
-[ ] §D6, §D10 cleanup — fold into whichever commit touches the file
+[ ] §C1  node-type templates                  — the semantic bar — NOT STARTED
+[ ] §C2  parallel dispatch                    — now correctness, not throughput — NOT STARTED
+[ ] §C3  probe planner                                  — NOT STARTED
+[ ] §C4  dashboard hardening (auth first)               — NOT STARTED
+[ ] §C5  eval harness: calls-by-tier and escalation precision first — NOT STARTED
+[x] §D6, §D10 cleanup — fold into whichever commit touches the file
+    [x] v2/survey.py's duplicated `return merged`
+    [x] pipeline/backends.py:_hidden_paths_for docstring corrected as part
+        of the §D2 fix
+    [x] v2/survey.py:load_spine's docstring re-checked against the current
+        text — the exact false phrase PLAN.md quoted ("as long as that
+        field carries a default") is no longer present; the docstring as
+        it stands makes no claim SpineUnit's current fields don't support,
+        so no change was needed here beyond confirming it
+
+[x] §D0c (P1, not in the original sequencing list above, but cheap and
+    directly adjacent to §D0b/§D0): a dead run is indistinguishable from a
+    working one. Added pipeline/liveness.py (record_driver_start /
+    run_liveness); RecursiveDriver.__init__ records {pid, started_at, host}
+    to driver.pid.json; `status` and the dashboard now surface a distinct
+    "STALLED" state (dead pid, or — when no usable pid record exists — a
+    phase.json timestamp older than 10 minutes) instead of a permanent,
+    silent "running" badge. Does not add a mid-phase heartbeat ticker (the
+    reported repro case is a fully-dead process, which a pid check alone
+    resolves); a phase that hangs without the process dying is not yet
+    distinguished from one making slow progress.
 ```
+
+**2026-08-10 session: §D0b, §D0, §D1, §D2, §D4, §D5 (interim), §D6, §D7,
+§D10, and §D0c shipped — everything in Part V except §D3 (subsumed by the
+not-yet-started §B1) and §D8/§D9 (subsumed by the not-yet-started
+§B2/§B3/§A10). 387 tests, ~23s, all green** (up from 370 at the top of this
+file — 17 new tests, one new test file per new module
+(`test_pipeline_liveness.py`, `test_environment_remote_files.py`), the rest
+extending existing suites). **§B1–§B6 and §C1–§C5 (the actual v6/v7
+architecture — work object, tiering, adaptive intake, probes, runtime
+split, tiered review fan-out, templates, parallel dispatch, dashboard auth,
+eval harness) are unstarted.** They are each a multi-day workstream in their
+own right per this file's own scoping; this session's time went to the
+defects in Part V because every one of them is a live bug in the harness
+that exists today, independent of whether v6 ever ships, and because §D0/
+§D0b in particular were blocking the ship gate this file states for §B1
+("a gptme Writer dispatched with kind="workspace" can read and patch a file
+in a real repo, and its out/<node>.md still lands in the run dir") — that
+gate was unreachable before this session: the artifact path was never in
+any prompt, and a relative run_dir made every path resolution wrong the
+moment the workspace stopped being the run directory itself.
 
 **Why this order.** §B1 before everything because a harness that cannot reach
 a repo cannot be evaluated on the use case that motivates the redesign. §B2
@@ -1095,8 +1150,17 @@ has established, in both directions.
 # Part VII — Results log
 
 One row per completed workstream or measurement: date, item, and what the
-number actually was. Nothing recorded yet.
+number actually was.
 
 | Date | Item | Result |
 |---|---|---|
-| | | |
+| 2026-08-10 | §D0b path anchoring | `resolve_runs_root`/`resolve_stored` added; `status`/`approve`/`amend`/`resume` now error against a missing run dir instead of silently creating one; dashboard `_input_tokens` no longer reports 0 for every planner-built node's inputs. |
+| 2026-08-10 | §D0 artifact path in writer prompt | `build_node_prompt` now states the absolute artifact path imperatively; `node.artifact != out/<id>.md` now raises at construction/load; gptme-flagged adapters (`has_file_tools=True`) no longer fall back to a chat message when `out/<node>.md` is empty. |
+| 2026-08-10 | §D1 goal reaches the Writer | `build_node_prompt` renders spec.md's `## Goal`/`## Global rubric`/`## Unresolved objections` sections, cached like contract.md. |
+| 2026-08-10 | §D2 cross-agent isolation | `out/` and `scratch/` are hidden from every Writer's prompt again, with an explicit per-node carve-out for its own two paths — the §11.8 fix's inverted test assertions (`assertNotIn("out/", ...)`) replaced with the correct ones. |
+| 2026-08-10 | §D4 corpus-less fake success | A run with no source text now raises instead of synthesizing a one-unit "The goal" spine and reporting `done`. |
+| 2026-08-10 | §D5 interim | `audit/<node>.json` now carries `truncated: true` when a reviewer verdict was reached over a `cap_artifact_text`-cut artifact. Fan-out (§B6) still open. |
+| 2026-08-10 | §D0c stalled-run detection | `pipeline/liveness.py` added; `status` prints `STALLED: <reason>`, dashboard header shows a ☠ STALLED badge, when the recorded driver pid is dead or (absent a usable pid record) `phase.json` hasn't advanced in 10 minutes. |
+| 2026-08-10 | §D7 remote_files cleanup | `write_remote_text`'s `finally` now catches `OSError`, not just `FileNotFoundError`. |
+| 2026-08-10 | §D6/§D10 cleanup | Duplicated `return merged` in `v2/survey.py` removed; `_hidden_paths_for` docstring corrected (part of §D2); `load_spine` docstring re-checked, already accurate. |
+| 2026-08-10 | Test suite | 370 → 387 tests (17 new: 2 new files — `test_pipeline_liveness.py`, `test_environment_remote_files.py` — plus additions to `test_pipeline_prompts.py`, `test_v0_resume.py`, `test_v1_units.py`, `test_v1_round_loop.py`, `test_pipeline_backends.py`, `test_driver_phases.py`). All green, ~23s. |

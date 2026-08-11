@@ -379,6 +379,39 @@ code plainly says is not repeated.
   test CLIs) is unaffected: `diagnostics_only` is `False` for them, so they
   keep falling back to raw `actions_log` exactly as before.
 
+  **Correction (2026-08-10, later the same day — PLAN.md §D0):** the
+  paragraph above's premise — "gptme's own save/patch tool calls write the
+  real artifact directly to `out/<node>.md` mid-episode" — was false as
+  written, and §11.10.17's fix was accidentally correct for the wrong
+  reason. `grep -rn "out/"` across `pipeline/prompts.py`, `v1/writer.py`,
+  and `adapters/cli_agent.py` found **no prompt anywhere that ever told a
+  Writer what path to save to.** The only file path any Writer was given
+  was `promotion.json`; `_ARTIFACT_INSTRUCTION` instead said "your last
+  message in this conversation becomes the artifact file verbatim," a
+  leftover from the deleted Claude Code/Codex adapters that actively fights
+  gptme's save/patch tool-loop grain. So §11.10.17's don't-clobber guard
+  was real and correct, but the artifact it was protecting essentially
+  never existed — the common case was an empty `out/<node>.md` (correctly
+  failing `nonempty`, which is why this *looked* fixed) or, worse, a stray
+  `\`\`\`save section.md` code fence or a confident "Done — I wrote it"
+  sentence landing in the artifact as if it were real content, silently
+  passing `nonempty`. Fixed properly now: `pipeline/prompts.py`'s
+  `build_node_prompt` states the absolute artifact path imperatively (see
+  that module's entry below), `_ARTIFACT_INSTRUCTION` no longer claims the
+  last message is the artifact, and `node.artifact` is asserted to equal
+  `out/<id>.md` at tree construction/load (`v1/tree.py`). `run_node`'s
+  fallback (the paragraph above) is now also gated on a new
+  `has_file_tools` adapter flag (`cli_agent.py`'s `CommandAgentAdapter`
+  defaults it `False`; `GptmeAdapter` sets it `True`): when the adapter has
+  file tools and the agent still left `out/<node>.md` empty, that is now a
+  genuine failure — `run_node` writes `""` and stops, it does **not** fall
+  back to `assistant_visible_output`/`actions_log` the way it still does for
+  an adapter with no file tools (the fake test CLIs, unaffected — their
+  `has_file_tools` stays `False`, so they keep today's fallback exactly as
+  before). This closes Case C from PLAN.md §D0 (a confident "Done — I wrote
+  it" sentence silently passing `nonempty`) without touching the resume
+  machinery above.
+
 Event vocabulary: `node_dispatched`, `session_captured`, `episode_completed`,
 `node_redispatched` (`reason`: `resumed_session` | `no_session_captured` |
 `resume_unsupported`).
@@ -395,7 +428,14 @@ Event vocabulary: `node_dispatched`, `session_captured`, `episode_completed`,
   `gates` list** — this is invariant 2 enforced in code. `rubric` carries
   per-node judgment text until contract derivation can generate it.
   `"stale"` and `last_defect` are additive, defaulted fields; every existing
-  `tree.json` loads unchanged.
+  `tree.json` loads unchanged. **PLAN.md §D0 (2026-08-10):** construction
+  now also raises when `node.artifact != f"out/{node.id}.md"`. Before this,
+  `node.artifact` was decorative — every actual reader (`node_artifact_path`,
+  the dashboard, the assembler) derived the real path from `node.id`
+  independently, so a disagreeing `node.artifact` would silently point a
+  Writer's prompt (which now states it literally, per `prompts.py` below) at
+  a file nothing else ever reads or writes. `node.artifact` is the single
+  source of truth now, enforced at both construction and `TaskTree.load`.
 - `gates.py` — evaluated in code, never sent to a model. Shipped set:
   `exists`, `nonempty`, `len:MIN-MAX`, `max_tokens:N`, `contains:TEXT`. The
   richer §6/§7 examples (`headers:std`, `terms_defined`, `problems>=5`) need
@@ -418,6 +458,15 @@ Event vocabulary: `node_dispatched`, `session_captured`, `episode_completed`,
   artifact must at least say so. The re-validation reviewer and document
   review's depth pass share the capper, and re-validation's cost estimate
   counts the same cap so the shown price matches what gets sent.
+  **PLAN.md §D5 interim (2026-08-10):** truncation was marked in the prompt
+  text the model saw, but a `passed` verdict reached over a truncated
+  artifact carried no record of that on the verdict itself — a defect past
+  the cut was structurally invisible and nothing downstream could tell.
+  `ReviewVerdict` gained a `truncated: bool` field, set whenever
+  `cap_artifact_text` actually cut the text, and `round_loop.py`'s
+  `_write_audit` merges it into `audit/<node>.json` alongside `items`/
+  `verdict`. The real fix — fan-out by heading into multiple `review_node`
+  calls instead of truncating at all — is `PLAN.md` §B6, still open.
 - `writer.py` — wraps v0's `run_node` unchanged (crash resume inherited free)
   and asks the agent to write `scratch/<node>/promotion.json`. Missing or
   unparseable → fall back to the episode's visible output; the ~400-token cap
@@ -649,6 +698,31 @@ prompt, not that node's own handoff).
   running" / "nothing to message" messaging (the `role === "explorer"`
   special-case in `renderOverview`, above) still applies — this is
   thinking-visible, still deliberately non-interactive.
+  **PLAN.md §D4 (2026-08-10):** `_phase_survey` used to synthesize a single
+  `SpineUnit(id="unit-01", label="The goal", ...)` for a corpus-less run,
+  which `build_tree` then forced into one meaningless leaf — the run
+  reported `done` having produced an artifact about nothing, because
+  `is_complete()` only checks node status, not whether the goal was ever
+  addressed. Now raises `ValueError` instead: a corpus-less goal is a real
+  case (`PLAN.md` §A3's `kind="none"`) but isn't supported yet, and failing
+  loudly beats a fake success.
+  **PLAN.md §D0c (2026-08-10):** `RecursiveDriver.__init__` now calls
+  `pipeline/liveness.py`'s `record_driver_start`, writing
+  `{pid, started_at, host}` to `driver.pid.json` — see `dashboard/state.py`
+  and `cli.py` below for what reads it back.
+- `liveness.py` — new module (PLAN.md §D0c). `record_driver_start` is a
+  best-effort write (a failure here must never fail a run — it's a
+  diagnostic aid, not part of the resume contract); `run_liveness` reads
+  `phase.json` + `driver.pid.json` back and classifies: a phase whose
+  status isn't `in_progress` is never stalled (waiting-on-a-human and
+  terminal states are legitimate, not stuck); a recorded pid that
+  `os.kill(pid, 0)` proves dead is stalled; a recorded pid confirmed alive
+  is not; with no usable pid record (a run from before this module existed,
+  or a different host) it falls back to a pure age check on `phase.json`'s
+  own `ts` against a 10-minute default threshold. Does not add a mid-phase
+  heartbeat ticker — the reported repro case (a fully-dead process) needs
+  only a pid check; a phase that hangs without its process dying is not yet
+  distinguished from one making slow progress.
 - `approvals.py` — the cross-process human gate. Append-only
   `approvals.jsonl`, latest record per `approval_id` wins; resume **reuses**
   the unanswered record instead of stacking duplicates.
@@ -664,20 +738,53 @@ prompt, not that node's own handoff).
   backend. `build_writer_adapter` passes `node.tools` through as the
   allowlist and **always layers the SearXNG tool on top** (deduped), so any
   Writer can search mid-episode; it also passes `node.budget.tokens` as the
-  episode context length and `hidden_paths` (the run's bookkeeping minus the
-  node's own paths). `build_research_adapter` grants *only* the search tool
+  episode context length and `hidden_paths` (the run's bookkeeping — `events.
+  jsonl`, `approvals.jsonl`, `audit/`, `scratch/`, `out/`, unconditionally,
+  every node, always). `build_research_adapter` grants *only* the search tool
   and **raises** for an unwired kind rather than silently granting full tool
   access — the driver catches that and marks the phase skipped.
+  **PLAN.md §D2 fix (2026-08-10):** the node's own carve-out (its
+  `out/<id>.md`, its `scratch/<id>/`) used to be expressed by *dropping*
+  `"out/"`/`"scratch/"` from `hidden_paths` entirely via a prefix match — but
+  `"out/<anything>.md".startswith("out/")` is trivially true for every
+  node's own path, so that dropped both entries for every node, always,
+  and cross-agent isolation (§2 invariant 6) was silently unenforced: any
+  Writer could read any other leaf's finished artifact. The regression test
+  (`test_pipeline_backends.py`) was written from the same misreading and
+  asserted the bug (`assertNotIn("out/", hidden_paths)`) rather than the
+  intent, so 370 green tests said nothing about it. Fixed by making the
+  carve-out a *separate* field instead of a filter:
+  `_hidden_path_exceptions_for(node)` returns the node's own two paths,
+  threaded through as `CommandAgentAdapter.hidden_path_exceptions` and
+  rendered by `cli_agent.py`'s `_hidden_paths_notice` as an explicit
+  "these are yours" exception alongside the still-intact "out/ and scratch/
+  are off limits" notice.
 - `prompts.py` — `build_node_prompt` assembles brief + contract + inputs +
   rubric + `last_defect` retry block + `depends_on` promotions before the
   episode starts. `inline_spans=True` replaces the input path list with
   retrieved spans under provenance headers (`[unit-03 · chunk 41]`); the
   fallback when no index exists is **silent and per-node**, unlike the survey
   phase's loud `survey_fallback` event, because a missing index here would
-  spam the log once per node. The byte-for-byte default prompt is pinned by
-  `test_pipeline_prompts.py::test_default_prompt_unchanged` — the regression
-  guard for the whole prompt surface. §11.10.15 bounds the contract cache
+  spam the log once per node. §11.10.15 bounds the contract cache
   (64 entries, FIFO, locked).
+  **PLAN.md §D0/§D1/§D0b fixes (2026-08-10)** changed the default prompt
+  shape, so the byte-for-byte pin moved with it (still
+  `test_pipeline_prompts.py::test_default_prompt_unchanged`, now asserting
+  the *new* byte-for-byte shape): every prompt now states the artifact path
+  imperatively, absolute, right after the brief (`_artifact_instruction`,
+  via `resolve_stored(run_dir, node.artifact)` — this is the fix for the
+  empty-artifact bug: no prompt had ever told a Writer where to save
+  before). When `spec.md`'s `## Goal` section is non-empty, a goal +
+  global-rubric (+ eventual `## Unresolved objections`) block is rendered
+  right after the contract, cached the same stat-stamp way as the contract
+  (`_load_spec_cached`) — previously nothing but `node.brief` ever reached a
+  Writer, which was fatal on a corpus-less run whose brief was synthesized
+  boilerplate ("Produce the artifact for The goal"). And every path in
+  `node.inputs` now renders absolute via the same `resolve_stored` (§D0b):
+  they used to render as the bare stored strings (a unit id, or
+  `spine/<id>.md`), which only happened to resolve correctly because the
+  agent's cwd was always the run directory — not an assumption that survives
+  workspace mode (§A3), where the agent's cwd is the target repo root.
 - `run.py` / `cli.py` — one argument parser, one run loop:
   `kusudaemon run|resume|status|approve|amend|serve` (a flat command set),
   with `--detach` spawning `python -m kusudaemon.pipeline.run`. A run id whose
@@ -685,6 +792,25 @@ prompt, not that node's own handoff).
   contributes nothing but the id. Bare `kusudaemon` = `serve` with defaults.
   Every handler operates purely on the run directory, so they work from a
   second terminal while a driver is attached.
+  **PLAN.md §D0b (2026-08-10):** the 2026-08-10 (earlier) fix below (driver
+  resolves `run_dir`) covered only the driver's own constructor — every CLI
+  command still resolved `Path(runs_root).expanduser() / run_id` **without**
+  `.resolve()`, so `status`/`approve`/`amend`/`resume`/`run` all anchored to
+  whatever directory the shell happened to be in at invocation time. Worse:
+  because `create_run_dir` is idempotent and creates directories, running
+  `kusudaemon pipeline run --run-id <id>` from the wrong cwd didn't error —
+  it silently created a second, empty run directory in a sister folder.
+  `pipeline/run_dir.py` gained `resolve_runs_root`/`resolve_stored`
+  (`resolve_stored` actually lives in `v0/run_dir.py`, re-exported here, so
+  v0–v3 modules can use it without importing `pipeline`); `cli.py`'s
+  `_run_dir` and `run.py`'s `run_from_args` both route through
+  `resolve_runs_root` now. `status`/`approve`/`amend`/`resume` (not `run`,
+  which is allowed to create) now call `_require_existing_run` and print
+  `no run at <absolute path> (missing events.jsonl)` instead of silently
+  proceeding against an empty directory; `run`/`status`/`serve` print the
+  resolved absolute run dir on every invocation, so the class of bug this
+  fixes is visible the next time it happens instead of invisible by
+  construction.
 - `dashboard/state.py` — `RunState`, which **reads fresh from disk on every
   call** (with a parse-on-change cache keyed on `(st_size, st_mtime_ns)`,
   valid only because the logs are append-only; §11.10.15 bounds it at 256
@@ -699,6 +825,23 @@ prompt, not that node's own handoff).
   worker tees a `{"type":"logdir"}` line into `trace.jsonl`, and appending to
   that logdir's `prompt-queue.jsonl` uses gptme's own between-turn queue
   rather than forking its chat loop.
+  **PLAN.md §D0b (2026-08-10):** `RunState.__init__` now resolves
+  `runs_root` through `resolve_runs_root` immediately — a `serve` process
+  started from a different cwd than the driver that owns the run was
+  previously landing on a different absolute directory, resolving the join
+  but not the (relative) root, so every node in an attached run read as
+  empty with nothing in the logs to say why. Also fixed: `_input_tokens`
+  used to return `0` for every non-absolute input ref — which is *every*
+  planner-built node's inputs, stored relative to `run_dir` by design — so
+  the dashboard reported zero input tokens for the entire tree; it and
+  `_input_exists` both route through `resolve_stored` now.
+  **PLAN.md §D0c (2026-08-10):** `snapshot()` now calls
+  `pipeline/liveness.py`'s `run_liveness` and exposes `stalled`/
+  `stalled_reason`, so a phase reading `in_progress` forever (the driver
+  process died mid-call — a hung provider call, a killed shell, a
+  dashboard-hosted thread whose server stopped) renders as a distinct
+  ☠ STALLED state instead of a permanent, silent "running" badge
+  indistinguishable from a run genuinely mid-call.
 - `dashboard/gptme_queue.py` — a from-scratch reimplementation of gptme's
   queue file protocol (not an import), so the long-lived server process stays
   independent of whether the gptme extra is installed.
@@ -1004,7 +1147,11 @@ Stdlib `unittest`. No pytest, no network, no agent binary, no API key.
 python3 -m unittest discover -s tests -p "test_*.py" -v
 ```
 
-**362 tests, ~23s, all passing** (2026-08-10).
+**387 tests, ~23s, all passing** (2026-08-10, later the same day — PLAN.md
+§D0b/§D0/§D1/§D2/§D4/§D5/§D6/§D7/§D10/§D0c fixes added 17 tests: two new
+files below, plus additions to `test_pipeline_prompts.py`, `test_v0_resume.py`,
+`test_v1_units.py`, `test_v1_round_loop.py`, `test_pipeline_backends.py`,
+`test_driver_phases.py`).
 
 **Every test file starts with `sys.path.insert(0, str(_REPO_ROOT / "src"))`.
 This is load-bearing, not boilerplate.** Stale `_editable_impl_*.pth` files
@@ -1016,9 +1163,9 @@ guard into any new test file.
 | File | n | Covers |
 |---|---|---|
 | `test_provider_config.py` | 35 | precedence chain, `require()`, `.env` and `provider.json` cwd/ancestor/installed-root search |
-| `test_v0_resume.py` | 5 | real-subprocess `SIGKILL` resume (both windows), no-op replay, fsync-per-append, single-parse dispatch |
-| `test_v1_units.py` | 33 | gates, tree validation, promotion cap, `complete_json` retry paths, artifact instruction, §11.10.13 reviewer input cap (truncation marked, ceiling measured) |
-| `test_v1_round_loop.py` | 11 | dependency order, gate-failure escalation, resume of passed and in-flight nodes, tool restriction, deterministic dispatch, gate cache merged into audit files, §11.10.16 round numbering continues across resumes |
+| `test_v0_resume.py` | 13 | real-subprocess `SIGKILL` resume (both windows), no-op replay, fsync-per-append, single-parse dispatch; §D0 gptme-shaped `has_file_tools` adapters never fall back to a save-fence or a confident sentence as the artifact |
+| `test_v1_units.py` | 34 | gates, tree validation (incl. §D0's `artifact != out/<id>.md` rejection), promotion cap, `complete_json` retry paths, artifact instruction, §11.10.13 reviewer input cap (truncation marked, ceiling measured, §D5's `verdict.truncated` flag) |
+| `test_v1_round_loop.py` | 11 | dependency order, gate-failure escalation, resume of passed and in-flight nodes, tool restriction, deterministic dispatch, gate cache merged into audit files (incl. §D5's `truncated` field), §11.10.16 round numbering continues across resumes |
 | `test_v1_orchestrator_policy.py` | 9 | `DispatchPolicy`, ready-set-bounded state |
 | `test_v2_intake.py` / `_survey.py` / `_planner.py` / `_pilot.py` | 4/22/12/7 | call counts, window→global index conversion, spine merge and folding, leaf gate, caps forcing leaves with zero calls, median pilot, contract ceiling |
 | `test_v2_survey_deterministic.py` | 12 | injected vectors only — clean shift fires once, uniform corpus silent, the lone-odd-chunk plateau that forced the implemented variant |
@@ -1029,8 +1176,10 @@ guard into any new test file.
 | `test_v4_*.py` | 2/2/5 | allowlist, derived-id dispatch + cache hit, finding attachment |
 | `test_dashboard_state.py` / `_server.py` | 25/22 | `RunState` directly (no port), then HTTP over a real loopback `ThreadingHTTPServer` incl. traversal rejection and `--no-control` 403s; §11.10.14 read-only poll leaves runs unmutated; §11.10.15 bounded cache + 8-thread hammer |
 | `test_dashboard_rendering.py` | 14 | `parse_trace`: `<think>`/`<thinking>` tag extraction incl. the Anthropic think-sig comment, `save`/`append`/`patch` code-fence → `tool_call` + `diff` entries, per-path diff continuity across turns (not "whole file added" every time), `error` vs routine `system` classification | 
-| `test_pipeline_prompts.py` / `_backends.py` / `test_driver_phases.py` | 14/7/2 | byte-identical default prompt, adapter wiring, phase detail preservation, §11.10.15 contract-cache bound | 
+| `test_pipeline_prompts.py` / `_backends.py` / `test_driver_phases.py` | 18/8/10 | byte-identical default prompt (now including §D0's absolute artifact-path line and §D1's goal block), §D2's out/scratch carve-out (hidden but excepted, not dropped), adapter wiring, phase detail preservation, §D4's corpus-less-raises, §11.10.15 contract-cache bound | 
 | `test_pipeline_approvals.py` | 4 | §11.10.12 incremental approvals scanning: each record parsed once across polls, torn tail re-read, cross-thread wait/resolve |
+| `test_pipeline_liveness.py` | 5 | §D0c: dead pid → stalled, live pid → not stalled, non-`in_progress` phase never stalled, no-pid-record falls back to phase-age threshold |
+| `test_environment_remote_files.py` | 2 | §D7: `write_remote_text`'s cleanup tolerates `PermissionError` (not just `FileNotFoundError`) on unlink without failing the write |
 | `test_gptme_adapter.py` / `test_searxng_tool.py` | 15/12 | command construction and output parsing; monkeypatched `urlopen`, never `execute_websearch` (it imports gptme) |
 
 Fixtures (`tests/fixtures/`): `fake_stream_agent.py` (a standalone script

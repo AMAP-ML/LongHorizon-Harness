@@ -65,6 +65,45 @@ class BuildNodePromptTest(unittest.TestCase):
         self.assertNotIn("MINIMAL", prompt)
 
 
+class ArtifactPathInstructionTest(unittest.TestCase):
+    """PLAN.md §D0: the artifact path appeared in no Writer prompt, in any
+    tier, ever. A built prompt must now state it explicitly, absolute."""
+
+    def test_prompt_states_absolute_artifact_path(self) -> None:
+        node = _node(id="ch01", artifact="out/ch01.md")
+        with tempfile.TemporaryDirectory() as run_dir:
+            prompt = build_node_prompt(node, run_dir)
+        self.assertIn(str(Path(run_dir) / "out" / "ch01.md"), prompt)
+
+    def test_prompt_no_longer_claims_last_message_is_the_artifact(self) -> None:
+        with tempfile.TemporaryDirectory() as run_dir:
+            prompt = build_node_prompt(_node(), run_dir)
+        self.assertNotIn("last message", prompt.lower())
+
+
+class GoalReachesWriterTest(unittest.TestCase):
+    """PLAN.md §D1: spec.md's goal and global rubric reach every node's
+    prompt — previously nothing but node.brief did, which is fatal on a
+    corpus-less run whose brief is synthesized boilerplate."""
+
+    def test_spec_goal_reaches_the_prompt(self) -> None:
+        with tempfile.TemporaryDirectory() as run_dir:
+            run_dir = Path(run_dir)
+            (run_dir / "spec.md").write_text(
+                "# Spec\n\n## Goal\nWrite a tutorial on distributed consensus.\n\n"
+                "## Global rubric\n- **audience**: beginners\n\n## Assumptions\n(none)\n",
+                encoding="utf-8",
+            )
+            prompt = build_node_prompt(_node(), run_dir)
+        self.assertIn("Write a tutorial on distributed consensus.", prompt)
+        self.assertIn("beginners", prompt)
+
+    def test_no_spec_means_no_goal_block(self) -> None:
+        with tempfile.TemporaryDirectory() as run_dir:
+            prompt = build_node_prompt(_node(), run_dir)
+        self.assertNotIn("Overall run goal", prompt)
+
+
 class DependsOnPromotionsTest(unittest.TestCase):
     """PLAN-zeromem.md §11.2: a node's depends_on promotions (the capped
     handoffs of the nodes it depends on) are injected; a node with no
@@ -81,7 +120,7 @@ class DependsOnPromotionsTest(unittest.TestCase):
         return run_dir
 
     def test_injects_promotions_of_depends_on(self) -> None:
-        node = _node(id="b", depends_on=["upstream"])
+        node = _node(id="b", artifact="out/b.md", depends_on=["upstream"])
         with tempfile.TemporaryDirectory() as root_str:
             run_dir = self._run_dir_with_manifest(Path(root_str))
             prompt = build_node_prompt(node, run_dir)
@@ -168,8 +207,11 @@ class InlineSpansTest(unittest.TestCase):
     def _assert_default_unmodified(self, node: TaskNode, run_dir: Path) -> None:
         expected = (
             "Your brief: Write the intro.\n\n"
+            f"Write your artifact to `{run_dir / 'out' / 'a.md'}` using your file "
+            "tools (e.g. gptme's save/patch). That file is the deliverable; "
+            "nothing else you write or say is.\n\n"
             "Inputs (read them with your tools before writing, and cite them "
-            "where relevant):\n- spine/unit-01.md"
+            f"where relevant):\n- {run_dir / 'spine' / 'unit-01.md'}"
         )
         self.assertEqual(build_node_prompt(node, run_dir), expected)
 
@@ -193,7 +235,7 @@ class InlineSpansTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as root_str:
             run_dir = _retrieval_run(Path(root_str))
             prompt = build_node_prompt(node, run_dir, inline_spans=True)
-        self.assertIn("- scratch/a/finding-web-1.md", prompt)
+        self.assertIn(f"- {run_dir / 'scratch' / 'a' / 'finding-web-1.md'}", prompt)
         self.assertIn("Source material (retrieved spans", prompt)
 
     def test_inline_spans_falls_back_when_index_missing(self) -> None:
@@ -203,7 +245,7 @@ class InlineSpansTest(unittest.TestCase):
             run_dir.mkdir()
             prompt = build_node_prompt(node, run_dir, inline_spans=True)
         self.assertIn("Inputs (read them with your tools", prompt)
-        self.assertIn("- spine/unit-01.md", prompt)
+        self.assertIn(f"- {run_dir / 'spine' / 'unit-01.md'}", prompt)
         self.assertNotIn("Source material", prompt)
 
     def test_inline_spans_includes_provenance_headers(self) -> None:

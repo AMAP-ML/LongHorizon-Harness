@@ -388,6 +388,11 @@ function renderHeader() {
         badge(snap.phase_status || "running"),
         (snap.pending_approvals || []).length ? el("span", { class: "badge", "data-status": "waiting_for_approval" }, "⚡ ACTION REQUIRED") : null,
         snap.halted ? badge("halted") : null,
+        // §D0c: "in_progress" forever is indistinguishable from mid-call
+        // unless something says so -- this is that something.
+        snap.stalled
+          ? el("span", { class: "badge", "data-status": "error", title: snap.stalled_reason || "" }, "☠ STALLED")
+          : null,
       ])
     );
   } else {

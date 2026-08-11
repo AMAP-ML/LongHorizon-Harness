@@ -99,7 +99,6 @@ def _merge_small_segments(segments: list[str], min_tokens: int) -> list[str]:
         running[-2] += running[-1]
         running.pop()
     return merged
-    return merged
 
 
 @dataclass

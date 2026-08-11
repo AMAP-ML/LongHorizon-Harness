@@ -57,7 +57,16 @@ from ..pipeline.driver import (
     apply_triage,
     reopen_node,
 )
-from ..pipeline.run_dir import approvals_path, halt_path, jobs_path, phase_path, run_spec_path
+from ..pipeline.liveness import run_liveness
+from ..pipeline.run_dir import (
+    approvals_path,
+    halt_path,
+    jobs_path,
+    phase_path,
+    resolve_runs_root,
+    resolve_stored,
+    run_spec_path,
+)
 from . import gptme_queue
 
 _DEFAULT_RUN_ID_PREFIX = "rec"
@@ -78,7 +87,11 @@ class RunState:
     concurrently."""
 
     def __init__(self, runs_root: str | Path | None = None) -> None:
-        self.runs_root = Path(runs_root) if runs_root else None
+        # §D0b: resolved once, here — a `serve` process started from a
+        # different cwd than the driver that owns the run must still land
+        # on the same absolute directory, or every node reads as empty
+        # with nothing in the logs to say why.
+        self.runs_root = resolve_runs_root(runs_root) if runs_root else None
         self._lock = threading.Lock()
         self._cache_lock = threading.Lock()
         self._attached: str | None = None
@@ -247,6 +260,10 @@ class RunState:
         events = self._cached_events(run_dir)
         tree = self._cached_tree(run_dir)
         approvals = self._cached_approvals(run_dir)
+        # §D0c: a phase reading "in_progress" is otherwise indistinguishable
+        # from a process that died mid-call -- surface that distinction
+        # instead of a permanent, silent "running" badge.
+        liveness = run_liveness(run_dir)
         return {
             "attached": True,
             "run_id": self.attached_run_id,
@@ -256,6 +273,8 @@ class RunState:
             "phase": str(phase.get("phase", "")),
             "phase_status": str(phase.get("status", "")),
             "phase_detail": str(phase.get("detail", "")),
+            "stalled": liveness.stalled,
+            "stalled_reason": liveness.reason if liveness.stalled else "",
             "phases": _phase_map(events),
             "tree": _tree_summary(run_dir, tree),
             "tree_counts": _count_statuses(tree),
@@ -898,17 +917,14 @@ def _safe_node_id(value: str) -> bool:
 
 
 def _input_tokens(run_dir: Path, ref: str) -> int:
-    path = Path(ref)
-    if not path.is_absolute():
-        return 0
-    return estimate_tokens(_read_text(path) or "")
+    # §D0b: a planner-built node's inputs are stored relative to run_dir
+    # (v2/survey.py:unit_input_path), so the old `not absolute -> 0` branch
+    # under-reported every one of them as zero input tokens.
+    return estimate_tokens(_read_text(resolve_stored(run_dir, ref)) or "")
 
 
 def _input_exists(run_dir: Path, ref: str) -> bool:
-    path = Path(ref)
-    if path.is_absolute():
-        return path.exists()
-    return (run_dir / ref).exists()
+    return resolve_stored(run_dir, ref).exists()
 
 
 def _list_versions(run_dir: Path, node_id: str) -> list[str]:

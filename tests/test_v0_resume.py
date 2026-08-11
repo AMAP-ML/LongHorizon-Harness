@@ -420,6 +420,86 @@ class ArtifactNotClobberedTest(unittest.TestCase):
             self.assertEqual(artifact_path.read_text(encoding="utf-8"), result.actions_log)
 
 
+class _CannedFileToolsAdapter(_CannedAdapter):
+    """Same canned-result adapter as above, but flagged has_file_tools=True
+    to simulate a real GptmeAdapter (PLAN.md §D0): an empty artifact after
+    one of these must fail the gate, never fall back to a chat message."""
+
+    has_file_tools = True
+
+
+class GptmeNoChatFallbackTest(unittest.TestCase):
+    """PLAN.md §D0's three observed outcomes, cases A and C: a gptme-shaped
+    adapter's post-episode chat text must never become the artifact,
+    whether that text is a stray save-fence (the agent's natural mode) or a
+    confident "I wrote it" sentence with no file actually written."""
+
+    def test_save_fence_in_last_message_does_not_become_the_artifact(self) -> None:
+        with tempfile.TemporaryDirectory() as root_str:
+            root = Path(root_str)
+            run_dir = create_run_dir(root, "run_fence")
+            node_id = "writer_fence"
+            artifact_path = node_artifact_path(run_dir, node_id)
+            fence = "```save section.md\n# Section\n\nBody text.\n```"
+            result = EpisodeResult(
+                status="done",
+                actions_log=fence,
+                metadata={"assistant_visible_output": fence, "actions_log_diagnostics_only": False},
+            )
+            adapter = _CannedFileToolsAdapter(result)  # never writes out/<node>.md itself
+            env = LocalEnvironment(tmp_dir=str(root / "tmp"))
+            budget = EpisodeBudget(max_duration_seconds=30)
+
+            asyncio.run(run_node(run_dir, node_id, "do the task", adapter, env, budget))
+
+            self.assertEqual(artifact_path.read_text(encoding="utf-8"), "")
+
+    def test_confident_sentence_with_no_file_written_leaves_artifact_empty(self) -> None:
+        with tempfile.TemporaryDirectory() as root_str:
+            root = Path(root_str)
+            run_dir = create_run_dir(root, "run_sentence")
+            node_id = "writer_sentence"
+            artifact_path = node_artifact_path(run_dir, node_id)
+            result = EpisodeResult(
+                status="done",
+                actions_log="Done — I wrote it to section.md.",
+                metadata={
+                    "assistant_visible_output": "Done — I wrote it to section.md.",
+                    "actions_log_diagnostics_only": False,
+                },
+            )
+            adapter = _CannedFileToolsAdapter(result)
+            env = LocalEnvironment(tmp_dir=str(root / "tmp"))
+            budget = EpisodeBudget(max_duration_seconds=30)
+
+            asyncio.run(run_node(run_dir, node_id, "do the task", adapter, env, budget))
+
+            # Empty, not the sentence -- so the `nonempty` gate fails
+            # instead of a bogus `passed` node (§D0's Case C).
+            self.assertEqual(artifact_path.read_text(encoding="utf-8"), "")
+
+    def test_real_save_still_survives_untouched(self) -> None:
+        # Sanity check the positive path is unaffected: a has_file_tools
+        # adapter that DID write the artifact keeps it, exactly like
+        # ArtifactNotClobberedTest above.
+        with tempfile.TemporaryDirectory() as root_str:
+            root = Path(root_str)
+            run_dir = create_run_dir(root, "run_real_save")
+            node_id = "writer_real_save"
+            artifact_path = node_artifact_path(run_dir, node_id)
+            real_text = "# Real section\n\nActually written via save().\n"
+            result = EpisodeResult(status="done", actions_log="", metadata={})
+            adapter = _CannedFileToolsAdapter(
+                result, artifact_path=artifact_path, artifact_text=real_text
+            )
+            env = LocalEnvironment(tmp_dir=str(root / "tmp"))
+            budget = EpisodeBudget(max_duration_seconds=30)
+
+            asyncio.run(run_node(run_dir, node_id, "do the task", adapter, env, budget))
+
+            self.assertEqual(artifact_path.read_text(encoding="utf-8"), real_text)
+
+
 class EventLogFsyncTest(unittest.TestCase):
     def test_append_calls_fsync(self) -> None:
         with tempfile.TemporaryDirectory() as root_str:

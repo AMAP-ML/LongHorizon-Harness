@@ -42,6 +42,7 @@ from ..v0.run_dir import (  # noqa: F401
     node_artifact_path,
     node_scratch_dir,
     node_trace_path,
+    resolve_stored,
     spec_path,
 )
 from ..v1.run_dir import (  # noqa: F401
@@ -86,3 +87,30 @@ def run_spec_path(run_dir: str | Path) -> Path:
 
 def jobs_path(run_dir: str | Path) -> Path:
     return Path(run_dir) / "jobs.jsonl"
+
+
+def driver_pid_path(run_dir: str | Path) -> Path:
+    """PLAN.md §D0c: which process (if any) currently owns this run. A
+    ``phase.json`` reading ``in_progress`` forever is indistinguishable
+    from a run genuinely mid-call unless something records who was
+    supposed to be making progress — this is that record, written once at
+    driver construction. Deliberately not ``jobs.jsonl``: that file already
+    has its own schema (dashboard-triggered background jobs, keyed by
+    ``job_id``) unrelated to driver-process liveness."""
+    return Path(run_dir) / "driver.pid.json"
+
+
+def resolve_runs_root(root: str | Path) -> Path:
+    """The one place a ``--runs-root`` string turns into an absolute path
+    (PLAN.md §D0b). Every CLI command and the dashboard server must route
+    through this rather than doing a bare ``Path(root)``: unresolved, the
+    same ``--runs-root`` value silently addresses a different directory
+    depending on the shell's cwd at invocation time, which is the root
+    cause behind "a run I started now shows empty" reports — a second,
+    empty run directory gets created in a sister folder and nothing errors.
+    """
+    return Path(root).expanduser().resolve()
+
+
+def resolve_run_dir(root: str | Path, run_id: str) -> Path:
+    return resolve_runs_root(root) / run_id

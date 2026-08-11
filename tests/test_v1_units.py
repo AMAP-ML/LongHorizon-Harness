@@ -73,6 +73,21 @@ class TreeValidationTest(unittest.TestCase):
             with self.assertRaises(TreeValidationError):
                 TaskTree.load(path)
 
+    def test_artifact_disagreeing_with_id_is_rejected(self) -> None:
+        # PLAN.md §D0: node.artifact used to be decorative -- every real
+        # reader derived out/<id>.md from node.id independently, so a
+        # disagreeing node.artifact silently pointed a Writer's prompt at a
+        # file nothing else ever reads or writes. Now the single source of
+        # truth, asserted at load.
+        with tempfile.TemporaryDirectory() as root_str:
+            root = Path(root_str)
+            path = self._write(
+                root,
+                [{"id": "a", "brief": "x", "artifact": "out/wrong.md", "gates": ["nonempty"]}],
+            )
+            with self.assertRaises(TreeValidationError):
+                TaskTree.load(path)
+
     def test_unknown_dependency_is_rejected(self) -> None:
         with tempfile.TemporaryDirectory() as root_str:
             root = Path(root_str)
@@ -253,9 +268,14 @@ class PromotionCapTest(unittest.TestCase):
 
 
 class WriterPromptTest(unittest.TestCase):
-    def test_writer_prompt_states_artifact_contract(self) -> None:
+    def test_writer_prompt_does_not_claim_last_message_is_the_artifact(self) -> None:
+        # PLAN.md §D0: "your last message becomes the artifact file verbatim"
+        # was a leftover from the deleted Claude Code/Codex adapters and
+        # fights gptme's save/patch tool-loop grain -- the artifact path
+        # instruction now lives in pipeline/prompts.py:build_node_prompt
+        # (see test_pipeline_prompts.py), not here.
         prompt = writer_prompt("Write the intro.", Path("/tmp/run/scratch/a/promotion.json"))
-        self.assertIn("your last message", prompt.lower())
+        self.assertNotIn("last message", prompt.lower())
         self.assertIn("Write the intro.", prompt)
 
     def test_writer_prompt_still_requests_promotion(self) -> None:
@@ -519,6 +539,10 @@ class ReviewerInputCapTest(unittest.TestCase):
         provider = FakeProvider([{"items": [], "verdict": "pass"}])
         verdict = review_node(self._node_with_judgment(), huge, provider)
         self.assertEqual(verdict.verdict, "pass")
+        # §D5: a `passed` verdict reached over a truncated artifact must say
+        # so on the verdict itself, not just in the prompt the model saw --
+        # the record is what a later reader (dashboard, audit) checks.
+        self.assertTrue(verdict.truncated)
         user_content = provider.calls[0][0][1]["content"]
         self.assertIn("ARTIFACT TRUNCATED", user_content)
         sent_artifact = user_content.split("Artifact:\n", 1)[1]
@@ -527,7 +551,8 @@ class ReviewerInputCapTest(unittest.TestCase):
     def test_small_artifact_passes_through_unmodified(self) -> None:
         small = "Short artifact, no truncation needed."
         provider = FakeProvider([{"items": [], "verdict": "pass"}])
-        review_node(self._node_with_judgment(), small, provider)
+        verdict = review_node(self._node_with_judgment(), small, provider)
+        self.assertFalse(verdict.truncated)
         user_content = provider.calls[0][0][1]["content"]
         self.assertIn("Short artifact, no truncation needed.", user_content)
         self.assertNotIn("ARTIFACT TRUNCATED", user_content)
