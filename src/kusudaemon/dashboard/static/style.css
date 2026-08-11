@@ -966,53 +966,76 @@ button.icon-btn {
   box-shadow: 0 4px 20px rgba(245, 158, 11, 0.18);
 }
 
-/* Live Thinking Stream Card */
-.thinking-live-card {
-  border-color: rgba(168, 85, 247, 0.45);
-  background: linear-gradient(180deg, var(--bg-secondary) 0%, rgba(168, 85, 247, 0.07) 100%);
-  box-shadow: var(--shadow-glow-purple);
-}
-
-/* One tab per agent (main + every live/recent subagent) -- toggles which
-   agent's chat window the card below shows, without dropping any of the
-   others: all of them keep polling in the background. */
-.thinking-agent-tabs {
+/* Marks where the main chat's live "what's running right now" stream
+   starts -- the entries below it (renderAgentChatEntry) are plain items
+   in the same flowing feed, not a boxed widget of their own. */
+.live-agent-divider {
   display: flex;
-  gap: 4px;
-  flex-wrap: wrap;
-  margin-bottom: 10px;
-}
-
-.thinking-agent-tab {
-  padding: 3px 10px;
+  align-items: center;
+  gap: 8px;
   font-size: 11px;
-  font-weight: 600;
-  color: var(--text-muted);
-  border: 1px solid var(--border-color);
-  background: var(--bg-darkest);
-  border-radius: 9999px;
-  cursor: pointer;
-  transition: all 0.2s ease;
-}
-
-.thinking-agent-tab.active {
-  background-color: rgba(168, 85, 247, 0.18);
-  border-color: rgba(168, 85, 247, 0.6);
+  font-weight: 700;
   color: var(--accent-purple);
+  text-transform: uppercase;
+  letter-spacing: 0.6px;
+  margin: 4px 0;
 }
 
-.thinking-live-body {
+.live-agent-divider .divider-line {
+  flex: 1;
+  height: 1px;
+  background: rgba(168, 85, 247, 0.25);
+}
+
+/* renderAgentChatEntry's per-role styling -- used both for the main
+   chat's live stream and the right workbench's per-agent Chat tab, so an
+   opened subagent reads as the same interface as the main agent. */
+.agent-chat-entry.role-thinking .msg-body {
+  color: var(--accent-purple);
+  font-style: italic;
+  background: rgba(168, 85, 247, 0.06);
+  border: 1px solid rgba(168, 85, 247, 0.25);
+}
+.agent-chat-entry.role-thinking .author { color: var(--accent-purple); }
+
+.agent-chat-entry.role-assistant .msg-body {
+  background-color: var(--bg-secondary);
+  border: 1px solid var(--border-color);
+}
+.agent-chat-entry.role-assistant .author { color: var(--accent-cyan); }
+
+.agent-chat-entry.role-tool_call .msg-body {
+  font-family: var(--font-mono);
+  font-size: 12px;
+  background: var(--accent-green-bg);
+  border: 1px solid rgba(16, 185, 129, 0.3);
+  padding: 8px 12px;
+}
+.agent-chat-entry.role-tool_call .author { color: var(--accent-green); }
+
+.agent-chat-entry.role-tool .msg-body,
+.agent-chat-entry.role-system .msg-body,
+.agent-chat-entry.role-logdir .msg-body,
+.agent-chat-entry.role-raw .msg-body {
   font-family: var(--font-mono);
   font-size: 11px;
-  padding: 12px 14px;
-  background-color: var(--bg-darkest);
-  border-radius: var(--radius-sm);
-  border: 1px solid var(--border-subtle);
-  max-height: 320px;
-  overflow-y: auto;
-  line-height: 1.55;
-  white-space: pre-wrap;
-  word-break: break-word;
+  color: var(--text-muted);
+  background: transparent;
+  border: 1px dashed var(--border-subtle);
+  padding: 6px 10px;
+  box-shadow: none;
+}
+
+.agent-chat-entry.role-error .msg-body {
+  color: var(--accent-red);
+  background: var(--accent-red-bg);
+  border: 1px solid rgba(244, 63, 94, 0.35);
+  font-weight: 600;
+}
+.agent-chat-entry.role-error .author { color: var(--accent-red); }
+
+.agent-diff-card {
+  border-color: rgba(56, 189, 248, 0.35);
 }
 
 /* Pane 3: Right Workbench Panel */
@@ -1181,22 +1204,32 @@ table.tree tr:hover td {
   font-family: var(--font-display);
 }
 
-/* Node Drawer Panel */
-.drawer-panel {
-  max-width: 940px;
-  width: 95%;
+/* Agent tab (right workbench): a specific node/subagent's own detail +
+   chat, embedded inline instead of a floating overlay -- everything opens
+   on the right side, never a modal covering the screen. */
+.agent-panel-hdr {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 12px;
 }
 
-.drawer-tabs {
+.agent-panel-hdr h3 {
+  font-size: 15px;
+  font-weight: 700;
+  color: var(--text-bright);
+  font-family: var(--font-mono);
+}
+
+.agent-tabs {
   display: flex;
   gap: 4px;
-  padding: 8px 18px 0;
   border-bottom: 1px solid var(--border-color);
-  background-color: var(--bg-primary);
+  margin-bottom: 16px;
 }
 
-.drawer-tab {
-  padding: 12px 18px;
+.agent-tab {
+  padding: 8px 16px;
   font-size: 12px;
   font-weight: 600;
   color: var(--text-muted);
@@ -1205,28 +1238,75 @@ table.tree tr:hover td {
   transition: all 0.15s ease;
 }
 
-.drawer-tab:hover {
+.agent-tab:hover {
   color: var(--text-bright);
 }
 
-.drawer-tab.active {
+.agent-tab.active {
   color: var(--accent-cyan);
   background-color: var(--bg-secondary);
   border-bottom: 2px solid var(--accent-cyan);
 }
 
-.drawer-body {
-  padding: 22px 26px;
-  overflow-y: auto;
-  flex: 1;
-  min-height: 240px;
-  max-height: 58vh;
+.agent-body {
+  margin-bottom: 16px;
 }
 
-.drawer-bar {
-  padding: 12px 26px;
-  border-top: 1px solid var(--border-subtle);
+.agent-chat-log {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.agent-bar {
+  padding: 12px 16px;
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-sm);
   background-color: var(--bg-primary);
+  margin-bottom: 10px;
+}
+
+/* Task Tree tab: node ids are dot-hierarchical, so this reads as an
+   actual indented tree (buildNodeTreeIndex/renderTreeBranch) instead of
+   the flat card list the left sidebar used to show. */
+.task-tree-view {
+  font-size: 13px;
+}
+
+.tree-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 8px;
+  border-radius: var(--radius-sm);
+  cursor: pointer;
+  transition: background-color 0.15s ease;
+}
+
+.tree-row:hover {
+  background-color: var(--bg-hover);
+}
+
+.tree-row.active {
+  background-color: var(--accent-blue-bg);
+}
+
+.tree-row-folder {
+  cursor: default;
+  color: var(--text-muted);
+  font-weight: 600;
+}
+
+.tree-glyph {
+  color: var(--text-dim);
+  width: 14px;
+  text-align: center;
+  flex-shrink: 0;
+}
+
+.tree-label {
+  font-family: var(--font-mono);
+  flex: 1;
 }
 
 .bar-label {
@@ -1320,30 +1400,8 @@ table.tree tr:hover td {
   color: var(--text-dim);
 }
 
-/* Trace View */
-.trace-log {
-  font-family: var(--font-mono);
-  font-size: 12px;
-  line-height: 1.7;
-  white-space: pre-wrap;
-  word-break: break-word;
-}
-
-.trace-entry { padding: 4px 0; }
-.trace-role { font-weight: 700; }
-.trace-entry.trace-assistant .trace-role { color: var(--accent-cyan); }
-.trace-entry.trace-user .trace-role { color: var(--accent-amber); }
-.trace-entry.trace-system .trace-role { color: var(--text-dim); }
-.trace-entry.trace-tool .trace-role { color: var(--accent-green); }
-.trace-entry.trace-tool_call { color: var(--accent-green); }
-.trace-entry.trace-tool_call .trace-role { color: var(--accent-green); }
-.trace-entry.trace-diff .trace-role { color: var(--accent-cyan); }
-.trace-entry.trace-error { color: var(--accent-red); font-weight: 600; }
-.trace-entry.trace-error .trace-role { color: var(--accent-red); }
-.trace-entry.trace-thinking { color: var(--accent-purple); font-style: italic; }
-.trace-entry.trace-thinking .trace-role { color: var(--accent-purple); }
-.trace-entry.trace-logdir { color: var(--text-dim); font-style: italic; }
-.trace-entry.trace-raw { color: var(--text-dim); }
+/* Trace View -- diff-pre modifier only; individual entries render via
+   renderAgentChatEntry's .agent-chat-entry.role-* rules instead. */
 .trace-diff-pre { margin: 4px 0 0; }
 
 /* Form Controls */

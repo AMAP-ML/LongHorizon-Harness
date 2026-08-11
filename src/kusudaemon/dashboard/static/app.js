@@ -2,26 +2,26 @@
 // Preserves every backend API hook the old 3-pane view had (/api/snapshot,
 // /api/runs, /api/halt, /api/amend, /api/approvals) and adds the surface
 // the (now-deleted) Textual TUI had on top of it: a Subagents view over
-// every dispatched Writer/repair/research episode, a node drawer with
-// Overview/Artifact/Diff/Thinking tabs, live mid-episode interject, and
-// per-node reopen.
+// every dispatched Writer/repair/research episode, a right-workbench Agent
+// tab (Overview/Artifact/Diff/Chat) for a specific node or subagent's own
+// detail, live mid-episode interject, and per-node reopen. Left sidebar is
+// navigation only (Runs/Subagents/Phases); every detail view -- including
+// the Task Tree -- opens on the right, never a floating overlay.
 
 const PHASES = ["intake", "survey", "plan", "pilot", "research", "execute", "assemble"];
 
 const state = {
   snapshot: { attached: false, runs: [], control_enabled: true },
-  sidebarTab: "sessions", // 'sessions' | 'tree' | 'subagents' | 'phases'
-  workbenchTab: "code",   // 'code' | 'contract' | 'spec' | 'spine' | 'assembly' | 'terminal'
+  sidebarTab: "sessions", // 'sessions' | 'subagents' | 'phases' -- navigation only; all detail views open in the right-side workbench (see workbenchTab)
+  workbenchTab: "code",   // 'code' | 'tree' | 'agent' | 'contract' | 'spec' | 'spine' | 'assembly' | 'terminal'
   selectedNode: null,
   nodeDetail: null,
   nodeSubagent: null,
   nodeDetailLoading: false,
-  drawerTab: "overview", // 'overview' | 'artifact' | 'diff' | 'thinking'
+  agentTab: "overview", // 'overview' | 'artifact' | 'diff' | 'chat' -- sub-tabs within the right workbench's Agent tab
   nodeDiff: null,        // [{tag, lines}] once loaded, keyed to selectedNode
-  nodeThinking: null,    // [{role, text}] once loaded, keyed to selectedNode
-  liveThinkingAgents: [], // [{id, label, entries, live}] -- every currently-active agent, polled continuously; see loadLiveThinking()
-  liveThinkingActiveTab: null,  // which agent's stream the toggle currently shows
-  liveThinkingTabManual: false, // true once the operator picks a tab by hand; see renderCenterStream
+  nodeThinking: null,    // [{role, text}] once loaded, keyed to selectedNode -- also the live chat feed for whichever agent is open, kept fresh by applySnapshot's isLive(selectedNode) refresh
+  mainAgentThinking: null, // {id, label, entries, live} -- "what's running right now," shown livestreamed in the main chat; see loadMainAgentThinking(). Independent of a specific subagent opened in the right panel's Agent tab, which keeps its own history regardless of what's currently live.
   newRunOpen: false,
   busy: false,
   toast: null,
@@ -103,50 +103,28 @@ function snapshotFingerprint(snap) {
   return JSON.stringify(rest);
 }
 
-function loadLiveThinking() {
+function loadMainAgentThinking() {
   const snap = state.snapshot;
-  if (!snap || !snap.attached) {
-    if (state.liveThinkingAgents.length) { state.liveThinkingAgents = []; render(); }
-    return;
-  }
-  const subagents = snap.subagents || [];
-  const liveSubs = subagents.filter((s) => s.live);
-  // Target every currently-live subagent at once -- not just one -- so
-  // concurrent dispatch (a config change away, per CLAUDE.md's v1 round
-  // loop notes) shows every stream simultaneously instead of the
-  // dashboard picking one and hiding the rest. When nothing is live right
-  // now, fall back to the most recently dispatched subagent (dispatch
-  // order, per RunState.subagents()): gptme runs each turn synchronously,
-  // no token-level streaming (_gptme_worker.py's `stream=False`), so a
-  // fast episode can dispatch, produce its one message, and complete
-  // inside a single ~1.5s polling gap, and this node's `live` may never
-  // be observed true. Always poll "main" too -- node_gptme_logdir's
-  // phase/traces-dir fallback can resolve a session for it even when no
-  // tree node claims it -- but only surface its card once it actually has
-  // entries, so it doesn't sit there as a permanent empty "waiting" card.
-  let targets = liveSubs.map((s) => s.id);
-  if (!targets.length && subagents.length) targets = [subagents[subagents.length - 1].id];
-  if (!targets.includes("main")) targets = targets.concat(["main"]);
-
-  Promise.all(
-    targets.map((id) =>
-      apiGet(`/api/node/${encodeURIComponent(id)}/thinking`)
-        .then((d) => ({ id, entries: d.entries || [] }))
-        .catch(() => ({ id, entries: null }))
-    )
-  ).then((results) => {
-    const next = [];
-    for (const { id, entries } of results) {
-      if (entries === null) continue;
-      if (id === "main" && !entries.length) continue;
-      const sub = subagents.find((s) => s.id === id);
-      next.push({ id, label: sub ? `${id} (${sub.role || sub.kind})` : id, entries, live: sub ? sub.live : false });
-    }
-    if (JSON.stringify(next) !== JSON.stringify(state.liveThinkingAgents)) {
-      state.liveThinkingAgents = next;
-      render();
-    }
-  });
+  const subagents = (snap && snap.subagents) || [];
+  const liveSub = subagents.find((s) => s.live);
+  // Follow whichever episode is actually live, or -- once it's no longer
+  // live -- the most recently dispatched one (RunState.subagents() returns
+  // dispatch order): gptme runs each turn synchronously, no token-level
+  // streaming (_gptme_worker.py's `stream=False`), so a fast episode can
+  // dispatch, produce its one message, and complete inside a single ~1.5s
+  // polling gap, and `live` may never be observed true for it. Falls back
+  // to "main" itself only once nothing has ever been dispatched.
+  const targetId = liveSub ? liveSub.id : (subagents.length ? subagents[subagents.length - 1].id : "main");
+  apiGet(`/api/node/${encodeURIComponent(targetId)}/thinking`)
+    .then((d) => {
+      const sub = subagents.find((s) => s.id === targetId);
+      const next = { id: targetId, label: sub ? `${targetId} (${sub.role || sub.kind})` : targetId, entries: d.entries || [], live: sub ? sub.live : false };
+      if (JSON.stringify(next) !== JSON.stringify(state.mainAgentThinking)) {
+        state.mainAgentThinking = next;
+        render();
+      }
+    })
+    .catch(() => {});
 }
 
 function applySnapshot(snap) {
@@ -155,11 +133,14 @@ function applySnapshot(snap) {
   }
   const unchanged = snapshotFingerprint(snap) === snapshotFingerprint(state.snapshot);
   state.snapshot = snap;
+  if (snap && snap.attached) loadMainAgentThinking();
+  // Keeps whichever agent is currently open (right workbench's Agent tab)
+  // streaming live while it's actually running, independent of whatever
+  // loadMainAgentThinking() above is following for the main chat -- an
+  // explicitly-opened subagent keeps showing *its own* chat even after
+  // something else becomes "live."
   if (state.selectedNode && isLive(state.selectedNode)) {
     loadThinkingIfNeeded(true);
-  }
-  if (snap.attached) {
-    loadLiveThinking();
   }
   if (!unchanged) render();
 }
@@ -220,9 +201,7 @@ function truncate(text, n) {
   return text.length > n ? text.slice(0, n) + "\n…[truncated]" : text;
 }
 
-// Shared by the drawer's Thinking tab and the live thinking-stream widget
-// (rendering.parse_trace on the backend feeds both /api/node/<id>/thinking
-// calls). A "diff" entry's text is a plain unified diff (rendering.py's
+// A "diff" entry's text is a plain unified diff (rendering.py's
 // format_diff_plain) -- classify each line by its leading character so it
 // gets the same add/remove/hunk/header coloring as the dedicated Diff tab,
 // rather than dumping raw +/- text.
@@ -234,16 +213,43 @@ function diffLineKind(line) {
   return "context";
 }
 
-function renderTraceEntry(e) {
-  const body =
-    e.role === "diff"
-      ? el(
-          "pre",
-          { class: "diff-pre trace-diff-pre" },
-          (e.text || "").split("\n").map((line) => el("div", { class: `diff-line diff-${diffLineKind(line)}` }, line))
-        )
-      : e.text;
-  return el("div", { class: `trace-entry trace-${e.role}` }, [el("span", { class: "trace-role" }, `[${e.role}] `), body]);
+// Turns one trace entry (rendering.parse_trace on the backend, served by
+// every /api/node/<id>/thinking call) into a normal item in a chat feed --
+// no bounding box of its own, no separate scroll region. Shared by the
+// main chat's live "what's running right now" stream and the right
+// workbench's per-agent Chat tab, so both read as the same chat interface:
+// a thought, then the tool call it led to, then the next thought below
+// it, each one just another entry in the history instead of everything
+// dumped into a fixed-height side widget.
+const _CHAT_ROLE_LABEL = {
+  assistant: "🤖 Agent",
+  thinking: "💭 Thinking",
+  tool_call: "🔧 Tool call",
+  tool: "🔧 Tool result",
+  system: "⚙️ System",
+  error: "❌ Error",
+  user: "Prompt",
+  diff: "📝 File change",
+  logdir: "Session",
+  raw: "",
+};
+
+function renderAgentChatEntry(e) {
+  if (e.role === "diff") {
+    return el("div", { class: "stream-card agent-diff-card" }, [
+      el("div", { class: "card-title" }, el("span", null, _CHAT_ROLE_LABEL.diff)),
+      el(
+        "pre",
+        { class: "diff-pre trace-diff-pre" },
+        (e.text || "").split("\n").map((line) => el("div", { class: `diff-line diff-${diffLineKind(line)}` }, line))
+      ),
+    ]);
+  }
+  const label = _CHAT_ROLE_LABEL[e.role] || e.role;
+  return el("div", { class: `stream-msg agent-chat-entry role-${e.role}` }, [
+    label ? el("div", { class: "msg-hdr" }, el("span", { class: "author" }, label)) : null,
+    el("div", { class: "msg-body" }, e.text),
+  ]);
 }
 
 // Renders one events.jsonl record for the chat feed. `phase_failed` (and
@@ -415,9 +421,11 @@ async function resumeAttached() {
 // ---------------------------------------------------------------------
 function renderSidebar() {
   const snap = state.snapshot;
+  // Navigation only -- every detail view (task tree, a specific node or
+  // subagent's chat, artifacts, ...) opens in the right-side workbench
+  // instead (renderRightWorkbench), never here.
   const tabs = [
     ["sessions", "Runs"],
-    ["tree", "Task Tree"],
     ["subagents", "Subagents"],
     ["phases", "Phases"],
   ];
@@ -434,7 +442,6 @@ function renderSidebar() {
             class: "run-item" + (r.attached ? " active" : ""),
             onclick: () => guarded(() => {
               state.targetAgentManual = false; // resume auto-following the live subagent in the new run
-              state.liveThinkingTabManual = false;
               return apiPost("/api/attach", { run_id: r.id });
             }),
           }, [
@@ -459,18 +466,6 @@ function renderSidebar() {
         )
       : [el("div", { class: "empty-state" }, "No runs found.")];
     content = el("ul", { class: "run-list" }, items);
-  } else if (state.sidebarTab === "tree") {
-    const nodes = snap.tree || [];
-    if (!nodes.length) {
-      content = el("div", { class: "empty-state" }, "No plan tree generated yet.");
-    } else {
-      content = el("div", { class: "node-tree-list" }, nodes.map((n) =>
-        el("div", { class: "node-card" + (n.id === state.selectedNode ? " active" : ""), onclick: () => openNode(n.id) }, [
-          el("div", { class: "node-hdr" }, [el("span", null, `[${n.id}] ${n.shape}`), badge(n.status)]),
-          el("div", { class: "brief" }, n.brief),
-        ])
-      ));
-    }
   } else if (state.sidebarTab === "subagents") {
     const subs = snap.subagents || [];
     if (!subs.length) {
@@ -580,55 +575,31 @@ function renderCenterStream() {
   historyItems.sort((x, y) => x.ts - y.ts);
   historyItems.forEach((item) => feed.appendChild(item.node));
 
-  // 2. Live Thinking Stream Widget -- a tabbed chat window per currently-
-  // active agent (every live subagent, plus "main" when it has its own
-  // active session), all polled continuously by loadLiveThinking() so
-  // none of them go stale while backgrounded; only the *display* toggles
-  // between tabs, one panel at a time -- "separate chat windows you can
-  // toggle between," not everything stacked at once. Auto-follows the
-  // live one until the operator clicks a tab by hand (mirrors
-  // renderPromptBar's targetAgentManual pattern), so an operator who
-  // hasn't touched it always lands on whatever's actually running.
-  const thinkAgents = state.liveThinkingAgents || [];
-  if (snap.attached && thinkAgents.length) {
-    if (!state.liveThinkingTabManual || !thinkAgents.find((a) => a.id === state.liveThinkingActiveTab)) {
-      const liveAgent = thinkAgents.find((a) => a.live);
-      state.liveThinkingActiveTab = (liveAgent || thinkAgents[0]).id;
-    }
-    const active = thinkAgents.find((a) => a.id === state.liveThinkingActiveTab) || thinkAgents[0];
-    const entries = active.entries || [];
-
+  // 2. Live "what's running right now" stream, following whichever
+  // episode is actually live (or most-recently dispatched -- see
+  // loadMainAgentThinking()). Each trace entry renders as a plain item
+  // directly in this same feed -- a thought, then the tool call it led
+  // to, then the next thought below it -- growing as the episode
+  // progresses, not boxed into a separate fixed-height widget. A
+  // subagent the operator explicitly opens gets its *own* full history in
+  // the right workbench's Agent tab (renderAgentTab), independent of
+  // whatever this section is currently following.
+  const mainAgent = state.mainAgentThinking;
+  if (snap.attached && mainAgent) {
     feed.appendChild(
-      el("div", { class: "stream-card thinking-live-card" }, [
-        el(
-          "div",
-          { class: "thinking-agent-tabs" },
-          thinkAgents.map((a) =>
-            el(
-              "button",
-              {
-                class: "thinking-agent-tab" + (a.id === active.id ? " active" : ""),
-                onclick: () => { state.liveThinkingTabManual = true; state.liveThinkingActiveTab = a.id; render(); },
-              },
-              [a.live ? "● " : "", a.label]
-            )
-          )
-        ),
-        el("div", { class: "card-title" }, [
-          el("span", { style: "color:var(--accent-purple); font-weight:600;" }, active.label),
-          active.live ? el("span", { class: "badge", "data-status": "running" }, "live") : null,
-          entries.length ? el("span", { class: "badge", "data-status": "passed" }, `${entries.length} entries`) : null,
-          el("button", { class: "xs-btn", onclick: () => openNode(active.id) }, "Open Details"),
-        ]),
-        el(
-          "div",
-          { class: "thinking-live-body", "data-scroll-key": active.id },
-          entries.length
-            ? entries.slice(-15).map(renderTraceEntry)
-            : [el("span", { class: "dim" }, `Waiting for trace from ${active.label}...`)]
-        ),
+      el("div", { class: "live-agent-divider" }, [
+        el("span", null, `🤖 ${mainAgent.label}`),
+        mainAgent.live ? el("span", { class: "badge", "data-status": "running" }, "live") : null,
+        el("span", { class: "divider-line" }),
+        el("span", { class: "node-link", onclick: () => openNode(mainAgent.id) }, "open in Agent tab"),
       ])
     );
+    const entries = mainAgent.entries || [];
+    if (entries.length) {
+      entries.forEach((e) => feed.appendChild(renderAgentChatEntry(e)));
+    } else {
+      feed.appendChild(el("div", { class: "empty-state" }, `Waiting for trace from ${mainAgent.label}...`));
+    }
   }
 
   // 3. Resume Status Card -- persistent call-to-action tied to the
@@ -797,6 +768,8 @@ async function handlePromptSubmit() {
 function renderRightWorkbench() {
   const wbTabs = [
     ["code", "💻 Code & Artifacts"],
+    ["tree", "🌳 Task Tree"],
+    ["agent", "🤖 Agent"],
     ["contract", "📜 Contract"],
     ["spec", "📋 Spec"],
     ["spine", "🦴 Spine"],
@@ -820,8 +793,12 @@ function renderRightWorkbench() {
         el("span", null, state.nodeDetail ? `Node Artifact: ${state.nodeDetail.id}` : "Assembled Output"),
         el("button", { class: "icon-btn", onclick: () => navigator.clipboard.writeText((state.nodeDetail && state.nodeDetail.artifact) || (state.assembly && state.assembly.output) || "") }, "📋 Copy"),
       ]),
-      el("pre", { class: "blob" }, (state.nodeDetail && state.nodeDetail.artifact) || (state.assembly && state.assembly.output) || "(No active artifact selected. Click a node in Task Tree to view it.)"),
+      el("pre", { class: "blob" }, (state.nodeDetail && state.nodeDetail.artifact) || (state.assembly && state.assembly.output) || "(No active artifact selected. Click a node in the Task Tree tab to view it.)"),
     ]);
+  } else if (state.workbenchTab === "tree") {
+    body = renderTaskTreeTab();
+  } else if (state.workbenchTab === "agent") {
+    body = renderAgentTab();
   } else if (state.workbenchTab === "contract") {
     body = el("pre", { class: "blob" }, state.contractText || "(No contract frozen yet)");
   } else if (state.workbenchTab === "spec") {
@@ -870,8 +847,8 @@ function openNode(id) {
   state.nodeDiff = null;
   state.nodeThinking = null;
   state.nodeDetailLoading = true;
-  state.drawerTab = "overview";
-  state.workbenchTab = "code";
+  state.agentTab = "overview";
+  state.workbenchTab = "agent"; // every detail view opens on the right, never a floating overlay
   render();
   apiGet(`/api/node/${encodeURIComponent(id)}`)
     .then((d) => { state.nodeDetail = d; state.nodeDetailLoading = false; render(); })
@@ -886,6 +863,7 @@ function closeNode() {
   state.selectedNode = null;
   state.nodeDetail = null;
   state.nodeSubagent = null;
+  state.workbenchTab = "code";
   render();
 }
 
@@ -982,7 +960,17 @@ function renderOverview() {
     el("div", { style: "display:flex; gap:12px; align-items:center; margin-bottom:8px;" }, [badge(s.status), el("span", null, `kind: ${s.kind}`), el("span", null, `role: ${s.role}`)]),
     el("div", { style: "color:var(--text-muted); font-size:12px;" }, `attempts: ${s.attempts}   duration: ${s.duration_ms || 0}ms`),
   ];
-  if (s.live) parts.push(el("div", { style: "color:var(--accent-amber); margin-top:8px; font-weight:600;" }, "● live — send it a message below"));
+  if (s.live) {
+    parts.push(el("div", { style: "color:var(--accent-amber); margin-top:8px; font-weight:600;" }, "● live — send it a message below"));
+  } else if (s.role === "explorer") {
+    // survey's optional large-corpus explorer subagent (driver.py's
+    // _phase_survey) wraps a plain, non-agentic model call: its status can
+    // say "running" while that call is in flight, but it never has a
+    // gptme session behind it, so it can never be live/messageable --
+    // spell that out instead of leaving "RUNNING" up top contradict a
+    // generic "not currently running" on the message box below.
+    parts.push(el("div", { class: "dim", style: "margin-top:8px;" }, "This step wraps a plain model call, not an interactive session — there's nothing to message, even while its status says \"running.\""));
+  }
   if (s.error) parts.push(el("div", { style: "color:var(--accent-red); margin-top:8px;" }, `error: ${s.error}`));
   parts.push(el("div", { class: "dim", style: "margin-top:12px;" }, "Not a tree node — see its parent tree node for artifact/diff history."));
   return el("div", null, parts);
@@ -1007,37 +995,55 @@ function renderDiffTab() {
   return el("div", null, blocks);
 }
 
-function renderThinkingTab() {
+// Chat sub-view within the Agent tab -- the same renderAgentChatEntry used
+// by the main chat's live "what's running right now" stream, so an
+// explicitly-opened subagent reads as the same interface as the main
+// agent, just scoped to its own history (loadThinkingIfNeeded keeps this
+// fresh while the opened node is live -- see applySnapshot).
+function renderAgentChatTab() {
   loadThinkingIfNeeded();
-  if (state.nodeThinking === "loading" || state.nodeThinking === null) return el("div", { class: "empty-state" }, "Loading trace…");
-  if (!state.nodeThinking.length) return el("div", { class: "empty-state" }, "(no trace yet)");
-  return el("div", { class: "trace-log" }, state.nodeThinking.map(renderTraceEntry));
+  if (state.nodeThinking === "loading" || state.nodeThinking === null) return el("div", { class: "empty-state" }, "Loading chat…");
+  if (!state.nodeThinking.length) return el("div", { class: "empty-state" }, "(no messages yet)");
+  return el("div", { class: "agent-chat-log" }, state.nodeThinking.map(renderAgentChatEntry));
 }
 
-function renderNodeDrawer() {
-  if (!state.selectedNode) return null;
+// The right workbench's Agent tab: a specific node or subagent's full
+// detail (Overview/Artifact/Diff/Chat) plus interject/reopen -- embedded
+// in the workbench instead of a floating overlay, so it opens on the
+// right side alongside Code/Tree/Contract/etc rather than covering the
+// whole screen. Replaces the old renderNodeDrawer.
+function renderAgentTab() {
+  if (!state.selectedNode) {
+    return el("div", { class: "empty-state" }, "Select a node from the Task Tree tab, or a subagent from the left sidebar, to open its chat here.");
+  }
   const id = state.selectedNode;
   const tabs = [
     ["overview", "Overview"],
     ["artifact", "Artifact"],
     ["diff", "Diff"],
-    ["thinking", "Thinking"],
+    ["chat", "Chat"],
   ];
 
-  const tabBar = el("div", { class: "drawer-tabs" }, tabs.map(([tid, label]) =>
-    el("div", { class: "drawer-tab" + (state.drawerTab === tid ? " active" : ""), onclick: () => { state.drawerTab = tid; render(); } }, label)
+  const tabBar = el("div", { class: "agent-tabs" }, tabs.map(([tid, label]) =>
+    el("div", { class: "agent-tab" + (state.agentTab === tid ? " active" : ""), onclick: () => { state.agentTab = tid; render(); } }, label)
   ));
 
   let body;
   if (state.nodeDetailLoading) {
     body = el("div", { class: "empty-state" }, "Loading…");
-  } else if (state.drawerTab === "overview") body = renderOverview();
-  else if (state.drawerTab === "artifact") body = renderArtifactTab();
-  else if (state.drawerTab === "diff") body = renderDiffTab();
-  else body = renderThinkingTab();
+  } else if (state.agentTab === "overview") body = renderOverview();
+  else if (state.agentTab === "artifact") body = renderArtifactTab();
+  else if (state.agentTab === "diff") body = renderDiffTab();
+  else body = renderAgentChatTab();
 
   const live = isLive(id);
-  const interjectInput = el("input", { type: "text", "data-key": `interject-${id}`, placeholder: live ? "Message the running agent…" : "(not currently running)", disabled: live ? null : "" });
+  const isExplorer = !!(state.nodeSubagent && state.nodeSubagent.role === "explorer");
+  const interjectPlaceholder = live
+    ? "Message the running agent…"
+    : isExplorer
+      ? "(this step wraps a plain model call — no interactive session to message)"
+      : "(not currently running)";
+  const interjectInput = el("input", { type: "text", "data-key": `interject-${id}`, placeholder: interjectPlaceholder, disabled: live ? null : "" });
   interjectInput.value = state.interjectDrafts[id] || "";
   interjectInput.addEventListener("input", () => { state.interjectDrafts[id] = interjectInput.value; });
   const interjectBtn = el("button", { class: "primary", disabled: live && !state.busy ? null : "", onclick: () => guarded(async () => {
@@ -1061,20 +1067,71 @@ function renderNodeDrawer() {
   }) }, "Reopen");
   reopenInput.addEventListener("keydown", (e) => { if (e.key === "Enter") reopenBtn.click(); });
 
-  const panel = el("div", { class: "panel drawer-panel" }, [
-    el("div", { class: "panel-hdr" }, [el("h2", null, `${id}`), el("button", { onclick: closeNode }, "Close")]),
+  return el("div", { class: "agent-panel" }, [
+    el("div", { class: "agent-panel-hdr" }, [el("h3", null, id), el("button", { class: "xs-btn", onclick: closeNode }, "✕ Close")]),
     tabBar,
-    el("div", { class: "drawer-body" }, body),
-    el("div", { class: "drawer-bar" }, [
+    el("div", { class: "agent-body" }, body),
+    el("div", { class: "agent-bar" }, [
       el("label", { class: "bar-label" }, "Message the running agent (mid-episode)"),
       el("div", { class: "bar-row" }, [interjectInput, interjectBtn]),
     ]),
-    el("div", { class: "drawer-bar" }, [
+    el("div", { class: "agent-bar" }, [
       el("label", { class: "bar-label" }, "Reopen (passed nodes only): defect to fix"),
       el("div", { class: "bar-row" }, [reopenInput, reopenBtn]),
     ]),
   ]);
-  return el("div", { class: "overlay", onclick: (e) => { if (e.target.classList.contains("overlay")) closeNode(); } }, panel);
+}
+
+// Task Tree tab: node ids are dot-hierarchical (planner.py's
+// `f"{path}.{candidate.id}"` when recursing into a slice), so grouping by
+// that path builds a real parent/child tree instead of the flat list the
+// left sidebar used to show. Intermediate path segments that aren't
+// themselves a dispatched leaf (a planning-level grouping, not a node in
+// tree.json) render as plain folders -- only real leaves get a status
+// badge and are clickable.
+function buildNodeTreeIndex(nodes) {
+  const root = { children: new Map(), node: null };
+  nodes.forEach((n) => {
+    let cur = root;
+    String(n.id).split(".").forEach((part) => {
+      if (!cur.children.has(part)) cur.children.set(part, { children: new Map(), node: null });
+      cur = cur.children.get(part);
+    });
+    cur.node = n;
+  });
+  return root;
+}
+
+function renderTreeBranch(branch, depth) {
+  const rows = [];
+  for (const [part, child] of branch.children) {
+    const n = child.node;
+    const hasKids = child.children.size > 0;
+    rows.push(
+      el(
+        "div",
+        {
+          class: "tree-row" + (n && n.id === state.selectedNode ? " active" : "") + (n ? "" : " tree-row-folder"),
+          style: `padding-left:${depth * 18 + 10}px;`,
+          onclick: n ? () => openNode(n.id) : null,
+        },
+        [
+          el("span", { class: "tree-glyph" }, hasKids ? "▾" : n ? "·" : " "),
+          el("span", { class: "tree-label" }, part),
+          n ? badge(n.status) : null,
+          n && n.shape ? el("span", { class: "dim", style: "font-size:11px; margin-left:6px;" }, n.shape) : null,
+        ]
+      )
+    );
+    if (hasKids) rows.push(...renderTreeBranch(child, depth + 1));
+  }
+  return rows;
+}
+
+function renderTaskTreeTab() {
+  const nodes = state.snapshot.tree || [];
+  if (!nodes.length) return el("div", { class: "empty-state" }, "No plan tree generated yet.");
+  return el("div", { class: "task-tree-view" }, renderTreeBranch(buildNodeTreeIndex(nodes), 0));
 }
 
 // ---------------------------------------------------------------------
@@ -1180,7 +1237,7 @@ function restoreFocusState(saved) {
 
 function captureScrollStates() {
   const map = new Map();
-  const selectors = ["#chat-feed-scroll", ".sidebar-content", ".workbench-content", ".drawer-body"];
+  const selectors = ["#chat-feed-scroll", ".sidebar-content", ".workbench-content"];
   selectors.forEach((sel) => {
     const el = root.querySelector(sel);
     if (el) {
@@ -1188,22 +1245,13 @@ function captureScrollStates() {
       map.set(sel, { scrollTop: el.scrollTop, atBottom });
     }
   });
-  // There can now be several live-thinking cards at once (one per active
-  // agent), so a single fixed id can't address them -- key each by the
-  // agent id its card was rendered with instead of a plain selector.
-  root.querySelectorAll(".thinking-live-body[data-scroll-key]").forEach((el) => {
-    const atBottom = el.scrollHeight - el.scrollTop - el.clientHeight < 60;
-    map.set(`thinking:${el.getAttribute("data-scroll-key")}`, { scrollTop: el.scrollTop, atBottom });
-  });
   return map;
 }
 
 function restoreScrollStates(savedMap) {
   if (!savedMap) return;
   savedMap.forEach((pos, sel) => {
-    const el = sel.startsWith("thinking:")
-      ? root.querySelector(`.thinking-live-body[data-scroll-key="${CSS.escape(sel.slice(9))}"]`)
-      : root.querySelector(sel);
+    const el = root.querySelector(sel);
     if (el) {
       if (sel === "#chat-feed-scroll" && pos.atBottom) {
         el.scrollTop = el.scrollHeight;
@@ -1227,9 +1275,6 @@ function render() {
     renderRightWorkbench(),
   ]);
   frag.appendChild(workspace);
-
-  const nodeDrawer = renderNodeDrawer();
-  if (nodeDrawer) frag.appendChild(nodeDrawer);
 
   const newRunModal = renderNewRunModal();
   if (newRunModal) frag.appendChild(newRunModal);

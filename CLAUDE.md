@@ -766,6 +766,77 @@ prompt, not that node's own handoff).
   banner: a question the operator hasn't answered yet needs to be at the
   bottom regardless of when it was asked, or an operator scrolled to the
   bottom would miss it.
+  **2026-08-10, fourth pass — superseded the tab-toggle above; final
+  layout.** More operator feedback refined this further than the third
+  pass: the main chat should keep showing the *main* agent's thinking
+  livestreamed (not lose it entirely to per-agent tabs), each subagent
+  should get its own dedicated chat reachable from the right side (not a
+  toggle inside the main feed), and no thinking should be boxed into a
+  separate fixed-height widget at all — it belongs directly in the
+  scrolling history, a thought then the tool call it led to then the next
+  thought below it. That retired the third pass's whole
+  `state.liveThinkingAgents`/`liveThinkingActiveTab`/`liveThinkingTabManual`
+  apparatus (multi-agent simultaneous polling, tab pills) in favor of two
+  independent, simpler mechanisms:
+  - **Main chat** (`renderCenterStream` section 2): `loadMainAgentThinking()`
+    follows a single target the same way the old tab-toggle auto-followed
+    (live subagent, else most-recently-dispatched, else `"main"`) into
+    `state.mainAgentThinking`, and its entries are appended as plain items
+    directly into the feed via `renderAgentChatEntry` — no bounding card,
+    no separate scroll region, entries just keep growing at the bottom of
+    history as the episode progresses.
+  - **A specific opened agent** (right workbench's new Agent tab,
+    `renderAgentTab`): reuses the pre-existing `state.nodeThinking`/
+    `loadThinkingIfNeeded` machinery (already kept live via
+    `applySnapshot`'s `isLive(selectedNode)` check) for its Chat sub-tab,
+    rendered with the same `renderAgentChatEntry` so it visually reads as
+    the same interface as the main chat — just scoped to that one agent's
+    own history, independent of whatever `loadMainAgentThinking()` is
+    currently following.
+
+  `renderAgentChatEntry` (replaces the old flat `renderTraceEntry`/
+  `.trace-log`) turns each `rendering.parse_trace` entry into its own chat
+  item styled by role (`.agent-chat-entry.role-*` in style.css): `thinking`
+  as an italic purple bubble, `tool_call` as a compact green mono card,
+  `tool`/`system`/`logdir`/`raw` as dim dashed-border lines, `error` red,
+  `diff` as its own card reusing the Diff tab's line-classification. A
+  `diff` entry still needs its own card (multi-line unified diffs don't
+  read as a chat bubble), everything else is a `stream-msg`.
+
+  **Left sidebar is navigation-only** (`renderSidebar`'s `tabs`: Runs /
+  Subagents / Phases — the old "Task Tree" tab is gone); **every** detail
+  view opens in the right workbench (`renderRightWorkbench`) instead of a
+  floating overlay:
+  - **Task Tree tab** (`renderTaskTreeTab`/`buildNodeTreeIndex`/
+    `renderTreeBranch`): node ids are dot-hierarchical
+    (`planner.py`'s `f"{path}.{candidate.id}"` when recursing into a
+    slice — §4.3), so grouping `tree.json`'s flat node list by that
+    dot-path builds a real indented parent/child tree instead of the flat
+    card list the sidebar used to show. An intermediate path segment that
+    isn't itself a dispatched leaf renders as a plain unclickable folder
+    row (`.tree-row-folder`); only real leaves get a status badge and open
+    the Agent tab on click.
+  - **Agent tab** (`renderAgentTab`, replacing `renderNodeDrawer`'s
+    `.overlay`): the exact same Overview/Artifact/Diff sub-tabs as before
+    (renamed "Thinking" → "Chat"), embedded in `.workbench-content`
+    instead of a `position:fixed` modal — `openNode(id)` now sets
+    `state.workbenchTab = "agent"` instead of opening an overlay, and
+    `closeNode()` returns to the Code tab. `.drawer-tabs`/`.drawer-body`/
+    `.drawer-bar` were renamed `.agent-tabs`/`.agent-body`/`.agent-bar` to
+    match (`.overlay`/`.panel`/`.panel-hdr` stay — the New Run modal still
+    uses them).
+
+  **The "explore-01 shows both RUNNING and 'not currently running'"
+  report** was two fields disagreeing, not one bug: `_summarize_subagent`'s
+  `status` string (`"running"` the instant `session_captured` logs, i.e.
+  the survey call is in flight) versus its `live` boolean (`bool(logdir)
+  and not completed` — always `False` for this pseudo-agent, since
+  `_phase_survey`'s explorer wraps a plain provider call with no gptme
+  session/logdir ever, see the `driver.py` entry above). Both were
+  individually correct; juxtaposed in the UI they read as a contradiction.
+  `renderOverview` now special-cases `role === "explorer"` with an explicit
+  note instead of leaving a bare "RUNNING" badge next to a generic
+  "(not currently running)" message box.
 
 ## Adapters (gptme-only)
 
