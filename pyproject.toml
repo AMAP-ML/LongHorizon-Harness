@@ -19,6 +19,15 @@ dependencies = [
     "websockets>=12",
 ]
 
+[project.optional-dependencies]
+# starlette>=1.6 imports httpx2 in its TestClient and only falls back to the
+# deprecated httpx; pinning httpx2 keeps the suite warning-free.
+test = [
+    "pytest",
+    "pytest-asyncio",
+    "httpx2",
+]
+
 [project.urls]
 Homepage = "https://github.com/AMAP-ML/LongHorizon-Harness"
 Issues = "https://github.com/AMAP-ML/LongHorizon-Harness/issues"

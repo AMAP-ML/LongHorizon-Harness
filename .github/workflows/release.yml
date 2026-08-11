@@ -59,7 +59,7 @@ jobs:
         run: test -f src/lh_harness/_frontend/web/dist/index.html
 
       - name: 🧪 Run Python tests
-        run: python -m pip install -e . pytest && python -m pytest -q
+        run: python -m pip install -e '.[test]' && python -m pytest -q
 
       - name: 📦 Install build tooling
         # twine >= 7 is required to validate PEP 639 license metadata.
