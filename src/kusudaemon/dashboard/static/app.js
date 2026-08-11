@@ -370,6 +370,32 @@ function liveMap() {
 // ---------------------------------------------------------------------
 // Header Component
 // ---------------------------------------------------------------------
+// §C4: the tier + escalation history belong in the run header — a tier is a
+// cost claim (PLAN.md §A4: "the entire claim of §A4 is a cost claim"), so
+// the operator should see which tier is paying for this run without opening
+// tier.json, and an escalation is the one visible symptom of the classifier
+// being wrong, so its trail deserves a badge of its own. The tier badge
+// carries measured/override detail in its tooltip; the escalation badge
+// carries the trigger trail ("size_defect_retry: T1 → T2 · node …").
+function renderTierBadges(snap) {
+  if (!snap.tier) return null;
+  const notes = [];
+  if (snap.measured_tier && snap.measured_tier !== snap.tier) notes.push(`measured ${snap.measured_tier}`);
+  if (snap.tier_override && String(snap.tier_override) !== snap.tier) notes.push(`override ${snap.tier_override}`);
+  const title = `tier ${snap.tier}` + (notes.length ? ` · ${notes.join(" · ")}` : "");
+  const badges = [el("span", { class: "badge", title: title }, `tier ${snap.tier}`)];
+  const esc = snap.escalation_history || [];
+  if (esc.length) {
+    const trail = esc
+      .map((e) => `${e.trigger}: ${e.from || "-"} → ${e.to || "-"}` + (e.node_id ? ` · node ${e.node_id}` : ""))
+      .join("\n");
+    badges.push(
+      el("span", { class: "badge", "data-status": "escalated", title: `escalations:\n${trail}` }, `⇡ ${esc.length}`)
+    );
+  }
+  return el("span", { class: "hdr-tier-badges" }, badges);
+}
+
 function renderHeader() {
   const snap = state.snapshot;
   const brand = el("div", { class: "brand" }, [
@@ -386,6 +412,7 @@ function renderHeader() {
         el("span", { style: "color:var(--text-muted);" }, "Run:"),
         el("span", { style: "font-weight:600;" }, snap.run_id),
         badge(snap.phase_status || "running"),
+        renderTierBadges(snap),
         (snap.pending_approvals || []).length ? el("span", { class: "badge", "data-status": "waiting_for_approval" }, "⚡ ACTION REQUIRED") : null,
         snap.halted ? badge("halted") : null,
         // §D0c: "in_progress" forever is indistinguishable from mid-call
@@ -1204,7 +1231,17 @@ function buildNodeTreeIndex(nodes) {
 // children (derived ids "<node>~repair1", "<node>~research~slug").
 function findAttachedSubagents(nodeId) {
   const subs = state.snapshot.subagents || [];
-  return subs.filter((s) => s.id === nodeId || s.id.startsWith(nodeId + "~"));
+  // §C4: match the node's own id (its Writer), any ``~repair``/``~research~``
+  // derived id carrying this node as a prefix (those live under this node),
+  // and any dot-hierarchical split child — ``parent.child1`` — the v7 split
+  // mechanism grafts (its Writer is its own dispatch, but it lives under
+  // this parent in the tree so the live badge still belongs here).
+  return subs.filter(
+    (s) =>
+      s.id === nodeId ||
+      s.id.startsWith(nodeId + "~") ||
+      s.id.startsWith(nodeId + ".")
+  );
 }
 
 function liveBadge() {

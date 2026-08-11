@@ -150,6 +150,8 @@ def build_pipeline_parser() -> argparse.ArgumentParser:
     serve_parser.add_argument("--port", type=int, default=8765)
     serve_parser.add_argument("--run-id", default=None, help="Attach to this run on startup.")
     serve_parser.add_argument("--no-control", action="store_true", help="Read-only view: disable start/attach/halt/approve/amend/reopen/interject.")
+    serve_parser.add_argument("--auth-token", default=None, help="PLAN.md §C4: token required for dashboard access when bound to a non-loopback host. Issued as a cookie at /api/attach; sent as Bearer by API clients.")
+    serve_parser.add_argument("--max-concurrent-runs", type=int, default=None, help="PLAN.md §C4: cap on concurrently-hosted dashboard runs (429 past this).")
     return parser
 
 
@@ -180,7 +182,7 @@ def cmd_run(argv: argparse.Namespace) -> int:
 
 
 def cmd_serve(argv: argparse.Namespace) -> int:
-    from ..dashboard.server import run_forever
+    from ..dashboard.server import DEFAULT_MAX_CONCURRENT_RUNS, run_forever
 
     run_forever(
         argv.runs_root,
@@ -188,6 +190,12 @@ def cmd_serve(argv: argparse.Namespace) -> int:
         argv.port,
         attach_run_id=argv.run_id,
         control_enabled=not argv.no_control,
+        auth_token=argv.auth_token or "",
+        max_concurrent_runs=(
+            argv.max_concurrent_runs
+            if argv.max_concurrent_runs is not None
+            else DEFAULT_MAX_CONCURRENT_RUNS
+        ),
     )
     return 0
 

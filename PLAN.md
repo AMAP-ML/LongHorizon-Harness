@@ -1250,9 +1250,62 @@ nothing else. Fixed by §A10's tiering.
     [x] 9 new tests (611 total): test_v1_round_loop_parallel.py (4 incl.
         a 3-episode 0.3s wave finishing < 0.8s wall clock with 1 provider
         call), RunOptionsMaxParallelTest (4), MaxParallelForgingDriverTest (1)
-[ ] §C3  probe planner                                  — NOT STARTED
-[ ] §C4  dashboard hardening (auth first)               — NOT STARTED
-[ ] §C5  eval harness: calls-by-tier and escalation precision first — NOT STARTED
+[x] §C3  probe planner                                  — DONE
+    [x] v4/probe_planner.py: windowed `complete_json` per 60 candidates
+        (window=stride=60, no overlap), needs_probe deterministic filter
+        (>=8-word brief + structural shape marker or external-lookup
+        marker), MAX_PROBES_PER_WINDOW=8, out-of-window ids dropped +
+        logged, per-node slug disambiguation, dedup by (slug, question)
+    [x] driver._phase_research builds the plan from candidate_nodes when
+        no explicit research_plan was supplied (RunOptions.auto_probe_plan)
+    [x] 19 new tests (634 total): test_v4_probe_planner.py (14), 5 more
+        in test_v4_probes.py / test_driver_phases.py
+[x] §C4  dashboard hardening (auth first)               — DONE
+    [x] server: --auth-token (docs, hmac.compare_digest via Bearer header
+        or kusudaemon_auth cookie, HttpOnly/SameSite=Strict/max-age 7d),
+        non-loopback hosts refuse to serve without a token, do_DELETE,
+        --max-concurrent-runs (default 4) with surfaced 429 + hosted
+        count in state; state.py hosted_count + snapshot tier /
+        measured_tier / tier_override / escalation_history
+    [x] app.js: run header tier badge + escalation count (data-status=
+        "escalated", trigger-trail tooltip), findAttachedSubagents
+        dot-hierarchy fallback for split parents
+    [x] 20 new tests (654 total): DashboardAuthTest (9), SafeHostTest
+        (4), MaxConcurrentRunsTest (2) in test_dashboard_server.py;
+        TierAndEscalationSnapshotTest (4) + HostedCountTest (1) in
+        test_dashboard_state.py; Python 3.13 Morsel.set() 3-arg fix
+[x] §C5  eval harness: calls-by-tier and escalation precision first — DONE
+    [x] src/kusudaemon/eval/: tasks.py (five fixed tasks: t0-typo /
+        t1-notes / t2-corpus / t2-feature / t3-refactor, each with canned
+        ESTIMATE/PARTITION/VERDICT responses + corpus spine or generated
+        workspace), measure.py (role_of_schema, calls_by_role,
+        call_input_tokens, terminal_events_per_node, escalation_events,
+        approval_rate_by_shape, per_leaf_segment_tokens /
+        mean_tokens_by_segment via build_node_prompt's new
+        segment_tokens callback, escalation_precision,
+        summarize_calls_by_tier), runner.py (run_eval_suite(_sync):
+        fresh driver run + resume over the same dir per run, scripted
+        provider, in-memory writer adapters with dispatch counters,
+        Approver auto-resolution)
+    [x] measured budgets, fresh run: T0=1, T1=1, T2=5 (estimate+plan+3
+        windowed review passes), T3=2 (estimate+plan; pilot auto-approves
+        blank, review spends nothing, short briefs keep probes at zero);
+        resume re-runs only review@T2 (3 calls), never re-dispatches
+    [x] 15 new tests (669 total): test_eval_harness.py — role
+        classification, approval-rate-by-shape, aggregation, segment
+        instrument, and the ship gate (full suite, exact per-tier call
+        counts, precision 1.0, clean resumes)
+    [x] segment instrument: pipeline/prompts.py build_node_prompt gained
+        segment_tokens callback over labeled segments (brief,
+        artifact_instruction, goal_and_rubric, contract, inputs, spans,
+        promotions, judgment_rubric, retry); pinned prompt test suite
+        still byte-identical
+    [ ] unbuilt: the other seven §C5 measurements (reviewer catch rate,
+        orchestrator context bound, planner schema validity, approval
+        rate across real edits, resume-after-kill-9) — measurements 3
+        and 7 stay blocked on §C1's instrument; the five-task suite
+        structure is in place to bolt them onto
+    [ ] §C5 CLI (kusudaemon eval) — runner exists as a library only
 [x] §D6, §D10 cleanup — fold into whichever commit touches the file
     [x] v2/survey.py's duplicated `return merged`
     [x] pipeline/backends.py:_hidden_paths_for docstring corrected as part

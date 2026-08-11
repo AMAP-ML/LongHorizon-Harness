@@ -18,12 +18,18 @@ import threading
 import unittest
 import urllib.error
 import urllib.request
+from http.client import HTTPConnection
 from pathlib import Path
 
 _REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(_REPO_ROOT / "src"))
 
-from kusudaemon.dashboard.server import make_server  # noqa: E402
+from kusudaemon.dashboard.server import (  # noqa: E402
+    DEFAULT_MAX_CONCURRENT_RUNS,
+    _AUTH_COOKIE_NAME,
+    _assert_safe_host,
+    make_server,
+)
 from kusudaemon.dashboard.state import RunState  # noqa: E402
 from kusudaemon.pipeline import approvals as approval_store  # noqa: E402
 from kusudaemon.pipeline.run_dir import run_spec_path  # noqa: E402
@@ -55,6 +61,8 @@ def _write_scripted_run(runs_root: Path, run_id: str) -> Path:
 
 class _ServerTestCase(unittest.TestCase):
     control_enabled = True
+    auth_token = ""
+    max_concurrent_runs = DEFAULT_MAX_CONCURRENT_RUNS
 
     def setUp(self) -> None:
         self.tmp = Path(tempfile.mkdtemp())
@@ -62,7 +70,14 @@ class _ServerTestCase(unittest.TestCase):
         self.runs_root.mkdir()
         self.run_dir = _write_scripted_run(self.runs_root, "run-a")
         self.state = RunState(self.runs_root)
-        self.httpd = make_server(self.state, "127.0.0.1", 0, control_enabled=self.control_enabled)
+        self.httpd = make_server(
+            self.state,
+            "127.0.0.1",
+            0,
+            control_enabled=self.control_enabled,
+            auth_token=self.auth_token,
+            max_concurrent_runs=self.max_concurrent_runs,
+        )
         self.port = self.httpd.server_address[1]
         self.thread = threading.Thread(target=self.httpd.serve_forever, daemon=True)
         self.thread.start()
@@ -278,6 +293,172 @@ class ReadOnlyDashboardServerTest(_ServerTestCase):
     def test_interject_is_forbidden(self) -> None:
         status, payload = self._post("/api/node/1/interject", {"text": "x"})
         self.assertEqual(status, 403)
+
+
+class DashboardAuthTest(_ServerTestCase):
+    """PLAN.md §C4: auth (token, hmac.compare_digest, cookie for SSE). The
+    loopback-default no-token server must behave byte-identically to before
+    (that's what every other class in this file exercises); here the token
+    is set, so every /api/* route must require it while the index and
+    /static/* stay anonymously reachable (they're the login surface)."""
+
+    auth_token = "sekrit-token"
+
+    def _request(self, path: str, headers: dict | None = None) -> tuple[int, dict, dict]:
+        req = urllib.request.Request(
+            self._url(path), headers=headers or {}, method="GET"
+        )
+        try:
+            with urllib.request.urlopen(req) as resp:
+                body = json.loads(resp.read().decode("utf-8"))
+                return resp.status, body, dict(resp.headers.items())
+        except urllib.error.HTTPError as exc:
+            body = json.loads(exc.read().decode("utf-8"))
+            return exc.code, body, dict(exc.headers.items())
+
+    def test_anonymous_index_and_static_still_serve(self) -> None:
+        with urllib.request.urlopen(self._url("/")) as resp:
+            self.assertEqual(resp.status, 200)
+            self.assertIn(b"<title>Kusudaemon</title>", resp.read())
+        with urllib.request.urlopen(self._url("/static/app.js")) as resp:
+            self.assertEqual(resp.status, 200)
+
+    def test_anonymous_api_request_is_401(self) -> None:
+        status, payload, _ = self._request("/api/runs")
+        self.assertEqual(status, 401)
+        self.assertEqual(payload["error"], "authentication required")
+
+    def test_wrong_bearer_token_is_401(self) -> None:
+        status, _, _ = self._request("/api/runs", {"Authorization": "Bearer wrong-token"})
+        self.assertEqual(status, 401)
+
+    def test_bearer_token_authenticates(self) -> None:
+        status, payload, _ = self._request("/api/runs", {"Authorization": f"Bearer {self.auth_token}"})
+        self.assertEqual(status, 200)
+        self.assertEqual([r["id"] for r in payload["runs"]], ["run-a"])
+
+    def test_attach_sets_cookie_and_reports_token_required(self) -> None:
+        data = json.dumps({"run_id": "run-a"}).encode("utf-8")
+        req = urllib.request.Request(
+            self._url("/api/attach"),
+            data=data,
+            method="POST",
+            headers={"Content-Type": "application/json", "Authorization": f"Bearer {self.auth_token}"},
+        )
+        with urllib.request.urlopen(req) as resp:
+            self.assertEqual(resp.status, 200)
+            payload = json.loads(resp.read().decode("utf-8"))
+            set_cookie = resp.headers.get("Set-Cookie", "")
+        self.assertTrue(payload.get("token_required"))
+        self.assertIn(_AUTH_COOKIE_NAME, set_cookie)
+        self.assertIn("HttpOnly", set_cookie)
+        self.assertIn("SameSite=Strict", set_cookie)
+
+    def test_cookie_authenticates_subsequent_requests(self) -> None:
+        cookie = self._acquire_cookie()
+        status, payload, _ = self._request("/api/snapshot", {"Cookie": cookie})
+        self.assertEqual(status, 200)
+        self.assertTrue(payload["attached"])
+
+    def test_cookie_with_wrong_value_is_401(self) -> None:
+        status, _, _ = self._request("/api/snapshot", {"Cookie": f"{_AUTH_COOKIE_NAME}=nope"})
+        self.assertEqual(status, 401)
+
+    def test_sse_stream_without_cookie_is_401(self) -> None:
+        status, payload, _ = self._request("/api/stream")
+        self.assertEqual(status, 401)
+        self.assertEqual(payload["error"], "authentication required")
+
+    def test_sse_stream_with_cookie_streams(self) -> None:
+        # The SSE endpoint never terminates, so a full response read would
+        # hang forever. Open with http.client, read one line, close — the
+        # server handles the resulting broken pipe (its own loop does).
+        cookie = self._acquire_cookie()
+        conn = HTTPConnection("127.0.0.1", self.port, timeout=5)
+        conn.request("GET", "/api/stream", headers={"Cookie": cookie})
+        resp = conn.getresponse()
+        self.assertEqual(resp.status, 200)
+        self.assertEqual(resp.getheader("Content-Type"), "text/event-stream")
+        first = resp.readline()
+        self.assertTrue(first.startswith(b"event: snapshot"))
+        conn.close()
+
+    def _acquire_cookie(self) -> str:
+        data = json.dumps({"run_id": "run-a"}).encode("utf-8")
+        req = urllib.request.Request(
+            self._url("/api/attach"),
+            data=data,
+            method="POST",
+            headers={"Content-Type": "application/json", "Authorization": f"Bearer {self.auth_token}"},
+        )
+        with urllib.request.urlopen(req) as resp:
+            resp.read()
+            set_cookie = resp.headers.get("Set-Cookie", "")
+        cookie_name = set_cookie.split(";", 1)[0]
+        self.assertIn(_AUTH_COOKIE_NAME, cookie_name)
+        return cookie_name
+
+
+class SafeHostTest(unittest.TestCase):
+    """PLAN.md §C4: "refuse to start on a non-loopback host without auth".
+    _assert_safe_host is the pure check make_server runs before binding; it
+    is unit-tested directly so the guard is verified without binding any
+    socket."""
+
+    def test_loopback_hosts_need_no_token(self) -> None:
+        for host in ("127.0.0.1", "::1", "localhost", ""):
+            _assert_safe_host(host, "")  # must not raise
+
+    def test_non_loopback_without_token_raises(self) -> None:
+        with self.assertRaises(ValueError):
+            _assert_safe_host("0.0.0.0", "")
+        with self.assertRaises(ValueError):
+            _assert_safe_host("192.168.1.10", "")
+
+    def test_non_loopback_with_token_passes(self) -> None:
+        _assert_safe_host("0.0.0.0", "sekrit")  # must not raise
+        _assert_safe_host("192.168.1.10", "sekrit")  # must not raise
+
+    def test_make_server_refuses_non_loopback_without_token(self) -> None:
+        from kusudaemon.dashboard.state import RunState
+
+        with tempfile.TemporaryDirectory() as root:
+            state = RunState(str(root))
+            with self.assertRaises(ValueError):
+                make_server(state, "0.0.0.0", 0, auth_token="")
+
+
+class MaxConcurrentRunsTest(_ServerTestCase):
+    """PLAN.md §C4: "max_concurrent_runs with a surfaced 429". Host one run
+    through RunState (a stub driver — start_run's thread only needs a run()
+    that returns), then the next /api/runs POST must 429, not silently
+    queue or start."""
+
+    max_concurrent_runs = 1
+
+    class _StubDriver:
+        def run(self):  # noqa: ANN201
+            return None
+
+    def test_second_concurrent_run_is_429(self) -> None:
+        run_id, error = self.state.start_run({"goal": "g"}, driver=self._StubDriver())
+        self.assertEqual(error, "")
+        self.assertIsNotNone(run_id)
+        self.assertEqual(self.state.hosted_count(), 1)
+
+        status, payload = self._post("/api/runs", {"goal": "another"})
+        self.assertEqual(status, 429)
+        self.assertIn("max_concurrent_runs", payload["error"])
+        self.assertEqual(payload["hosted"], 1)
+        self.assertEqual(payload["max_concurrent_runs"], 1)
+
+    def test_below_cap_starts_normally(self) -> None:
+        # Stub the driver factory so the hosted run never touches the
+        # network — the suite's hard rule is no real provider calls.
+        self.state._default_driver = lambda run_dir, options: self._StubDriver()
+        status, payload = self._post("/api/runs", {"goal": "g"})
+        self.assertEqual(status, 200)
+        self.assertIn("run_id", payload)
 
 
 if __name__ == "__main__":

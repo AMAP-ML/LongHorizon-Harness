@@ -66,6 +66,7 @@ from ..pipeline.run_dir import (
     resolve_runs_root,
     resolve_stored,
     run_spec_path,
+    tier_path,
 )
 from . import gptme_queue
 
@@ -264,6 +265,11 @@ class RunState:
         # from a process that died mid-call -- surface that distinction
         # instead of a permanent, silent "running" badge.
         liveness = run_liveness(run_dir)
+        # §C4: tier + escalation history belong in the run header, per
+        # PLAN.md §C4's last paragraph. tier.json holds the current
+        # ``{tier, measured_tier, override, ...}``; the escalation history
+        # is derived from events.jsonl's ``run_tier_escalated`` rows.
+        tier_record, escalation_history = self._tier_and_escalation(run_dir, events)
         return {
             "attached": True,
             "run_id": self.attached_run_id,
@@ -275,6 +281,10 @@ class RunState:
             "phase_detail": str(phase.get("detail", "")),
             "stalled": liveness.stalled,
             "stalled_reason": liveness.reason if liveness.stalled else "",
+            "tier": tier_record.get("tier", ""),
+            "measured_tier": tier_record.get("measured_tier", ""),
+            "tier_override": tier_record.get("override"),
+            "escalation_history": escalation_history,
             "phases": _phase_map(events),
             "tree": _tree_summary(run_dir, tree),
             "tree_counts": _count_statuses(tree),
@@ -298,6 +308,39 @@ class RunState:
             return []
         events = self._cached_events(run_dir)
         return [e for e in events[after:]]
+
+    # ------------------------------------------------------------------
+    # §C4: tier + escalation history for the run header. Read fresh off
+    # disk on every snapshot call, like every other field in this method —
+    # tier.json changes when an escalation trigger fires mid-run, and the
+    # dashboard needs to surface that without restart.
+    # ------------------------------------------------------------------
+    def _tier_and_escalation(
+        self, run_dir: Path, events: list[dict[str, Any]]
+    ) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+        tier_record: dict[str, Any] = {}
+        tp = tier_path(run_dir)
+        if tp.exists():
+            try:
+                tier_record = json.loads(tp.read_text(encoding="utf-8"))
+                if not isinstance(tier_record, dict):
+                    tier_record = {}
+            except (OSError, json.JSONDecodeError):
+                tier_record = {}
+        escalation_history: list[dict[str, Any]] = []
+        for event in events:
+            if event.get("type") != "run_tier_escalated":
+                continue
+            escalation_history.append(
+                {
+                    "trigger": str(event.get("trigger", "")),
+                    "from": str(event.get("from", "")),
+                    "to": str(event.get("to", "")),
+                    "node_id": str(event.get("node_id", "")) if event.get("node_id") else "",
+                    "ts": int(event.get("ts", 0) or 0),
+                }
+            )
+        return tier_record, escalation_history
 
     # ------------------------------------------------------------------
     # Subagents: every distinct dispatched episode (tree Writer nodes,
@@ -446,6 +489,15 @@ class RunState:
     def is_hosted(self, run_id: str | None = None) -> bool:
         with self._lock:
             return (run_id or self._attached) in self._hosts
+
+    def hosted_count(self) -> int:
+        """§C4: the number of currently in-flight hosted runs. _post_runs
+        checks this against ``max_concurrent_runs`` and returns 429 when
+        the cap is reached. Held under the same _lock that mutate-hosts
+        operations use, so a concurrent _post_runs sees a consistent
+        count rather than reading mid-add."""
+        with self._lock:
+            return len(self._hosts)
 
     def halt(self, value: bool) -> bool:
         run_dir = self._attached_dir()

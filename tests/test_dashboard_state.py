@@ -25,7 +25,7 @@ _REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(_REPO_ROOT / "src"))
 
 from kusudaemon.pipeline import approvals as approval_store  # noqa: E402
-from kusudaemon.pipeline.run_dir import run_spec_path  # noqa: E402
+from kusudaemon.pipeline.run_dir import run_spec_path, tier_path  # noqa: E402
 from kusudaemon.dashboard import gptme_queue  # noqa: E402
 from kusudaemon.dashboard.state import RunState  # noqa: E402
 from kusudaemon.v0.events import EventLog  # noqa: E402
@@ -392,6 +392,82 @@ class RateLimitTest(unittest.TestCase):
         self.assertTrue(is_rate_limit_or_busy_error("501 Server Busy"))
         self.assertTrue(is_rate_limit_or_busy_error("Model capacity overloaded"))
         self.assertFalse(is_rate_limit_or_busy_error("FileNotFoundError: missing input file"))
+
+
+class TierAndEscalationSnapshotTest(unittest.TestCase):
+    """PLAN.md §C4's last paragraph: "the tier + escalation history belong
+    in the run header". The header renders from snapshot fields, so the
+    state layer must surface tier.json's current verdict plus every
+    run_tier_escalated event (in log order) to the dashboard without the
+    frontend ever reading run-directory files."""
+
+    def setUp(self) -> None:
+        self.tmp = Path(tempfile.mkdtemp())
+        self.runs_root = self.tmp / "runs"
+        self.runs_root.mkdir()
+        self.run_dir = _write_scripted_run(self.runs_root, "run-a")
+        self.state = RunState(self.runs_root)
+        self.state.attach("run-a")
+
+    def tearDown(self) -> None:
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_no_tier_file_yields_empty_fields(self) -> None:
+        snap = self.state.snapshot()
+        self.assertEqual(snap["tier"], "")
+        self.assertEqual(snap["measured_tier"], "")
+        self.assertIsNone(snap["tier_override"])
+        self.assertEqual(snap["escalation_history"], [])
+
+    def test_tier_record_surfaces_verbatim(self) -> None:
+        tier_path(self.run_dir).write_text(
+            json.dumps({"tier": "T2", "measured_tier": "T1", "override": "T2", "ts": 1}),
+            encoding="utf-8",
+        )
+        snap = self.state.snapshot()
+        self.assertEqual(snap["tier"], "T2")
+        self.assertEqual(snap["measured_tier"], "T1")
+        self.assertEqual(snap["tier_override"], "T2")
+
+    def test_escalation_history_derived_from_events_in_order(self) -> None:
+        log = EventLog(events_path(self.run_dir))
+        log.append({"node_id": "-", "role": "harness", "round": 0, "type": "run_tier_escalated", "trigger": "size_defect_retry", "from": "T1", "to": "T2", "ts": 10})
+        log.append({"node_id": "3", "role": "harness", "round": 0, "type": "run_tier_escalated", "trigger": "split_accepted", "from": "T2", "to": "T3", "ts": 20})
+        snap = self.state.snapshot()
+        history = snap["escalation_history"]
+        self.assertEqual([h["trigger"] for h in history], ["size_defect_retry", "split_accepted"])
+        self.assertEqual(history[0]["from"], "T1")
+        self.assertEqual(history[0]["to"], "T2")
+        self.assertEqual(history[1]["node_id"], "3")
+        self.assertEqual(history[1]["ts"], 20)
+
+    def test_malformed_tier_file_is_tolerated(self) -> None:
+        tier_path(self.run_dir).write_text("{not json", encoding="utf-8")
+        snap = self.state.snapshot()
+        self.assertEqual(snap["tier"], "")
+
+
+class HostedCountTest(unittest.TestCase):
+    def setUp(self) -> None:
+        self.tmp = Path(tempfile.mkdtemp())
+        self.runs_root = self.tmp / "runs"
+        self.runs_root.mkdir()
+        self.run_dir = _write_scripted_run(self.runs_root, "run-a")
+        self.state = RunState(self.runs_root)
+
+    def tearDown(self) -> None:
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_hosted_count_counts_in_flight_hosted_runs(self) -> None:
+        self.assertEqual(self.state.hosted_count(), 0)
+
+        class _StubDriver:
+            def run(self):  # noqa: ANN201
+                return None
+
+        run_id, error = self.state.start_run({"goal": "g"}, driver=_StubDriver())
+        self.assertEqual(error, "")
+        self.assertEqual(self.state.hosted_count(), 1)
 
 
 if __name__ == "__main__":

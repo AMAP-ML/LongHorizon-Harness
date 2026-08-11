@@ -31,10 +31,47 @@ the run directory... can be attached from anywhere"):
   ever touching a run.
 * bare ``kusudaemon`` (no subcommand) — shorthand for ``serve`` with the
   default ``--runs-root``, matching the old bare-invocation ergonomics.
+
+**PLAN.md §C4 — Auth and concurrency hardening (2026-08-11).**
+
+The original dashboard shipped with no auth at all — ``control_enabled``
+gates mutating actions, but any anonymous requester reaching the bound
+host can read every artifact, every trace, every approval. Loopback-only
+default binding made that a small exposure, but ``--host 0.0.0.0`` (the
+explicit flag this server exposes) was the only thing keeping the
+operator's run directory from being reachable from anywhere on the LAN.
+
+Three hard-earned rules, all enforced in this module:
+
+1. **Refuse to start on a non-loopback host without an auth token.** The
+   ``--host`` flag explicitly invites off-loopback binding, so the same
+   flag's safety check is what refuses it: ``_assert_safe_host`` raises
+   before ``make_server`` ever binds the socket, with a message naming
+   the ``--auth-token`` flag the operator needs to set. ``127.0.0.1`` and
+   ``::1`` are loopback; any other non-empty host string needs a token.
+2. **Token comparison uses ``hmac.compare_digest``** — never ``==``. A
+   timing-attack-resistant comparison is cheap; the alternative is not.
+3. **Cookie for SSE, not ``Authorization``.** ``EventSource`` cannot set
+   custom headers, so the SSE endpoint cannot carry an ``Authorization``
+   token the way every fetch route can. ``/api/attach`` issues a
+   ``Set-Cookie`` when a token is configured; ``_serve_stream`` and every
+   route then validate that cookie with the same timing-safe comparison.
+   A non-loopback server without a token never starts (rule 1), so the
+   cookie is the second factor for off-loopback and a no-op on loopback
+   (where the cookie gate always passes when the token is empty).
+
+Plus ``max_concurrent_runs`` (§C4: "max_concurrent_runs with a surfaced
+429"): ``_post_runs`` returns 429 instead of starting a run when the
+count of in-flight hosted runs reaches the cap. The cap defaults to 4
+(one driver per run is the design; more than a handful is usually a
+misconfiguration — provider rate limits will clamp it harder than the
+dashboard would, and silently queuing is worse than surfacing the 429).
 """
 
 from __future__ import annotations
 
+import hmac
+import http.cookies
 import json
 import mimetypes
 import re
@@ -50,6 +87,19 @@ from .state import RunState
 
 _STATIC_DIR = Path(__file__).parent / "static"
 _STREAM_INTERVAL = 1.5
+
+# §C4: the maximum number of concurrently-hosted runs the dashboard will
+# accept. Each hosted run owns a driver thread with a process and a provider
+# connection; more than a small number is almost always a misconfiguration
+# (provider rate limits clamp harder than this cap), so surfacing a 429 is
+# the right thing rather than silently queuing or thrashing.
+DEFAULT_MAX_CONCURRENT_RUNS = 4
+
+# Cookie name for the auth token set on /api/attach when one is configured.
+# Marked HttpOnly + SameSite=Strict per the standard pattern — the dashboard
+# client never reads it directly, the browser carries it on every same-origin
+# request including the SSE EventSource.
+_AUTH_COOKIE_NAME = "kusudaemon_auth"
 
 _Handler = Callable[["DashboardRequestHandler", "re.Match[str]", dict[str, Any]], tuple[int, Any]]
 
@@ -90,18 +140,41 @@ def _get_events(handler: "DashboardRequestHandler", match: Any, body: dict) -> t
 def _post_attach(handler: "DashboardRequestHandler", match: Any, body: dict) -> tuple[int, Any]:
     run_id = str(body.get("run_id", ""))
     ok = handler.state.attach(run_id)
-    return (200, {"ok": True}) if ok else (404, {"ok": False, "error": "no such run"})
+    if not ok:
+        return 404, {"ok": False, "error": "no such run"}
+    # §C4: on a successful attach under an auth-token-protected server,
+    # set the cookie the SSE endpoint will validate on every subsequent
+    # same-origin request. The browser carries it automatically; an
+    # EventSource request can't set custom headers, so the cookie is the
+    # one way auth survives into the stream.
+    if handler.auth_token:
+        handler._set_auth_cookie()
+    return 200, {"ok": True, "token_required": bool(handler.auth_token)}
 
 
 @_route("POST", r"^/api/runs$")
 def _post_runs(handler: "DashboardRequestHandler", match: Any, body: dict) -> tuple[int, Any]:
     handler.require_control()
+    # §C4: refuse to start a new concurrent run when the cap is reached.
+    # The cap lives on the handler so a future multi-tenant dashboard could
+    # set it per-virtual-host; today it's set once at make_server time.
+    hosted_count = handler.state.hosted_count()
+    if hosted_count >= handler.max_concurrent_runs:
+        return 429, {
+            "error": f"max_concurrent_runs reached ({handler.max_concurrent_runs})",
+            "hosted": hosted_count,
+            "max_concurrent_runs": handler.max_concurrent_runs,
+        }
     body = dict(body)
     body["goal"] = _read_text_field(body.get("goal"))
     body["source"] = _read_text_field(body.get("source"))
     run_id, error = handler.state.start_run(body)
     if run_id is None:
         return 400, {"error": error}
+    if handler.auth_token:
+        # A new run auto-attaches the operator; set the auth cookie now so
+        # the SSE stream that follows the 200 keeps working.
+        handler._set_auth_cookie()
     return 200, {"run_id": run_id}
 
 
@@ -267,6 +340,14 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
     state: RunState
     verbose: bool = False
     control_enabled: bool = True
+    # §C4: when auth_token is non-empty, every request must carry a matching
+    # cookie (set on /api/attach) or an ``Authorization: Bearer <token>``
+    # header. When empty (loopback default), auth is a no-op.
+    auth_token: str = ""
+    # §C4: the cap on concurrently-hosted runs. Surfaces as a 429 from
+    # _post_runs when the count reaches this. Set on the handler class the
+    # same way ``state``/``control_enabled`` are.
+    max_concurrent_runs: int = DEFAULT_MAX_CONCURRENT_RUNS
 
     def log_message(self, fmt: str, *args: Any) -> None:  # noqa: A003
         if self.verbose:
@@ -285,17 +366,35 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
     def do_POST(self) -> None:  # noqa: N802
         self._dispatch("POST")
 
+    def do_DELETE(self) -> None:  # noqa: N802
+        self._dispatch("DELETE")
+
     def _dispatch(self, method: str) -> None:
         parts = urlsplit(self.path)
         path = parts.path
         self.query = parse_qs(parts.query)
 
+        # §C4: the static index page (and its JS) load *before* any auth
+        # check would fire, exactly because the login surface itself has
+        # to be reachable anonymously. /static/* is safe to serve without
+        # auth (it's static, not run-state), and serving the index bare is
+        # what makes the auth flow work (the client POSTs /api/attach with
+        # the cookie, then the SSE handshake replays it). An authenticated
+        # requester sees the same index; the difference is what /api/*
+        # then returns.
         if method == "GET" and path == "/":
             self._serve_static("index.html")
             return
         if method == "GET" and path.startswith("/static/"):
             self._serve_static(path[len("/static/") :])
             return
+
+        # Auth gate: every other route (including /api/stream) requires a
+        # valid cookie or Authorization header when an auth_token is set.
+        if not self._check_auth():
+            self._send_json(401, {"error": "authentication required"})
+            return
+
         if method == "GET" and path == "/api/stream":
             self._serve_stream()
             return
@@ -329,6 +428,48 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
     def require_control(self) -> None:
         if not self.control_enabled:
             raise ControlDisabledError()
+
+    # -- auth (§C4) ------------------------------------------------------
+    def _check_auth(self) -> bool:
+        """Timing-safe auth check. When no auth_token is configured on the
+        handler class, every request passes — this is the loopback default,
+        where ``127.0.0.1`` binding already keeps the dashboard off the
+        network. When a token is configured, a request must carry it via
+        either an ``Authorization: Bearer <token>`` header (used by fetch
+        callers) or the ``kusudaemon_auth`` cookie (set by /api/attach,
+        used by SSE — ``EventSource`` cannot set custom headers)."""
+        if not self.auth_token:
+            return True
+        # Cookie path — SSE EventSource and any browser fetch with default
+        # ``credentials: 'same-origin'`` carry this on every same-origin
+        # request.
+        cookie_header = self.headers.get("Cookie", "")
+        cookie_token = self._cookie_value(cookie_header, _AUTH_COOKIE_NAME)
+        if cookie_token and hmac.compare_digest(cookie_token, self.auth_token):
+            return True
+        # Authorization: Bearer <token> — the standard path for non-SSE
+        # API clients. Matches any case of ``Bearer``.
+        auth_header = self.headers.get("Authorization", "")
+        if auth_header.lower().startswith("bearer "):
+            bearer = auth_header[7:].strip()
+            if bearer and hmac.compare_digest(bearer, self.auth_token):
+                return True
+        return False
+
+    @staticmethod
+    def _cookie_value(cookie_header: str, name: str) -> str:
+        """Parse a ``Cookie:`` header with ``http.cookies`` (stdlib) and
+        return one named value, or ``""`` if absent. Robust against a
+        malformed header — a parse failure is treated as no cookie,
+        matching the conservative posture of "unknown -> deny"."""
+        if not cookie_header:
+            return ""
+        try:
+            c = http.cookies.SimpleCookie()
+            c.load(cookie_header)
+            return str(c[name].value) if name in c else ""
+        except Exception:
+            return ""
 
     # -- static ------------------------------------------------------------
     def _serve_static(self, rel_path: str) -> None:
@@ -384,9 +525,68 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
         data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
         self.send_response(status)
         self.send_header("Content-Type", "application/json")
+        # §C4: include any pending Set-Cookie header that's been queued
+        # for this response. Used by /api/attach to drop the auth cookie
+        # alongside its JSON payload.
+        if self._pending_set_cookie is not None:
+            self.send_header("Set-Cookie", self._pending_set_cookie)
+            self._pending_set_cookie = None
         self.send_header("Content-Length", str(len(data)))
         self.end_headers()
         self.wfile.write(data)
+
+    # §C4: a Set-Cookie value queued by _set_auth_cookie and consumed by
+    # _send_json. None when no cookie is pending.
+    _pending_set_cookie: str | None = None
+
+    def _set_auth_cookie(self) -> None:
+        """Issue the auth cookie as part of the next _send_json response.
+        SameSite=Strict + HttpOnly — the dashboard client never reads it
+        directly; the browser carries it to every same-origin request,
+        including the SSE EventSource which can't set custom headers."""
+        morsel = http.cookies.Morsel()
+        # Morsel.set() requires the coded_value third arg since 3.13 (it
+        # used to be optional); passing the same value for both is exactly
+        # what BaseCookie does internally.
+        morsel.set(_AUTH_COOKIE_NAME, self.auth_token, self.auth_token)
+        morsel["path"] = "/"
+        morsel["httponly"] = True
+        morsel["samesite"] = "Strict"
+        # Same-origin only — no cross-site CSRF surface. Max-Age is 7 days
+        # (a long enough window to cover an overnight or long-weekend run
+        # the operator re-attaches to, short enough to expire stale
+        # sessions).
+        morsel["max-age"] = str(60 * 60 * 24 * 7)
+        self._pending_set_cookie = morsel.OutputString()
+
+
+_LOOPBACK_HOSTS = frozenset({"127.0.0.1", "::1", "localhost", ""})
+
+
+def _assert_safe_host(host: str, auth_token: str) -> None:
+    """§C4: refuse to start on a non-loopback host without an auth token.
+
+    The ``--host`` flag explicitly invites off-loopback binding, so the
+    same flag's safety check is what refuses it. A non-loopback host
+    exposes every artifact, every trace, every approval to any requester
+    who can route to the LAN — a single ``Authorization: Bearer`` (or the
+    SSE-equivalent cookie) at least gates the read surface. Loopback
+    (``127.0.0.1``, ``::1``, ``localhost``) doesn't need a token: the
+    binding itself is the safety.
+
+    Raises ``ValueError`` before ``make_server`` is ever called, so the
+    socket is never bound in the unsafe configuration. The error message
+    names the ``--auth-token`` flag the operator needs to set, exactly the
+    way ``provider_config.resolve`` names the missing env var.
+    """
+    if host in _LOOPBACK_HOSTS:
+        return
+    if not auth_token:
+        raise ValueError(
+            f"refusing to bind dashboard to non-loopback host {host!r} without "
+            f"an auth token -- set --auth-token (and re-run with the same token, "
+            f"or one a remote browser can read)"
+        )
 
 
 def make_server(
@@ -396,11 +596,23 @@ def make_server(
     *,
     control_enabled: bool = True,
     verbose: bool = False,
+    auth_token: str = "",
+    max_concurrent_runs: int = DEFAULT_MAX_CONCURRENT_RUNS,
 ) -> ThreadingHTTPServer:
+    # §C4: refuse to bind off-loopback without auth. Done here, not in
+    # run_forever, so any caller constructing the server directly (including
+    # serve_in_background and tests) gets the same guard for free.
+    _assert_safe_host(host, auth_token)
     handler_cls = type(
         "_BoundHandler",
         (DashboardRequestHandler,),
-        {"state": state, "verbose": verbose, "control_enabled": control_enabled},
+        {
+            "state": state,
+            "verbose": verbose,
+            "control_enabled": control_enabled,
+            "auth_token": auth_token,
+            "max_concurrent_runs": max_concurrent_runs,
+        },
     )
     httpd = ThreadingHTTPServer((host, port), handler_cls)
     httpd.daemon_threads = True
@@ -408,11 +620,26 @@ def make_server(
 
 
 def serve_in_background(
-    runs_root: str, host: str = "127.0.0.1", port: int = 8765, *, control_enabled: bool = True, verbose: bool = False
+    runs_root: str,
+    host: str = "127.0.0.1",
+    port: int = 8765,
+    *,
+    control_enabled: bool = True,
+    verbose: bool = False,
+    auth_token: str = "",
+    max_concurrent_runs: int = DEFAULT_MAX_CONCURRENT_RUNS,
 ) -> tuple[ThreadingHTTPServer, RunState]:
     """Start the dashboard on a background thread; caller owns shutdown."""
     state = RunState(runs_root)
-    httpd = make_server(state, host, port, control_enabled=control_enabled, verbose=verbose)
+    httpd = make_server(
+        state,
+        host,
+        port,
+        control_enabled=control_enabled,
+        verbose=verbose,
+        auth_token=auth_token,
+        max_concurrent_runs=max_concurrent_runs,
+    )
     thread = threading.Thread(target=httpd.serve_forever, name="kusudaemon-dashboard", daemon=True)
     thread.start()
     return httpd, state
@@ -425,16 +652,28 @@ def run_forever(
     *,
     attach_run_id: str | None = None,
     control_enabled: bool = True,
+    auth_token: str = "",
+    max_concurrent_runs: int = DEFAULT_MAX_CONCURRENT_RUNS,
 ) -> None:
     """Blocking entrypoint for ``kusudaemon serve`` / bare ``kusudaemon`` /
     ``python -m kusudaemon.dashboard.server``."""
     state = RunState(runs_root)
     if attach_run_id:
         state.attach(attach_run_id)
-    httpd = make_server(state, host, port, control_enabled=control_enabled, verbose=True)
+    httpd = make_server(
+        state,
+        host,
+        port,
+        control_enabled=control_enabled,
+        verbose=True,
+        auth_token=auth_token,
+        max_concurrent_runs=max_concurrent_runs,
+    )
     print(f"kusudaemon dashboard: http://{host}:{port}/ (watching {runs_root})")
     if not control_enabled:
         print("read-only view: control actions (attach a run to start one, approve, amend...) are disabled")
+    if auth_token:
+        print("auth token required: clients must send the token as a Bearer header or a kusudaemon_auth cookie")
     try:
         httpd.serve_forever()
     except KeyboardInterrupt:
@@ -453,13 +692,21 @@ def _build_parser():
     parser.add_argument("--port", type=int, default=8765)
     parser.add_argument("--run-id", default=None, help="Attach to this run on startup.")
     parser.add_argument("--no-control", action="store_true", help="Read-only view: disable start/attach/halt/approve/amend/reopen/interject.")
+    parser.add_argument("--auth-token", default=None, help="PLAN.md §C4: token required for dashboard access when bound to a non-loopback host. Issued as a cookie at /api/attach; sent as Bearer by API clients.")
+    parser.add_argument("--max-concurrent-runs", type=int, default=DEFAULT_MAX_CONCURRENT_RUNS, help="PLAN.md §C4: cap on concurrently-hosted dashboard runs (429 past this).")
     return parser
 
 
 def main(argv: list[str] | None = None) -> int:
     args = _build_parser().parse_args(argv)
     run_forever(
-        args.runs_root, args.host, args.port, attach_run_id=args.run_id, control_enabled=not args.no_control
+        args.runs_root,
+        args.host,
+        args.port,
+        attach_run_id=args.run_id,
+        control_enabled=not args.no_control,
+        auth_token=args.auth_token or "",
+        max_concurrent_runs=args.max_concurrent_runs,
     )
     return 0
 

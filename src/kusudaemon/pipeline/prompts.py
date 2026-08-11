@@ -33,6 +33,7 @@ import threading
 from pathlib import Path
 
 from ..v0.run_dir import spec_path
+from ..v1.gates import estimate_tokens
 from ..v1.manifest import read_all_manifest_entries
 from ..v1.tree import TaskNode
 from ..v2.contract import load_contract
@@ -181,17 +182,32 @@ def build_node_prompt(
     *,
     inline_spans: bool = False,
     top_k: int = DEFAULT_TOP_K,
+    segment_tokens: Callable[[str, int], None] | None = None,
 ) -> str:
+    """Assemble a Writer's prompt. ``segment_tokens`` (PLAN.md §C5's
+    "mean input tokens per leaf broken down by prompt segment" instrument)
+    is an optional callback invoked once per segment with ``(label,
+    token_count)`` after the whole prompt is assembled — deterministic,
+    zero side effects, and the eval harness uses it to report which part
+    of a leaf's prompt actually costs tokens. Default None reproduces
+    exactly the pre-instrument behavior."""
     run_dir = Path(run_dir)
-    parts = [f"Your brief: {node.brief}"]
-    parts.append(_artifact_instruction(node, run_dir))
+    segments: list[tuple[str, str]] = [("brief", f"Your brief: {node.brief}")]
+
+    def add(label: str, text: str) -> None:
+        text = text.strip()
+        if text:
+            segments.append((label, text))
+
+    add("artifact_instruction", _artifact_instruction(node, run_dir))
     goal_block = _goal_and_rubric_block(run_dir)
     if goal_block:
-        parts.append(goal_block)
+        add("goal_and_rubric", goal_block)
     contract = _load_contract_cached(run_dir).strip()
     if contract:
-        parts.append(
-            "Global contract — every artifact you produce must satisfy it:\n" + contract
+        add(
+            "contract",
+            "Global contract — every artifact you produce must satisfy it:\n" + contract,
         )
     if node.inputs:
         # §D0b: a path stored on a node (a materialized spine unit, a v4
@@ -206,32 +222,36 @@ def build_node_prompt(
             if spans_block is not None:
                 finding_paths = _non_unit_inputs(node, run_dir)
                 if finding_paths:
-                    parts.append(
+                    add(
+                        "inputs",
                         "Inputs (read them with your tools before writing, and "
                         "cite them where relevant):\n"
-                        + "\n".join(f"- {_abs(item)}" for item in finding_paths)
+                        + "\n".join(f"- {_abs(item)}" for item in finding_paths),
                     )
-                parts.append(spans_block)
+                add("spans", spans_block)
             else:
                 # Index missing, or nothing retrieved: silent per-node
                 # fallback to today's path-list rendering (PLAN-zeromem.md
                 # §4.4) — unlike §3's phase-level fallback, this is per-node
                 # and would spam events.jsonl.
-                parts.append(
+                add(
+                    "inputs",
                     "Inputs (read them with your tools before writing, and cite "
                     "them where relevant):\n"
-                    + "\n".join(f"- {_abs(item)}" for item in node.inputs)
+                    + "\n".join(f"- {_abs(item)}" for item in node.inputs),
                 )
         else:
-            parts.append(
+            add(
+                "inputs",
                 "Inputs (read them with your tools before writing, and cite them "
-                "where relevant):\n" + "\n".join(f"- {_abs(item)}" for item in node.inputs)
+                "where relevant):\n" + "\n".join(f"- {_abs(item)}" for item in node.inputs),
             )
     promotions = _promotions_of(node, run_dir)
     if promotions:
-        parts.append(
+        add(
+            "promotions",
             "Upstream nodes' handoffs (what the nodes you depend on actually "
-            "delivered — read them before writing):\n" + promotions
+            "delivered — read them before writing):\n" + promotions,
         )
     if node.judgment and node.rubric:
         rubric_lines = "\n".join(
@@ -239,14 +259,17 @@ def build_node_prompt(
             for judgment_id in node.judgment
             if judgment_id in node.rubric
         )
-        parts.append(f"Judgment rubric the Reviewer will hold you to:\n{rubric_lines}")
+        add("judgment_rubric", f"Judgment rubric the Reviewer will hold you to:\n{rubric_lines}")
     if node.last_defect:
         # node.attempts is already incremented (by round_loop's transition)
         # before a retry is redispatched, so attempts==1 is building the
         # prompt for the node's 2nd dispatch, attempts>=2 for its 3rd+.
         instruction = _PATCH_RETRY_INSTRUCTION if node.attempts <= 1 else _REGENERATE_RETRY_INSTRUCTION
-        parts.append(instruction + node.last_defect)
-    return "\n\n".join(parts)
+        add("retry", instruction + node.last_defect)
+    if segment_tokens is not None:
+        for label, text in segments:
+            segment_tokens(label, estimate_tokens(text))
+    return "\n\n".join(text for _, text in segments)
 
 
 def _non_unit_inputs(node: TaskNode, run_dir: Path) -> list[str]:

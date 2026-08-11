@@ -799,6 +799,23 @@ new dispatch pattern — structural exploration, scheduled pre-plan at T2+.**
   never source content (§3's "Planner never sees source content" invariant
   — a ≤300-token *summary* the harness already paid for is not source
   content), just labels, token counts, and now a summary line too.
+- **§C3, `v4/probe_planner.py`** — the model-scheduled counterpart to §B4's
+  code-scheduled structural exploration: "targeted exploration (post-intake,
+  T1+), probes for specific open questions, selected by the windowed
+  planner." One windowed `complete_json` per 60 candidate nodes
+  (`window=stride=60`, no overlap — a probe suggestion is a property of one
+  node, unlike a cross-leaf boundary check); `needs_probe(node)` is the
+  deterministic code-side pre-filter (≥8-word brief **and** a structural
+  shape marker or external-lookup marker in the brief — wide on purpose,
+  a false skip is the failure mode it's engineered against); suggestions
+  naming ids outside their window are dropped and logged, per window capped
+  at `MAX_PROBES_PER_WINDOW` (8), per-node dedup by `(slug, question)` with
+  slug disambiguation so two distinct suggestions never clobber each
+  other's finding file. `driver._phase_research` builds the plan from
+  `candidate_nodes(tree)` when the operator didn't supply an explicit
+  `research_plan` (`RunOptions.auto_probe_plan`). The eval tasks' short
+  briefs rely on the 8-word floor to keep this call at zero — see the v8
+  section.
 
 ## v5 — pipeline driver and control surface (`pipeline/`, `dashboard/`)
 
@@ -1051,6 +1068,23 @@ new dispatch pattern — structural exploration, scheduled pre-plan at T2+.**
   `control_enabled` gating on every mutating route (`attach` stays ungated).
   `goal`/`source` fields get server-side `@path` resolution, since a browser
   can't read server files the way the old same-process UI could.
+  **§C4 (2026-08-11): auth and a concurrency cap.** `--auth-token` (or
+  `KUSUDAEMON_DASHBOARD_TOKEN`) arms `token_required`: every `/api` route
+  demands a token — passed as `Authorization: Bearer <token>`, or as the
+  `kusudaemon_auth` cookie `_set_auth_cookie` plants on first successful
+  attach (HttpOnly, SameSite=Strict, 7-day max-age) so the SSE stream
+  re-authenticates without the JS ever reading the token. Comparison is
+  `hmac.compare_digest`; a configured token also *unlocks non-loopback
+  hosts* — without one, `_assert_safe_host` raises (and `make_server`
+  refuses to bind) for any host that isn't loopback, so a server
+  accidentally exposed on a LAN refuses to serve secrets-less rather than
+  serving a control surface to the network. `--max-concurrent-runs`
+  (default `DEFAULT_MAX_CONCURRENT_RUNS = 4`) caps concurrently *hosted*
+  runs: the driver's per-hosted-run semaphore (`hosted_count`) makes
+  `_launch_run` return a 429 whose payload names `hosted` and
+  `max_concurrent_runs` instead of silently queueing a run the operator
+  will think is running. Python 3.13 note: `Morsel.set(key, val, coded)`
+  needs all three args — the two-arg call raised `TypeError` on attach.
 - `dashboard/static/` — dependency-free vanilla JS, no build step, SSE with a
   2s poll fallback. **`render()` has no diffing** — every update tears down
   and rebuilds `#app`. Consequence, and the live constraint: **every
@@ -1248,6 +1282,17 @@ new dispatch pattern — structural exploration, scheduled pre-plan at T2+.**
   Subagent finished", etc.) so the main chat's history reads as the
   operator-facing updates it was always supposed to be, not raw
   `events.jsonl` type strings.
+
+  **§C4 (2026-08-11): run-header tier + escalation badges.** The run
+  selector's header row gains `renderTierBadges(snap)` (a `hdr-tier-badges`
+  span next to the phase badge): a `tier <name>` badge (tooltip names the
+  measured tier and the `--tier` override when set) and, when
+  `snap.escalation_history` is non-empty, an `escalated` badge showing the
+  count with a tooltip of the trigger trail (`from → to` per event, node id
+  included). Both fields come from `state.py`'s snapshot (`tier`,
+  `measured_tier`, `tier_override`, `escalation_history` — the latter
+  derived from `run_tier_escalated` events in log order via
+  `_tier_and_escalation`, tolerating a malformed `tier.json`).
 
 ## v6 — the work object (v6/)
 
@@ -1793,6 +1838,75 @@ what the dashboard's existing dot-path grouping (`CLAUDE.md`'s v5 section,
 `buildNodeTreeIndex`) already renders as a nested tree — asserted directly
 against the id strings, without touching `dashboard/` itself.
 
+## v8 — the §C5 eval harness (eval/)
+
+PLAN.md §C5's two headline measurements, implemented first as the spec
+demands: **calls-by-tier** ("the entire claim of §A4 is a cost claim, and
+a cost claim without a number is a preference") and **escalation
+precision** ("high escalation means the classifier is too aggressive; zero
+escalation across varied tasks means it is too conservative"). The rest of
+§14's measurement list is structurally unbuilt — see PLAN.md.
+
+- `eval/tasks.py` — the five fixed tasks, exactly one per tier band:
+  `t0-typo` (a 1-file workspace fix → T0), `t1-notes` (a single corpus
+  file → T1), `t2-corpus` (three-chapter primer → T2), `t2-feature`
+  (a CLI flag + test → T2), `t3-refactor` (a generated >150k-token,
+  4-package workspace → T3). Each carries its canned `ESTIMATE` response
+  (with `answerable_without_exploration: true`, which is what keeps
+  intake/structural-exploration/probe dispatch at zero — `needs_explore:
+  false` short-circuits `_phase_explore` before `_run_structural_
+  exploration`), a plan builder, and corpus spine pre-seeds or workspace
+  files. **Plan briefs are deliberately <=7 words with `prose-dominant`
+  shape** so `v4/probe_planner.py`'s `needs_probe` filter (>=8 words or a
+  structural/lookup marker) admits zero candidates — a probe-planning
+  call can never fire, keeping the call budgets exact. The T3 workspace
+  is ~1.6MB of generated filler because T3 classification is *measured*:
+  `classify` requires `work_tokens >= 150_000` (or artifacts > 8), so the
+  fixture must genuinely measure that large with real files, not fake it.
+- `eval/measure.py` — pure, disk-based measurement: provider calls are
+  classified by their schema's top-level property set (`role_of_schema`;
+  `VERDICT_SCHEMA` serves both per-leaf review and document review, so
+  both count "reviewer" — the honest accounting); `approval_rate_by_
+  shape` reads pilot approvals (blank `user_input` = accepted as-is,
+  non-blank = edited, the two signals §14's shape-segmented approval-rate
+  metric exists to separate); `per_leaf_segment_tokens`/`mean_tokens_by_
+  segment` rebuild each leaf's prompt with `build_node_prompt`'s new
+  `segment_tokens` callback (deterministic — the rebuilt prompt is
+  byte-identical to what the Writer saw, so no driver changes were needed
+  to instrument it); `escalation_precision`/`summarize_calls_by_tier`
+  aggregate per-run dicts.
+- `eval/runner.py` — `run_eval_suite(_sync)`: per task x run, writes the
+  fixture, pre-seeds `spine.json` (corpus) or measures the workspace,
+  computes the canned PARTITION against the *exact* unit list the planner
+  will see (for workspace tasks that's `survey_workspace`'s own output,
+  reproduced in the runner — pure code, same input, so the partition
+  tiles exactly), then drives the driver **twice**: a fresh run and a
+  resume over the same dir with a fresh scripted provider. The resume
+  asserts zero writer dispatches — §10's replay invariant ("a resuming
+  process must never re-execute a completed leaf") measured per run, not
+  just designed. Approvals auto-resolve through the same `Approver`
+  thread the test suite uses; the pilot auto-approves with a blank edit,
+  which is the zero-call contract-derivation path (§4.4: an unedited
+  pilot spends zero model calls).
+- **The measured budget, fresh run** (asserted exactly in the ship-gate
+  test, because it is implied by the phase table and a deviation means
+  the tier machinery drifted): T0=1 (ESTIMATE; direct node's review is
+  free — no judgment items), T1=1 (ESTIMATE; the one node is built by
+  code, never a plan call), T2=5 (ESTIMATE + PARTITION + document
+  review's 3 windowed passes over one window — `keep_depth_pass=False`
+  per `driver._phase_review`), T3=2 (ESTIMATE + PARTITION; pilot
+  auto-approves, T3's review spends nothing). **Resume** re-runs only the
+  tier-scoped phases: T2's `review@T2` re-runs document review (3 calls);
+  T0/T1/T3 resume with zero provider calls (classify/plan/pilot
+  short-circuit on their durable artifacts; the execute round loop
+  replays an already-passed tree without dispatching). The aggregate's
+  `total_calls` is the *fresh-run* cost — §C5's per-tier price — with
+  `resume_calls` reported separately per run, never folded in.
+- `pipeline/prompts.py` — `build_node_prompt` gained the `segment_tokens`
+  callback (the §C5 instrument; see the v1-era §8 note above on where it
+  sits in the prompt-assembly order). Pinned byte-identical prompt tests
+  (`test_pipeline_prompts.py`) still pass untouched.
+
 ## Adapters (gptme-only)
 
 - `cli_agent.py` — `CommandAgentAdapter`, the shared base: builds a command
@@ -1865,7 +1979,7 @@ Stdlib `unittest`. No pytest, no network, no agent binary, no API key.
 python3 -m unittest discover -s tests -p "test_*.py" -v
 ```
 
-**553 tests, ~23s, all passing.** History: 387 after 2026-08-10's
+**669 tests, ~30s, all passing.** History: 387 after 2026-08-10's
 §D0b/§D0/§D1/§D2/§D4/§D5/§D6/§D7/§D10/§D0c defect-fix session → 410 after
 §B1 (the v6 work object: new `test_v6_work_object.py` (23), plus additions
 to `test_pipeline_backends.py`/`test_driver_phases.py`) → 461 after §B2
@@ -1877,9 +1991,13 @@ the old per-dimension `test_v2_intake.py` rewritten, plus 2 new
 `test_v4_probes.py` (21) and `test_workspace_read_tool.py` (9)) → 540 after
 §B5 (runtime split: new `test_v7_split.py`, plus extensions across
 `test_v1_units.py`/`test_v3_assemble.py`/`test_v3_checks.py`/
-`test_driver_phases.py`/`test_v6_tiering.py`) → **553 after §B6** (tiered
+`test_driver_phases.py`/`test_v6_tiering.py`) → 553 after §B6 (tiered
 review fan-out: new `test_v1_reviewer_fanout.py` (9), plus 4 more
-`test_driver_phases.py` cases).
+`test_driver_phases.py` cases) → 634 after §C3 (the probe planner: new
+`test_v4_probe_planner.py` (14), plus 5 more across
+`test_v4_probes.py`/`test_driver_phases.py`) → 654 after §C4 (dashboard
+hardening: `test_dashboard_server.py` +15, `test_dashboard_state.py` +5)
+→ **669 after §C5** (the eval harness: new `test_eval_harness.py` (15)).
 
 **Every test file starts with `sys.path.insert(0, str(_REPO_ROOT / "src"))`.
 This is load-bearing, not boilerplate.** Stale `_editable_impl_*.pth` files
@@ -1904,13 +2022,15 @@ guard into any new test file.
 | `test_v3_document_review.py` | 14 | windowed call count flat in node count, id attribution and dropping |
 | `test_v4_research.py` / `_mcp_research.py` / `_research_loop.py` | 2/2/5 | derived-id dispatch + cache hit, `Probe`/`ResearchQuery` alias + `normalize_probe_kind`, finding attachment |
 | `test_v4_probes.py` | 21 | §B4: `workspace` probe gets no write/shell tool, `max_explorers_for` enforced (more units than the cap still dispatches ≤ the cap), 300-token finding cap regardless of input, cached-finding idempotency (no re-dispatch), `plan_level`'s prompt includes explorer summaries and no source content |
+| `test_v4_probe_planner.py` | 14 | §C3: `needs_probe` filter boundaries (8-word brief floor, shape markers, URL/doc lookup markers), windowed one-call-per-60-candidates (call count flat in candidate count), out-of-window ids dropped + logged, per-window cap, per-node dedup + slug disambiguation, driver integration (auto plan from candidates, no explicit research_plan needed) |
 | `test_workspace_read_tool.py` | 9 | §B4: `list_dir`/`grep` confined to a root, `../..` escape attempts rejected in code (`_resolve_within_root`), importable outside a real gptme process |
-| `test_dashboard_state.py` / `_server.py` | 25/22 | `RunState` directly (no port), then HTTP over a real loopback `ThreadingHTTPServer` incl. traversal rejection and `--no-control` 403s; §11.10.14 read-only poll leaves runs unmutated; §11.10.15 bounded cache + 8-thread hammer |
+| `test_dashboard_state.py` / `_server.py` | 25/22 | `RunState` directly (no port), then HTTP over a real loopback `ThreadingHTTPServer` incl. traversal rejection and `--no-control` 403s; §11.10.14 read-only poll leaves runs unmutated; §11.10.15 bounded cache + 8-thread hammer. §C4: tier/escalation snapshot fields, hosted-count cap; auth via Bearer/cookie over loopback (anonymous 401, wrong token 401, cookie 403 for SSE without it), non-loopback refusal without token, 429 at `--max-concurrent-runs` |
 | `test_dashboard_rendering.py` | 14 | `parse_trace`: `<think>`/`<thinking>` tag extraction incl. the Anthropic think-sig comment, `save`/`append`/`patch` code-fence → `tool_call` + `diff` entries, per-path diff continuity across turns (not "whole file added" every time), `error` vs routine `system` classification | 
 | `test_pipeline_prompts.py` / `_backends.py` / `test_driver_phases.py` | 18/11/34 | byte-identical default prompt (now including §D0's absolute artifact-path line and §D1's goal block), §D2's out/scratch carve-out (hidden but excepted, not dropped), adapter wiring incl. §B1's workspace-mode `run_dir` branches and §B4's probe-kind allowlists, phase detail preservation, §D4's corpus-less-raises, §11.10.15 contract-cache bound, §B1's default-writer-factory and `--workspace` CLI wiring, §B2's `_phase_done("classify"/"explore")`, `tier_override` spec round-trip, `escalate_run`, `--tier`/`escalate` CLI wiring, §B3's adaptive-intake driver integration, §B4's T2/T3 structural-exploration dispatch, §B5's `split_accepted` escalation end-to-end, §B6's T2-unconditional/T3-still-flag-gated document review split | 
 | `test_v6_work_object.py` | 15 | §B1: measurement excludes binaries/`.git`/`node_modules`/lockfiles/oversized files, gitignore respected, `top_dirs` grouping; `kind="text"`/`kind="none"` constructors; `survey_workspace`'s members resolve to real files and respect a token ceiling; the run dir is hidden as one subtree when nested inside `work.root`; ship gate via a real subprocess fixture (not gptme) proving cwd=work.root and the artifact still lands under run_dir |
 | `test_v6_tiering.py` | 39 | §B2: `Signals`/`measure_signals` word-boundary marker counts, `estimate_scope`'s digest never leaks file content, `classify`'s four table triggers + the `unknown`-forces-≥T2 override, `phases_for` per tier, `escalate` monotone under every trigger incl. `split_accepted` (§B5, uncalled at §B2 ship time, wired now — see `test_v7_split.py`), `max_explorers_for` per tier (§B4), the three-goals/one-repo ship gate, T0's ≤3-provider-call full-driver run, `--tier T3` floor running every T3 phase on a trivial goal, resume after a live T1→T2 escalation continuing from the freshly-planned tree |
 | `test_v7_split.py` | 21 | §B5: the §A8.2 gate's five preconditions individually (no-overrun rejects and preserves the attempt, depth/node caps refuse, a leaf-gate-failing child rejects the whole proposal), gapped/overlapping proposals repaired not trusted, crash-between-graft-and-first-child-dispatch resumes correctly, the parent's artifact equals the fresh concatenation of its passed children, full end-to-end `run_round_loop` ship gate with dot-hierarchical child ids |
+| `test_eval_harness.py` | 15 | §C5: schema-property role classification, approval-rate-by-shape over synthetic approvals, the two aggregators, the segment instrument over a synthetic tree, and the ship gate — a full five-task suite through real driver runs asserting the exact per-tier call budgets (T0=1, T1=1, T2=5, T3=2; resume re-runs only T2's review, 3 calls), escalation precision 1.0, one terminal event per dispatched node, and the expected tier/dispatch counts per task |
 | `test_pipeline_approvals.py` | 4 | §11.10.12 incremental approvals scanning: each record parsed once across polls, torn tail re-read, cross-thread wait/resolve |
 | `test_pipeline_liveness.py` | 5 | §D0c: dead pid → stalled, live pid → not stalled, non-`in_progress` phase never stalled, no-pid-record falls back to phase-age threshold |
 | `test_environment_remote_files.py` | 2 | §D7: `write_remote_text`'s cleanup tolerates `PermissionError` (not just `FileNotFoundError`) on unlink without failing the write |

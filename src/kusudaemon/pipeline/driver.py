@@ -92,6 +92,7 @@ from ..v2.survey import (
 from ..v3.assembly_loop import run_assembly_loop
 from ..v3.document_review import DocumentReviewResult, run_document_review, serialize_triage
 from ..v3.revalidate import Triage, apply_revalidation_triage, run_revalidation_pass, summarize_triage
+from ..v4.probe_planner import plan_probes
 from ..v4.research import ResearchQuery, run_research_query
 from ..v4.research_loop import run_research_loop
 from ..v4.run_dir import research_finding_path
@@ -192,6 +193,12 @@ class RunOptions:
     # actually used for phases_for() is max(measured, tier_override).
     # One of "T0"/"T1"/"T2"/"T3", or None for "no forced floor".
     tier_override: str | None = None
+    # PLAN.md §C3: when true and no explicit research_plan was supplied,
+    # _phase_research builds one from the probe planner (windowed
+    # complete_json over candidate leaves). The operator-supplied
+    # research_plan still wins when present — explicit targeting overrides
+    # auto-targeting the same way --tier overrides the classifier.
+    auto_probe_plan: bool = True
 
     def to_spec(self) -> dict[str, Any]:
         spec = {
@@ -212,6 +219,7 @@ class RunOptions:
             "survey_mode": self.survey_mode,
             "inline_spans": self.inline_spans,
             "tier_override": self.tier_override,
+            "auto_probe_plan": self.auto_probe_plan,
         }
         # §11.10.7: the corpus lives once, in source.txt. Embedding
         # source_text here duplicated the run's largest file into a JSON
@@ -241,6 +249,7 @@ class RunOptions:
             survey_mode=str(data.get("survey_mode", "model")),
             inline_spans=bool(data.get("inline_spans", False)),
             tier_override=data.get("tier_override"),
+            auto_probe_plan=bool(data.get("auto_probe_plan", True)),
         )
 
 
@@ -981,19 +990,69 @@ class RecursiveDriver:
         freeze_contract(self.run_dir, rules)
 
     async def _phase_research(self) -> None:
-        if not self.options.research_plan:
+        """Dispatch targeted exploration (PLAN.md §A6 second bullet/§C3).
+
+        Two paths, in priority order:
+
+        1. **Operator-supplied** ``options.research_plan`` — unchanged
+           from pre-§C3 behavior. The plan is the contract; the harness
+           never second-guesses it.
+        2. **Auto-planned** (§C3) — when ``options.auto_probe_plan`` is on
+           and no explicit plan was supplied, build one from the probe
+           planner (windowed ``complete_json`` over candidate leaves).
+           This is the "targeted exploration" §A6 names — a model-driven
+           decision about which leaves benefit from a probe, gated by a
+           deterministic ``needs_probe`` filter and a per-window cap, so
+           a model that suggests probes to avoid work is bounded.
+
+        Both paths feed the same ``run_research_loop`` (the existing
+        targeted-loop machinery), so findings attach to ``node.inputs``
+        exactly the way operator-supplied findings already do.
+        """
+        plan = self.options.research_plan
+        if not plan and self.options.auto_probe_plan:
+            plan = self._build_auto_probe_plan()
+        if not plan:
             return None
         try:
             await run_research_loop(
                 self.run_dir,
                 tree_path(self.run_dir),
-                self.options.research_plan,
+                plan,
                 self.research_adapter_factory,
                 self.env,
                 EpisodeBudget(),
             )
         except ValueError as exc:  # only capability refusal is a soft miss
             self._set_phase("research", "done", detail=f"skipped: {exc}")
+
+    def _build_auto_probe_plan(self) -> dict[str, list[ResearchQuery]]:
+        """PLAN.md §C3: windowed probe planner over the current tree. The
+        plan is the shape ``run_research_loop`` accepts; an empty plan
+        (no candidate leaves, or the planner returned nothing) is a no-op
+        return, not a skip — ``_phase_research``'s caller may still have
+        its own skip logic. Logged as a single harness event so the
+        dashboard can show "auto probe planner ran, produced N probes"
+        without parsing ``events.jsonl`` for ``node_dispatched`` lines."""
+        if not (self.run_dir / "tree.json").exists():
+            return {}
+        try:
+            tree = TaskTree.load(tree_path(self.run_dir))
+        except Exception:
+            return {}
+        plan = plan_probes(tree, self.provider)
+        total_probes = sum(len(qs) for qs in plan.values())
+        self._log(
+            {
+                "node_id": "-",
+                "role": "harness",
+                "round": 0,
+                "type": "probe_plan_built",
+                "total_probes": total_probes,
+                "nodes_with_probes": len(plan),
+            }
+        )
+        return plan
 
     async def _phase_execute(self) -> None:
         """Tier-branched (PLAN.md §A4.3/§B2):

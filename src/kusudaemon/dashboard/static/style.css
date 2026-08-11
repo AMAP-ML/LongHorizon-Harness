@@ -234,6 +234,15 @@ body::before {
   flex: 1;
 }
 
+/* §C4: tier + escalation badges in the run header. The parent
+   .run-selector-badge is a flex row, so the wrapper just inherits its
+   gap and alignment. */
+.hdr-tier-badges {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+
 .hdr-actions {
   display: flex;
   align-items: center;

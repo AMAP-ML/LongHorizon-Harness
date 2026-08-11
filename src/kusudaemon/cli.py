@@ -51,6 +51,13 @@ def main(argv: list[str] | None = None) -> int:
         args.port = 8765
         args.run_id = None
         args.no_control = False
+        # §C4: bare-kusudaemon invocation keeps the auth_token default
+        # ("") so the loopback default is anonymous (the same as before
+        # this workstream). Setting --auth-token re-enables auth; setting
+        # --host to a non-loopback without --auth-token raises in
+        # run_forever via _assert_safe_host.
+        args.auth_token = None
+        args.max_concurrent_runs = None
     if written is not None:
         print(f"Created provider config: {written} (edit it to change your provider)")
     return dispatch(args)

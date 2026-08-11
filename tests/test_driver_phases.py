@@ -1342,5 +1342,209 @@ class PhasePlanGlossaryC1Test(unittest.TestCase):
         asyncio.run(scenario())
 
 
+class PhaseResearchAutoProbePlanTest(unittest.TestCase):
+    """PLAN.md §C3: ``_phase_research`` builds a probe plan from the probe
+    planner when no operator-supplied research_plan was supplied, logs a
+    ``probe_plan_built`` event, and dispatches the suggested probes through
+    the existing ``run_research_loop`` machinery. An operator-supplied plan
+    still wins; ``auto_probe_plan=False`` skips the planner entirely; and a
+    T0 run with no ``tree.json`` skips cleanly (nothing to plan over)."""
+
+    def _write_tree(self, run_dir: Path) -> None:
+        from kusudaemon.v1.tree import TaskNode, TaskTree
+
+        tree = TaskTree(
+            nodes={
+                f"n{i}": TaskNode(
+                    id=f"n{i}",
+                    brief=(
+                        f"problem set {i} covers these topics with at least "
+                        f"twelve words in the brief here now please"
+                    ),
+                    artifact=f"out/n{i}.md",
+                    gates=["nonempty"],
+                    shape="problem-set-dominant",
+                )
+                for i in range(3)
+            }
+        )
+        tree.save(tree_path(run_dir))
+
+    def test_auto_plan_builds_from_probe_planner_and_logs_event(self) -> None:
+        import asyncio
+        from kusudaemon.types import EpisodeResult
+
+        async def scenario() -> None:
+            with tempfile.TemporaryDirectory() as root_str:
+                run_dir = Path(root_str) / "run"
+                create_run_dir(run_dir.parent, run_dir.name)
+                self._write_tree(run_dir)
+                # The probe planner's complete_json call returns one probe
+                # for the first candidate in the window. _phase_research
+                # feeds the planned probes to run_research_loop, which calls
+                # research_adapter_factory(node, query) per probe — give it
+                # an in-memory adapter that returns a finding.
+                provider = FakeProvider(
+                    [
+                        {
+                            "probes": [
+                                {
+                                    "node_id": "n0",
+                                    "slug": "ctx",
+                                    "question": "what is n0 about?",
+                                    "kind": "web",
+                                }
+                            ]
+                        }
+                    ]
+                )
+
+                class _InMemProbe:
+                    has_file_tools = False
+                    supports_session_resume = False
+
+                    async def run_episode(self, prompt, env, budget, live_trajectory_path=None, **kwargs) -> EpisodeResult:
+                        return EpisodeResult(status="done", actions_log="probe finding text", duration_ms=1, metadata={})
+
+                driver = RecursiveDriver(
+                    run_dir,
+                    provider=provider,  # type: ignore[arg-type]
+                    options=RunOptions(goal="g", auto_probe_plan=True, research_plan={}),
+                    writer_adapter_factory=lambda node: (_ for _ in ()).throw(
+                        AssertionError("no writer dispatch expected")
+                    ),
+                    research_adapter_factory=lambda node, query: _InMemProbe(),
+                    poll_interval=0.02,
+                )
+                await driver._phase_research()
+
+                events = EventLog(events_path(run_dir)).read_all()
+                built = [e for e in events if e.get("type") == "probe_plan_built"]
+                self.assertEqual(len(built), 1)
+                self.assertEqual(built[0]["total_probes"], 1)
+                # The finding file lands under scratch/<node>/research/<slug>.md,
+                # and the planned node's inputs now carry its path. Compare
+                # resolved paths — macOS resolves /var -> /private/var so the
+                # literal strings disagree, but the paths they point at agree.
+                from kusudaemon.v4.run_dir import research_finding_path
+                finding = research_finding_path(run_dir, "n0", "ctx")
+                self.assertTrue(finding.exists())
+                tree = TaskTree.load(tree_path(run_dir))
+                self.assertIn(
+                    str(finding.resolve()),
+                    [str(Path(p).resolve()) for p in tree.nodes["n0"].inputs],
+                )
+
+        asyncio.run(scenario())
+
+    def test_operator_supplied_research_plan_wins_over_auto_plan(self) -> None:
+        import asyncio
+        from kusudaemon.types import EpisodeResult
+        from kusudaemon.v4.research import Probe
+
+        async def scenario() -> None:
+            with tempfile.TemporaryDirectory() as root_str:
+                run_dir = Path(root_str) / "run"
+                create_run_dir(run_dir.parent, run_dir.name)
+                self._write_tree(run_dir)
+                # Provider has no canned responses -- if _phase_research tried
+                # to auto-plan, the complete_json call would raise.
+                provider = FakeProvider([])
+
+                class _InMemProbe:
+                    has_file_tools = False
+                    supports_session_resume = False
+
+                    async def run_episode(self, prompt, env, budget, live_trajectory_path=None, **kwargs) -> EpisodeResult:
+                        return EpisodeResult(status="done", actions_log="explicit plan finding", duration_ms=1, metadata={})
+
+                explicit_plan = {"n1": [Probe(slug="op", kind="web", question="what?")]}
+                driver = RecursiveDriver(
+                    run_dir,
+                    provider=provider,  # type: ignore[arg-type]
+                    options=RunOptions(
+                        goal="g", auto_probe_plan=True, research_plan=explicit_plan
+                    ),
+                    writer_adapter_factory=lambda node: (_ for _ in ()).throw(
+                        AssertionError("no writer dispatch expected")
+                    ),
+                    research_adapter_factory=lambda node, query: _InMemProbe(),
+                    poll_interval=0.02,
+                )
+                await driver._phase_research()
+
+                # No probe_plan_built event -- the operator plan was used.
+                events = EventLog(events_path(run_dir)).read_all()
+                self.assertEqual(
+                    [e for e in events if e.get("type") == "probe_plan_built"],
+                    [],
+                )
+                from kusudaemon.v4.run_dir import research_finding_path
+                finding = research_finding_path(run_dir, "n1", "op")
+                self.assertTrue(finding.exists())
+
+        asyncio.run(scenario())
+
+    def test_auto_probe_plan_false_skips_planner(self) -> None:
+        import asyncio
+
+        async def scenario() -> None:
+            with tempfile.TemporaryDirectory() as root_str:
+                run_dir = Path(root_str) / "run"
+                create_run_dir(run_dir.parent, run_dir.name)
+                self._write_tree(run_dir)
+                provider = FakeProvider([])
+                driver = RecursiveDriver(
+                    run_dir,
+                    provider=provider,  # type: ignore[arg-type]
+                    options=RunOptions(goal="g", auto_probe_plan=False, research_plan={}),
+                    writer_adapter_factory=lambda node: (_ for _ in ()).throw(
+                        AssertionError("no writer dispatch expected")
+                    ),
+                    research_adapter_factory=lambda node, query: (_ for _ in ()).throw(
+                        AssertionError("no research dispatch expected")
+                    ),
+                    poll_interval=0.02,
+                )
+                await driver._phase_research()
+
+                events = EventLog(events_path(run_dir)).read_all()
+                self.assertEqual(
+                    [e for e in events if e.get("type") == "probe_plan_built"],
+                    [],
+                )
+
+        asyncio.run(scenario())
+
+    def test_no_tree_skips_auto_plan_cleanly(self) -> None:
+        import asyncio
+
+        async def scenario() -> None:
+            with tempfile.TemporaryDirectory() as root_str:
+                run_dir = Path(root_str) / "run"
+                create_run_dir(run_dir.parent, run_dir.name)
+                # No tree.json -- T0 direct path.
+                provider = FakeProvider([])
+                driver = RecursiveDriver(
+                    run_dir,
+                    provider=provider,  # type: ignore[arg-type]
+                    options=RunOptions(goal="g", auto_probe_plan=True, research_plan={}),
+                    writer_adapter_factory=lambda node: (_ for _ in ()).throw(
+                        AssertionError("no writer dispatch expected")
+                    ),
+                    research_adapter_factory=lambda node, query: (_ for _ in ()).throw(
+                        AssertionError("no research dispatch expected")
+                    ),
+                    poll_interval=0.02,
+                )
+                # Returns None cleanly; does not raise, does not call the
+                # provider.
+                result = await driver._phase_research()
+                self.assertIsNone(result)
+                self.assertEqual(len(provider.calls), 0)
+
+        asyncio.run(scenario())
+
+
 if __name__ == "__main__":
     unittest.main()
