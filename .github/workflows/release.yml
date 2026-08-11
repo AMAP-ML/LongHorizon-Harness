@@ -27,11 +27,24 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: "20"
+          registry-url: https://registry.npmjs.org
           cache: npm
           cache-dependency-path: frontend/web/package-lock.json
 
+      - name: 🔍 Verify the lockfile resolves only to the public registry
+        # A private/mirror registry URL committed into package-lock.json makes
+        # this job hang until it times out on a runner that cannot reach it.
+        run: |
+          foreign="$(grep -o '"resolved": "https://[^/]*' frontend/web/package-lock.json \
+            | grep -v '"resolved": "https://registry.npmjs.org$' | sort -u || true)"
+          if [ -n "$foreign" ]; then
+            echo "$foreign"
+            echo "::error::package-lock.json resolves packages outside registry.npmjs.org"
+            exit 1
+          fi
+
       - name: 📦 Install Web dependencies
-        run: npm ci --prefix frontend/web
+        run: npm ci --prefix frontend/web --no-audit --no-fund
 
       - name: 🧪 Test shared frontend core
         # frontend/core has no lockfile of its own; its test script reuses the
