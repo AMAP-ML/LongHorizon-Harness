@@ -838,6 +838,53 @@ prompt, not that node's own handoff).
   note instead of leaving a bare "RUNNING" badge next to a generic
   "(not currently running)" message box.
 
+  **2026-08-10, fifth pass — Task Tree as the default right-column view,
+  per-node subagent/artifact indicators, and an Artifacts list.** Operator
+  spec: right column defaults to the Task Tree; each tree row shows whether
+  a subagent is currently attached and running, plus how many artifacts
+  that node has produced; clicking an attached subagent opens straight to
+  its chat; every agent's chat has an "Artifacts" button that lists and
+  views everything that agent's owning node has written, in the right
+  column. `state.workbenchTab` now initializes to `"tree"` (was `"code"`),
+  `closeNode()` returns to `"tree"` instead of `"code"`, and every run-attach
+  path (sidebar run click, New Run modal, prompt-bar "New Run") resets
+  `workbenchTab` to `"tree"` and clears `selectedNode` so switching runs
+  always lands back on the tree rather than a stale node from the previous
+  run. `renderTreeBranch`'s `findAttachedSubagents(nodeId)` matches
+  `snap.subagents` entries by `id === nodeId` (the node's own Writer
+  dispatch) or `id.startsWith(nodeId + "~")` (its repair/research children,
+  which carry the parent's id as a derived-id prefix per `repair.py`/
+  `research.py`'s collision-avoidance scheme) — a live match renders a
+  clickable "● live" pill that opens that subagent's Chat tab directly
+  (`openNode(id, "chat")`, `openNode` now takes an optional target sub-tab);
+  otherwise the most recent attached subagent's own status badge is shown
+  next to the node's tree-gate status, since they answer different
+  questions (node.status is tree.json's gate state; a subagent's status is
+  its episode state) and collapsing them the way the old flat Subagents
+  list did loses that distinction on the node that matters most: the one
+  you're looking at. Artifact counts come from a new backend field,
+  `state.py`'s `_tree_summary(run_dir, tree)` (now takes `run_dir` — the one
+  caller, `snapshot()`, was updated) computing `_artifact_count` per node as
+  1 (if `out/<node>.md` is non-empty) plus `len(_list_versions(...))` — read
+  fresh off disk on every snapshot like everything else in this file,
+  deliberately not cached against `tree.json`'s own mtime since artifacts
+  change independently of the tree. The new "📁 Artifacts" Agent-tab (and
+  matching quick-button in both the Chat sub-tab and the main chat's live
+  divider) resolves *through the owning tree node*, not the clicked
+  subagent's own id — `artifactsOwnerId(id)` strips everything from the
+  first `~` onward, because a repair/research episode never owns its own
+  artifact file; repairs land on the same real `out/<node>.md` as their
+  parent once they pass review, and pre-repair snapshots live under
+  `out/.versions/<node>/` keyed by that same parent id. It lists "current"
+  plus every version tag (newest first) and fetches the selected one's text
+  from the existing `/api/node/<id>/artifact` / `/api/node/<id>/version/<tag>`
+  endpoints — no new backend routes needed. `renderEventEntry` also gained a
+  `_EVENT_LABEL` lookup (`phase_started` → "▶️ Phase started",
+  `node_dispatched` → "🚀 Subagent spawned", `episode_completed` → "🏁
+  Subagent finished", etc.) so the main chat's history reads as the
+  operator-facing updates it was always supposed to be, not raw
+  `events.jsonl` type strings.
+
 ## Adapters (gptme-only)
 
 - `cli_agent.py` — `CommandAgentAdapter`, the shared base: builds a command

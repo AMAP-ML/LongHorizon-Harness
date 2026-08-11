@@ -257,7 +257,7 @@ class RunState:
             "phase_status": str(phase.get("status", "")),
             "phase_detail": str(phase.get("detail", "")),
             "phases": _phase_map(events),
-            "tree": _tree_summary(tree),
+            "tree": _tree_summary(run_dir, tree),
             "tree_counts": _count_statuses(tree),
             "approvals": [item.to_dict() for item in approvals],
             "pending_approvals": [item.to_dict() for item in approvals if item.status == "pending"],
@@ -833,7 +833,7 @@ def _load_tree(run_dir: Path) -> TaskTree:
         return TaskTree(nodes={})
 
 
-def _tree_summary(tree: TaskTree) -> list[dict[str, Any]]:
+def _tree_summary(run_dir: Path, tree: TaskTree) -> list[dict[str, Any]]:
     return [
         {
             "id": node.id,
@@ -845,9 +845,20 @@ def _tree_summary(tree: TaskTree) -> list[dict[str, Any]]:
             "gates": len(node.gates),
             "attempts": node.attempts,
             "depends_on": node.depends_on,
+            "artifact_count": _artifact_count(run_dir, node.id),
         }
         for node in tree.nodes.values()
     ]
+
+
+def _artifact_count(run_dir: Path, node_id: str) -> int:
+    """How many artifact files this node has produced: the current
+    ``out/<node>.md`` (if non-empty) plus every pre-repair snapshot under
+    ``out/.versions/<node>/`` -- shown on each Task Tree row per the
+    dashboard's node-level artifact count."""
+    count = 1 if _has_content(node_artifact_path(run_dir, node_id)) else 0
+    count += len(_list_versions(run_dir, node_id))
+    return count
 
 
 def _count_statuses(tree: TaskTree) -> dict[str, int]:

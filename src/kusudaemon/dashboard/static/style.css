@@ -1347,6 +1347,61 @@ table.tree tr:hover td {
 .gate-list .gate-fail { color: var(--accent-red); }
 .dim { color: var(--text-muted); }
 
+/* Task Tree row: artifact count next to the node/subagent status badges */
+.tree-artifact-count {
+  font-size: 11px;
+  font-family: var(--font-mono);
+  white-space: nowrap;
+}
+
+/* Agent tab's "Artifacts" sub-tab: a list of every artifact file this
+   node's owning tree node has produced (current + pre-repair snapshots)
+   alongside a viewer for whichever one is selected -- reachable both as
+   its own tab and via the quick button in the Chat sub-tab / main chat. */
+.artifacts-pane {
+  display: flex;
+  gap: 16px;
+  align-items: flex-start;
+}
+
+.artifacts-list {
+  width: 220px;
+  flex-shrink: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.artifact-item {
+  display: flex;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 6px 10px;
+  border-radius: var(--radius-sm);
+  cursor: pointer;
+  font-size: 12px;
+  font-family: var(--font-mono);
+}
+
+.artifact-item:hover {
+  background-color: var(--bg-hover);
+}
+
+.artifact-item.active {
+  background-color: var(--accent-blue-bg);
+}
+
+.artifact-viewer {
+  flex: 1;
+  min-width: 0;
+}
+
+.chat-artifacts-bar {
+  display: flex;
+  justify-content: flex-end;
+  margin-bottom: 10px;
+}
+
 /* Diff View */
 .diff-block {
   margin-bottom: 20px;

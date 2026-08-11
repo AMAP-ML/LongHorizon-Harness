@@ -13,14 +13,17 @@ const PHASES = ["intake", "survey", "plan", "pilot", "research", "execute", "ass
 const state = {
   snapshot: { attached: false, runs: [], control_enabled: true },
   sidebarTab: "sessions", // 'sessions' | 'subagents' | 'phases' -- navigation only; all detail views open in the right-side workbench (see workbenchTab)
-  workbenchTab: "code",   // 'code' | 'tree' | 'agent' | 'contract' | 'spec' | 'spine' | 'assembly' | 'terminal'
+  workbenchTab: "tree",   // 'tree' | 'code' | 'agent' | 'contract' | 'spec' | 'spine' | 'assembly' | 'terminal' -- Task Tree is the default view
   selectedNode: null,
   nodeDetail: null,
   nodeSubagent: null,
   nodeDetailLoading: false,
-  agentTab: "overview", // 'overview' | 'artifact' | 'diff' | 'chat' -- sub-tabs within the right workbench's Agent tab
+  agentTab: "overview", // 'overview' | 'artifact' | 'artifacts' | 'diff' | 'chat' -- sub-tabs within the right workbench's Agent tab
   nodeDiff: null,        // [{tag, lines}] once loaded, keyed to selectedNode
   nodeThinking: null,    // [{role, text}] once loaded, keyed to selectedNode -- also the live chat feed for whichever agent is open, kept fresh by applySnapshot's isLive(selectedNode) refresh
+  artifactsDetail: null,      // owner node's /api/node/<id> detail (artifact + versions), keyed to artifactsOwnerId(selectedNode)
+  selectedArtifactTag: undefined, // undefined = not yet loaded/picked; null = "current" artifact; a version tag string otherwise
+  selectedArtifactText: null,
   mainAgentThinking: null, // {id, label, entries, live} -- "what's running right now," shown livestreamed in the main chat; see loadMainAgentThinking(). Independent of a specific subagent opened in the right panel's Agent tab, which keeps its own history regardless of what's currently live.
   newRunOpen: false,
   busy: false,
@@ -259,6 +262,18 @@ function renderAgentChatEntry(e) {
 // renderCenterStream's history-merge comment for the ordering bug that
 // caused. Styling it here instead means it's still visually distinct, but
 // sits at its real place in history.
+// Friendlier author label for the run's lifecycle events -- "updates like
+// phase completed, phase started, subagent spawned" per the operator's ask,
+// rather than the raw events.jsonl `type` string.
+const _EVENT_LABEL = {
+  phase_started: "▶️ Phase started",
+  phase_done: "✅ Phase completed",
+  node_dispatched: "🚀 Subagent spawned",
+  node_redispatched: "🔁 Subagent re-dispatched",
+  session_captured: "🔗 Subagent session attached",
+  episode_completed: "🏁 Subagent finished",
+};
+
 function renderEventEntry(ev) {
   const isAutoResume = ev.type === "phase_auto_resuming";
   const isFailure = ev.type === "phase_failed" || ev.type === "run_escalated" || (ev.type === "phase_done" && ev.status === "escalated");
@@ -277,9 +292,10 @@ function renderEventEntry(ev) {
   } else if (ev.error) {
     msgText += ` — Error: "${ev.error}"`;
   }
+  const author = isAutoResume ? "🔄 Auto-Resume" : (_EVENT_LABEL[ev.type] || "Event");
   return el("div", { class: "stream-msg agent", style: isAutoResume ? "border-left: 3px solid var(--accent-amber); background: rgba(245, 158, 11, 0.05);" : "" }, [
     el("div", { class: "msg-hdr" }, [
-      el("span", { class: "author", style: isAutoResume ? "color:var(--accent-amber);" : "" }, isAutoResume ? "🔄 Auto-Resume" : "Event"),
+      el("span", { class: "author", style: isAutoResume ? "color:var(--accent-amber);" : "" }, author),
       el("span", null, fmtTime(ev.ts)),
       ev.node_id && ev.node_id !== "-" ? el("span", { class: "node-link", onclick: () => openNode(ev.node_id) }, ev.node_id) : null,
     ]),
@@ -442,6 +458,8 @@ function renderSidebar() {
             class: "run-item" + (r.attached ? " active" : ""),
             onclick: () => guarded(() => {
               state.targetAgentManual = false; // resume auto-following the live subagent in the new run
+              state.selectedNode = null;
+              state.workbenchTab = "tree"; // Task Tree is the default view for whichever run is attached
               return apiPost("/api/attach", { run_id: r.id });
             }),
           }, [
@@ -591,7 +609,8 @@ function renderCenterStream() {
         el("span", null, `🤖 ${mainAgent.label}`),
         mainAgent.live ? el("span", { class: "badge", "data-status": "running" }, "live") : null,
         el("span", { class: "divider-line" }),
-        el("span", { class: "node-link", onclick: () => openNode(mainAgent.id) }, "open in Agent tab"),
+        el("span", { class: "node-link", onclick: () => openNode(mainAgent.id, "chat") }, "open in Agent tab"),
+        el("span", { class: "node-link", onclick: () => openNode(mainAgent.id, "artifacts") }, "📁 Artifacts"),
       ])
     );
     const entries = mainAgent.entries || [];
@@ -758,6 +777,8 @@ async function handlePromptSubmit() {
   } else {
     const res = await apiPost("/api/runs", { goal: text });
     state.promptText = "";
+    state.selectedNode = null;
+    state.workbenchTab = "tree";
     showToast(`Started run ${res.run_id}`);
   }
 }
@@ -767,9 +788,9 @@ async function handlePromptSubmit() {
 // ---------------------------------------------------------------------
 function renderRightWorkbench() {
   const wbTabs = [
-    ["code", "💻 Code & Artifacts"],
     ["tree", "🌳 Task Tree"],
     ["agent", "🤖 Agent"],
+    ["code", "💻 Code & Artifacts"],
     ["contract", "📜 Contract"],
     ["spec", "📋 Spec"],
     ["spine", "🦴 Spine"],
@@ -840,14 +861,17 @@ function fetchWorkbenchData(id) {
 // ---------------------------------------------------------------------
 // Node / Subagent Detail Drawer
 // ---------------------------------------------------------------------
-function openNode(id) {
+function openNode(id, tab) {
   state.selectedNode = id;
   state.nodeDetail = null;
   state.nodeSubagent = null;
   state.nodeDiff = null;
   state.nodeThinking = null;
   state.nodeDetailLoading = true;
-  state.agentTab = "overview";
+  state.agentTab = tab || "overview";
+  state.artifactsDetail = null;
+  state.selectedArtifactTag = undefined;
+  state.selectedArtifactText = null;
   state.workbenchTab = "agent"; // every detail view opens on the right, never a floating overlay
   render();
   apiGet(`/api/node/${encodeURIComponent(id)}`)
@@ -863,8 +887,18 @@ function closeNode() {
   state.selectedNode = null;
   state.nodeDetail = null;
   state.nodeSubagent = null;
-  state.workbenchTab = "code";
+  state.workbenchTab = "tree"; // Task Tree is the default/resting view of the right column
   render();
+}
+
+// A repair/research subagent's derived id ("<node>~repair1", "<node>~research~slug")
+// doesn't own its own artifact -- repairs land on the same real out/<node>.md
+// as their parent tree node once they pass, and pre-repair snapshots live
+// under out/.versions/<node>/ keyed by that same parent id. So "this agent's
+// artifacts" always resolves through the owning tree node's id.
+function artifactsOwnerId(id) {
+  const idx = (id || "").indexOf("~");
+  return idx === -1 ? id : id.slice(0, idx);
 }
 
 function isLive(id) {
@@ -982,6 +1016,59 @@ function renderArtifactTab() {
   return el("pre", { class: "blob" }, d.artifact || "(empty)");
 }
 
+// "Artifacts" — every artifact file this agent's owning tree node has ever
+// produced: the current out/<node>.md plus each pre-repair snapshot,
+// picked from a list and viewed right here in the right column.
+function loadArtifactsIfNeeded() {
+  if (state.artifactsDetail !== null) return;
+  const ownerId = artifactsOwnerId(state.selectedNode);
+  state.artifactsDetail = "loading";
+  apiGet(`/api/node/${encodeURIComponent(ownerId)}`)
+    .then((d) => { state.artifactsDetail = d; render(); })
+    .catch(() => { state.artifactsDetail = {}; render(); });
+}
+
+function loadArtifactText(ownerId, tag) {
+  state.selectedArtifactTag = tag;
+  state.selectedArtifactText = "loading";
+  render();
+  const req = tag
+    ? apiGet(`/api/node/${encodeURIComponent(ownerId)}/version/${encodeURIComponent(tag)}`)
+    : apiGet(`/api/node/${encodeURIComponent(ownerId)}/artifact`);
+  req
+    .then((d) => { state.selectedArtifactText = d.text || "(empty)"; render(); })
+    .catch(() => { state.selectedArtifactText = "(failed to load)"; render(); });
+}
+
+function renderArtifactsTab() {
+  loadArtifactsIfNeeded();
+  const d = state.artifactsDetail;
+  if (d === "loading" || d === null) return el("div", { class: "empty-state" }, "Loading artifacts…");
+  const ownerId = artifactsOwnerId(state.selectedNode);
+  const items = [];
+  if (d.artifact) items.push({ tag: null, label: "current", meta: `${d.artifact_tokens || 0} tok` });
+  (d.versions || []).slice().reverse().forEach((v) => items.push({ tag: v, label: v, meta: "pre-repair snapshot" }));
+  if (!items.length) return el("div", { class: "empty-state" }, "(no artifacts generated yet)");
+
+  const list = el("div", { class: "artifacts-list" }, items.map((it) =>
+    el("div", {
+      class: "artifact-item" + (state.selectedArtifactTag === it.tag ? " active" : ""),
+      onclick: () => loadArtifactText(ownerId, it.tag),
+    }, [
+      el("span", null, it.label),
+      el("span", { class: "dim" }, it.meta),
+    ])
+  ));
+  const viewer = el(
+    "div",
+    { class: "artifact-viewer" },
+    state.selectedArtifactTag === undefined
+      ? el("div", { class: "empty-state" }, "Select an artifact on the left to view its content.")
+      : el("pre", { class: "blob" }, state.selectedArtifactText === "loading" ? "Loading…" : state.selectedArtifactText)
+  );
+  return el("div", { class: "artifacts-pane" }, [list, viewer]);
+}
+
 function renderDiffTab() {
   loadDiffIfNeeded();
   if (state.nodeDiff === "loading" || state.nodeDiff === null) return el("div", { class: "empty-state" }, "Loading diff…");
@@ -1002,9 +1089,12 @@ function renderDiffTab() {
 // fresh while the opened node is live -- see applySnapshot).
 function renderAgentChatTab() {
   loadThinkingIfNeeded();
-  if (state.nodeThinking === "loading" || state.nodeThinking === null) return el("div", { class: "empty-state" }, "Loading chat…");
-  if (!state.nodeThinking.length) return el("div", { class: "empty-state" }, "(no messages yet)");
-  return el("div", { class: "agent-chat-log" }, state.nodeThinking.map(renderAgentChatEntry));
+  const artifactsBar = el("div", { class: "chat-artifacts-bar" }, [
+    el("button", { class: "xs-btn", onclick: () => { state.agentTab = "artifacts"; render(); } }, "📁 Artifacts"),
+  ]);
+  if (state.nodeThinking === "loading" || state.nodeThinking === null) return el("div", null, [artifactsBar, el("div", { class: "empty-state" }, "Loading chat…")]);
+  if (!state.nodeThinking.length) return el("div", null, [artifactsBar, el("div", { class: "empty-state" }, "(no messages yet)")]);
+  return el("div", null, [artifactsBar, el("div", { class: "agent-chat-log" }, state.nodeThinking.map(renderAgentChatEntry))]);
 }
 
 // The right workbench's Agent tab: a specific node or subagent's full
@@ -1020,6 +1110,7 @@ function renderAgentTab() {
   const tabs = [
     ["overview", "Overview"],
     ["artifact", "Artifact"],
+    ["artifacts", "📁 Artifacts"],
     ["diff", "Diff"],
     ["chat", "Chat"],
   ];
@@ -1033,6 +1124,7 @@ function renderAgentTab() {
     body = el("div", { class: "empty-state" }, "Loading…");
   } else if (state.agentTab === "overview") body = renderOverview();
   else if (state.agentTab === "artifact") body = renderArtifactTab();
+  else if (state.agentTab === "artifacts") body = renderArtifactsTab();
   else if (state.agentTab === "diff") body = renderDiffTab();
   else body = renderAgentChatTab();
 
@@ -1102,11 +1194,28 @@ function buildNodeTreeIndex(nodes) {
   return root;
 }
 
+// Every subagent episode dispatched under a tree node's id -- the node
+// itself (a Writer dispatch, id === node.id) plus any repair/research
+// children (derived ids "<node>~repair1", "<node>~research~slug").
+function findAttachedSubagents(nodeId) {
+  const subs = state.snapshot.subagents || [];
+  return subs.filter((s) => s.id === nodeId || s.id.startsWith(nodeId + "~"));
+}
+
+function liveBadge() {
+  // Reuses the "running" badge color (see style.css's data-status rules)
+  // under a more literal "live" label for the tree's attached-subagent dot.
+  return el("span", { class: "badge", "data-status": "running" }, "● live");
+}
+
 function renderTreeBranch(branch, depth) {
   const rows = [];
   for (const [part, child] of branch.children) {
     const n = child.node;
     const hasKids = child.children.size > 0;
+    const attached = n ? findAttachedSubagents(n.id) : [];
+    const liveSub = attached.find((s) => s.live);
+    const lastSub = attached.length ? attached[attached.length - 1] : null;
     rows.push(
       el(
         "div",
@@ -1120,6 +1229,17 @@ function renderTreeBranch(branch, depth) {
           el("span", { class: "tree-label" }, part),
           n ? badge(n.status) : null,
           n && n.shape ? el("span", { class: "dim", style: "font-size:11px; margin-left:6px;" }, n.shape) : null,
+          liveSub
+            ? el("span", {
+                onclick: (e) => { e.stopPropagation(); openNode(liveSub.id, "chat"); },
+                title: `subagent ${liveSub.id} is running -- click to open its chat`,
+              }, liveBadge())
+            : lastSub
+              ? el("span", { title: `subagent ${lastSub.id}: ${lastSub.status}` }, badge(lastSub.status))
+              : null,
+          n && n.artifact_count
+            ? el("span", { class: "dim tree-artifact-count", title: "artifacts generated" }, `📄 ${n.artifact_count}`)
+            : null,
         ]
       )
     );
@@ -1177,6 +1297,8 @@ function renderNewRunModal() {
     });
     state.newRunOpen = false;
     resetNewRunDraft();
+    state.selectedNode = null;
+    state.workbenchTab = "tree";
     showToast(`Started run ${res.run_id}`);
   }) }, "Start Run");
 
