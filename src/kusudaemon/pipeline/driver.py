@@ -66,7 +66,7 @@ from ..v1.reviewer import ReviewVerdict
 from ..v1.round_loop import run_round_loop
 from ..v1.tree import TaskNode, TaskTree
 from ..v2.contract import ContractRule, freeze_contract
-from ..v2.intake import GlobalRubric, render_spec_md, run_intake
+from ..v2.intake import GlobalRubric, IntakeObjection, IntakeQuestion, render_spec_md, run_intake
 from ..v2.pilot import (
     approve_pilot,
     run_pilot,
@@ -575,7 +575,10 @@ class RecursiveDriver:
             )
             self._write_minimal_spec(goal)
             return
-        run_intake(self.run_dir, goal, self.provider, self._answer_intake)
+        estimate = self._read_tier_record().get("estimate") or {}
+        ambiguities = [str(item) for item in (estimate.get("ambiguities") or [])]
+        objections = [str(item) for item in (estimate.get("objections") or [])]
+        run_intake(self.run_dir, goal, ambiguities, objections, self.provider, self._ask_intake_round)
 
     def _write_minimal_spec(self, goal: str) -> None:
         rubric = GlobalRubric(
@@ -589,19 +592,44 @@ class RecursiveDriver:
         )
         spec_path(self.run_dir).write_text(render_spec_md(rubric), encoding="utf-8")
 
-    def _answer_intake(self, question: str, dimension: str) -> str:
-        """§11.9: the approval is keyed on the rubric dimension, so a resume
-        that restarts the question loop reuses *that dimension's* pending
-        record instead of handing the next-dimension question whatever
-        answer is still sitting in the file."""
+    def _ask_intake_round(
+        self,
+        round_index: int,
+        questions: tuple[IntakeQuestion, ...],
+        objections: tuple[IntakeObjection, ...],
+    ) -> dict[str, str]:
+        """PLAN.md §A5.3/§B3: one approval carries every question in the
+        round — a form, not one blocking prompt per question (the design
+        this superseded, keyed one approval per rubric *dimension*, seven
+        of them). Keyed on ``round`` (not on any single question's id) so a
+        resume that restarts intake reuses this round's own pending record
+        (§11.9's reasoning, carried over) rather than stacking a duplicate.
+        Objections ride along in the message body — they are shown to the
+        operator here even though only the questions themselves are
+        individually answerable; see ``v2.intake.run_intake``'s docstring
+        for why that's the whole mechanism rather than a per-objection
+        acknowledge action."""
+        lines: list[str] = []
+        if objections:
+            lines.append("Objections raised by scope estimation:")
+            for objection in objections:
+                detail = f" — {objection.why}" if objection.why else ""
+                options = f" (options: {', '.join(objection.options)})" if objection.options else ""
+                lines.append(f"- {objection.claim}{detail}{options}")
+            lines.append("")
+        if questions:
+            lines.append("Questions (leave blank to accept the stated default assumption):")
+            for question in questions:
+                default = f" [default if unanswered: {question.default_assumption}]" if question.default_assumption else ""
+                lines.append(f"- [{question.id}] {question.text}{default}")
         approval = self._ask(
-            "intake_question",
-            title="Intake question",
-            message=question,
-            input_label="Your answer",
-            context={"dimension": dimension},
+            "intake_questions",
+            title=f"Intake round {round_index}",
+            message="\n".join(lines),
+            context={"round": round_index},
+            questions=[{"id": question.id, "text": question.text} for question in questions],
         )
-        return approval.user_input.strip()
+        return dict(approval.answers)
 
     async def _phase_survey(self) -> None:
         from ..v2.embeddings import embeddings_available
@@ -1047,15 +1075,22 @@ class RecursiveDriver:
         message: str,
         input_label: str = "",
         context: dict[str, Any] | None = None,
+        questions: list[dict[str, str]] | None = None,
     ) -> Any:
         """Create (or reuse the unanswered) pending approval for (kind,
-        context) and block until any surface resolves it."""
+        context) and block until any surface resolves it. ``questions``
+        (PLAN.md §A5/§B3) turns this into a batch-form approval — every
+        question of one intake round in a single record — instead of the
+        plain single free-text prompt every other ``kind`` still uses."""
         context = context or {}
         existing = approval_store.find_pending(self.run_dir, kind=kind, **context)
-        approval = existing or self._create_approval(kind, title=title, message=message, input_label=input_label, context=context)
+        approval = existing or self._create_approval(
+            kind, title=title, message=message, input_label=input_label,
+            context=context, questions=questions,
+        )
         current_phase = _read_phase(self.run_dir).get("phase", "intake")
-        dim_info = f" ({context['dimension']})" if context and "dimension" in context else ""
-        self._set_phase(current_phase, "waiting_for_approval", detail=f"Waiting for approval: {title}{dim_info}")
+        extra = f" ({context['round']})" if context and "round" in context else ""
+        self._set_phase(current_phase, "waiting_for_approval", detail=f"Waiting for approval: {title}{extra}")
         try:
             res = approval_store.wait_for_resolution(
                 self.run_dir, approval.approval_id, poll_interval=self.poll_interval
@@ -1064,9 +1099,13 @@ class RecursiveDriver:
             self._set_phase(current_phase, _IN_PROGRESS, detail="")
         return res
 
-    def _create_approval(self, kind: str, *, title: str, message: str, input_label: str, context: dict[str, Any]):
+    def _create_approval(
+        self, kind: str, *, title: str, message: str, input_label: str,
+        context: dict[str, Any], questions: list[dict[str, str]] | None = None,
+    ):
         record = approval_store.Approval.create(
-            kind, title=title, message=message, input_label=input_label, context=context
+            kind, title=title, message=message, input_label=input_label, context=context,
+            questions=questions,
         )
         approval_store.append(self.run_dir, record)
         self._log(

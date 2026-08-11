@@ -16,9 +16,13 @@ from pathlib import Path
 
 _REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(_REPO_ROOT / "src"))
+sys.path.insert(0, str(_REPO_ROOT / "tests" / "fixtures"))
 
+from fake_provider import FakeProvider  # noqa: E402
+from kusudaemon.pipeline import approvals as approval_store  # noqa: E402
 from kusudaemon.pipeline.driver import RecursiveDriver, RunOptions, escalate_run  # noqa: E402
 from kusudaemon.pipeline.run_dir import run_spec_path, tier_path  # noqa: E402
+from kusudaemon.v0.run_dir import create_run_dir, spec_path  # noqa: E402
 from kusudaemon.v1.tree import TaskNode  # noqa: E402
 from kusudaemon.v6.work_object import measure_workspace  # noqa: E402
 
@@ -538,6 +542,111 @@ class PhaseDoneClassifyExploreTest(unittest.TestCase):
             (driver.run_dir / "spine.json").write_text("[]", encoding="utf-8")
             self.assertTrue(driver._phase_done("explore"))
             self.assertTrue(driver._phase_done("survey"))
+
+
+class PhaseIntakeAdaptiveTest(unittest.TestCase):
+    """PLAN.md §A5/§B3: _phase_intake routes to the new adaptive intake
+    (v2/intake.py's run_intake) fed the classify estimate's own
+    ambiguities/objections when tier.json's needs_intake is True, and stays
+    on the existing zero-call _write_minimal_spec path, unaffected, when
+    it's False."""
+
+    def _driver(self, run_dir: Path, provider: FakeProvider) -> RecursiveDriver:
+        return RecursiveDriver(
+            run_dir,
+            provider=provider,  # type: ignore[arg-type]
+            options=RunOptions(goal="ambiguous goal"),
+            writer_adapter_factory=lambda node: (_ for _ in ()).throw(
+                AssertionError("no writer dispatch expected")
+            ),
+            research_adapter_factory=lambda node, query: (_ for _ in ()).throw(
+                AssertionError("no research dispatch expected")
+            ),
+            poll_interval=0.02,
+        )
+
+    def test_skip_path_is_unaffected_zero_calls_goal_section_present(self) -> None:
+        import asyncio
+
+        async def scenario() -> None:
+            with tempfile.TemporaryDirectory() as root_str:
+                run_dir = Path(root_str) / "run"
+                create_run_dir(run_dir.parent, run_dir.name)
+                tier_path(run_dir).write_text(
+                    json.dumps({"tier": "T0", "needs_intake": False, "estimate": {}, "ts": 0}),
+                    encoding="utf-8",
+                )
+                provider = FakeProvider([])
+                driver = self._driver(run_dir, provider)
+                await driver._phase_intake()
+                self.assertEqual(len(provider.calls), 0)
+                text = spec_path(driver.run_dir).read_text(encoding="utf-8")
+                self.assertIn("## Goal", text)
+
+        asyncio.run(scenario())
+
+    def test_needs_intake_feeds_the_estimates_own_ambiguities_and_objections(self) -> None:
+        import asyncio
+
+        async def scenario() -> None:
+            with tempfile.TemporaryDirectory() as root_str:
+                run_dir = Path(root_str) / "run"
+                create_run_dir(run_dir.parent, run_dir.name)
+                tier_path(run_dir).write_text(
+                    json.dumps(
+                        {
+                            "tier": "T2",
+                            "needs_intake": True,
+                            "estimate": {
+                                "ambiguities": ["which module does this touch?"],
+                                "objections": ["conflicting scope instructions"],
+                            },
+                            "ts": 0,
+                        }
+                    ),
+                    encoding="utf-8",
+                )
+                # round 1 asks one question; round 2 (eligible once round 1
+                # gets a non-blank answer, §A5.4) returns none and ends
+                # intake -- exactly the "worst case" shape test_v2_intake.py
+                # already covers in isolation, exercised here end-to-end
+                # through the driver's own approval plumbing.
+                provider = FakeProvider(
+                    [
+                        {
+                            "questions": [
+                                {
+                                    "id": "q1",
+                                    "text": "Which module does this touch?",
+                                    "default_assumption": "the whole repo",
+                                }
+                            ],
+                            "objections": [],
+                        },
+                        {"questions": [], "objections": []},
+                    ]
+                )
+                driver = self._driver(run_dir, provider)
+                with approval_store.Approver(
+                    run_dir, poll_interval=0.02, answers={"q1": "the auth module"}
+                ):
+                    await driver._phase_intake()
+
+                self.assertEqual(len(provider.calls), 2)
+                sent_messages = provider.calls[0][0]
+                joined = "\n".join(m["content"] for m in sent_messages)
+                self.assertIn("which module does this touch?", joined)
+                self.assertIn("conflicting scope instructions", joined)
+
+                text = spec_path(driver.run_dir).read_text(encoding="utf-8")
+                self.assertIn("the auth module", text)
+
+                approvals = approval_store.read_all(run_dir)
+                self.assertEqual(len(approvals), 1)  # one approval for the whole round
+                self.assertEqual(approvals[0].kind, "intake_questions")
+                self.assertEqual(len(approvals[0].questions), 1)
+
+        asyncio.run(scenario())
 
 
 class RunOptionsTierOverrideRoundTripTest(unittest.TestCase):
