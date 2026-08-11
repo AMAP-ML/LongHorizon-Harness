@@ -354,7 +354,30 @@ code plainly says is not repeated.
   returns, since a crash can land any time after that line hits disk.
   Deliberately **does not** write `manifest.jsonl` — a lone Writer has no
   gates to evaluate, so the manifest line is written by whoever ran gates
-  (v1's round loop).
+  (v1's round loop). **§11.10.17 (2026-08-10 fix): the post-episode
+  artifact write no longer clobbers content the agent already wrote
+  itself.** gptme's own `save`/`patch` tool calls write the real artifact
+  directly to `out/<node>.md` mid-episode (its workspace cwd *is* this
+  `run_dir`) — but `run_node` used to unconditionally overwrite that same
+  path afterward with `assistant_visible_output or actions_log or ""`, a
+  leftover from the deleted Claude Code/Codex adapters where "the last
+  message becomes the artifact" was the *only* way an episode produced
+  output. For gptme this is actively destructive: an episode that crashed
+  right after printing its one bootstrap `{"type": "logdir", ...}` debug
+  line (before any real assistant message) left `actions_log` as just that
+  single diagnostic line, which then got stamped into the artifact as if it
+  were real content — corrupting the pilot approval card (§4.4) and any
+  later gate/reviewer read with raw protocol JSON instead of an honest
+  empty artifact. Now: if the artifact path already has non-blank content,
+  it's left alone entirely. Otherwise the fallback only writes
+  `assistant_visible_output` (a real parsed prose message, still valid for
+  an agent that talks instead of saving) or, when `cli_agent.py`'s
+  `actions_log_diagnostics_only` flag says a structured parser exists but
+  found nothing, an empty string rather than raw log noise — so a genuinely
+  failed episode now correctly fails the `nonempty` gate with a clean
+  signal instead of a fake pass. An adapter with no parser at all (the fake
+  test CLIs) is unaffected: `diagnostics_only` is `False` for them, so they
+  keep falling back to raw `actions_log` exactly as before.
 
 Event vocabulary: `node_dispatched`, `session_captured`, `episode_completed`,
 `node_redispatched` (`reason`: `resumed_session` | `no_session_captured` |
@@ -602,6 +625,30 @@ prompt, not that node's own handoff).
   flips `completed`/`status` off the real `"episode_completed"`) to
   `"episode_completed"`, so this pseudo-agent's dashboard status resolves
   to "done" instead of sitting on "running" forever.
+  **2026-08-10, explorer thinking:** the operator's follow-up complaint —
+  "this is a subagent, I can't see any thinking" — was weighed against §3's
+  actual invariant (only the Writer gets a tool loop; Survey/Planner/
+  Reviewer are deliberately plain text-in/JSON-out calls) and resolved as
+  "surface thinking, stay non-interactive" rather than promoting the
+  explorer to a real gptme episode, which would change survey's cost and
+  behavior for a UI-only complaint. `v1/provider.py`'s `complete_json`
+  gained an opt-in `on_reasoning: Callable[[str], None] | None` — called
+  with the endpoint's `reasoning_content` (§12) right after each raw
+  response, before JSON parsing/validation, so it fires even on a retry.
+  `v2/survey.py`'s `survey_chunks` threads the same parameter straight
+  through to every windowed `complete_json` call, unopinionated about what
+  it's for. `_phase_survey` is the only caller that supplies one — only
+  when `subagent_id` is set (the large-corpus path) — via
+  `_append_explorer_reasoning`, which appends one
+  `{"type": "reasoning", "content": ...}` line to `explore-01`'s own
+  `scratch/explore-01/trace.jsonl`. That exact `type` is already handled by
+  `rendering.parse_trace` (it was built for a real gptme trace but never
+  assumed one) as a "thinking" entry, so the dashboard's Chat tab renders
+  it with zero changes on that side. No `logdir` line is ever written for
+  it, so `live` correctly stays `False` and the existing "not currently
+  running" / "nothing to message" messaging (the `role === "explorer"`
+  special-case in `renderOverview`, above) still applies — this is
+  thinking-visible, still deliberately non-interactive.
 - `approvals.py` — the cross-process human gate. Append-only
   `approvals.jsonl`, latest record per `approval_id` wins; resume **reuses**
   the unanswered record instead of stacking duplicates.

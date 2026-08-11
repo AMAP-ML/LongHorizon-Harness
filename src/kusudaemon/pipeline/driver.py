@@ -42,7 +42,7 @@ from ..environment.base import Environment
 from ..types import EpisodeBudget
 from ..v0.events import EventLog
 from ..v0.run_dir import write_text_atomic
-from ..v0.run_dir import create_run_dir, events_path, manifest_path, node_artifact_path, spec_path
+from ..v0.run_dir import create_run_dir, ensure_node_trace_path, events_path, manifest_path, node_artifact_path, spec_path
 from ..v1.provider import OpenAICompatibleProvider
 from ..v1.reviewer import ReviewVerdict
 from ..v1.round_loop import run_round_loop
@@ -386,7 +386,21 @@ class RecursiveDriver:
                                 ),
                             }
                         )
-                    votes = survey_chunks(chunks, self.provider)
+                    # This wraps plain provider.complete_json calls, not a
+                    # gptme episode -- deliberately not interactive (§3:
+                    # only the Writer needs a tool loop). But the model may
+                    # still return reasoning_content alongside its JSON vote
+                    # (§12), and that was previously discarded entirely,
+                    # leaving the dashboard's explore-01 card with nothing to
+                    # show. Surface it (thinking only, no tool loop) the same
+                    # way a real gptme trace does, so the Chat tab renders it
+                    # without any dashboard-side changes.
+                    on_reasoning = (
+                        (lambda text: self._append_explorer_reasoning(subagent_id, text))
+                        if subagent_id
+                        else None
+                    )
+                    votes = survey_chunks(chunks, self.provider, on_reasoning=on_reasoning)
             finally:
                 if subagent_id:
                     # "episode_completed", not the made-up "session_ended" this
@@ -629,6 +643,18 @@ class RecursiveDriver:
         phase_path(self.run_dir).write_text(
             json.dumps(payload, ensure_ascii=False, sort_keys=True) + "\n", encoding="utf-8"
         )
+
+    def _append_explorer_reasoning(self, node_id: str, text: str) -> None:
+        """Append one ``{"type": "reasoning", ...}`` line to the explorer
+        pseudo-agent's trace.jsonl -- ``rendering.parse_trace`` already
+        turns that exact type into a "thinking" chat entry (same code path
+        a real gptme trace uses), so the dashboard's existing Chat tab
+        renders it with no changes on that side. Not fsync'd like
+        events.jsonl: a lost reasoning line on a crash is cosmetic, unlike
+        losing which node was dispatched."""
+        trace_path = ensure_node_trace_path(self.run_dir, node_id)
+        with trace_path.open("a", encoding="utf-8") as fh:
+            fh.write(json.dumps({"type": "reasoning", "content": text}, ensure_ascii=False) + "\n")
 
     def _halted(self) -> bool:
         return halt_path(self.run_dir).exists()

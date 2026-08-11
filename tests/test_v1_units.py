@@ -343,6 +343,41 @@ class ProviderStructuredOutputTest(unittest.TestCase):
         self.assertEqual(result, {"action": "stop"})
         self.assertEqual(len(calls), 2)
 
+    def test_on_reasoning_receives_reasoning_content_alongside_the_json(self) -> None:
+        # §12: reasoning arrives as reasoning_content alongside content --
+        # complete_json used to discard it entirely, leaving callers like
+        # survey's explorer pseudo-agent with nothing to surface as
+        # "thinking". on_reasoning is the opt-in hook that lets a caller
+        # capture it without changing complete_json's return value.
+        def transport(url, payload, headers):
+            return {
+                "choices": [
+                    {
+                        "message": {
+                            "content": '{"action": "go"}',
+                            "reasoning_content": "weighing go vs stop...",
+                        }
+                    }
+                ]
+            }
+
+        captured: list[str] = []
+        provider = OpenAICompatibleProvider(transport=transport, api_key="unused")
+        result = provider.complete_json(
+            [{"role": "user", "content": "hi"}], self.SCHEMA, on_reasoning=captured.append
+        )
+        self.assertEqual(result, {"action": "go"})
+        self.assertEqual(captured, ["weighing go vs stop..."])
+
+    def test_on_reasoning_is_not_called_when_the_endpoint_sends_none(self) -> None:
+        def transport(url, payload, headers):
+            return {"choices": [{"message": {"content": '{"action": "go"}'}}]}
+
+        captured: list[str] = []
+        provider = OpenAICompatibleProvider(transport=transport, api_key="unused")
+        provider.complete_json([{"role": "user", "content": "hi"}], self.SCHEMA, on_reasoning=captured.append)
+        self.assertEqual(captured, [])
+
     def test_gives_up_after_exhausting_retries(self) -> None:
         def transport(url, payload, headers):
             return {"choices": [{"message": {"content": "still not json"}}]}

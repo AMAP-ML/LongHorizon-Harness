@@ -69,6 +69,27 @@ class SurveyChunksTest(unittest.TestCase):
         self.assertEqual(len(provider.calls), 1)
         self.assertEqual(votes, [BoundaryVote(boundary_after=2, label="shift", confidence=0.9)])
 
+    def test_on_reasoning_is_forwarded_to_each_window_call(self) -> None:
+        # survey_chunks itself never inspects reasoning -- it just has to
+        # pass the caller's hook through to every complete_json call
+        # unchanged, so the driver's explore-01 pseudo-agent (§12) can
+        # capture reasoning per window without survey.py knowing anything
+        # about the dashboard.
+        class _RecordingProvider:
+            def __init__(self) -> None:
+                self.on_reasoning_seen: list[object] = []
+
+            def complete_json(self, messages, schema, *, temperature=0.0, retries=2, on_reasoning=None):
+                self.on_reasoning_seen.append(on_reasoning)
+                return {"boundaries": []}
+
+        chunks = self._chunks(20)
+        provider = _RecordingProvider()
+        sentinel = lambda text: None  # noqa: E731
+        survey_chunks(chunks, provider, window_size=12, stride=8, on_reasoning=sentinel)
+        self.assertGreater(len(provider.on_reasoning_seen), 1)
+        self.assertTrue(all(seen is sentinel for seen in provider.on_reasoning_seen))
+
     def test_multiple_windows_convert_local_to_global_indices(self) -> None:
         chunks = self._chunks(20)
         provider = FakeProvider(

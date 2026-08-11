@@ -104,6 +104,67 @@ class PhaseDetailPreservationTest(unittest.TestCase):
         asyncio.run(scenario())
 
 
+class ExplorerReasoningTest(unittest.TestCase):
+    """§11.10.17 companion: survey's large-corpus explore-01 pseudo-agent
+    wraps plain provider.complete_json calls, not a gptme episode -- by
+    design it stays non-interactive (§3: only the Writer needs a tool
+    loop). But it must surface whatever reasoning_content the model
+    returns, instead of discarding it, so the dashboard's Chat tab for
+    explore-01 has something to show."""
+
+    class _ReasoningProvider:
+        """Enough of OpenAICompatibleProvider's surface for _phase_survey's
+        windowed boundary voting: always votes an empty boundary list, and
+        always reports reasoning_content via on_reasoning if given."""
+
+        def __init__(self, reasoning_text: str) -> None:
+            self._reasoning_text = reasoning_text
+            self.on_reasoning_calls = 0
+
+        def complete_json(self, messages, schema, *, temperature=0.0, retries=2, on_reasoning=None):
+            if on_reasoning is not None:
+                on_reasoning(self._reasoning_text)
+                self.on_reasoning_calls += 1
+            return {"boundaries": []}
+
+    def test_reasoning_is_written_to_explorer_trace_for_a_large_corpus(self) -> None:
+        import asyncio
+
+        from kusudaemon.v0.run_dir import node_trace_path
+
+        async def scenario() -> None:
+            with tempfile.TemporaryDirectory() as root_str:
+                run_dir = Path(root_str) / "run"
+                # >50000 chars trips _phase_survey's is_large_corpus check,
+                # which is what spawns the explore-01 pseudo-agent at all;
+                # multiple headings are needed so chunk_text produces more
+                # than one chunk (survey_chunks makes zero calls otherwise).
+                long_source = "".join(f"## Section {i}\n" + ("word " * 2000) + "\n\n" for i in range(10))
+                provider = self._ReasoningProvider("weighing where this section ends...")
+                driver = RecursiveDriver(
+                    run_dir,
+                    provider=provider,  # type: ignore[arg-type]
+                    options=RunOptions(goal="test", source_text=long_source),
+                    writer_adapter_factory=lambda node: (_ for _ in ()).throw(
+                        AssertionError("no writer dispatch expected")
+                    ),
+                    research_adapter_factory=lambda node, query: (_ for _ in ()).throw(
+                        AssertionError("no research dispatch expected")
+                    ),
+                )
+                driver._write_source_and_spec()
+                await driver._phase_survey()
+
+                self.assertGreater(provider.on_reasoning_calls, 0)
+                trace_text = node_trace_path(driver.run_dir, "explore-01").read_text(encoding="utf-8")
+                lines = [json.loads(line) for line in trace_text.splitlines() if line.strip()]
+                self.assertTrue(lines, "expected at least one reasoning line in explore-01's trace")
+                self.assertTrue(all(line["type"] == "reasoning" for line in lines))
+                self.assertEqual(lines[0]["content"], "weighing where this section ends...")
+
+        asyncio.run(scenario())
+
+
 class CliDetachSourceTest(unittest.TestCase):
     """§11.10.8: --detach must not ship the corpus through argv — an inline
     corpus hits E2BIG before 'corpus-scale'. It is materialized into the run

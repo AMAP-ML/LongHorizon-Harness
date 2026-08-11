@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import sys
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "src"))
 
@@ -29,6 +29,7 @@ class FakeProvider:
         *,
         temperature: float = 0.0,
         retries: int = 2,
+        on_reasoning: Callable[[str], None] | None = None,
     ) -> dict[str, Any]:
         self.calls.append((messages, schema))
         if not self._responses:

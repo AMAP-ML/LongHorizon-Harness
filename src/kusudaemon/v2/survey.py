@@ -156,6 +156,7 @@ def survey_chunks(
     *,
     window_size: int = DEFAULT_WINDOW_SIZE,
     stride: int = DEFAULT_WINDOW_STRIDE,
+    on_reasoning: Callable[[str], None] | None = None,
 ) -> list[BoundaryVote]:
     """Walk ``chunks`` in overlapping windows of ``window_size`` (advancing
     by ``stride``), collecting one boundary-vote call per window. Each call's
@@ -173,7 +174,7 @@ def survey_chunks(
             {"role": "system", "content": _SURVEY_SYSTEM_PROMPT},
             {"role": "user", "content": _render_window(window)},
         ]
-        payload = provider.complete_json(messages, SURVEY_SCHEMA)
+        payload = provider.complete_json(messages, SURVEY_SCHEMA, on_reasoning=on_reasoning)
         for boundary in payload.get("boundaries", []):
             global_index = start + int(boundary["boundary_after"])
             if 0 <= global_index < len(chunks) - 1:

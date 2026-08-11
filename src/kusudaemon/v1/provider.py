@@ -138,6 +138,7 @@ class OpenAICompatibleProvider:
         *,
         temperature: float = 0.0,
         retries: int = _DEFAULT_STRUCTURED_RETRIES,
+        on_reasoning: Callable[[str], None] | None = None,
     ) -> dict[str, Any]:
         working_messages: list[dict[str, str]] = [
             {
@@ -183,7 +184,12 @@ class OpenAICompatibleProvider:
                     raise
                 use_format = False
                 raw = self._call(make_payload(with_format=False))
-            content = _first_choice_message(raw).get("content") or ""
+            message = _first_choice_message(raw)
+            if on_reasoning is not None:
+                reasoning = message.get("reasoning_content")
+                if reasoning:
+                    on_reasoning(reasoning)
+            content = message.get("content") or ""
             parsed, parse_error = _parse_json_object(content)
             if parsed is not None:
                 schema_errors = validate(parsed, schema)

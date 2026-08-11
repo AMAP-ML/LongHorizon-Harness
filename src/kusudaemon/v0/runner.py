@@ -133,8 +133,28 @@ async def run_node(
             await watcher
 
     artifact_path = node_artifact_path(run_dir, node_id)
-    artifact_text = result.metadata.get("assistant_visible_output") or result.actions_log or ""
-    artifact_path.write_text(artifact_text, encoding="utf-8")
+    # gptme writes the real artifact itself, mid-episode, via its own
+    # save/patch tool calls against this exact path (its workspace cwd is
+    # this run_dir) — so if the file already has content, that *is* the
+    # artifact and must never be clobbered by anything derived from the
+    # episode's raw output after the fact. Only fall back when the agent
+    # never actually wrote anything (crash, or an old adapter with no file
+    # tools that relies on "last message becomes the artifact").
+    existing = artifact_path.read_text(encoding="utf-8") if artifact_path.exists() else ""
+    if not existing.strip():
+        visible_output = result.metadata.get("assistant_visible_output") or ""
+        # actions_log_diagnostics_only (cli_agent.py) is set when an adapter
+        # *has* a structured visible-output parser (gptme's --output-format
+        # json) but it found no real assistant message — meaning actions_log
+        # is raw protocol/tool-call JSON, not prose, and must not be written
+        # as if it were content (this is exactly how a bare
+        # ``{"type": "logdir", ...}`` bootstrap line — everything printed
+        # before a crash mid-episode — used to end up masquerading as a
+        # node's artifact). An adapter with no parser at all (fake/test
+        # adapters) still falls back to the raw log, unchanged.
+        diagnostics_only = bool(result.metadata.get("actions_log_diagnostics_only"))
+        artifact_text = visible_output or ("" if diagnostics_only else result.actions_log)
+        artifact_path.write_text(artifact_text, encoding="utf-8")
 
     # v0 does not write manifest.jsonl: a single Writer node has no gates to
     # evaluate and no way to derive the PLAN.md §6 manifest schema. That

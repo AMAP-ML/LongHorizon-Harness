@@ -26,9 +26,9 @@ sys.path.insert(0, str(_REPO_ROOT / "tests" / "fixtures"))
 
 from fake_adapter import FakeStreamAgentAdapter  # noqa: E402
 from kusudaemon.environment.local import LocalEnvironment  # noqa: E402
-from kusudaemon.types import EpisodeBudget  # noqa: E402
+from kusudaemon.types import EpisodeBudget, EpisodeResult  # noqa: E402
 from kusudaemon.v0.events import EventLog  # noqa: E402
-from kusudaemon.v0.run_dir import create_run_dir, events_path  # noqa: E402
+from kusudaemon.v0.run_dir import create_run_dir, events_path, node_artifact_path  # noqa: E402
 from kusudaemon.v0.runner import _watch_for_session_id, run_node  # noqa: E402
 
 FAKE_CLI = _REPO_ROOT / "tests" / "fixtures" / "fake_stream_agent.py"
@@ -322,6 +322,102 @@ class ResumeAfterCompleteIsNoopTest(unittest.TestCase):
             )
             self.assertEqual(artifact_path.stat().st_mtime_ns, artifact_mtime_before)
             self.assertEqual(artifact_path.read_text(), artifact_text_before)
+
+
+class _CannedAdapter:
+    """A minimal AgentAdapter that returns a caller-supplied EpisodeResult,
+    optionally writing to the artifact path first (simulating gptme's own
+    save/patch tool call landing real content on disk mid-episode) --
+    exercises run_node's post-episode artifact handling without any real
+    subprocess or session-resume plumbing."""
+
+    def __init__(self, result: EpisodeResult, *, artifact_path=None, artifact_text: str | None = None) -> None:
+        self._result = result
+        self._artifact_path = artifact_path
+        self._artifact_text = artifact_text
+
+    async def run_episode(self, prompt, env, budget, live_trajectory_path=None, **kwargs):
+        if self._artifact_path is not None and self._artifact_text is not None:
+            self._artifact_path.parent.mkdir(parents=True, exist_ok=True)
+            self._artifact_path.write_text(self._artifact_text, encoding="utf-8")
+        return self._result
+
+
+class ArtifactNotClobberedTest(unittest.TestCase):
+    """§11.10.17 regression: run_node used to unconditionally overwrite
+    out/<node>.md with derived "visible output" after every episode, even
+    when the agent had already written the real artifact itself via its own
+    save/patch tool call to that exact path. A gptme episode that crashed
+    right after printing its one bootstrap `{"type": "logdir", ...}` debug
+    line (before any real assistant message) turned that single diagnostic
+    line into raw actions_log -- which then got stamped into the artifact
+    as if it were real content, corrupting the pilot approval card and any
+    later gate/reviewer read."""
+
+    def test_agent_written_artifact_survives_diagnostics_only_actions_log(self) -> None:
+        with tempfile.TemporaryDirectory() as root_str:
+            root = Path(root_str)
+            run_dir = create_run_dir(root, "run_clobber")
+            node_id = "writer_clobber"
+            artifact_path = node_artifact_path(run_dir, node_id)
+            real_text = "# Real section\n\nThe agent actually wrote this via save().\n"
+            result = EpisodeResult(
+                status="done",
+                actions_log='{"type": "logdir", "logdir": "/tmp/kusudaemon-gptme-abc123"}',
+                metadata={"assistant_visible_output": "", "actions_log_diagnostics_only": True},
+            )
+            adapter = _CannedAdapter(result, artifact_path=artifact_path, artifact_text=real_text)
+            env = LocalEnvironment(tmp_dir=str(root / "tmp"))
+            budget = EpisodeBudget(max_duration_seconds=30)
+
+            asyncio.run(run_node(run_dir, node_id, "do the task", adapter, env, budget))
+
+            self.assertEqual(artifact_path.read_text(encoding="utf-8"), real_text)
+
+    def test_diagnostics_only_actions_log_is_not_written_when_nothing_saved(self) -> None:
+        with tempfile.TemporaryDirectory() as root_str:
+            root = Path(root_str)
+            run_dir = create_run_dir(root, "run_crash")
+            node_id = "writer_crash"
+            artifact_path = node_artifact_path(run_dir, node_id)
+            result = EpisodeResult(
+                status="error",
+                actions_log='{"type": "logdir", "logdir": "/tmp/kusudaemon-gptme-def456"}',
+                metadata={"assistant_visible_output": "", "actions_log_diagnostics_only": True},
+                error="gptme worker error: RuntimeError: boom",
+            )
+            adapter = _CannedAdapter(result)  # never writes the artifact -- simulates a crash before save()
+            env = LocalEnvironment(tmp_dir=str(root / "tmp"))
+            budget = EpisodeBudget(max_duration_seconds=30)
+
+            asyncio.run(run_node(run_dir, node_id, "do the task", adapter, env, budget))
+
+            self.assertTrue(artifact_path.exists())
+            self.assertEqual(artifact_path.read_text(encoding="utf-8"), "")
+
+    def test_generic_adapter_without_a_parser_still_falls_back_to_actions_log(self) -> None:
+        # No visible_output_parser at all (an adapter with no structured
+        # output format, e.g. the fake test CLIs elsewhere in this file) must
+        # keep using raw actions_log as the artifact when nothing else is
+        # available -- diagnostics_only only suppresses the fallback when a
+        # parser exists and came up empty.
+        with tempfile.TemporaryDirectory() as root_str:
+            root = Path(root_str)
+            run_dir = create_run_dir(root, "run_generic")
+            node_id = "writer_generic"
+            artifact_path = node_artifact_path(run_dir, node_id)
+            result = EpisodeResult(
+                status="done",
+                actions_log="plain CLI transcript, no structured parser involved",
+                metadata={},
+            )
+            adapter = _CannedAdapter(result)
+            env = LocalEnvironment(tmp_dir=str(root / "tmp"))
+            budget = EpisodeBudget(max_duration_seconds=30)
+
+            asyncio.run(run_node(run_dir, node_id, "do the task", adapter, env, budget))
+
+            self.assertEqual(artifact_path.read_text(encoding="utf-8"), result.actions_log)
 
 
 class EventLogFsyncTest(unittest.TestCase):
