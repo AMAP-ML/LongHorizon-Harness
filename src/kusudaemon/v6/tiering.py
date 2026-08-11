@@ -288,6 +288,35 @@ _ESCALATION_TARGET: dict[str, Tier] = {
 }
 
 
+# PLAN.md §A4.3's table: T1 -> 2, T2 -> 6. T0 has no explore phase at all
+# (phases_for("T0") is classify/execute/verify — no "explore" entry), so
+# 0 here is not a real cap being exercised, just an honest value for a
+# tier that never calls max_explorers_for in practice. T3's row lists only
+# "depth cap 4, node cap 400" under Caps — no explorer number — so PLAN.md
+# §B4 leaves the exact figure to this implementation. 8 is chosen
+# deliberately, not left "unbounded" or "= number of top-level units":
+# either of those would defeat the entire point of a cap (a 200-directory
+# monorepo would still dispatch 200 probes under "= units", and
+# "unbounded" needs no comment). One more than T2's cap keeps the ordering
+# "richer tiers get a little more room to explore" without inventing a
+# second, unrelated scale — revisit once real eval data (PLAN.md
+# §C5/§C6) exists to justify a different number.
+_MAX_EXPLORERS: dict[Tier, int] = {"T0": 0, "T1": 2, "T2": 6, "T3": 8}
+
+
+def max_explorers_for(tier: Tier) -> int:
+    """PLAN.md §A4.3/§A6/§B4: the hard per-tier cap on structural-exploration
+    probe episodes — one of the three code-side cost fences §A6 requires
+    (a per-probe episode budget, this cap, and the 300-token finding cap,
+    ``v4/research.py``'s ``RESEARCH_FINDING_TOKEN_CAP``). Bounds cost by
+    tier, never by corpus size: a work object with 4 top-level units and one
+    with 400 both dispatch at most this many probes."""
+    try:
+        return _MAX_EXPLORERS[tier]
+    except KeyError as exc:
+        raise ValueError(f"unknown tier: {tier!r}") from exc
+
+
 def escalate(current: Tier, trigger: str) -> Tier:
     """PLAN.md §A2 invariant 9: the result is never lower than ``current``,
     for *every* trigger, including ones not wired to any call site yet.

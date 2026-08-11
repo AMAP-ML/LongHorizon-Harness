@@ -53,11 +53,13 @@ from ..v6.tiering import (
     classify,
     escalate,
     estimate_scope,
+    max_explorers_for,
     measure_signals,
     phases_for,
     tier_max,
 )
 from ..v6.work_object import WorkObject, survey_workspace, work_object_from_text, work_object_none
+from ..v7.split import handle_split_proposal, maybe_derive_split_parent
 from ..v0.events import EventLog
 from ..v0.run_dir import write_text_atomic
 from ..v0.run_dir import create_run_dir, ensure_node_trace_path, events_path, manifest_path, node_artifact_path, spec_path
@@ -66,7 +68,7 @@ from ..v1.reviewer import ReviewVerdict
 from ..v1.round_loop import run_round_loop
 from ..v1.tree import TaskNode, TaskTree
 from ..v2.contract import ContractRule, freeze_contract
-from ..v2.intake import GlobalRubric, render_spec_md, run_intake
+from ..v2.intake import GlobalRubric, IntakeObjection, IntakeQuestion, render_spec_md, run_intake
 from ..v2.pilot import (
     approve_pilot,
     run_pilot,
@@ -87,9 +89,11 @@ from ..v2.survey import (
     unit_input_path,
 )
 from ..v3.assembly_loop import run_assembly_loop
-from ..v3.revalidate import Triage, apply_revalidation_triage, run_revalidation_pass
-from ..v4.research import ResearchQuery
+from ..v3.document_review import DocumentReviewResult, run_document_review, serialize_triage
+from ..v3.revalidate import Triage, apply_revalidation_triage, run_revalidation_pass, summarize_triage
+from ..v4.research import ResearchQuery, run_research_query
 from ..v4.research_loop import run_research_loop
+from ..v4.run_dir import research_finding_path
 from . import approvals as approval_store
 from .backends import parse_research_plan
 from .liveness import record_driver_start
@@ -244,6 +248,17 @@ class RunReport:
 
 WriterAdapterFactory = Callable[[TaskNode], AgentAdapter]
 ResearchAdapterFactory = Callable[[TaskNode, ResearchQuery], AgentAdapter]
+ProbeAdapterFactory = Callable[[ResearchQuery], AgentAdapter]
+
+# PLAN.md §A6/§B4: the pseudo-node id structural-exploration probes dispatch
+# under. Deliberately not "explore-01" — that's already _phase_survey's own
+# large-corpus reasoning-explainer pseudo-agent id (see that method below);
+# using the same id would collide both dispatch ids (research_node_id's
+# "<id>~research~<slug>" derivation) and, worse, the two pseudo-agents'
+# trace.jsonl files. "explore" (no "-01" suffix) can't collide with either a
+# real Writer node id (planner-built ids are always dot-hierarchical or a
+# leaf id from a partition call, never bare "explore") or explore-01.
+_EXPLORE_PROBE_NODE_ID = "explore"
 
 
 def is_rate_limit_or_busy_error(exc: Exception | str) -> bool:
@@ -278,6 +293,7 @@ class RecursiveDriver:
         env: Environment | None = None,
         writer_adapter_factory: WriterAdapterFactory | None = None,
         research_adapter_factory: ResearchAdapterFactory | None = None,
+        probe_adapter_factory: ProbeAdapterFactory | None = None,
         poll_interval: float = 1.0,
     ) -> None:
         # Resolved, not just wrapped: workspace_path/prompt_dir (below) are
@@ -297,6 +313,7 @@ class RecursiveDriver:
         self.env = env or _local_env(self.run_dir)
         self.writer_adapter_factory = writer_adapter_factory or self._default_writer_factory()
         self.research_adapter_factory = research_adapter_factory or self._default_research_factory()
+        self.probe_adapter_factory = probe_adapter_factory or self._default_probe_adapter_factory()
         self.poll_interval = poll_interval
         create_run_dir(self.run_dir.parent, self.run_dir.name)
         self._write_source_and_spec()
@@ -575,7 +592,10 @@ class RecursiveDriver:
             )
             self._write_minimal_spec(goal)
             return
-        run_intake(self.run_dir, goal, self.provider, self._answer_intake)
+        estimate = self._read_tier_record().get("estimate") or {}
+        ambiguities = [str(item) for item in (estimate.get("ambiguities") or [])]
+        objections = [str(item) for item in (estimate.get("objections") or [])]
+        run_intake(self.run_dir, goal, ambiguities, objections, self.provider, self._ask_intake_round)
 
     def _write_minimal_spec(self, goal: str) -> None:
         rubric = GlobalRubric(
@@ -589,19 +609,44 @@ class RecursiveDriver:
         )
         spec_path(self.run_dir).write_text(render_spec_md(rubric), encoding="utf-8")
 
-    def _answer_intake(self, question: str, dimension: str) -> str:
-        """§11.9: the approval is keyed on the rubric dimension, so a resume
-        that restarts the question loop reuses *that dimension's* pending
-        record instead of handing the next-dimension question whatever
-        answer is still sitting in the file."""
+    def _ask_intake_round(
+        self,
+        round_index: int,
+        questions: tuple[IntakeQuestion, ...],
+        objections: tuple[IntakeObjection, ...],
+    ) -> dict[str, str]:
+        """PLAN.md §A5.3/§B3: one approval carries every question in the
+        round — a form, not one blocking prompt per question (the design
+        this superseded, keyed one approval per rubric *dimension*, seven
+        of them). Keyed on ``round`` (not on any single question's id) so a
+        resume that restarts intake reuses this round's own pending record
+        (§11.9's reasoning, carried over) rather than stacking a duplicate.
+        Objections ride along in the message body — they are shown to the
+        operator here even though only the questions themselves are
+        individually answerable; see ``v2.intake.run_intake``'s docstring
+        for why that's the whole mechanism rather than a per-objection
+        acknowledge action."""
+        lines: list[str] = []
+        if objections:
+            lines.append("Objections raised by scope estimation:")
+            for objection in objections:
+                detail = f" — {objection.why}" if objection.why else ""
+                options = f" (options: {', '.join(objection.options)})" if objection.options else ""
+                lines.append(f"- {objection.claim}{detail}{options}")
+            lines.append("")
+        if questions:
+            lines.append("Questions (leave blank to accept the stated default assumption):")
+            for question in questions:
+                default = f" [default if unanswered: {question.default_assumption}]" if question.default_assumption else ""
+                lines.append(f"- [{question.id}] {question.text}{default}")
         approval = self._ask(
-            "intake_question",
-            title="Intake question",
-            message=question,
-            input_label="Your answer",
-            context={"dimension": dimension},
+            "intake_questions",
+            title=f"Intake round {round_index}",
+            message="\n".join(lines),
+            context={"round": round_index},
+            questions=[{"id": question.id, "text": question.text} for question in questions],
         )
-        return approval.user_input.strip()
+        return dict(approval.answers)
 
     async def _phase_survey(self) -> None:
         from ..v2.embeddings import embeddings_available
@@ -708,18 +753,18 @@ class RecursiveDriver:
         table actually uses.
 
         §A4.3's "explore? fires only when ``answerable_without_exploration``
-        is false" is written for real agentic probes (PLAN.md §B4 —
-        *not built yet*, a separate, not-yet-started workstream). Until
-        those exist, producing ``spine.json`` is not optional — "plan"
-        needs it unconditionally, at every tier that has a plan phase — so
-        this method always ensures it exists. ``needs_explore`` instead
-        gates the one *additional* thing this harness can currently do that
-        resembles exploration: running v4's research loop early (only when
-        the operator supplied an explicit ``research_plan`` — same gate
-        ``_phase_research`` already uses). This is an honest, documented
-        approximation of "probe episodes," not a claim that §B4 is done —
-        the ≤2/≤6 "explorers" caps in §A4.3's table are not enforced here
-        because nothing dispatches a bounded number of probe episodes yet.
+        is false" gates two things now (PLAN.md §B4): producing
+        ``spine.json`` is *not* itself optional — "plan" needs it
+        unconditionally, at every tier that has a plan phase — so this
+        method always ensures it exists regardless of ``needs_explore``.
+        What ``needs_explore`` actually gates is (1) structural exploration
+        — one bounded probe per top-level ``SpineUnit``, capped by
+        ``max_explorers_for(tier)``, T2+ only (T1 has no "plan" phase to
+        feed a summary into; T0 has no "explore" phase at all) — and (2)
+        running v4's research loop early when the operator supplied an
+        explicit ``research_plan`` (same gate ``_phase_research`` already
+        uses for the "targeted, post-intake" pattern, §A6's second bullet,
+        still carried unchanged from before this workstream).
         """
         if not (self.run_dir / "spine.json").exists():
             await self._phase_survey()
@@ -736,8 +781,90 @@ class RecursiveDriver:
                 }
             )
             return
+        tier = self._current_tier()
+        if tier in ("T2", "T3"):
+            await self._run_structural_exploration(tier)
         if self.options.research_plan:
             await self._phase_research()
+
+    async def _run_structural_exploration(self, tier: Tier) -> None:
+        """PLAN.md §A6 first bullet/§B4: "one probe per top-level unit of
+        the work object, up to ``max_explorers`` (tier cap)". Pre-plan,
+        T2+ only (the caller enforces that). Applies identically whether
+        the work object is a ``kind="workspace"`` repo or a ``kind="text"``
+        corpus — both already have real per-unit content on disk by this
+        point (``survey_workspace``'s members, or corpus mode's
+        materialized ``spine/<unit>.md`` — §A6's table lists both
+        ``workspace`` and ``corpus`` probe kinds explicitly for exactly this
+        reason). Three independent code-side cost fences, all real, none
+        reinvented here (§A6's own words): a per-probe ``EpisodeBudget``
+        (default, same as every other v4 research dispatch); this method's
+        own ``cap`` slice, so a work object with 4 top-level units and one
+        with 400 both dispatch at most ``max_explorers_for(tier)`` probes;
+        and ``run_research_query``'s existing 300-token finding cap.
+
+        **Which units get probed when there are more than the cap**: the
+        largest ``cap`` units by token count (ties broken by id for
+        determinism) — the ones a planner partitioning by size would need
+        the most help with, and the choice that makes the cap's cost bound
+        exact regardless of how the caller orders ``spine.json``.
+
+        Findings land at ``research_finding_path(run_dir, "explore",
+        unit.id)`` — reusing v4's existing finding-path scheme (rather than
+        the literal ``scratch/explore/<unit>.md`` §A6's table shows) so
+        idempotency (a probe with an existing nonempty finding is not
+        re-dispatched) comes for free from ``run_research_query``'s own
+        cache check instead of being reimplemented here.
+        """
+        units = load_spine(self.run_dir)
+        if not units:
+            return
+        cap = max_explorers_for(tier)
+        if cap <= 0:
+            return
+        selected = sorted(units, key=lambda unit: (-unit.tokens, unit.id))[:cap]
+        work = self._effective_work_object()
+        probe_kind = "workspace" if work.kind == "workspace" else "corpus"
+        budget = EpisodeBudget()
+        for unit in selected:
+            query = ResearchQuery(
+                slug=unit.id,
+                kind=probe_kind,
+                question=self._structural_probe_question(unit, work),
+            )
+            adapter = self.probe_adapter_factory(query)
+            await run_research_query(
+                self.run_dir, _EXPLORE_PROBE_NODE_ID, query, adapter, self.env, budget
+            )
+
+    def _structural_probe_question(self, unit: SpineUnit, work: WorkObject) -> str:
+        """The one question every structural-exploration probe answers —
+        generic on purpose (§A6: "a strictly better partition input than
+        the label alone", not a targeted question about run-specific
+        content). ``workspace`` probes get the unit's own member paths (so
+        they know where to point their read-only list/grep tools without
+        having to rediscover the grouping ``survey_workspace`` already
+        computed); ``corpus`` probes get the materialized unit file's path
+        directly, since a corpus probe's allowlist is `read` alone."""
+        if work.kind == "workspace":
+            members = ", ".join(unit.members[:20]) or "(no files)"
+            return (
+                f'This is the "{unit.label}" portion of a codebase a planner '
+                f"is about to partition into work items. Its files (relative "
+                f"to your workspace root) include: {members}. Using your "
+                f"read-only list/grep/read tools, summarize in <=300 tokens: "
+                f"what this part of the codebase does, how it's organized, "
+                f"and anything a planner partitioning work here should know "
+                f"(natural sub-boundaries, risky areas, cross-cutting "
+                f"concerns)."
+            )
+        unit_path = unit_input_path(self.run_dir, unit)
+        return (
+            f'This is the "{unit.label}" unit of a text corpus a planner is '
+            f"about to partition into work items. Read {unit_path} and "
+            f"summarize in <=300 tokens: its structure, purpose, and "
+            f"anything a planner partitioning work here should know."
+        )
 
     async def _phase_plan(self) -> None:
         tree = build_tree(
@@ -745,8 +872,23 @@ class RecursiveDriver:
             self.provider,
             input_path_for=lambda unit: unit_input_path(self.run_dir, unit),
             log=self.log,
+            unit_summary_for=self._explore_summary_for,
         )
         tree.save(tree_path(self.run_dir))
+
+    def _explore_summary_for(self, unit: SpineUnit) -> str:
+        """PLAN.md §A7 point 3/§B4: reads back whatever
+        ``_run_structural_exploration`` wrote for this unit during
+        "explore" — empty when nothing did (T1's escalation path never runs
+        explore's structural-exploration branch; a unit outside the top
+        ``max_explorers_for(tier)`` picks never got probed either).
+        ``plan_level``/``build_tree`` treat an empty string as "no summary
+        line," so this degrades to today's label-only rendering rather than
+        failing."""
+        path = research_finding_path(self.run_dir, _EXPLORE_PROBE_NODE_ID, unit.id)
+        if not path.exists():
+            return ""
+        return path.read_text(encoding="utf-8").strip()
 
     async def _phase_pilot(self) -> None:
         tree = self._load_tree()
@@ -820,12 +962,25 @@ class RecursiveDriver:
           Uses a lower ``max_attempts`` than T2/T3 (§A4.4: "T0/T1 node fails
           gates twice with a size defect -> promote to T2") — see
           ``v6/direct.py:DIRECT_MAX_ATTEMPTS``'s docstring for why 2, not 3.
-        - **T2/T3** — unchanged from pre-§B2 behavior: the round loop over
-          whatever ``tree.json`` planning already produced.
+        - **T2/T3** — unchanged from pre-§B2 behavior save one addition:
+          the round loop over whatever ``tree.json`` planning already
+          produced, but now also wired for runtime split (PLAN.md §A8/
+          §B5) via the ``split_handler``/``on_node_passed`` callables
+          (``v7/split.py``) — never for T1 (single node, its own
+          size-overrun path is ``size_defect_retry`` below, a deliberately
+          different move — replan for real at T2 rather than graft a
+          partial partition onto a tree that's about to be archived) or
+          T0 (no ``tree.json`` to graft into at all). See
+          ``v1/round_loop.py``'s module docstring for why these are
+          injected callables rather than a direct import there.
 
         The size-defect escalation check only applies to T1 (T0's own
         check lives in ``_phase_verify``, since T0 never touches
-        ``tree.json``/``TaskTree.is_blocked()`` at all).
+        ``tree.json``/``TaskTree.is_blocked()`` at all). The
+        ``split_accepted`` escalation trigger (§A4.4's fourth row) only
+        applies to T2 — T3 is already the escalation ceiling that trigger
+        targets (``majority_regenerate``'s own driver-side check gates the
+        same way).
         """
         tier = self._current_tier()
         if tier == "T0":
@@ -846,6 +1001,10 @@ class RecursiveDriver:
             build_single_node_tree(self.options.goal.strip()).save(tree_path(self.run_dir))
 
         max_attempts = DIRECT_MAX_ATTEMPTS if tier == "T1" else self.options.max_attempts
+        # PLAN.md §A8/§B5: runtime split only makes sense against a real,
+        # multi-node-capable tree.json — never T1's code-built single-node
+        # tree (docstring above).
+        enable_split = tier in ("T2", "T3")
         await run_round_loop(
             self.run_dir,
             tree_path(self.run_dir),
@@ -861,6 +1020,8 @@ class RecursiveDriver:
             max_rounds=self.options.max_rounds,
             max_attempts=max_attempts,
             dispatch_policy=self.options.dispatch_policy,
+            split_handler=handle_split_proposal if enable_split else None,
+            on_node_passed=maybe_derive_split_parent if enable_split else None,
         )
         tree = self._load_tree()
         if tier == "T1" and tree.is_blocked():
@@ -868,6 +1029,16 @@ class RecursiveDriver:
             if node is not None and is_size_defect(node.last_defect):
                 self._archive_tree_before_replan()
                 self._escalate_tier("size_defect_retry", node_id=node.id)
+                return None
+        if tier == "T2":
+            split_parents = sorted(n.id for n in tree.nodes.values() if n.status == "split")
+            if split_parents:
+                # PLAN.md §A4.4 row 4: "any node's accepted split proposal
+                # -> promote T2 -> T3." One trigger per _phase_execute call
+                # is enough — escalate() is monotone (v6/tiering.py), and
+                # once tier.json says T3 this branch's own `tier == "T2"`
+                # guard stops firing on a later resume.
+                self._escalate_tier("split_accepted", node_id=split_parents[0])
                 return None
         return None if not tree.is_blocked() else False
 
@@ -927,69 +1098,99 @@ class RecursiveDriver:
         ``v1/round_loop.py``'s dispatch and review are coupled per node (a
         node cannot be reviewed before its own gates pass, and splitting
         that into two fully separate global passes over the whole tree is a
-        larger restructuring than this workstream's scope). This phase is
-        the confirmation checkpoint the table's phase name promises: it
-        spends nothing further, it just reports whether the tree that
-        execute produced is blocked."""
+        larger restructuring than this workstream's scope). For T1/T3 this
+        phase spends nothing further: it just reports whether the tree
+        execute produced is blocked.
+
+        **T2 gets one more thing here, unconditionally (PLAN.md §A9's
+        table row: "T2: gates + review_node per leaf + one cross-leaf
+        consistency pass"):** ``document_review``'s passes 1-3 (coverage,
+        duplication, contract-compliance — already windowed over
+        promotions, never artifact prose) run every T2 execution, not only
+        when the operator opts in via ``RunOptions.document_review``. That
+        flag still gates T3's *additional* depth pass (§A11: "T3: as
+        today") — this is a difference in what tier T2 structurally *is*,
+        not a change to the flag's meaning. ``keep_depth_pass=False`` here
+        is what keeps T2 to exactly the 3 windowed passes the table
+        promises, without T3's extra per-artifact spot check.
+
+        The triage this pass produces is handled the same way T3's
+        flag-gated document review handles its own
+        (``_handle_document_review_triage``, factored out so both callers
+        share the majority-regenerate escalation guard, the repair
+        dispatch, and the audit log line) — except **T2 applies repairs
+        without an operator approval gate.** This mirrors §A10's own
+        reasoning for why the pilot/contract's ``awaiting_approval`` state
+        is T3-only: "a run the operator expected to take four minutes must
+        not silently park overnight waiting for a form." A T2 run is the
+        cheap/fast tier by construction (no pilot, no contract-freeze
+        interview); parking it on a human gate for a check that only ever
+        proposes *scoped, gate-and-review-checked* repairs (same guardrail
+        as every other repair path — snapshot, gates + review, only then
+        overwrite) would reintroduce exactly the overnight-park failure
+        mode §A10 was written to avoid, for a tier whose whole point is
+        that it doesn't need one. T3 keeps asking, unchanged, because a T3
+        run has already paid for a pilot/contract interview and the
+        operator is already in the loop for that run.
+
+        An unattributable cross-leaf defect (``review.escalated`` — a
+        defect ``document_review`` could not pin to any node id) escalates
+        this phase exactly like an unattributable compile failure escalates
+        ``assembly_loop.py`` — the operator's `reopen_node` intervention is
+        the recovery path, not something this phase can resolve on its
+        own.
+        """
         tree = self._load_tree()
-        return None if not tree.is_blocked() else False
-
-    async def _phase_assemble(self) -> None:
-        from ..v3.document_review import serialize_triage
-        from ..v3.revalidate import summarize_triage
-
-        result = await run_assembly_loop(
-            self.run_dir,
-            tree_path(self.run_dir),
-            str(manifest_path(self.run_dir)),
-            writer_adapter_factory=self.writer_adapter_factory,
-            env=self.env,
-            provider=self.provider,
-            compile_command=self.options.compile_command,
-            writer_budget=EpisodeBudget(),
-            max_repairs=3,
-            max_attempts=self.options.max_attempts,
-            document_review=self.options.document_review,
-        )
-        if result.escalated:
+        if tree.is_blocked():
             return False
-        if result.review is not None and result.review.triage:
-            counts = summarize_triage(result.review.triage)
-            # PLAN.md §A4.4: "Reviewer returns class: regenerate on >= half
-            # of a T2 plan's leaves -> promote to T3, re-pilot." Checked
-            # here, not inside v3/document_review.py itself, for the same
-            # reason the size-defect check lives in the driver rather than
-            # v1/round_loop.py — document_review is tier-agnostic and used
-            # by T3 too, where this trigger must never fire (T3 is already
-            # the ceiling). Escalating supersedes this pass's own
-            # repair-approval flow entirely: once tier.json says T3, the
-            # next iteration of run()'s phase loop picks up "pilot" (T2
-            # never ran it) and re-enters execute/review/assemble under the
-            # freshly-frozen contract, so asking approval for a T2-scoped
-            # repair here would just be discarded work.
-            #
-            # Known gap, documented rather than silently glossed over: this
-            # escalates and re-pilots, but does not itself retroactively
-            # re-validate T2's already-"passed" leaves against the new
-            # contract (that is the existing §10 amend/re-validate
-            # machinery, a separate intervention this trigger does not
-            # invoke). The trigger fires and the tier rises correctly; full
-            # retroactive contract enforcement on old leaves is not part of
-            # what §B2 wires.
-            total = sum(counts.values())
-            regenerate = counts.get("regenerate", 0)
-            tier = self._current_tier()
-            if tier == "T2" and total > 0 and regenerate / total >= 0.5:
-                self._escalate_tier(
-                    "majority_regenerate",
-                    regenerate=regenerate,
-                    total=total,
-                )
-                return None
+        if self._current_tier() == "T2":
+            review = run_document_review(
+                self.run_dir, tree, self.provider, keep_depth_pass=False, log=self.log
+            )
+            if review.escalated:
+                return False
+            await self._handle_document_review_triage(
+                review, approval_context="review", require_approval=False
+            )
+        return None
+
+    async def _handle_document_review_triage(
+        self, review: DocumentReviewResult, *, approval_context: str, require_approval: bool
+    ) -> bool:
+        """Shared triage-application half of a document-review pass
+        (PLAN.md §A9/§B6), factored out because two call sites now run the
+        identical windowed cross-leaf pass under different tiers: T2's
+        mandatory ``_phase_review`` above (unconditional, no approval
+        gate) and T3's flag-gated ``_phase_assemble`` below (unchanged:
+        still asks). Handles, in order: the §A4.4 row-3 majority-regenerate
+        escalation (tier-gated to T2 *inside* this method via
+        ``self._current_tier()``, so calling it from T3 is a correct no-op
+        — T3 is already the ceiling that trigger targets); the optional
+        operator approval; and dispatching the repairs via
+        ``apply_triage``.
+
+        Returns ``True`` iff repairs were actually applied (approval
+        granted, or no gate at all) — the one thing that differs between
+        the two callers' next step: T3's caller owns the terminal
+        concatenation/compile gate and re-runs it against the repaired
+        artifacts; T2's caller does not, because ``_phase_assemble`` (which
+        owns that) hasn't run yet this round and will pick up the repaired
+        files naturally when it does.
+        """
+        if not review.triage:
+            return False
+        counts = summarize_triage(review.triage)
+        total = sum(counts.values())
+        regenerate = counts.get("regenerate", 0)
+        tier = self._current_tier()
+        if tier == "T2" and total > 0 and regenerate / total >= 0.5:
+            self._escalate_tier("majority_regenerate", regenerate=regenerate, total=total)
+            return False
+        if require_approval:
             summary = ", ".join(f"{kind}={count}" for kind, count in counts.items())
             sample = "; ".join(
                 f"{node_id} ({triage.classification})"
-                for node_id, triage in sorted(result.review.triage.items())[:8]
+                for node_id, triage in sorted(review.triage.items())[:8]
             )
             approval = self._ask(
                 "document_review",
@@ -1001,39 +1202,92 @@ class RecursiveDriver:
                     "(snapshot, gates + review, only then overwrite). Reply "
                     "'no' to leave defects in place."
                 ),
-                context={"phase": "assemble"},
+                context={"phase": approval_context},
             )
             if approval.user_input.strip().lower() in ("n", "no", "abort", "halt"):
-                return None
-            repaired = await apply_triage(
-                self.run_dir,
-                triage=serialize_triage(result.review.triage),
-                writer_adapter_factory=self.writer_adapter_factory,
-                env=self.env,
-                provider=self.provider,
-                max_attempts=self.options.max_attempts,
+                return False
+        repaired = await apply_triage(
+            self.run_dir,
+            triage=serialize_triage(review.triage),
+            writer_adapter_factory=self.writer_adapter_factory,
+            env=self.env,
+            provider=self.provider,
+            max_attempts=self.options.max_attempts,
+        )
+        self._log(
+            {
+                "node_id": "-",
+                "role": "harness",
+                "round": 0,
+                "type": "document_review_repairs",
+                "repaired": repaired,
+            }
+        )
+        return True
+
+    async def _phase_assemble(self) -> None:
+        """PLAN.md §A11: T2's assembly is unchanged ("concatenation + index
+        + checks + compile, as today") — its cross-leaf consistency pass
+        already ran, unconditionally, inside ``_phase_review`` above, so
+        asking ``run_assembly_loop`` to run ``document_review`` again here
+        for T2 would be a redundant second pass, and worse, one that
+        defaults to the depth-pass-enabled shape this table only grants
+        T3. Only T3 ever asks ``document_review`` to run from this phase,
+        and only when the operator opted in via
+        ``RunOptions.document_review`` — byte-identical to pre-§B6
+        behavior for T3."""
+        run_full_document_review = (
+            self.options.document_review and self._current_tier() == "T3"
+        )
+        result = await run_assembly_loop(
+            self.run_dir,
+            tree_path(self.run_dir),
+            str(manifest_path(self.run_dir)),
+            writer_adapter_factory=self.writer_adapter_factory,
+            env=self.env,
+            provider=self.provider,
+            compile_command=self.options.compile_command,
+            writer_budget=EpisodeBudget(),
+            max_repairs=3,
+            max_attempts=self.options.max_attempts,
+            document_review=run_full_document_review,
+        )
+        if result.escalated:
+            return False
+        if result.review is not None:
+            # PLAN.md §A4.4's majority-regenerate trigger (checked inside
+            # ``_handle_document_review_triage``) never fires from here in
+            # practice — ``run_full_document_review`` above is only ever
+            # True when the tier is already T3, the ceiling that trigger
+            # targets — but the guard lives in the shared helper, not
+            # duplicated here, so this stays correct even if that
+            # precondition ever changes.
+            #
+            # Known gap, documented rather than silently glossed over: were
+            # this trigger ever to fire from T3 it would be a no-op by
+            # construction (escalate() cannot rise above T3); the real
+            # majority-regenerate escalation path (T2 -> T3) lives in
+            # _phase_review now, and does not itself retroactively
+            # re-validate any node already "passed" under T2 against a new
+            # contract (that is the existing §10 amend/re-validate
+            # machinery, a separate intervention this trigger does not
+            # invoke).
+            applied = await self._handle_document_review_triage(
+                result.review, approval_context="assemble", require_approval=True
             )
-            result = await run_assembly_loop(
-                self.run_dir,
-                tree_path(self.run_dir),
-                str(manifest_path(self.run_dir)),
-                writer_adapter_factory=self.writer_adapter_factory,
-                env=self.env,
-                provider=self.provider,
-                compile_command=self.options.compile_command,
-                writer_budget=EpisodeBudget(),
-                max_repairs=3,
-                max_attempts=self.options.max_attempts,
-            )
-            self._log(
-                {
-                    "node_id": "-",
-                    "role": "harness",
-                    "round": 0,
-                    "type": "document_review_repairs",
-                    "repaired": repaired,
-                }
-            )
+            if applied:
+                result = await run_assembly_loop(
+                    self.run_dir,
+                    tree_path(self.run_dir),
+                    str(manifest_path(self.run_dir)),
+                    writer_adapter_factory=self.writer_adapter_factory,
+                    env=self.env,
+                    provider=self.provider,
+                    compile_command=self.options.compile_command,
+                    writer_budget=EpisodeBudget(),
+                    max_repairs=3,
+                    max_attempts=self.options.max_attempts,
+                )
         return None if not result.escalated else False
 
     # ------------------------------------------------------------------
@@ -1047,15 +1301,22 @@ class RecursiveDriver:
         message: str,
         input_label: str = "",
         context: dict[str, Any] | None = None,
+        questions: list[dict[str, str]] | None = None,
     ) -> Any:
         """Create (or reuse the unanswered) pending approval for (kind,
-        context) and block until any surface resolves it."""
+        context) and block until any surface resolves it. ``questions``
+        (PLAN.md §A5/§B3) turns this into a batch-form approval — every
+        question of one intake round in a single record — instead of the
+        plain single free-text prompt every other ``kind`` still uses."""
         context = context or {}
         existing = approval_store.find_pending(self.run_dir, kind=kind, **context)
-        approval = existing or self._create_approval(kind, title=title, message=message, input_label=input_label, context=context)
+        approval = existing or self._create_approval(
+            kind, title=title, message=message, input_label=input_label,
+            context=context, questions=questions,
+        )
         current_phase = _read_phase(self.run_dir).get("phase", "intake")
-        dim_info = f" ({context['dimension']})" if context and "dimension" in context else ""
-        self._set_phase(current_phase, "waiting_for_approval", detail=f"Waiting for approval: {title}{dim_info}")
+        extra = f" ({context['round']})" if context and "round" in context else ""
+        self._set_phase(current_phase, "waiting_for_approval", detail=f"Waiting for approval: {title}{extra}")
         try:
             res = approval_store.wait_for_resolution(
                 self.run_dir, approval.approval_id, poll_interval=self.poll_interval
@@ -1064,9 +1325,13 @@ class RecursiveDriver:
             self._set_phase(current_phase, _IN_PROGRESS, detail="")
         return res
 
-    def _create_approval(self, kind: str, *, title: str, message: str, input_label: str, context: dict[str, Any]):
+    def _create_approval(
+        self, kind: str, *, title: str, message: str, input_label: str,
+        context: dict[str, Any], questions: list[dict[str, str]] | None = None,
+    ):
         record = approval_store.Approval.create(
-            kind, title=title, message=message, input_label=input_label, context=context
+            kind, title=title, message=message, input_label=input_label, context=context,
+            questions=questions,
         )
         approval_store.append(self.run_dir, record)
         self._log(
@@ -1186,13 +1451,54 @@ class RecursiveDriver:
 
             return build_research_adapter(
                 self.options.backend,
-                workspace_path=self.run_dir,
+                workspace_path=self._probe_workspace_path(query),
                 prompt_dir=self.run_dir / "tmp" / "prompts",
                 query=query,
                 model=self.options.model,
+                run_dir=self.run_dir,
             )
 
         return factory
+
+    def _default_probe_adapter_factory(self) -> ProbeAdapterFactory:
+        """PLAN.md §A6/§B4: builds the adapter for one structural-exploration
+        probe (``_run_structural_exploration``, above). A separate factory
+        from ``research_adapter_factory`` because that one's shape —
+        ``Callable[[TaskNode, ResearchQuery], AgentAdapter]`` — is tied to a
+        real, already-planned ``TaskNode``; a structural-exploration probe
+        runs *before* planning even starts, over a ``SpineUnit``, not a
+        node. Kept as its own overridable driver attribute (not inlined
+        into ``_run_structural_exploration``) so a test can inject a
+        call-counting fake the same way ``writer_adapter_factory``/
+        ``research_adapter_factory`` already can."""
+
+        def factory(query: ResearchQuery) -> AgentAdapter:
+            from .backends import build_research_adapter
+
+            return build_research_adapter(
+                self.options.backend,
+                workspace_path=self._probe_workspace_path(query),
+                prompt_dir=self.run_dir / "tmp" / "prompts",
+                query=query,
+                model=self.options.model,
+                run_dir=self.run_dir,
+            )
+
+        return factory
+
+    def _probe_workspace_path(self, query: ResearchQuery) -> Path:
+        """PLAN.md §A6/§B4: a ``workspace``-kind probe's cwd must actually be
+        (or be able to read into) the work object's root, not the run
+        directory — mirroring ``_default_writer_factory``'s existing
+        ``kind="workspace"`` branch above. Every other kind (``web``,
+        ``corpus``, ``doc_retrieval``) keeps today's behavior: the run
+        directory (``corpus`` reads ``spine/`` there; ``web`` and
+        ``doc_retrieval`` get no filesystem tools at all, so this is moot
+        for them)."""
+        work = self._effective_work_object()
+        if query.kind == "workspace" and work.kind == "workspace" and work.root is not None:
+            return work.root
+        return self.run_dir
 
 
 def _local_env(run_dir: Path) -> Environment:

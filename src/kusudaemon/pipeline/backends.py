@@ -50,7 +50,7 @@ from ..adapters.base import AgentAdapter
 from ..adapters.gptme_adapter import DEFAULT_TOOL_ALLOWLIST, GptmeAdapter
 from ..v1.tree import TaskNode
 from ..v4.mcp_research import allowed_tools_for
-from ..v4.research import ResearchQuery
+from ..v4.research import ResearchQuery, normalize_probe_kind
 
 WRITER_BACKENDS = ("gptme",)
 _RESEARCH_CAPABLE: tuple[str, ...] = ("gptme",)
@@ -81,6 +81,38 @@ def _hidden_path_exceptions_for(node: TaskNode) -> tuple[str, ...]:
     list (``cli_agent.py:_hidden_paths_notice``) rather than by removing the
     broader entry."""
     return (f"out/{node.id}.md", f"scratch/{node.id}")
+
+
+def _hidden_run_dir_subtree_for_probe(run_dir: Path, workspace_root: Path) -> tuple[str, ...]:
+    """PLAN.md §A6/§B4: the read-only-probe counterpart of
+    ``_hidden_paths_and_exceptions_for``, without an exceptions half.
+    ``workspace``/``corpus`` probes never get a write tool at all (see
+    ``v4/research.py``'s module docstring — the finding is captured via
+    the assistant-message fallback, same as today's web-kind probes), so
+    there is no "its own artifact/scratch dir" to carve back out the way a
+    Writer's does. This still has to hide the run directory's bookkeeping
+    from a ``workspace``-kind probe's read/list/grep tools, or a probe
+    reading "the whole repo" would also read every other node's finished
+    artifact and scratch notes (§2 invariant 6) the instant the run
+    directory happens to be nested inside the workspace (the default
+    ``--workspace`` ``runs_root``)."""
+    try:
+        run_dir_resolved = run_dir.resolve()
+        workspace_resolved = workspace_root.resolve()
+    except OSError:
+        return ()
+    if run_dir_resolved == workspace_resolved:
+        # Corpus-mode probes: workspace_path *is* run_dir (spine/ lives
+        # there), so the per-file names apply exactly as they do for a
+        # Writer. This is the "spine/ only" approximation the module
+        # docstring in v4/mcp_research.py documents: everything but this
+        # denylist stays readable, which includes spine/ itself.
+        return _HIDDEN_RUN_PATHS
+    try:
+        run_dir_rel = run_dir_resolved.relative_to(workspace_resolved)
+    except ValueError:
+        return ()
+    return (f"{run_dir_rel.as_posix()}/",)
 
 
 def _hidden_paths_and_exceptions_for(
@@ -187,17 +219,29 @@ def build_research_adapter(
     prompt_dir: str | Path,
     query: ResearchQuery,
     model: str | None = None,
+    run_dir: str | Path | None = None,
 ) -> AgentAdapter:
-    """Adapter for one v4 research query.
+    """Adapter for one v4/§B4 probe.
 
-    ``web_search`` gets a ``GptmeAdapter`` narrowed to exactly the SearXNG
-    tool (``v4/mcp_research.py``'s ``allowed_tools_for``) — nothing else, so
-    the episode can't drift into shell/file access it has no reason to
-    need. ``doc_retrieval`` still raises there: it needed Claude Code's
-    Context7 MCP wiring, which no longer exists in this gptme-only harness.
-    Raise instead of silently giving a query full tool access: a
-    research_plan that can't be honored should fail the run loudly rather
-    than degrade it.
+    ``web`` (legacy ``web_search``) gets a ``GptmeAdapter`` narrowed to
+    exactly the SearXNG tool (``v4/mcp_research.py``'s ``allowed_tools_for``)
+    — nothing else, so the episode can't drift into shell/file access it
+    has no reason to need. ``doc_retrieval`` still raises there: it needed
+    Claude Code's Context7 MCP wiring, which no longer exists in this
+    gptme-only harness. Raise instead of silently giving a query full tool
+    access: a research_plan that can't be honored should fail the run
+    loudly rather than degrade it.
+
+    ``workspace``/``corpus`` (PLAN.md §A6/§B4) additionally need
+    ``hidden_paths`` set, the same "hide the run directory's own
+    bookkeeping" guarantee ``build_writer_adapter`` already gives every
+    Writer (§2 invariant 6) — a read/list/grep-capable probe pointed at a
+    real repo must not incidentally read every other node's finished
+    artifact just because the run directory happens to be nested inside
+    the workspace it's exploring. ``run_dir`` is optional (``None`` skips
+    this — today's ``web``/``doc_retrieval`` callers never pass it, since
+    those kinds get no filesystem tools at all) so this stays a strict,
+    additive change to the signature.
     """
     if backend not in _RESEARCH_CAPABLE:
         raise ValueError(
@@ -205,12 +249,25 @@ def build_research_adapter(
             f"backend {backend!r} cannot. Remove the research_plan or add "
             f"support for this backend."
         )
-    return GptmeAdapter(
+    kwargs: dict[str, Any] = dict(
         model=model,
         workspace_path=str(workspace_path),
         prompt_dir=str(prompt_dir),
         tool_allowlist=allowed_tools_for(query.kind),
     )
+    kind = normalize_probe_kind(query.kind)
+    if kind in ("workspace", "corpus") and run_dir is not None:
+        kwargs["hidden_paths"] = _hidden_run_dir_subtree_for_probe(
+            Path(run_dir), Path(workspace_path)
+        )
+    return GptmeAdapter(**kwargs)
+
+
+# PLAN.md §B4: research_plan JSON (CLI/web) still ships the legacy spelling
+# "web_search" (unchanged shipped contract); "web" is accepted directly too
+# so a caller that already generalized to Probe's vocabulary isn't forced
+# back to the old name. Both normalize to "web" inside Probe.__post_init__.
+_VALID_PLAN_KINDS = ("web", "web_search", "workspace", "corpus", "doc_retrieval")
 
 
 def parse_research_plan(raw: Any) -> dict[str, list[ResearchQuery]]:
@@ -218,7 +275,8 @@ def parse_research_plan(raw: Any) -> dict[str, list[ResearchQuery]]:
 
     Accepted shapes: a list of ``{node_id, slug, kind, question}`` objects,
     or a dict mapping ``node_id -> [same objects]`` (without node_id). Kind
-    defaults to ``"web_search"``.
+    defaults to ``"web_search"`` (normalized to ``"web"`` by ``Probe``
+    construction — see ``v4/research.py``).
     """
     if not raw:
         return {}
@@ -244,7 +302,7 @@ def parse_research_plan(raw: Any) -> dict[str, list[ResearchQuery]]:
         if not node_id:
             continue
         kind = str(item.get("kind") or "web_search")
-        if kind not in ("web_search", "doc_retrieval"):
+        if kind not in _VALID_PLAN_KINDS:
             raise ValueError(f"unknown research kind: {kind!r}")
         query = ResearchQuery(
             slug=str(item.get("slug") or f"q{len(plan.get(node_id, [])) + 1}"),

@@ -16,10 +16,16 @@ from pathlib import Path
 
 _REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(_REPO_ROOT / "src"))
+sys.path.insert(0, str(_REPO_ROOT / "tests" / "fixtures"))
 
+from fake_provider import FakeProvider  # noqa: E402
+from kusudaemon.pipeline import approvals as approval_store  # noqa: E402
 from kusudaemon.pipeline.driver import RecursiveDriver, RunOptions, escalate_run  # noqa: E402
-from kusudaemon.pipeline.run_dir import run_spec_path, tier_path  # noqa: E402
-from kusudaemon.v1.tree import TaskNode  # noqa: E402
+from kusudaemon.pipeline.run_dir import run_spec_path, tier_path, tree_path  # noqa: E402
+from kusudaemon.v0.events import EventLog  # noqa: E402
+from kusudaemon.v0.run_dir import create_run_dir, events_path, manifest_path, node_artifact_path, spec_path  # noqa: E402
+from kusudaemon.v1.manifest import append_manifest_line  # noqa: E402
+from kusudaemon.v1.tree import TaskNode, TaskTree  # noqa: E402
 from kusudaemon.v6.work_object import measure_workspace  # noqa: E402
 
 _PROVIDER_ENV_KEYS = (
@@ -540,6 +546,111 @@ class PhaseDoneClassifyExploreTest(unittest.TestCase):
             self.assertTrue(driver._phase_done("survey"))
 
 
+class PhaseIntakeAdaptiveTest(unittest.TestCase):
+    """PLAN.md §A5/§B3: _phase_intake routes to the new adaptive intake
+    (v2/intake.py's run_intake) fed the classify estimate's own
+    ambiguities/objections when tier.json's needs_intake is True, and stays
+    on the existing zero-call _write_minimal_spec path, unaffected, when
+    it's False."""
+
+    def _driver(self, run_dir: Path, provider: FakeProvider) -> RecursiveDriver:
+        return RecursiveDriver(
+            run_dir,
+            provider=provider,  # type: ignore[arg-type]
+            options=RunOptions(goal="ambiguous goal"),
+            writer_adapter_factory=lambda node: (_ for _ in ()).throw(
+                AssertionError("no writer dispatch expected")
+            ),
+            research_adapter_factory=lambda node, query: (_ for _ in ()).throw(
+                AssertionError("no research dispatch expected")
+            ),
+            poll_interval=0.02,
+        )
+
+    def test_skip_path_is_unaffected_zero_calls_goal_section_present(self) -> None:
+        import asyncio
+
+        async def scenario() -> None:
+            with tempfile.TemporaryDirectory() as root_str:
+                run_dir = Path(root_str) / "run"
+                create_run_dir(run_dir.parent, run_dir.name)
+                tier_path(run_dir).write_text(
+                    json.dumps({"tier": "T0", "needs_intake": False, "estimate": {}, "ts": 0}),
+                    encoding="utf-8",
+                )
+                provider = FakeProvider([])
+                driver = self._driver(run_dir, provider)
+                await driver._phase_intake()
+                self.assertEqual(len(provider.calls), 0)
+                text = spec_path(driver.run_dir).read_text(encoding="utf-8")
+                self.assertIn("## Goal", text)
+
+        asyncio.run(scenario())
+
+    def test_needs_intake_feeds_the_estimates_own_ambiguities_and_objections(self) -> None:
+        import asyncio
+
+        async def scenario() -> None:
+            with tempfile.TemporaryDirectory() as root_str:
+                run_dir = Path(root_str) / "run"
+                create_run_dir(run_dir.parent, run_dir.name)
+                tier_path(run_dir).write_text(
+                    json.dumps(
+                        {
+                            "tier": "T2",
+                            "needs_intake": True,
+                            "estimate": {
+                                "ambiguities": ["which module does this touch?"],
+                                "objections": ["conflicting scope instructions"],
+                            },
+                            "ts": 0,
+                        }
+                    ),
+                    encoding="utf-8",
+                )
+                # round 1 asks one question; round 2 (eligible once round 1
+                # gets a non-blank answer, §A5.4) returns none and ends
+                # intake -- exactly the "worst case" shape test_v2_intake.py
+                # already covers in isolation, exercised here end-to-end
+                # through the driver's own approval plumbing.
+                provider = FakeProvider(
+                    [
+                        {
+                            "questions": [
+                                {
+                                    "id": "q1",
+                                    "text": "Which module does this touch?",
+                                    "default_assumption": "the whole repo",
+                                }
+                            ],
+                            "objections": [],
+                        },
+                        {"questions": [], "objections": []},
+                    ]
+                )
+                driver = self._driver(run_dir, provider)
+                with approval_store.Approver(
+                    run_dir, poll_interval=0.02, answers={"q1": "the auth module"}
+                ):
+                    await driver._phase_intake()
+
+                self.assertEqual(len(provider.calls), 2)
+                sent_messages = provider.calls[0][0]
+                joined = "\n".join(m["content"] for m in sent_messages)
+                self.assertIn("which module does this touch?", joined)
+                self.assertIn("conflicting scope instructions", joined)
+
+                text = spec_path(driver.run_dir).read_text(encoding="utf-8")
+                self.assertIn("the auth module", text)
+
+                approvals = approval_store.read_all(run_dir)
+                self.assertEqual(len(approvals), 1)  # one approval for the whole round
+                self.assertEqual(approvals[0].kind, "intake_questions")
+                self.assertEqual(len(approvals[0].questions), 1)
+
+        asyncio.run(scenario())
+
+
 class RunOptionsTierOverrideRoundTripTest(unittest.TestCase):
     """PLAN.md §B2: tier_override round-trips through to_spec/from_spec —
     a --tier floor set at run start must survive a resume the same way
@@ -699,6 +810,201 @@ class CliEscalateSubcommandTest(unittest.TestCase):
         args = parser.parse_args(["escalate", "some-run-id"])
         self.assertEqual(args.pipeline_command, "escalate")
         self.assertEqual(args.run_id, "some-run-id")
+
+
+def _passed_node(node_id: str) -> TaskNode:
+    return TaskNode(
+        id=node_id,
+        brief=f"write the {node_id} section",
+        artifact=f"out/{node_id}.md",
+        gates=["nonempty"],
+        status="passed",
+    )
+
+
+def _populate_two_leaf_tree(run_dir: Path) -> TaskTree:
+    """Two passed leaves with manifest promotions -- exactly the input
+    ``run_document_review`` reads (promotions + briefs, never artifact
+    prose), same fixture shape as test_v3_document_review.py's ``_populate``."""
+    tree = TaskTree(nodes={n.id: n for n in (_passed_node("alpha"), _passed_node("beta"))})
+    tree.save(tree_path(run_dir))
+    for node in tree.nodes.values():
+        node_artifact_path(run_dir, node.id).write_text(f"Content of {node.id}.", encoding="utf-8")
+        append_manifest_line(
+            manifest_path(run_dir),
+            node_id=node.id,
+            artifact_path=str(node_artifact_path(run_dir, node.id)),
+            artifact_text="word " * 10,
+            gate_results=[],
+            promotion=f"The {node.id} section covers its ground.",
+        )
+    return tree
+
+
+def _write_tier(run_dir: Path, tier: str) -> None:
+    tier_path(run_dir).write_text(
+        json.dumps(
+            {
+                "tier": tier, "measured_tier": tier, "override": None,
+                "needs_intake": False, "needs_explore": False,
+                "signals": {}, "estimate": {}, "ts": 0,
+            }
+        ),
+        encoding="utf-8",
+    )
+
+
+def _driver_with_provider(run_dir: Path, provider: FakeProvider, *, document_review: bool = False) -> RecursiveDriver:
+    """Same shape as PhaseIntakeAdaptiveTest._driver above -- a real
+    RecursiveDriver (not _ScriptedDriver, whose fixed provider=None/
+    options=RunOptions(goal="test") kwargs collide with overriding either
+    one through **kwargs) wired to a FakeProvider and a writer/research
+    factory that fails loudly if a phase under test tries to dispatch one."""
+    return RecursiveDriver(
+        run_dir,
+        provider=provider,  # type: ignore[arg-type]
+        options=RunOptions(goal="g", document_review=document_review),
+        writer_adapter_factory=lambda node: (_ for _ in ()).throw(
+            AssertionError("no writer dispatch expected")
+        ),
+        research_adapter_factory=lambda node, query: (_ for _ in ()).throw(
+            AssertionError("no research dispatch expected")
+        ),
+        poll_interval=0.02,
+    )
+
+
+class PhaseReviewT2DocumentReviewTest(unittest.TestCase):
+    """PLAN.md §A9/§B6: T2 gets the 3-pass cross-leaf consistency check
+    (document_review passes 1-3) unconditionally, as part of what tier T2
+    *is* -- not gated behind ``RunOptions.document_review`` the way T3's
+    extra depth pass still is."""
+
+    def test_t2_runs_document_review_even_with_the_flag_off(self) -> None:
+        import asyncio
+
+        async def scenario() -> None:
+            with tempfile.TemporaryDirectory() as root_str:
+                run_dir = Path(root_str) / "run"
+                _ScriptedDriver(run_dir)
+                _write_tier(run_dir, "T2")
+                _populate_two_leaf_tree(run_dir)
+
+                provider = FakeProvider(
+                    [
+                        {"items": [], "verdict": "pass"},  # coverage
+                        {"items": [], "verdict": "pass"},  # duplication
+                        {"items": [], "verdict": "pass"},  # contract_compliance
+                    ]
+                )
+                driver = _driver_with_provider(run_dir, provider)
+                outcome = await driver._phase_review()
+                self.assertIsNone(outcome)
+                self.assertEqual(len(provider.calls), 3)
+
+        asyncio.run(scenario())
+
+    def test_no_triage_leaves_tier_unchanged(self) -> None:
+        import asyncio
+
+        async def scenario() -> None:
+            with tempfile.TemporaryDirectory() as root_str:
+                run_dir = Path(root_str) / "run"
+                _ScriptedDriver(run_dir)
+                _write_tier(run_dir, "T2")
+                _populate_two_leaf_tree(run_dir)
+                provider = FakeProvider([{"items": [], "verdict": "pass"} for _ in range(3)])
+                driver = _driver_with_provider(run_dir, provider)
+                await driver._phase_review()
+                record = json.loads(tier_path(run_dir).read_text(encoding="utf-8"))
+                self.assertEqual(record["tier"], "T2")
+
+        asyncio.run(scenario())
+
+
+class PhaseAssembleT3UnchangedTest(unittest.TestCase):
+    """PLAN.md §A11: T3's assemble-phase document review is unchanged --
+    still gated behind ``RunOptions.document_review``, still off by
+    default. Regression guard for the §B6 refactor that factored the
+    triage-handling block into ``_handle_document_review_triage``."""
+
+    def test_t3_with_flag_off_does_not_run_document_review(self) -> None:
+        import asyncio
+
+        async def scenario() -> None:
+            with tempfile.TemporaryDirectory() as root_str:
+                run_dir = Path(root_str) / "run"
+                _ScriptedDriver(run_dir)
+                _write_tier(run_dir, "T3")
+                _populate_two_leaf_tree(run_dir)
+
+                # No canned responses at all: any accidental document_review
+                # call raises loudly via FakeProvider's own "ran out of
+                # canned responses" guard, rather than silently misbehaving.
+                provider = FakeProvider([])
+                driver = _driver_with_provider(run_dir, provider)
+                outcome = await driver._phase_assemble()
+                self.assertIsNone(outcome)
+                self.assertEqual(len(provider.calls), 0)
+
+        asyncio.run(scenario())
+
+
+class MajorityRegenerateEscalationViaReviewTest(unittest.TestCase):
+    """PLAN.md §A4.4 row 3, now reachable from _phase_review's mandatory T2
+    pass rather than only from the flag-gated assemble pass: "Reviewer
+    returns class: regenerate on >= half of a T2 plan's leaves -> promote
+    to T3." Exercises the shared ``_handle_document_review_triage`` helper
+    through the exact call site that fires it today."""
+
+    def test_majority_regenerate_during_t2_review_escalates_to_t3(self) -> None:
+        import asyncio
+
+        async def scenario() -> None:
+            with tempfile.TemporaryDirectory() as root_str:
+                run_dir = Path(root_str) / "run"
+                _ScriptedDriver(run_dir)
+                _write_tier(run_dir, "T2")
+                _populate_two_leaf_tree(run_dir)
+
+                provider = FakeProvider(
+                    [
+                        {
+                            "items": [
+                                {
+                                    "id": "coverage", "pass": False,
+                                    "defect": "alpha and beta disagree",
+                                    "class": "regenerate", "node_ids": ["alpha"],
+                                },
+                                {
+                                    "id": "coverage", "pass": False,
+                                    "defect": "beta contradicts alpha",
+                                    "class": "regenerate", "node_ids": ["beta"],
+                                },
+                            ],
+                            "verdict": "fail",
+                        },  # coverage: both leaves flagged regenerate
+                        {"items": [], "verdict": "pass"},  # duplication
+                        {"items": [], "verdict": "pass"},  # contract_compliance
+                    ]
+                )
+                driver = _driver_with_provider(run_dir, provider)
+                outcome = await driver._phase_review()
+                # Escalating is not a phase failure -- the driver's phase
+                # loop picks up the grown T3 phase list on its own next
+                # iteration, same as every other escalation trigger.
+                self.assertIsNone(outcome)
+
+                record = json.loads(tier_path(run_dir).read_text(encoding="utf-8"))
+                self.assertEqual(record["tier"], "T3")
+                events = EventLog(events_path(run_dir)).read_all()
+                escalations = [e for e in events if e.get("type") == "run_tier_escalated"]
+                self.assertEqual(len(escalations), 1)
+                self.assertEqual(escalations[0]["trigger"], "majority_regenerate")
+                self.assertEqual(escalations[0]["from"], "T2")
+                self.assertEqual(escalations[0]["to"], "T3")
+
+        asyncio.run(scenario())
 
 
 if __name__ == "__main__":

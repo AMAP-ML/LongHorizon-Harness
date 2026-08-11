@@ -29,11 +29,13 @@ where the rule moved. When a workstream ships, its §A-section is folded into
 # Part 0 — Where things stand
 
 Built and green: v0–v5 plus Zero-Mem §§1–11 and audit batches §11.1–§11.11.
-**387 tests, ~23s, all passing** — up from 370 (see Part VII: §D0b, §D0,
+**553 tests, ~23s, all passing** — up from 370 (see Part VII: §D0b, §D0,
 §D1, §D2, §D4, §D5 interim, §D6, §D7 fixed 2026-08-10; §D7's
 environment-dependent unlink error is now caught rather than escaping the
-cleanup path, so that flake is gone too). §B1–§B6 and §C1–§C5 below are
-still entirely unstarted.
+cleanup path, so that flake is gone too). **§B1–§B6 are now all shipped**
+(§B1/§B2 on 2026-08-10, §B3–§B6 in one 2026-08-11 session — see Part VI/VII
+for the file-by-file breakdown of each). §A10 (pilot/contract tiered to
+T3-only, tracked under §D9) and §C1–§C5 remain unstarted.
 
 What today's harness genuinely does well, and which this plan does not touch:
 
@@ -1122,15 +1124,99 @@ nothing else. Fixed by §A10's tiering.
     [x] 51 new tests (test_v6_tiering.py + test_driver_phases.py
         additions); 461 total, all green
 
-[ ] §B3  adaptive intake                      (§D8) — NOT STARTED
+[x] §B3  adaptive intake                      (§D8) — SHIPPED 2026-08-11
+    [x] v2/intake.py rewritten around IntakeQuestion/IntakeObjection/
+        QuestionSet + build_question_set (one complete_json call per round,
+        MAX_INTAKE_ROUNDS=2 code cap, round 2 only fires if round 1 got a
+        non-blank answer and a fresh call still returns questions)
+    [x] approvals.py Approval gained additive questions/answers fields;
+        one approval per round (not per question) via driver.py's new
+        _ask_intake_round, replacing the old one-approval-per-dimension
+        _answer_intake
+    [x] spec.md gains ## Unresolved objections (prompts.py's
+        _goal_and_rubric_block already read this heading — built ahead of
+        need in the §D1 fix, now finally written to)
+    [x] zero calls when needs_intake is false (unchanged skip path); ship
+        gate: 1 call typical / <=2 worst case per triggered run, well under
+        the <3 mean-across-five-goals target
+    [x] 11 new tests (472 total)
+
 [ ] §A10 pilot/contract tiered to T3          (§D9) — NOT STARTED
-[ ] §B4  probes / delegated exploration                — NOT STARTED
-[ ] §B5  runtime split                        (v7)      — NOT STARTED
-[ ] §B6  tiered review + fan-out              (§D5)      — NOT STARTED; interim
-    [x] §D5 interim: audit/<node>.json carries `truncated: true` on a
-        verdict reached over a cap_artifact_text-truncated artifact — the
-        fan-out itself (splitting an over-cap artifact by heading into
-        multiple review_node calls) is still open.
+
+[x] §B4  probes / delegated exploration                — SHIPPED 2026-08-11
+    [x] v4/research.py: ResearchQuery generalized to Probe{kind: web |
+        workspace | corpus | doc_retrieval}; ResearchQuery kept as a literal
+        alias; normalize_probe_kind maps legacy "web_search" -> "web"
+    [x] new adapters/tools/workspace_read.py (list_dir/grep, read-only,
+        path-confined) gives the "workspace" probe kind read+list+grep with
+        no write/shell tool in its allowlist; "corpus" kind gets read-only
+        over spine/
+    [x] v6/tiering.py: max_explorers_for(tier) = {T0:0, T1:2, T2:6, T3:8}
+    [x] driver.py's _phase_explore dispatches structural exploration at
+        T2/T3 (not T1 — no plan phase to feed): one probe per top-level
+        SpineUnit, capped by max_explorers_for, largest-by-tokens first,
+        findings capped at 300 tokens via the existing v4 cache/idempotency
+    [x] v2/planner.py's plan_level/build_tree/_render_slice gained
+        unit_summary_for, threading capped explorer findings into the
+        Planner's prompt (still never source content)
+    [x] ship gate: >6 top-level units still dispatches <=6 (T2)/<=8 (T3)
+        probes, cap independent of corpus size
+    [x] 30 new tests (502 total)
+
+[x] §B5  runtime split                        (v7)      — SHIPPED 2026-08-11
+    [x] new v7/split.py: SplitProposal/read_split_proposal, evaluate_split
+        (the 5-precondition §A8.2 gate: measured overrun, depth/node caps,
+        set-based tiling repair of children against node.inputs, leaf_gate
+        per child, 2<=children<=8), graft_split, handle_split_proposal,
+        maybe_derive_split_parent
+    [x] v1/tree.py: NodeStatus gained "split" (terminal); TaskNode gained
+        additive parent:str=""; is_complete() treats ("passed","split") as
+        done
+    [x] v1/round_loop.py: dispatch_node/review_and_transition_node/
+        run_round_loop gained optional split_handler/on_node_passed
+        callables (default None = byte-identical); wired only from
+        driver.py for T2/T3, never for T0/T1's v6/direct.py path (T1's own
+        size_defect_retry->T2 escalation already covers single-node
+        overrun; split needs a real multi-node tree.json to graft into)
+    [x] v1/writer.py: the split-proposal option is only mentioned in the
+        prompt when the node's resolved inputs already exceed its token
+        budget
+    [x] v3/assemble.py: split parents excluded from top-level concatenation
+        (their content already appears via their children) but not treated
+        as "incomplete"; v3/checks.py gained check_split_parents_derived
+    [x] escalation trigger #4 (split_accepted, T2->T3) finally wired from
+        driver.py's _phase_execute, closing the last of §A4.4's four
+        triggers
+    [x] ship gate: one full run_round_loop pass where a leaf overruns,
+        splits into dot-hierarchical children (parent.child1, parent.child2,
+        ...), all children pass, and the parent's artifact equals their
+        concatenation
+    [x] 38 new tests (540 total)
+
+[x] §B6  tiered review + fan-out              (§D5)      — SHIPPED 2026-08-11
+    [x] §D5 interim (superseded): audit/<node>.json's `truncated: true`
+        flag stays, but now means "a section was genuinely cut," not "the
+        artifact was merely large" — see below.
+    [x] v1/reviewer.py's review_node fans out transparently when over cap:
+        split by the shallowest heading level present into <=6 groups (no
+        headings -> falls back to the old plain cap_artifact_text
+        truncation, documented last resort), one complete_json call per
+        group, items merged by union, verdict = all-groups-pass. Public
+        signature unchanged; an under-cap artifact is byte-identical to the
+        old single-call path.
+    [x] driver.py's _phase_review now runs document_review's 3 windowed
+        passes (coverage/duplication/contract-compliance, keep_depth_pass=
+        False) unconditionally at T2 — not gated behind --document-review,
+        which stays T3-only and unchanged (still gated, still gets the
+        depth pass). New _handle_document_review_triage(...) factors the
+        majority-regenerate-check/approval/apply_triage sequence shared by
+        both call sites; T2's repairs auto-apply with no operator approval
+        (mirroring §A10's "T2 must not silently park overnight" reasoning),
+        T3's keeps its existing approval gate.
+    [x] ship gate: a defect planted past where plain 8k-token truncation
+        would have cut it is caught post-fan-out (asserted against the
+        pre-fan-out truncation point, not just in isolation)
+    [x] 13 new tests (553 total)
 
 [ ] §C1  node-type templates                  — the semantic bar — NOT STARTED
 [ ] §C2  parallel dispatch                    — now correctness, not throughput — NOT STARTED
@@ -1221,6 +1307,33 @@ system that runs the wrong phases on the wrong input is measuring the wrong
 thing. §C2 late because parallelism multiplies whatever correctness the rest
 has established, in both directions.
 
+**2026-08-11 session: §B3–§B6 shipped, closing out the whole B-series.** Four
+sequential subagents, one per workstream, each building on the last's commit
+on this same branch (`5d6621b` §B3, `1df43b2` §B4, `e467e4a` §B5, `0de6e8b`
+§B6) — sequential rather than parallel-isolated specifically because each
+touches overlapping shared modules (`pipeline/driver.py` above all; `v1/tree.py`
+for §B5's new `"split"` status). §B3 replaced the old fixed 8-call intake
+interview with the question-set-plus-objections design §A5 specifies. §B4
+generalized `ResearchQuery` to `Probe` and wired structural exploration
+(one capped probe per top-level unit, tier-capped) into the T2/T3 plan
+phase, closing the gap `_phase_explore`'s own docstring had flagged since
+§B2. §B5 built the whole runtime-split mechanism from nothing — a new `v7`
+package, a `"split"` node status, and the fourth (last) of §A4.4's
+escalation triggers finally wired to a real call site. §B6 replaced
+§D5's interim truncation-flag fix with the real fix (heading fan-out) and
+gave T2 the mandatory cross-leaf consistency pass §A9's table specifies.
+Each workstream's own ship gate is demonstrated the same sandbox-honest way
+every prior v6 workstream was (`FakeProvider`/fake adapters standing in for
+a real LLM/gptme install, neither available in this sandbox — see
+`CLAUDE.md`'s "Provenance and licensing constraints" / Part III preamble).
+**553 tests, ~23s, all green (up from 461 at the start of the session).**
+See `CLAUDE.md`'s new "v2 — adaptive intake", "v4 — probes", and
+"v7 — runtime split" sections (and the updated "v1 — the round loop" /
+"v1 — reviewer" entries) for the file-by-file breakdown of all four.
+§A10 (pilot/contract tiered to T3-only) and §C1–§C5 remain unstarted —
+of those, §C1 (node-type templates) is the highest-value gap left, per
+this file's own ranking above.
+
 ---
 
 # Part VII — Results log
@@ -1246,3 +1359,15 @@ number actually was.
 | 2026-08-10 | §B2 tier classification | `v6/tiering.py` added: `Signals`/`measure_signals` (free, word-boundary marker counts, coarse `named_paths` from `top_dirs`), `ScopeEstimate`/`estimate_scope` (one `complete_json` call, content-free digest via `work_object.iter_workspace_paths`), `classify` (§A4.3's table + the `unknown`-forces-≥T2 override), `phases_for` (maximal per-tier phase list — a deliberate reading of §A4.3's table over its literal short tuples, see CLAUDE.md), `escalate`/`tier_max`. `v6/direct.py` added: T0's tree-less `run_direct_episode` (persists to `direct_node.json`, never `tree.json`) and T1's code-built `build_single_node_tree`, both reusing `v1/round_loop.py`'s newly-extracted `dispatch_node`/`review_and_transition_node` (pulled out of `run_round_loop`'s inline closures, purely mechanical, no behavior change). `pipeline/driver.py`: new `_phase_classify`/`_phase_verify`/`_phase_review`/`_phase_explore`; `_phase_survey` now branches on `work_object.kind=="workspace"`; `_phase_intake` skips the full interview when the estimate reported no ambiguities/objections; `run()` is tier-driven (re-reads `tier.json` every loop iteration, `_ran_key` tracks tier-scoped phase names like `"execute@T1"` separately from tier-independent ones). Three of four §A4.4 escalation triggers wired end to end (size-defect-twice, operator, majority-regenerate); the fourth (split-accepted) is a correct, tested, uncalled function pending §B5. `--tier` floor and `kusudaemon pipeline escalate` added to both CLI entry points. |
 | 2026-08-10 | §B2 ship gate | Sandbox-honest (no LLM/API key available, same constraint as §B1): `test_v6_tiering.py::ShipGateThreeGoalsTest` builds one real small repo and three goal strings shaped like the spec's own one-line-edit/three-file-feature/repo-wide-refactor examples, scripts `estimate_scope`'s one call with `FakeProvider`, and asserts `classify()` returns T0-or-T1/T2/T3 respectively. `T0ShipGateCallCountTest` drives a full fake-provider-and-fake-writer `RecursiveDriver.run()` for a T0 goal and asserts total provider calls ≤3 (measured: exactly 1 — `classify`; review is free since the direct node declares no judgment items). `TierOverrideFloorTest` confirms `--tier T3` on a trivial goal still runs every T3 phase. `ResumeAfterEscalationTest` confirms a live T1→T2 escalation (caught mid-run by a fresh `RecursiveDriver` construction, simulating process resume) correctly re-enters at `plan`/`execute` under the new tier rather than re-visiting the archived T1 tree — this test caught a real bug during development (T1's code-built `tree.json` was making `_phase_done("plan")` falsely report done post-escalation; fixed by archiving it aside before the tier bump). |
 | 2026-08-10 | Test suite | 410 → 461 tests (51 new: `test_v6_tiering.py` (38), plus 13 additions to `test_driver_phases.py`). All green, ~23s. |
+| 2026-08-11 | §B3 adaptive intake | `v2/intake.py` rewritten: `MAX_INTAKE_ROUNDS=2`, `IntakeQuestion`/`IntakeObjection`/`QuestionSet`, `build_question_set` (one `complete_json` call per round, each question carries a `default_assumption` so no separate finalize call is needed), `run_intake(run_dir, goal, ambiguities, objections, provider, ask_fn) -> GlobalRubric` (round-capped, round 2 only if round 1 got ≥1 non-blank answer and a fresh call still returns questions). `approvals.py`'s `Approval` gained additive `questions`/`answers` fields; `driver.py`'s `_phase_intake` now reads the estimate's ambiguities/objections back out of `tier.json` and posts ONE approval per round (`_ask_intake_round`, replacing the old one-approval-per-dimension `_answer_intake`). `spec.md` gains `## Unresolved objections` when any survive intake, feeding straight into `prompts.py`'s already-built (but previously always-empty) reader. Objections have no per-item resolved/unresolved state machine — every objection from round 1 reaches the operator via the approval and is unconditionally copied to `spec.md` if intake ends without one, satisfying the ship gate literally without inventing unrequested machinery. |
+| 2026-08-11 | §B3 ship gate | `mean intake calls across five varied goals is <3` demonstrated via two explicit call-budget tests: 1 call in the typical case (no round 2 needed), ≤2 worst case — both well under the target (today's old design: exactly 8, unconditionally). A self-contradictory goal's objection is asserted to reach both the operator's approval message and `spec.md`. |
+| 2026-08-11 | Test suite | 461 → 472 tests (net +11: -5 old per-dimension intake tests, +14 new intake tests, +2 driver-phase intake tests). All green, ~23s. |
+| 2026-08-11 | §B4 probes / delegated exploration | `v4/research.py`: `ResearchQuery` generalized to `Probe{kind: web \| workspace \| corpus \| doc_retrieval}` (`ResearchQuery = Probe`, a literal alias; `normalize_probe_kind` maps legacy `"web_search"` → `"web"` so old JSON research-plan payloads still parse). New `adapters/tools/workspace_read.py` (file-path-loaded gptme tool, same pattern as `searxng_search.py`): `list_dir`/`grep`, path-confined to a root, giving the `"workspace"` probe kind read+list+grep with no write/shell tool ever in its allowlist; `"corpus"` gets bare `"read"` scoped by the same hidden-paths mechanism Writers already use. `v6/tiering.py` gained `max_explorers_for(tier) = {T0:0, T1:2, T2:6, T3:8}` (T3's number isn't given by §A4.3's table; 8 was chosen over "unbounded" specifically so a 200-directory monorepo doesn't defeat the cap's purpose). `driver.py`'s `_phase_explore` now dispatches one probe per top-level `SpineUnit` (both `workspace`- and `corpus`-mode runs) at T2/T3 only (T1 has no `plan` phase to feed), capped by `max_explorers_for`, largest-units-first when over the cap, reusing v4's existing 300-token cap and nonempty-finding idempotency cache verbatim. `v2/planner.py`'s `plan_level`/`build_tree`/`_render_slice` gained an optional `unit_summary_for` callable threading each unit's capped finding into the Planner's rendered slice — still never source content. |
+| 2026-08-11 | §B4 ship gate | A corpus with more top-level units than `max_explorers_for("T2")` (6) still dispatches ≤6 probes — the cap bounds cost independent of corpus size, demonstrating the "≥200-file repo, cost ≤ max_explorers" claim without needing an actual 200-file fixture. |
+| 2026-08-11 | Test suite | 472 → 502 tests (30 new: `test_v4_probes.py` (21), `test_workspace_read_tool.py` (9)). All green, ~23s. |
+| 2026-08-11 | §B5 runtime split | New `v7/split.py`: `SplitProposal`/`read_split_proposal` (mirrors `v1/writer.py`'s `_read_promotion` defensive parse), `evaluate_split` (the §A8.2 gate — measured overrun via `estimate_tokens` on resolved inputs or `v6/direct.py:is_size_defect`, depth/node caps against `v2/planner.py`'s own `DEFAULT_DEPTH_CAP`/`DEFAULT_NODE_CAP`, a set-based tiling repair of the proposal's children against the parent's `node.inputs` — not `_repair_partition` reused unchanged, since that function is keyed to spine-unit index ranges and split children declare `inputs: list[str]` instead — then `leaf_gate` reused verbatim per child, then `2<=children<=8`), `graft_split` (dot-hierarchical child ids `f"{parent.id}.{child.id}"`, `depends_on` copied from the parent so nothing waits on the parent itself, a new additive `TaskNode.parent` field), `handle_split_proposal`, `maybe_derive_split_parent` (rewrites the parent's `out/<parent>.md` as the concatenation of its children once every sibling has passed). `v1/tree.py` gained the `"split"` terminal `NodeStatus` and treats `("passed","split")` as complete in `is_complete()`. `v1/round_loop.py`'s `dispatch_node`/`review_and_transition_node`/`run_round_loop` gained optional `split_handler`/`on_node_passed` callables (default `None`, byte-identical when unset) — `pipeline/driver.py` wires them only for T2/T3's `_phase_execute`, never for T0/T1's tree-less/single-node `v6/direct.py` path, since a rejected-precondition attempt must be preserved (not burned) and T0 has nowhere to graft children into anyway. `v3/assemble.py` excludes `"split"`-status nodes from the top-level document concatenation (their content already appears via their children) while still counting them as complete for `require_complete`; `v3/checks.py` gained `check_split_parents_derived`. Escalation trigger #4 (`split_accepted`, T2→T3 — correct and unit-tested since §B2 but never wired to a call site) is now called from `_phase_execute` whenever a T2 round produces a `"split"`-status node. |
+| 2026-08-11 | §B5 ship gate | One full `run_round_loop` pass where a leaf's fake adapter writes `split.json` instead of an artifact on its first dispatch, the proposal is accepted and grafted, each dot-hierarchical child's fake adapter writes a real artifact and passes, and the parent ends `"split"` with `out/<parent>.md` equal to the fresh concatenation of its now-`"passed"` children — asserted directly, plus the children's id shape (`f"{parent}.{child}"`) is asserted to match what the dashboard's existing dot-path grouping already renders as a nested tree, without touching `dashboard/` itself. |
+| 2026-08-11 | Test suite | 502 → 540 tests (38 new, in `test_v7_split.py` plus extensions to `test_v1_units.py`/`test_v3_assemble.py`/`test_v3_checks.py`/`test_driver_phases.py`/`test_v6_tiering.py`). All green, ~23s. |
+| 2026-08-11 | §B6 tiered review + fan-out | `v1/reviewer.py`'s `review_node` fans out transparently on an over-cap artifact — public signature unchanged, under-cap path byte-identical to before. Splits by the *shallowest* markdown heading level actually present (never mixed levels) into ≤`MAX_FANOUT_SECTIONS=6` groups (more headings than that get merged into contiguous, near-equal-count runs, never dropped); one `complete_json` call per group; `items` merged by union, `verdict` = all-groups-pass. No headings at all → the old plain `cap_artifact_text` truncation, kept as a documented last resort; a single group that's *still* over cap after splitting gets that same per-group truncation. `ReviewVerdict.truncated` now means "a group was genuinely cut," superseding §D5's interim meaning of "the artifact was merely large." `pipeline/driver.py`'s `_phase_review` runs `v3/document_review.py`'s 3 windowed passes (`keep_depth_pass=False`) unconditionally at T2 — not gated behind `--document-review`, which stays exactly as it was, T3-only. New `_handle_document_review_triage(...)` factors the majority-regenerate-check/approval/`apply_triage` sequence shared by both `_phase_review` (T2, repairs auto-apply, no operator approval — mirroring §A10's "must not silently park overnight" reasoning for why T2 skips human gates) and `_phase_assemble` (T3, unchanged, still asks). |
+| 2026-08-11 | §B6 ship gate | A defect planted in an over-cap artifact, positioned past the point where plain 8k-token truncation would have cut it (the test computes that cutoff and asserts the defect's section starts after it, not just asserting the new behavior in isolation), is caught post-fan-out — the exact "today: structurally impossible" claim §B6 names. |
+| 2026-08-11 | Test suite | 540 → 553 tests (13 new: `test_v1_reviewer_fanout.py` (9), plus 4 additions to `test_driver_phases.py`). All green, ~23s. |

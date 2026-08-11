@@ -94,12 +94,33 @@ class Candidate:
     tokens: int
 
 
-def _render_slice(units: list[SpineUnit]) -> str:
-    return "\n".join(f"{i}: {unit.label} ({unit.tokens} tokens)" for i, unit in enumerate(units))
+def _render_slice(
+    units: list[SpineUnit],
+    unit_summary_for: Callable[[SpineUnit], str] | None = None,
+) -> str:
+    """One line per unit — label and token count only, per §3: "Planner
+    never sees source content." PLAN.md §A7 point 3/§B4 adds one more line
+    per unit *only* when ``unit_summary_for`` returns something: the
+    ≤300-token capped finding a structural-exploration probe already wrote
+    (``v4/research.py``'s ``RESEARCH_FINDING_TOKEN_CAP``), never source —
+    the harness already paid for that summary before this call, and it's
+    strictly a better partition input than the label alone."""
+    lines = []
+    for i, unit in enumerate(units):
+        line = f"{i}: {unit.label} ({unit.tokens} tokens)"
+        summary = unit_summary_for(unit) if unit_summary_for is not None else ""
+        if summary:
+            line += f"\n   summary: {summary}"
+        lines.append(line)
+    return "\n".join(lines)
 
 
 def plan_level(
-    units: list[SpineUnit], provider: OpenAICompatibleProvider, *, top_level: bool
+    units: list[SpineUnit],
+    provider: OpenAICompatibleProvider,
+    *,
+    top_level: bool,
+    unit_summary_for: Callable[[SpineUnit], str] | None = None,
 ) -> list[Candidate]:
     hint = (
         f"{DEFAULT_TOP_LEVEL_MIN_CHILDREN}-{DEFAULT_TOP_LEVEL_MAX_CHILDREN} children"
@@ -112,7 +133,7 @@ def plan_level(
             "role": "user",
             "content": (
                 f"Slice has {len(units)} units, indices 0..{len(units) - 1}. Target: {hint}.\n\n"
-                + _render_slice(units)
+                + _render_slice(units, unit_summary_for)
             ),
         },
     ]
@@ -260,6 +281,7 @@ def build_tree(
     default_gates: tuple[str, ...] = ("nonempty",),
     input_path_for: Callable[[SpineUnit], str] | None = None,
     log: EventLog | None = None,
+    unit_summary_for: Callable[[SpineUnit], str] | None = None,
 ) -> TaskTree:
     """Recurse level-at-a-time from the full spine to a flat set of leaf
     TaskNodes. Depth cap, node cap, and a size floor (a one-unit slice
@@ -277,7 +299,13 @@ def build_tree(
     ``planner_partition_repaired`` (the model's partition did not tile its
     slice — §11.4) and ``planner_node_cap_reached`` (the node cap dropped
     remaining units). Both were silent before; both are structural
-    corrections, not model judgment."""
+    corrections, not model judgment.
+
+    ``unit_summary_for`` (PLAN.md §A7 point 3/§B4) resolves a unit to its
+    structural-exploration probe summary, if one exists — threaded through
+    to every ``plan_level`` call at every recursion depth, not just the
+    top-level one, so a deeper slice re-planned after a failing leaf still
+    sees whatever summary its units have."""
     nodes: dict[str, TaskNode] = {}
     budget = _NodeBudget(node_cap)
     cap_event_emitted = False
@@ -352,7 +380,9 @@ def build_tree(
             forced_leaf(slice_units, path or f"depth{depth}", "depth cap reached")
             return
 
-        candidates = plan_level(slice_units, provider, top_level=(depth == 0))
+        candidates = plan_level(
+            slice_units, provider, top_level=(depth == 0), unit_summary_for=unit_summary_for
+        )
         if not candidates:
             forced_leaf(slice_units, path or f"depth{depth}", "planner returned no children")
             return

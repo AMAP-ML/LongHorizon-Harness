@@ -25,6 +25,16 @@ Record shape (flat dict, JSON-serializable):
     user_input: str            -- free-form answer / edited document once resolved
     reason: str | ""
     created_at / resolved_at: float
+    questions: [{id, text}]   -- PLAN.md §A5/§B3: a batch-form approval (e.g.
+                                 kind "intake_questions") carries every
+                                 question for one round here instead of one
+                                 approval per question; empty for every
+                                 other kind. Additive, defaulted -- every
+                                 pre-§B3 approvals.jsonl line loads unchanged.
+    answers: {id: text}       -- the operator's per-question answers once
+                                 resolved, keyed by the matching entry in
+                                 `questions`. Blank/missing = unanswered.
+                                 Additive, defaulted, same reasoning.
 """
 
 from __future__ import annotations
@@ -59,11 +69,17 @@ class Approval:
     reason: str = ""
     created_at: float = field(default_factory=time.time)
     resolved_at: float | None = None
+    questions: list[dict[str, str]] = field(default_factory=list)
+    answers: dict[str, str] = field(default_factory=dict)
 
-    def resolve(self, *, action: str = "", user_input: str = "", reason: str = "") -> "Approval":
+    def resolve(
+        self, *, action: str = "", user_input: str = "", reason: str = "",
+        answers: dict[str, str] | None = None,
+    ) -> "Approval":
         self.action = str(action or "")
         self.user_input = str(user_input or "")
         self.reason = str(reason or "")
+        self.answers = {str(k): str(v) for k, v in (answers or {}).items()}
         self.status = "resolved"
         self.resolved_at = time.time()
         return self
@@ -72,6 +88,7 @@ class Approval:
     def create(
         kind: str, *, title: str, message: str = "", options: list[dict[str, str]] | None = None,
         allow_input: bool = True, input_label: str = "", context: dict[str, Any] | None = None,
+        questions: list[dict[str, str]] | None = None,
     ) -> "Approval":
         return Approval(
             approval_id=uuid.uuid4().hex[:12],
@@ -82,6 +99,7 @@ class Approval:
             allow_input=allow_input,
             input_label=input_label,
             context=context or {},
+            questions=[dict(q) for q in (questions or [])],
         )
 
     def to_dict(self) -> dict[str, Any]:
@@ -103,6 +121,8 @@ class Approval:
             reason=str(data.get("reason", "")),
             created_at=float(data.get("created_at") or time.time()),
             resolved_at=data.get("resolved_at"),
+            questions=[dict(q) for q in list(data.get("questions") or [])],
+            answers={str(k): str(v) for k, v in dict(data.get("answers") or {}).items()},
         )
 
 
@@ -250,11 +270,18 @@ class Approver:
         *,
         action: str = "answer",
         user_input: str = "",
+        answers: dict[str, str] | None = None,
         poll_interval: float = 0.05,
     ) -> None:
         self.run_dir = Path(run_dir)
         self.action = action
         self.user_input = user_input
+        # PLAN.md §B3: keyed by question id, for a form-shaped approval
+        # (non-empty `questions`) -- a question whose id isn't in here
+        # resolves blank, same as a silent operator. Ignored entirely for
+        # every non-form kind (pilot, amend, ...), which never sets
+        # `questions` in the first place.
+        self.answers = dict(answers or {})
         self.poll_interval = poll_interval
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
@@ -293,6 +320,9 @@ class Approver:
         self.resolved.append(approval_id)
 
     def resolve(self, approval: Approval) -> None:
-        record = approval.resolve(action=self.action, user_input=self.user_input)
+        per_question = {q["id"]: self.answers.get(q["id"], "") for q in approval.questions}
+        record = approval.resolve(
+            action=self.action, user_input=self.user_input, answers=per_question
+        )
         append(self.run_dir, record)
         self.resolved.append(approval.approval_id)

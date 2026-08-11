@@ -43,8 +43,17 @@ class IndexEntry:
 
 def ordered_node_ids(tree: TaskTree) -> list[str]:
     """Document order: the order nodes appear in ``tree.json`` (see module
-    docstring for why that's already the right order and not a coincidence)."""
-    return list(tree.nodes.keys())
+    docstring for why that's already the right order and not a coincidence).
+
+    PLAN.md §A8.3/§B5: a "split" node's own artifact is a *derived*
+    concatenation of its already-grafted children (``v7/split.py``), and
+    those children are themselves ordinary entries in ``tree.nodes`` in
+    their own right. Including the split parent here too would duplicate
+    its children's content in the top-level assembly — excluded, the same
+    way a "split" status is excluded from being a defect elsewhere in this
+    package (``check_all_nodes_passed``) without being excluded from
+    *completeness* (``require_complete`` below, ``TaskTree.is_complete()``)."""
+    return [node_id for node_id, node in tree.nodes.items() if node.status != "split"]
 
 
 def build_index(tree: TaskTree) -> list[IndexEntry]:
@@ -56,10 +65,15 @@ def build_index(tree: TaskTree) -> list[IndexEntry]:
 
 def require_complete(tree: TaskTree) -> None:
     """Assembly reads every node's artifact, so every node must have
-    actually passed first — §4.6 assumes the leaves are done, not that
+    actually finished first — §4.6 assumes the leaves are done, not that
     assembly is what finishes them. Raise with a full list, not just the
-    first miss, since the caller needs to know how much is left."""
-    incomplete = [n.id for n in tree.nodes.values() if n.status != "passed"]
+    first miss, since the caller needs to know how much is left.
+
+    "split" counts as finished (PLAN.md §A8/§B5): a split parent never
+    reaches "passed" itself (its children do), but it is a genuine,
+    successful terminal outcome, not an incomplete one — matching
+    ``TaskTree.is_complete()``'s own treatment."""
+    incomplete = [n.id for n in tree.nodes.values() if n.status not in ("passed", "split")]
     if incomplete:
         raise AssemblyNotReadyError(
             f"{len(incomplete)} node(s) not yet passed, cannot assemble: {incomplete}"
@@ -87,12 +101,17 @@ def concatenate_artifacts(
     tree: TaskTree,
     *,
     render: Callable[[TaskNode, str], str] = _default_render,
+    node_ids: list[str] | None = None,
 ) -> str:
+    """``node_ids``, when given, overrides ``ordered_node_ids(tree)`` as the
+    set/order to render — PLAN.md §A8.3: this is also how a split parent's
+    own derived artifact gets built (``v7/split.py:maybe_derive_split_parent``,
+    ``v3/checks.py:check_split_parents_derived``), scoped to just that
+    parent's grafted children rather than the whole tree, without
+    duplicating this join/render logic a second time."""
     run_dir = Path(run_dir)
-    parts = [
-        render(tree.nodes[node_id], _read_artifact(run_dir, node_id))
-        for node_id in ordered_node_ids(tree)
-    ]
+    ids = node_ids if node_ids is not None else ordered_node_ids(tree)
+    parts = [render(tree.nodes[node_id], _read_artifact(run_dir, node_id)) for node_id in ids]
     return "\n\n".join(part.rstrip() for part in parts).rstrip() + "\n"
 
 

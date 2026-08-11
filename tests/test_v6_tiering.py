@@ -36,10 +36,11 @@ from fake_provider import FakeProvider  # noqa: E402
 
 from kusudaemon.pipeline import approvals as approval_store  # noqa: E402
 from kusudaemon.pipeline.driver import RecursiveDriver, RunOptions  # noqa: E402
-from kusudaemon.pipeline.run_dir import node_artifact_path, tier_path, tree_path  # noqa: E402
+from kusudaemon.pipeline.run_dir import events_path, node_artifact_path, tier_path, tree_path  # noqa: E402
 from kusudaemon.types import EpisodeBudget, EpisodeResult  # noqa: E402
 from kusudaemon.v0.run_dir import create_run_dir  # noqa: E402
-from kusudaemon.v1.tree import TaskTree  # noqa: E402
+from kusudaemon.v0.events import EventLog  # noqa: E402
+from kusudaemon.v1.tree import NodeBudget, TaskNode, TaskTree  # noqa: E402
 from kusudaemon.v2.survey import SpineUnit, save_spine  # noqa: E402
 from kusudaemon.v6.direct import DIRECT_NODE_ID, SINGLE_NODE_ID, is_size_defect  # noqa: E402
 from kusudaemon.v6.tiering import (  # noqa: E402
@@ -617,9 +618,22 @@ class ResumeAfterEscalationTest(unittest.TestCase):
                 # run dir, this time with what "plan" actually needs (one
                 # spine unit forces a zero-call leaf, per v2/planner.py) and
                 # a real writer for the new leaf.
+                # PLAN.md §A9/§B6: the escalated tier is T2, so the "review"
+                # phase now runs document_review's 3 windowed cross-leaf
+                # passes unconditionally (not gated behind
+                # RunOptions.document_review) -- one window each, since the
+                # replanned tree has a single passed leaf. Canned pass/pass/
+                # pass responses so this resume proves escalation wiring,
+                # not document-review's own findings.
                 driver2 = RecursiveDriver(
                     run_dir,
-                    provider=FakeProvider([]),  # type: ignore[arg-type]
+                    provider=FakeProvider(  # type: ignore[arg-type]
+                        [
+                            {"items": [], "verdict": "pass"},  # coverage
+                            {"items": [], "verdict": "pass"},  # duplication
+                            {"items": [], "verdict": "pass"},  # contract_compliance
+                        ]
+                    ),
                     options=RunOptions(goal="do the thing", dispatch_policy="document_order"),
                     writer_adapter_factory=_writer_factory(run_dir.resolve()),
                     research_adapter_factory=lambda node, query: (_ for _ in ()).throw(
@@ -634,6 +648,115 @@ class ResumeAfterEscalationTest(unittest.TestCase):
                 # discarded (PLAN.md §A4.4: "strictly additive to durable
                 # state -- nothing is discarded").
                 self.assertNotIn(SINGLE_NODE_ID, tree.nodes)
+
+        asyncio.run(scenario())
+
+
+# ----------------------------------------------------------------------
+# PLAN.md §A4.4 row 4 / §B5: a node's accepted split proposal promotes
+# T2 -> T3. `escalate(tier, "split_accepted")` was already correct and
+# unit-tested in isolation above (EscalateTest); this drives the actual
+# call site (`pipeline/driver.py:_phase_execute`) end to end.
+# ----------------------------------------------------------------------
+class _SplitProposingWriterAdapter:
+    has_file_tools = True
+    supports_session_resume = False
+
+    def __init__(self, run_dir: Path, node_id: str) -> None:
+        self._run_dir = run_dir
+        self._node_id = node_id
+
+    async def run_episode(self, prompt, env, budget, live_trajectory_path=None, **kwargs) -> EpisodeResult:
+        from kusudaemon.v0.run_dir import ensure_node_scratch_dir
+
+        scratch = ensure_node_scratch_dir(self._run_dir, self._node_id)
+        (scratch / "split.json").write_text(
+            json.dumps(
+                {
+                    "reason": "too large for one episode",
+                    "children": [
+                        {"id": "a", "brief": "handle part a", "inputs": ["part_a.md"], "estimated_calls": 3},
+                        {"id": "b", "brief": "handle part b", "inputs": ["part_b.md"], "estimated_calls": 3},
+                    ],
+                }
+            ),
+            encoding="utf-8",
+        )
+        return EpisodeResult(status="done", actions_log="", duration_ms=1, metadata={})
+
+
+class SplitAcceptedEscalationDriverTest(unittest.TestCase):
+    """PLAN.md §A4.4: "any node's accepted split proposal -> promote T2 ->
+    T3." Only for T2 -- majority_regenerate's own driver-side check gates
+    the same way, since T3 is already the ceiling that trigger targets."""
+
+    def test_an_accepted_split_during_t2_execute_promotes_to_t3(self) -> None:
+        async def scenario() -> None:
+            with tempfile.TemporaryDirectory() as root_str:
+                run_dir = Path(root_str) / "run"
+                create_run_dir(run_dir.parent, run_dir.name)
+
+                tier_path(run_dir).write_text(
+                    json.dumps(
+                        {
+                            "tier": "T2", "measured_tier": "T2", "override": None,
+                            "needs_intake": False, "needs_explore": False,
+                            "signals": {}, "estimate": {}, "ts": 0,
+                        }
+                    ),
+                    encoding="utf-8",
+                )
+                from kusudaemon.v0.run_dir import spec_path
+
+                spec_path(run_dir).write_text("# Spec\n\n## Goal\ndo the thing\n", encoding="utf-8")
+                save_spine(run_dir, [SpineUnit(id="unit-01", label="whole thing", start_chunk=0, end_chunk=0, tokens=10)])
+
+                # 40 words each -> ~53 tokens each; joined ~106 tokens
+                # exceeds the node's own 80-token budget (overrun), while
+                # each part alone (~53 tokens) fits the same 80-token
+                # ceiling every grafted child inherits (leaf_gate passes).
+                (run_dir / "part_a.md").write_text(" ".join(["word"] * 40), encoding="utf-8")
+                (run_dir / "part_b.md").write_text(" ".join(["word"] * 40), encoding="utf-8")
+                big_node = TaskNode(
+                    id="big", brief="write the whole thing", artifact="out/big.md",
+                    gates=["nonempty"], inputs=["part_a.md", "part_b.md"],
+                    budget=NodeBudget(tokens=80, calls=15),
+                )
+                TaskTree(nodes={"big": big_node}).save(tree_path(run_dir))
+
+                def writer_adapter_factory(node):
+                    if node.id == "big":
+                        return _SplitProposingWriterAdapter(run_dir.resolve(), node.id)
+                    return _InMemoryWriterAdapter(
+                        node_artifact_path(run_dir.resolve(), node.id),
+                        f"real content for {node.id}\n",
+                    )
+
+                driver = RecursiveDriver(
+                    run_dir,
+                    provider=FakeProvider([]),  # type: ignore[arg-type]
+                    options=RunOptions(goal="do the thing", dispatch_policy="document_order"),
+                    writer_adapter_factory=writer_adapter_factory,
+                    research_adapter_factory=lambda node, query: (_ for _ in ()).throw(
+                        AssertionError("no research dispatch expected")
+                    ),
+                )
+
+                await driver._phase_execute()
+
+                tier_record = json.loads(tier_path(driver.run_dir).read_text(encoding="utf-8"))
+                self.assertEqual(tier_record["tier"], "T3")
+                events = EventLog(events_path(driver.run_dir)).read_all()
+                escalations = [e for e in events if e.get("type") == "run_tier_escalated"]
+                self.assertEqual(len(escalations), 1)
+                self.assertEqual(escalations[0]["trigger"], "split_accepted")
+                self.assertEqual(escalations[0]["from"], "T2")
+                self.assertEqual(escalations[0]["to"], "T3")
+
+                tree = TaskTree.load(tree_path(driver.run_dir))
+                self.assertEqual(tree.nodes["big"].status, "split")
+                self.assertEqual(tree.nodes["big.a"].status, "passed")
+                self.assertEqual(tree.nodes["big.b"].status, "passed")
 
         asyncio.run(scenario())
 

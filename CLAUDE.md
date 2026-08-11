@@ -436,6 +436,15 @@ Event vocabulary: `node_dispatched`, `session_captured`, `episode_completed`,
   Writer's prompt (which now states it literally, per `prompts.py` below) at
   a file nothing else ever reads or writes. `node.artifact` is the single
   source of truth now, enforced at both construction and `TaskTree.load`.
+  **PLAN.md §A8/§B5 (2026-08-11):** `NodeStatus` gained `"split"`, a
+  terminal-for-writers status a node reaches when its runtime split proposal
+  is accepted (`v7/split.py`) instead of ever producing its own artifact
+  directly; `TaskNode` gained an additive, defaulted `parent: str = ""`
+  pointing a grafted child back at the node it was split from.
+  `TaskTree.is_complete()` treats `("passed", "split")` as done — a split
+  parent never becomes literally `"passed"`, but a run isn't stuck just
+  because one exists. See the new "v7 — runtime split" section below for
+  the whole mechanism.
 - `gates.py` — evaluated in code, never sent to a model. Shipped set:
   `exists`, `nonempty`, `len:MIN-MAX`, `max_tokens:N`, `contains:TEXT`. The
   richer §6/§7 examples (`headers:std`, `terms_defined`, `problems>=5`) need
@@ -465,8 +474,33 @@ Event vocabulary: `node_dispatched`, `session_captured`, `episode_completed`,
   `ReviewVerdict` gained a `truncated: bool` field, set whenever
   `cap_artifact_text` actually cut the text, and `round_loop.py`'s
   `_write_audit` merges it into `audit/<node>.json` alongside `items`/
-  `verdict`. The real fix — fan-out by heading into multiple `review_node`
-  calls instead of truncating at all — is `PLAN.md` §B6, still open.
+  `verdict`.
+  **PLAN.md §A9/§B6 (2026-08-11), the real fix:** `review_node` now fans out
+  transparently on an over-cap artifact instead of truncating it — public
+  signature unchanged, and an under-cap artifact still takes the exact same
+  single-call path as before (byte-identical). Over cap: split by the
+  *shallowest* markdown heading level actually present in the artifact
+  (never mixed levels, so a doc using only `###` still gets sane top-level
+  sections) into at most `MAX_FANOUT_SECTIONS` (6) groups — more headings
+  than that get merged into contiguous, near-equal-count runs rather than
+  dropped past the 6th. One `complete_json` call per group, against the
+  *same* full rubric each time (a defect can be anywhere, sections aren't
+  independently scoped). `items` merge by union across groups (no dedup —
+  two groups independently flagging the same real defect isn't obviously
+  wrong, and a heuristic that could drop a distinct one is worse);
+  `verdict` is `"pass"` only if every group's was. No headings at all falls
+  back to the old plain `cap_artifact_text` truncation, kept as a
+  documented last resort — likewise a single group that's *still* over cap
+  after splitting gets that same per-group truncation. `truncated` now
+  means "a group was genuinely cut," which should be rare post-fan-out,
+  not the routine case it was for anything over ~6000 words pre-§B6. The
+  document-review depth pass (`v3/document_review.py`) deliberately did
+  **not** get the same fan-out treatment — it's already bounded to ≤4
+  shape-median nodes, so fan-out there would ~6x its call count for a
+  secondary spot-check, when per-leaf `review_node` (already fanned out)
+  is the primary correctness signal for those same nodes; a documented
+  scope cut, revisit if shape-median artifacts routinely exceed the cap in
+  practice.
 - `writer.py` — wraps v0's `run_node` unchanged (crash resume inherited free)
   and asks the agent to write `scratch/<node>/promotion.json`. Missing or
   unparseable → fall back to the episode's visible output; the ~400-token cap
@@ -474,6 +508,15 @@ Event vocabulary: `node_dispatched`, `session_captured`, `episode_completed`,
   promotion rather than breaking the loop. A separate instruction states that
   **the artifact is the deliverable** — without it, `out/<node>.md` collects
   the agent's last chat message, i.e. a sign-off line.
+  **PLAN.md §A8/§B5 (2026-08-11):** `run_writer_node` now also checks
+  whether the node's *resolved* inputs already exceed `node.budget.tokens`
+  (the same `estimate_tokens` measurement `v7/split.py`'s own overrun
+  precondition uses) and, only then, appends a split-proposal hint to the
+  prompt — the exact `split.json` schema, and permission to write it
+  instead of an artifact if the brief genuinely can't be completed within
+  budget. A node whose inputs don't exceed budget sees nothing about
+  splitting at all: "a node that cannot legally split is never told it
+  can" (§B5's own framing).
 - `round_loop.py` — the v1 entrypoint. Per-node tool restriction is the
   caller's job via `writer_adapter_factory`, so the loop never touches
   adapter internals. **Resumability:** before asking the orchestrator
@@ -496,13 +539,60 @@ Event vocabulary: `node_dispatched`, `session_captured`, `episode_completed`,
   round 0 into the previous process's `round-000.jsonl` — each run's
   rounds are a fresh, numbered file and `events.jsonl`'s `round` field
   carries the same rebased index.
+  **PLAN.md §A8/§B5 (2026-08-11):** `dispatch_node`, `review_and_transition_
+  node`, and `run_round_loop` each gained an optional injected callable —
+  `split_handler` (checked right after a Writer episode, before gate
+  evaluation; a hit short-circuits the normal gate/review path entirely) and
+  `on_node_passed` (checked right after a node reaches `"passed"`, to
+  opportunistically re-derive a just-completed split parent's concatenated
+  artifact). Both default to `None`, which reproduces this module's exact
+  pre-§B5 behavior — `v6/direct.py`'s T0/T1 path calls `dispatch_node`/
+  `review_and_transition_node` directly and never supplies either, so split
+  proposals are structurally impossible there (T0 has no `tree.json` to
+  graft children into at all, and T1's own oversized-single-node path is
+  the pre-existing `size_defect_retry`→T2 escalation, unchanged). Only
+  `pipeline/driver.py`'s `_phase_execute`, for T2/T3, wires them.
 
 ## v2 — intake, survey, planning, pilot, contract (`v2/`)
 
-- `intake.py` — one small call per rubric dimension (7), then one finalize
-  call. **The model, not the harness, decides what a reasonable default is**
-  for an unanswered dimension, and must emit a matching assumption line.
-  `answer_fn` is the seam to a real operator.
+- `intake.py` — **rewritten for PLAN.md §A5/§B3 (2026-08-11).** The old
+  design (one small call per rubric dimension × 7, then one finalize call,
+  unconditional on every run) is gone; see the "v6 — tier classification"
+  section below for why it now runs at all only when the classify phase's
+  one `estimate_scope` call already found ambiguities or objections.
+  `build_question_set(goal, ambiguities, objections, provider, *,
+  prior_qa=())` is the one call per round: it turns those free-text
+  ambiguity/objection strings into a bounded `QuestionSet` — ≤4
+  `IntakeQuestion`s (id, text, **and a `default_assumption`** — folding
+  what the old design's separate finalize call did into the same response,
+  so no second call is needed at all) plus `IntakeObjection`s restated as
+  `{claim, why, options[]}` concrete conflicts. `MAX_INTAKE_ROUNDS = 2` is a
+  code constant, not model judgment: round 2 fires only if round 1 got at
+  least one non-blank answer *and* a fresh call still returns questions — a
+  silent operator ends intake after round 1. `run_intake(run_dir, goal,
+  ambiguities, objections, provider, ask_fn) -> GlobalRubric` is the round
+  loop; `ask_fn` is the harness-side seam, now batched — **one approval per
+  round, carrying every question in it**, not one approval per question the
+  way the old per-dimension design worked. Unanswered questions become
+  assumption lines from their own `default_assumption`; objections that
+  survive to the end of intake unaddressed are copied verbatim into
+  `spec.md`'s new `## Unresolved objections` section (which
+  `pipeline/prompts.py`'s `_goal_and_rubric_block` was already built to
+  read, ahead of need, back in the §D1 fix — this is the first thing that
+  ever writes to it). There is no per-objection resolved/unresolved state
+  machine — every objection reaches the operator via the round's approval
+  and is unconditionally carried to `spec.md` if nothing later addresses
+  it, which satisfies §A5's "the agent should push back" requirement
+  without inventing machinery the spec didn't ask for.
+  `pipeline/driver.py`'s `_phase_intake` now reads the estimate's
+  ambiguities/objections back out of `tier.json` (written by `_phase_
+  classify`) rather than re-deriving anything, and `_ask_intake_round`
+  replaces the old `_answer_intake` (one approval per *round* now, keyed by
+  `context={"round": round_index}` for resume, instead of one per
+  *dimension*). `approvals.py`'s `Approval` gained additive `questions:
+  list[dict]` / `answers: dict[str,str]` fields so a form-shaped approval
+  round-trips through `approvals.jsonl` — old records with neither field
+  still load unchanged.
 - `survey.py` — chunking (model-free, folds undersized fragments into
   neighbors). The fold keeps a running token count per merged segment
   (11.10.9) — re-estimating a string it was also concatenating in place was
@@ -555,10 +645,24 @@ Event vocabulary: `node_dispatched`, `session_captured`, `episode_completed`,
   document order. `require_complete` raises listing every unfinished node.
   Output is generic markdown; a caller needing `main.tex` passes its own
   `render` callable — nothing here assumes a toolchain.
+  **PLAN.md §A8/§B5 (2026-08-11):** `ordered_node_ids` now excludes
+  `status == "split"` nodes from the top-level walk — their content already
+  appears via their grafted children, which *are* walked, so including the
+  parent too would duplicate it in the final document. `require_complete`
+  treats `("passed", "split")` as done rather than flagging a split parent
+  as unfinished. `concatenate_artifacts` gained an optional `node_ids`
+  filter, so the same function now backs both the whole-tree top-level
+  assembly and `v7/split.py`'s scoped re-derivation of one split parent's
+  artifact from just its own children.
 - `checks.py` — script only. Ships what is derivable today:
   all-nodes-passed, artifacts exist and nonempty, **gate drift** (an artifact
   that passed at dispatch time but no longer would), manifest desync. The
   `refs_out`/glossary checks in §4.6 need the node-type template system.
+  **PLAN.md §A8/§B5 (2026-08-11):** `check_all_nodes_passed` accepts
+  `("passed", "split")`; new `check_split_parents_derived` flags a split
+  parent whose on-disk artifact no longer matches a fresh concatenation of
+  its children (the file changed under us since — same framing as
+  `check_no_gate_drift`), wired into `run_cross_cutting_checks`.
 - `compile.py` — `compile_command` is a plain injected shell string run
   through `Environment.exec`. No command configured → trivial pass; most
   corpora compile nothing.
@@ -625,6 +729,76 @@ prompt, not that node's own handoff).
   `inputs`. Skips a finding that failed its own gate (a missing citation
   degrades gracefully rather than blocking a run) and never duplicates a
   path. Raises `KeyError` loudly on a plan naming an unknown node.
+
+**PLAN.md §A6/§B4 (2026-08-11): generalized to probes, and given a second,
+new dispatch pattern — structural exploration, scheduled pre-plan at T2+.**
+
+- `research.py` — `ResearchQuery` generalized to `Probe{kind: web |
+  workspace | corpus | doc_retrieval}` (was `{web_search | doc_retrieval}`).
+  Per PLAN.md §A12, `ResearchQuery` is kept as a **literal alias**
+  (`ResearchQuery = Probe`, not a subclass) so every existing caller across
+  `pipeline/backends.py`, `research_loop.py`, and every test keeps working
+  unchanged. `normalize_probe_kind` maps the legacy `"web_search"` string to
+  `"web"` (applied in `Probe.__post_init__` and in `parse_research_plan`),
+  so an old `{"kind": "web_search", ...}` research-plan JSON payload still
+  parses exactly as before — `"doc_retrieval"` is unchanged and still
+  raises (documented, unimplemented gap, not touched by this workstream).
+- `mcp_research.py` — `allowed_tools_for(kind)` gained two new kinds
+  matching §A6's table: `"workspace"` → `("read", <workspace_read tool
+  path>)` — gptme's built-in `read` plus a new harness-authored tool (below)
+  — **no `save`/`patch`/`shell` ever in this allowlist**, which is the
+  entire "no write, no shell mutation" guarantee (this codebase has no
+  filesystem sandbox anywhere — that guarantee, like every `hidden_paths`
+  guarantee elsewhere, is enforced by *omission from the tool allowlist*,
+  not by a runtime check). `"corpus"` → `("read",)` alone, scoped by the
+  same `hidden_paths` confinement mechanism a Writer already gets, over
+  `spine/`.
+- **New `adapters/tools/workspace_read.py`** — a read-only `list_dir`/`grep`
+  gptme tool, following `searxng_search.py`'s exact pattern (loaded by
+  gptme via file path, stdlib-only, `try/except ImportError`-guarded so it
+  stays importable and unit-testable outside a real gptme process).
+  `_resolve_within_root` is the one place in this codebase a path
+  confinement is actually *enforced in code* rather than left as prompt
+  text — necessary here because this tool's own arguments (a caller-supplied
+  relative path) let a model attempt to walk out via `../..` in a way
+  `read`/`shell` never could (they never took a caller-supplied relative
+  path before this tool existed).
+- `pipeline/backends.py` — `build_research_adapter` gained an optional
+  `run_dir` kwarg; for `workspace`/`corpus` probe kinds it hides the run
+  directory subtree the same way `build_writer_adapter` already does for
+  Writers in workspace mode (`_hidden_run_dir_subtree_for_probe`), and a
+  `workspace`-kind probe's adapter cwd is the work object's `root`
+  (mirroring `_default_writer_factory`'s existing branch), not the run dir.
+- **`v6/tiering.py`** gained `max_explorers_for(tier) -> int` — `{"T0": 0,
+  "T1": 2, "T2": 6, "T3": 8}`. §A4.3's table only gives T1/T2 numbers; T3's
+  8 was chosen deliberately over "unbounded" or "= number of top-level
+  units," since either would let a huge monorepo defeat the entire point of
+  a cap.
+- **`pipeline/driver.py`**'s `_phase_explore` now dispatches **structural
+  exploration** at T2/T3 only (T1 has no `plan` phase to feed, so it isn't
+  built there — T1 keeps its pre-existing operator-supplied-`research_plan`
+  path, unchanged): one probe per top-level `SpineUnit` from `load_spine`
+  (both `workspace`- and `corpus`-mode runs get this, symmetrically — §A6's
+  table lists `corpus` explicitly), capped by `max_explorers_for(tier)`,
+  largest-by-tokens selected first when there are more units than the cap
+  allows. Each probe asks a generic "summarize this unit's structure for a
+  planner deciding how to partition work" question, dispatched under the
+  pseudo-node-id `"explore"` (distinct from `_phase_survey`'s own unrelated
+  `"explore-01"` large-corpus reasoning-explainer pseudo-agent, so neither
+  collides with the other's trace/dispatch ids) through the *exact same*
+  `run_research_query` machinery every other probe uses — same 300-token
+  cap, same nonempty-finding idempotency cache (a probe with an existing
+  finding is never re-dispatched), same per-probe `EpisodeBudget`. Three
+  independent cost fences, all actually enforced in code: the episode
+  budget, `max_explorers_for`, and the 300-token cap.
+- **`v2/planner.py`** — `_render_slice`, `plan_level`, and `build_tree` all
+  gained an optional `unit_summary_for: Callable[[SpineUnit], str] | None`,
+  threaded through every recursion depth. `pipeline/driver.py`'s
+  `_phase_plan` supplies it, reading back each unit's capped exploration
+  finding — one extra line per unit in the slice the Planner sees. Still
+  never source content (§3's "Planner never sees source content" invariant
+  — a ≤300-token *summary* the harness already paid for is not source
+  content), just labels, token counts, and now a summary line too.
 
 ## v5 — pipeline driver and control surface (`pipeline/`, `dashboard/`)
 
@@ -1271,21 +1445,34 @@ episode instead of intake+survey+plan+pilot+execute+assemble.
     `T0 = (classify, execute, verify)`; `T1 = (classify, intake, explore,
     execute, review)`; `T2 = (classify, intake, explore, plan, execute,
     review, assemble)`; `T3` adds `pilot`/`research` in the CLAUDE.md §4
-    order. **"explore" is not a new mechanism** — until §B4's real probes
-    exist, it's the v6-vocabulary name for what `_phase_survey` already
-    does (see `pipeline/driver.py` below); **"review"** is a named
-    checkpoint after "execute", not a second dispatch pass — per-node
-    review already happens *inside* `_phase_execute` via
-    `v1/round_loop.py`'s coupled dispatch+review (a node can't be reviewed
-    before its own gates pass), so `_phase_review` just confirms the tree
-    isn't blocked.
+    order. **"explore" started as not-a-new-mechanism** — at §B2 ship time,
+    before §B4's real probes existed, it was purely the v6-vocabulary name
+    for what `_phase_survey` already does (see `pipeline/driver.py` below).
+    **PLAN.md §A6/§B4 (2026-08-11) gave it real content**: at T2/T3 it now
+    also dispatches structural exploration (one capped probe per top-level
+    unit, tier-bounded) before falling through to ensuring `spine.json`
+    exists — see the updated "v4 — probes" section above for the mechanism.
+    **"review"** is a named checkpoint after "execute", not a second
+    dispatch pass — per-node review already happens *inside* `_phase_execute`
+    via `v1/round_loop.py`'s coupled dispatch+review (a node can't be
+    reviewed before its own gates pass). **PLAN.md §A9/§B6 (2026-08-11)**
+    gave `_phase_review` real content too, at T2 specifically: beyond
+    confirming the tree isn't blocked, it now also runs
+    `v3/document_review.py`'s 3 windowed cross-leaf passes unconditionally
+    (§A9's table: T2 gets this as part of what the tier *is*, not gated
+    behind the `--document-review` operator flag the way T3's optional
+    depth-pass-inclusive full pass still is) — see the "v3" section above
+    for `_handle_document_review_triage`'s shared repair-dispatch plumbing.
   - `escalate(current, trigger) -> Tier` — invariant 9 enforced in one
-    place: never returns lower than `current`, for every trigger,
-    including `"split_accepted"` (§B5, not built — see below). `"operator"`
-    is the one relative trigger (+1 tier, clamped at T3); every other
-    trigger names its own floor tier directly (`size_defect_retry` → T2,
-    `majority_regenerate`/`split_accepted` → T3). An unknown trigger name
-    raises rather than silently no-op-ing.
+    place: never returns lower than `current`, for every trigger.
+    `"operator"` is the one relative trigger (+1 tier, clamped at T3);
+    every other trigger names its own floor tier directly
+    (`size_defect_retry` → T2, `majority_regenerate`/`split_accepted` →
+    T3). An unknown trigger name raises rather than silently no-op-ing.
+    **PLAN.md §A8/§B5 (2026-08-11):** `"split_accepted"` was correct and
+    unit-tested here since §B2 shipped but had no call site until §B5
+    built the runtime-split mechanism it belongs to — see the "v7 —
+    runtime split" section below for where it's now actually called from.
   - `tier_max(a, b)` — the ordering `--tier`'s floor-not-ceiling override
     needs (`pipeline/driver.py`: `tier = tier_max(measured, override)`).
 - `v6/direct.py` — T0's whole "no `tree.json`" execution path, plus T1's
@@ -1359,11 +1546,11 @@ episode instead of intake+survey+plan+pilot+execute+assemble.
   - `_phase_intake` — skips CLAUDE.md §4.1's full interview and writes a
     minimal `spec.md` (goal + one assumption line explaining the skip)
     directly, zero calls, whenever `tier.json`'s `needs_intake` is false
-    (the classify estimate reported no ambiguities/objections). This is
-    *not* §B3's adaptive intake (question-set + approval form) — that
-    workstream is still unstarted; this is only the on/off gate §A4.3
-    itself describes, reusing today's all-or-nothing interview when it
-    does fire.
+    (the classify estimate reported no ambiguities/objections). At §B2 ship
+    time this fell through to the old all-or-nothing 8-call interview when
+    it *did* fire; **PLAN.md §A5/§B3 (2026-08-11)** replaced that fallback
+    with the real adaptive question-set-plus-objections design — see the
+    rewritten "v2 — intake" section above for the mechanism.
   - `_phase_survey` — gained a `work_object.kind == "workspace"` branch at
     the top, calling `survey_workspace` directly instead of falling
     through to the corpus-only `source_text` check. This is the fix for
@@ -1373,16 +1560,23 @@ episode instead of intake+survey+plan+pilot+execute+assemble.
     structure discovery; kept as its own method (not a rename of
     `_phase_survey`) so pre-existing tests calling `_phase_survey` by name
     (§D4's corpus-less-raises test, the explorer-reasoning test) stay
-    correct unmodified. **It is not real agentic probing** — §B4 (`Probe`,
-    generalized from `v4/research.py`) is a separate, not-yet-started
-    workstream; until it lands, `_phase_explore` always ensures
+    correct unmodified. At §B2 ship time it was **not real agentic
+    probing** — §B4 (`Probe`, generalized from `v4/research.py`) hadn't
+    landed yet. **PLAN.md §A6/§B4 (2026-08-11) closed that gap** at T2/T3:
+    before falling through to the pre-existing behavior below, it now
+    dispatches one capped structural-exploration probe per top-level unit
+    (bounded by `max_explorers_for(tier)`) and threads the findings into
+    the subsequent `plan` call — see the updated "v4 — probes" section
+    above. T1 still gets none of this (no `plan` phase to feed). The
+    pre-existing behavior, still exactly as it was, always ensures
     `spine.json` exists (delegating to `_phase_survey`, since "plan" needs
     it unconditionally at every tier that has a plan phase) and, only when
     `needs_explore` is true, additionally runs the existing v4 research
-    loop if the operator supplied an explicit `research_plan`. This is an
-    honestly-documented approximation, not a claim that §B4 is done — the
-    §A4.3 table's "≤2/≤6 explorers" caps are not enforced anywhere because
-    nothing dispatches a bounded number of probe episodes yet.
+    loop if the operator supplied an explicit `research_plan` — this
+    targeted-exploration path is unchanged and still separate from
+    structural exploration above. §A4.3's "≤2/≤6 explorers" caps are now
+    genuinely enforced (`max_explorers_for`), closing the gap this
+    paragraph used to flag as open.
   - `_phase_execute`/`_phase_verify`/`_phase_review` — tier-branched.
     T0 dispatches via `v6/direct.py:run_direct_episode` and always reports
     "done" from `_phase_execute` itself; `_phase_verify` (T0's dedicated
@@ -1392,7 +1586,8 @@ episode instead of intake+survey+plan+pilot+execute+assemble.
     do it), then flows through the *unmodified* round loop with
     `DIRECT_MAX_ATTEMPTS` instead of the usual 3. T2/T3 are byte-identical
     to pre-§B2 behavior.
-  - **Escalation, three of four §A4.4 triggers wired**:
+  - **Escalation, all four §A4.4 triggers wired (2026-08-11, §B5 wired the
+    last one)**:
     1. *T0/T1 size-defect-after-two-attempts → T2.* Checked in
        `_phase_verify` (T0) and `_phase_execute` (T1, after
        `run_round_loop` returns and `tree.is_blocked()`) — both live in
@@ -1426,12 +1621,15 @@ episode instead of intake+survey+plan+pilot+execute+assemble.
        machinery, a separate intervention this trigger does not invoke.
        The trigger fires and the tier rises correctly; full retroactive
        contract enforcement on old leaves is not part of what §B2 wires.
-    4. *A node's accepted split proposal → T2 → T3* (§A8/§B5) — **not
-       wired to any call site**. `escalate(tier, "split_accepted")` exists
-       and is correct in isolation (tested directly in
-       `test_v6_tiering.py`), but runtime split (§B5) doesn't exist yet —
-       wiring a call site for a mechanism that isn't built would be fake,
-       not deferred honestly.
+    4. *A node's accepted split proposal → T2 → T3* (§A8/§B5) — **wired
+       2026-08-11**. `_phase_execute` calls `self._escalate_tier(
+       "split_accepted", ...)` whenever a T2 round produces a node with
+       `status == "split"` (checked after `run_round_loop` returns,
+       alongside the existing size-defect check). T3 splits don't escalate
+       further — T3 is already the ceiling this trigger targets, same
+       reasoning `majority_regenerate`'s `tier == "T2"` guard already uses.
+       See the new "v7 — runtime split" section below for the mechanism
+       that produces `"split"`-status nodes in the first place.
   - `--tier` (`pipeline/cli.py`'s `run` subparser, `pipeline/run.py`'s own
     parser) → `RunOptions.tier_override`, round-tripped through
     `to_spec`/`from_spec` like every other option. A floor, never a
@@ -1457,6 +1655,143 @@ goal end to end (fake writer adapter, no subprocess) and asserts the fake
 provider's total call count stays ≤3 — in practice exactly 1 (`classify`;
 T0's review call is free, zero calls, because the direct node declares no
 judgment items, identically to every other leaf today).
+
+## v7 — runtime split (v7/)
+
+PLAN.md §A8/§B5: "a subagent that finds its subtask too large breaks it down
+and dispatches its own children, recursively" — adopted with the decision
+gate moved from the model to the harness (§A2 invariant 2, amended: a model
+may *propose* a split, the harness accepts it only under measured
+preconditions, never on a model's opinion that something "feels too big").
+A Writer episode now has three possible terminations, not two: **submit**
+(`out/<node>.md` non-blank, today's path, unchanged), **split proposal**
+(`scratch/<node>/split.json` exists and is valid), **fail** (neither).
+
+- `v7/split.py` — the whole gate-evaluation-plus-graft pipeline, pure
+  functions operating on `TaskTree`/`TaskNode`, same shape `v6/tiering.py`/
+  `v6/direct.py` already use:
+  - `read_split_proposal(run_dir, node_id) -> SplitProposal | None` — mirrors
+    `v1/writer.py:_read_promotion`'s defensive parse (missing/malformed →
+    `None`, never trusted at face value; `split.json` mirrors
+    `promotion.json`'s whole "the agent writes it, the harness re-derives
+    everything that matters" posture).
+  - `evaluate_split(run_dir, node, tree, proposal, *, depth_cap=
+    DEFAULT_DEPTH_CAP, node_cap=DEFAULT_NODE_CAP) -> SplitDecision` — the
+    §A8.2 gate, all five preconditions in code, first failure rejects the
+    whole proposal:
+    1. **Measured overrun** — `estimate_tokens` over the node's *resolved*
+       input text exceeds `node.budget.tokens`, or `v6/direct.py:
+       is_size_defect(node.last_defect)` is true from a prior failed
+       attempt. No overrun, no split: the proposal is discarded, the
+       node's attempt/status are left untouched (a rejected proposal is
+       not a burned attempt), and a `split_rejected` event names which
+       precondition failed.
+    2. **Budget remains** — `depth(node.id) < depth_cap` (depth = number
+       of `.`-separated segments in the dot-hierarchical id, the same
+       scheme `v2/planner.py:build_tree` already uses when recursing) and
+       `len(tree.nodes) < node_cap`.
+    3. **The children tile the parent** — *not* `v2/planner.py:
+       _repair_partition` reused unchanged: that function is keyed to
+       spine-unit index *ranges*, and a split child instead declares
+       `inputs: list[str]`, a set-based claim on the parent's own
+       `node.inputs`. A parallel set-based tiling repair (first-claim-wins
+       on duplicates, a forced gap-fill child for anything unclaimed) does
+       the same defensive job — "never trust the model's partition to
+       tile exactly" — against the right data shape, emitting a
+       `split_partition_repaired` event on any deviation (naming
+       convention deliberately parallel to `planner_partition_repaired`).
+    4. **Each child passes `leaf_gate`** — `v2/planner.py:leaf_gate` reused
+       verbatim, fed a throwaway `Candidate` built from each repaired
+       child.
+    5. **`2 <= len(children) <= 8`.**
+  - `graft_split(run_dir, node, tree, tree_path, children, log, ...) ->
+    list[str]` — on acceptance: children get dot-hierarchical ids
+    (`f"{parent.id}.{child.id}"`, the exact scheme the planner already
+    uses, which is what makes the dashboard's existing dot-path tree
+    grouping nest a split's children "for free" per §C4's own framing);
+    `depends_on` **copied from the parent**, not `[parent.id]` — nothing
+    should have to wait on the split parent itself, which never becomes
+    `"passed"`; a new additive `TaskNode.parent` field points each child
+    back at it; the parent's status becomes `"split"`; one `node_split`
+    event is appended naming the accepted children and the proposal's
+    stated reason.
+  - `handle_split_proposal(...) -> bool` — the `split_handler` callable
+    `v1/round_loop.py` now accepts (see below): `False` when there's no
+    `split.json` at all (the ordinary submit/fail path proceeds
+    untouched); otherwise runs the gate and either grafts or rejects,
+    always returning `True` (proposal was handled one way or the other,
+    so the caller must not also evaluate gates/review against a
+    non-existent artifact).
+  - `maybe_derive_split_parent(...) -> None` — the `on_node_passed`
+    callable: after any node passes, if it has a `parent` whose siblings
+    have *all* now passed, (re)writes the parent's `out/<parent>.md` as
+    the fresh concatenation of its children (`v3/assemble.py:
+    concatenate_artifacts`, scoped via its new `node_ids` filter to just
+    that sibling set) — §A8.3: "script concatenation of its children, in
+    tree order — zero tokens. Not an integrator child episode," the same
+    read-only-assembler discipline `CLAUDE.md` §4.6 already enforces
+    everywhere else, extended down to a single split's own artifact.
+
+**Where split detection plugs in, and where it deliberately doesn't.**
+`dispatch_node`/`review_and_transition_node`/`run_round_loop`
+(`v1/round_loop.py`) gained optional `split_handler`/`on_node_passed`
+callables, defaulted `None` (byte-identical to pre-§B5 behavior when
+unset). `v1/round_loop.py` cannot import `v7/split.py` directly — this
+codebase's dependency layering is strictly bottom-up, and `v1` sits below
+`v7` — so the wiring is entirely `pipeline/driver.py`'s job, and only for
+T2/T3's `_phase_execute`. **T0/T1 never get either callable**: T0 has no
+`tree.json` at all to graft children into, and T1's own oversized-single-
+node path is the pre-existing, unrelated `size_defect_retry` → T2
+escalation (archive the one-node tree, re-plan for real) — `v6/direct.py`'s
+`run_direct_episode` calls `dispatch_node`/`review_and_transition_node`
+directly and supplies neither callable, so a split proposal is structurally
+impossible there regardless of what the writer prompt says.
+
+**The writer prompt hint** (`v1/writer.py`): the split-proposal option is
+only mentioned in a node's prompt when its *resolved* inputs already
+exceed `node.budget.tokens` — the identical measurement `evaluate_split`'s
+own overrun precondition uses. "A node that cannot legally split is never
+told it can" (§B5's own framing) — a node with plenty of budget left sees
+nothing about splitting at all.
+
+**Cross-cutting correctness this workstream had to get right, not just the
+mechanism**: a `"split"`-status node stays in `tree.nodes` alongside its
+grafted children, so every place that used to assume `node.status ==
+"passed"` meant "done" needed a look. `TaskTree.is_complete()` now treats
+`("passed", "split")` as done. `v3/assemble.py`'s top-level document
+concatenation now *excludes* `"split"`-status nodes (their content already
+appears via their separately-walked children — including the parent too
+would duplicate it) while `require_complete` still treats them as finished,
+not missing. `v3/checks.py` gained `check_split_parents_derived` (a split
+parent whose on-disk artifact no longer matches a fresh concatenation of
+its children is a defect, mirroring `check_no_gate_drift`'s framing) and
+`check_all_nodes_passed` accepts `("passed", "split")`. `TaskTree.is_ready()`'s
+`depends_on` check was **deliberately left `"passed"`-only** — a dependent
+of a split parent would need the *derived* artifact, which only exists once
+every child has passed and `maybe_derive_split_parent`'s hook fires;
+treating `"split"` as ready-equivalent immediately would let a dependent
+race ahead of a not-yet-written artifact. Documented as currently
+unreachable in practice (real `depends_on` edges, §A7, aren't wired up
+yet — every planner leaf still gets `depends_on=[]`), not fixed.
+
+**Escalation trigger #4** (`v6/tiering.py:escalate(tier, "split_accepted")`,
+correct and unit-tested since §B2 but uncalled until now) is wired from
+`pipeline/driver.py`'s `_phase_execute`: a T2 round that produces any
+`"split"`-status node escalates the run to T3 (T3 splits don't escalate
+further — already the ceiling).
+
+**Ship gate, as actually demonstrated (2026-08-11):** same sandbox
+constraint as every other v6/v7 workstream (no gptme install/API key
+available) — a fake-provider, fake-adapter-driven `run_round_loop` where
+the target leaf's adapter writes `split.json` instead of an artifact on its
+first dispatch, the proposal clears all five preconditions and is grafted,
+each dot-hierarchical child (`f"{parent}.{child}"`) is dispatched and
+passes for real, and the test asserts: the parent ends `"split"`, every
+child ends `"passed"`, the parent's `out/<parent>.md` equals the fresh
+concatenation of its children, and the children's id shape matches exactly
+what the dashboard's existing dot-path grouping (`CLAUDE.md`'s v5 section,
+`buildNodeTreeIndex`) already renders as a nested tree — asserted directly
+against the id strings, without touching `dashboard/` itself.
 
 ## Adapters (gptme-only)
 
@@ -1530,13 +1865,21 @@ Stdlib `unittest`. No pytest, no network, no agent binary, no API key.
 python3 -m unittest discover -s tests -p "test_*.py" -v
 ```
 
-**461 tests, ~23s, all passing** (2026-08-10: 387 after that day's
-§D0b/§D0/§D1/§D2/§D4/§D5/§D6/§D7/§D10/§D0c defect-fix session, then §B1 —
-the v6 work object — added 23 more (410 total: a new
-`test_v6_work_object.py`, plus additions to `test_pipeline_backends.py` and
-`test_driver_phases.py`), then §B2 — tier classification and phase
-routing — added 51 more: a new `test_v6_tiering.py` (38), plus 13 more
-additions to `test_driver_phases.py`).
+**553 tests, ~23s, all passing.** History: 387 after 2026-08-10's
+§D0b/§D0/§D1/§D2/§D4/§D5/§D6/§D7/§D10/§D0c defect-fix session → 410 after
+§B1 (the v6 work object: new `test_v6_work_object.py` (23), plus additions
+to `test_pipeline_backends.py`/`test_driver_phases.py`) → 461 after §B2
+(tier classification and phase routing: new `test_v6_tiering.py` (38), plus
+13 more additions to `test_driver_phases.py`) → **then, in one 2026-08-11
+session, §B3→§B6 in sequence**: 472 after §B3 (adaptive intake — net +11:
+the old per-dimension `test_v2_intake.py` rewritten, plus 2 new
+`test_driver_phases.py` cases) → 502 after §B4 (probes: new
+`test_v4_probes.py` (21) and `test_workspace_read_tool.py` (9)) → 540 after
+§B5 (runtime split: new `test_v7_split.py`, plus extensions across
+`test_v1_units.py`/`test_v3_assemble.py`/`test_v3_checks.py`/
+`test_driver_phases.py`/`test_v6_tiering.py`) → **553 after §B6** (tiered
+review fan-out: new `test_v1_reviewer_fanout.py` (9), plus 4 more
+`test_driver_phases.py` cases).
 
 **Every test file starts with `sys.path.insert(0, str(_REPO_ROOT / "src"))`.
 This is load-bearing, not boilerplate.** Stale `_editable_impl_*.pth` files
@@ -1549,21 +1892,25 @@ guard into any new test file.
 |---|---|---|
 | `test_provider_config.py` | 35 | precedence chain, `require()`, `.env` and `provider.json` cwd/ancestor/installed-root search |
 | `test_v0_resume.py` | 13 | real-subprocess `SIGKILL` resume (both windows), no-op replay, fsync-per-append, single-parse dispatch; §D0 gptme-shaped `has_file_tools` adapters never fall back to a save-fence or a confident sentence as the artifact |
-| `test_v1_units.py` | 34 | gates, tree validation (incl. §D0's `artifact != out/<id>.md` rejection), promotion cap, `complete_json` retry paths, artifact instruction, §11.10.13 reviewer input cap (truncation marked, ceiling measured, §D5's `verdict.truncated` flag) |
+| `test_v1_units.py` | 46 | gates, tree validation (incl. §D0's `artifact != out/<id>.md` rejection, §B5's `"split"` status + `parent` field), promotion cap, `complete_json` retry paths, artifact instruction, §11.10.13 reviewer input cap (truncation marked, ceiling measured, §D5's `verdict.truncated` flag), §B5's split-hint-only-when-inputs-exceed-budget prompt gating |
 | `test_v1_round_loop.py` | 11 | dependency order, gate-failure escalation, resume of passed and in-flight nodes, tool restriction, deterministic dispatch, gate cache merged into audit files (incl. §D5's `truncated` field), §11.10.16 round numbering continues across resumes |
-| `test_v1_orchestrator_policy.py` | 9 | `DispatchPolicy`, ready-set-bounded state |
-| `test_v2_intake.py` / `_survey.py` / `_planner.py` / `_pilot.py` | 4/22/12/7 | call counts, window→global index conversion, spine merge and folding, leaf gate, caps forcing leaves with zero calls, median pilot, contract ceiling |
+| `test_v1_reviewer_fanout.py` | 9 | §B6: under-cap byte-identical single call, over-cap heading fan-out call count + merged verdict, tail-section defects survive the merge, no-headings/still-over-cap-after-grouping truncation fallbacks, >6 headings grouped not dropped |
+| `test_v1_orchestrator_policy.py` | 12 | `DispatchPolicy`, ready-set-bounded state |
+| `test_v2_intake.py` / `_survey.py` / `_planner.py` / `_pilot.py` | 14/24/16/8 | §B3: question-set schema, one-approval-per-round, round cap, silent-operator termination, objections reaching spec.md; window→global index conversion, spine merge and folding; leaf gate, caps forcing leaves with zero calls, §B4's `unit_summary_for` threading; median pilot, contract ceiling |
 | `test_v2_survey_deterministic.py` | 12 | injected vectors only — clean shift fires once, uniform corpus silent, the lone-odd-chunk plateau that forced the implemented variant |
 | `test_v2_retrieval.py` | 11 | BM25/IDF, unit-restricted candidates, clamped closure, fusion flipping rank, idempotent index, matrix cached across scorer constructions |
-| `test_v3_assemble/checks/compile/repair/assembly_loop.py` | 3/5/4/4/5 | tree order, each check's true positive, injected compile command, derived-id repair + snapshot + rollback, attribute→repair→recompile |
+| `test_v3_assemble/checks/compile/repair/assembly_loop.py` | 5/9/4/5/6 | tree order (incl. §B5's split-parent exclusion from top-level concatenation), each check's true positive (incl. §B5's `check_split_parents_derived`), injected compile command, derived-id repair + snapshot + rollback, attribute→repair→recompile |
 | `test_v3_revalidate.py` / `_prefilter.py` | 10/10 | four triage buckets, read-only phase 1, pre-filter skip/force rules |
 | `test_v3_document_review.py` | 14 | windowed call count flat in node count, id attribution and dropping |
-| `test_v4_*.py` | 2/2/5 | allowlist, derived-id dispatch + cache hit, finding attachment |
+| `test_v4_research.py` / `_mcp_research.py` / `_research_loop.py` | 2/2/5 | derived-id dispatch + cache hit, `Probe`/`ResearchQuery` alias + `normalize_probe_kind`, finding attachment |
+| `test_v4_probes.py` | 21 | §B4: `workspace` probe gets no write/shell tool, `max_explorers_for` enforced (more units than the cap still dispatches ≤ the cap), 300-token finding cap regardless of input, cached-finding idempotency (no re-dispatch), `plan_level`'s prompt includes explorer summaries and no source content |
+| `test_workspace_read_tool.py` | 9 | §B4: `list_dir`/`grep` confined to a root, `../..` escape attempts rejected in code (`_resolve_within_root`), importable outside a real gptme process |
 | `test_dashboard_state.py` / `_server.py` | 25/22 | `RunState` directly (no port), then HTTP over a real loopback `ThreadingHTTPServer` incl. traversal rejection and `--no-control` 403s; §11.10.14 read-only poll leaves runs unmutated; §11.10.15 bounded cache + 8-thread hammer |
 | `test_dashboard_rendering.py` | 14 | `parse_trace`: `<think>`/`<thinking>` tag extraction incl. the Anthropic think-sig comment, `save`/`append`/`patch` code-fence → `tool_call` + `diff` entries, per-path diff continuity across turns (not "whole file added" every time), `error` vs routine `system` classification | 
-| `test_pipeline_prompts.py` / `_backends.py` / `test_driver_phases.py` | 18/11/28 | byte-identical default prompt (now including §D0's absolute artifact-path line and §D1's goal block), §D2's out/scratch carve-out (hidden but excepted, not dropped), adapter wiring incl. §B1's workspace-mode `run_dir` branches, phase detail preservation, §D4's corpus-less-raises, §11.10.15 contract-cache bound, §B1's default-writer-factory and `--workspace` CLI wiring, §B2's `_phase_done("classify"/"explore")`, `tier_override` spec round-trip, `escalate_run`, `--tier`/`escalate` CLI wiring | 
+| `test_pipeline_prompts.py` / `_backends.py` / `test_driver_phases.py` | 18/11/34 | byte-identical default prompt (now including §D0's absolute artifact-path line and §D1's goal block), §D2's out/scratch carve-out (hidden but excepted, not dropped), adapter wiring incl. §B1's workspace-mode `run_dir` branches and §B4's probe-kind allowlists, phase detail preservation, §D4's corpus-less-raises, §11.10.15 contract-cache bound, §B1's default-writer-factory and `--workspace` CLI wiring, §B2's `_phase_done("classify"/"explore")`, `tier_override` spec round-trip, `escalate_run`, `--tier`/`escalate` CLI wiring, §B3's adaptive-intake driver integration, §B4's T2/T3 structural-exploration dispatch, §B5's `split_accepted` escalation end-to-end, §B6's T2-unconditional/T3-still-flag-gated document review split | 
 | `test_v6_work_object.py` | 15 | §B1: measurement excludes binaries/`.git`/`node_modules`/lockfiles/oversized files, gitignore respected, `top_dirs` grouping; `kind="text"`/`kind="none"` constructors; `survey_workspace`'s members resolve to real files and respect a token ceiling; the run dir is hidden as one subtree when nested inside `work.root`; ship gate via a real subprocess fixture (not gptme) proving cwd=work.root and the artifact still lands under run_dir |
-| `test_v6_tiering.py` | 38 | §B2: `Signals`/`measure_signals` word-boundary marker counts, `estimate_scope`'s digest never leaks file content, `classify`'s four table triggers + the `unknown`-forces-≥T2 override, `phases_for` per tier, `escalate` monotone under every trigger incl. the uncalled split trigger, the three-goals/one-repo ship gate, T0's ≤3-provider-call full-driver run, `--tier T3` floor running every T3 phase on a trivial goal, resume after a live T1→T2 escalation continuing from the freshly-planned tree |
+| `test_v6_tiering.py` | 39 | §B2: `Signals`/`measure_signals` word-boundary marker counts, `estimate_scope`'s digest never leaks file content, `classify`'s four table triggers + the `unknown`-forces-≥T2 override, `phases_for` per tier, `escalate` monotone under every trigger incl. `split_accepted` (§B5, uncalled at §B2 ship time, wired now — see `test_v7_split.py`), `max_explorers_for` per tier (§B4), the three-goals/one-repo ship gate, T0's ≤3-provider-call full-driver run, `--tier T3` floor running every T3 phase on a trivial goal, resume after a live T1→T2 escalation continuing from the freshly-planned tree |
+| `test_v7_split.py` | 21 | §B5: the §A8.2 gate's five preconditions individually (no-overrun rejects and preserves the attempt, depth/node caps refuse, a leaf-gate-failing child rejects the whole proposal), gapped/overlapping proposals repaired not trusted, crash-between-graft-and-first-child-dispatch resumes correctly, the parent's artifact equals the fresh concatenation of its passed children, full end-to-end `run_round_loop` ship gate with dot-hierarchical child ids |
 | `test_pipeline_approvals.py` | 4 | §11.10.12 incremental approvals scanning: each record parsed once across polls, torn tail re-read, cross-thread wait/resolve |
 | `test_pipeline_liveness.py` | 5 | §D0c: dead pid → stalled, live pid → not stalled, non-`in_progress` phase never stalled, no-pid-record falls back to phase-age threshold |
 | `test_environment_remote_files.py` | 2 | §D7: `write_remote_text`'s cleanup tolerates `PermissionError` (not just `FileNotFoundError`) on unlink without failing the write |

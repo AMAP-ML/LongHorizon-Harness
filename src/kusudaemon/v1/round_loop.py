@@ -36,6 +36,52 @@ functions an in-memory, single-node ``TaskTree`` and a JSON path of its own
 choosing (never named ``tree.json`` — PLAN.md §A4.3: "T0 has no
 ``tree.json``"), and gets the identical gate-cache-write, manifest-line,
 and status-transition behavior a real round-loop dispatch gets.
+
+**Runtime split (PLAN.md §A8/§B5) is wired here as two optional, injected
+callables — ``split_handler`` and ``on_node_passed`` — never as a direct
+import of ``v7/split.py``.** This package's layering is strictly
+bottom-up (``v0`` -> ``v1`` -> ``v2`` -> ...; grep any ``v1/*.py`` and none
+of them import from ``v2`` or later), and ``v7/split.py`` needs ``TaskTree``/
+``TaskNode`` from here plus ``leaf_gate`` from ``v2/planner.py`` — so this
+module cannot import it without inverting that rule. Instead
+``dispatch_node`` and ``review_and_transition_node`` accept the real
+functions as parameters, and ``pipeline/driver.py`` (which already imports
+both ``v1`` and ``v7``) is the one place that wires
+``v7.split.handle_split_proposal``/``v7.split.maybe_derive_split_parent``
+in — and only for the T2/T3 tiers, never for T0/T1 (``v6/direct.py``'s own
+calls to these two functions never pass either callable, so its behavior
+is byte-for-byte unchanged: PLAN.md §A8.1's mechanism only makes sense
+against a real, multi-node-capable ``tree.json``, which T0 has none of and
+T1's is a single node the driver builds directly with its own, different,
+already-built escalation path — ``v6/direct.py:is_size_defect`` /
+``size_defect_retry``). Left ``None`` (every existing caller of these three
+functions, and every test of this module before §B5), ``split_handler``/
+``on_node_passed`` cost nothing and change nothing: split detection is
+purely additive.
+
+``split_handler(run_dir, node, tree, tree_path, log) -> bool`` runs right
+after the Writer episode returns, before gate evaluation — a split
+proposal is a third kind of episode termination (submit / split / fail,
+§A8.1), and gate-evaluating a blank ``out/<node>.md`` from a node that
+proposed a split instead of submitting would misread it as a plain
+"fail" and burn an attempt PLAN.md explicitly says a rejected proposal
+must not cost. Returning ``True`` means a ``split.json`` was present and
+fully handled (accepted-and-grafted, or evaluated-and-rejected) — either
+way ``dispatch_node`` returns immediately without touching gates, the
+manifest, or ``_transition_after_writer``. Returning ``False`` means no
+``split.json`` existed at all, and ``dispatch_node`` proceeds exactly as
+before this workstream.
+
+``on_node_passed(run_dir, node, tree, tree_path, log) -> None`` runs
+inside ``review_and_transition_node`` immediately after a node's status
+becomes "passed" — the natural place to ask "did this completion just
+finish off a split parent's last outstanding child," mirroring how
+dependency-based readiness (``TaskTree.is_ready``) is already re-checked
+reactively rather than polled. Re-checking on every passing node (instead
+of tracking "is this the last one" explicitly) is deliberately the simple
+option: the condition itself (``all(sibling.status == "passed" for
+sibling in siblings)``) is cheap and idempotent to recompute, so there is
+nothing to get out of sync.
 """
 
 from __future__ import annotations
@@ -72,6 +118,10 @@ from .writer import run_writer_node
 
 AdapterFactory = Callable[[TaskNode], AgentAdapter]
 PromptBuilder = Callable[[TaskNode], str]
+# PLAN.md §A8/§B5 — see module docstring for why these are injected
+# callables rather than a direct import of v7/split.py.
+SplitHandler = Callable[[Path, TaskNode, TaskTree, Path, EventLog], bool]
+NodePassedHook = Callable[[Path, TaskNode, TaskTree, Path, EventLog], None]
 
 
 async def dispatch_node(
@@ -87,6 +137,7 @@ async def dispatch_node(
     manifest: str | Path,
     max_attempts: int,
     log: EventLog,
+    split_handler: SplitHandler | None = None,
 ) -> None:
     """One Writer episode + gate evaluation + manifest line + status
     transition for a single node — ``run_round_loop``'s original ``dispatch``
@@ -97,6 +148,12 @@ async def dispatch_node(
     result, promotion = await run_writer_node(
         run_dir, node, prompt_for_node(node), adapter, env, budget
     )
+    if split_handler is not None and split_handler(run_dir, node, tree, tree_path, log):
+        # A split.json existed and was fully evaluated (accepted-and-grafted
+        # or rejected-with-attempt-preserved) — module docstring. Either way
+        # this was not a "submit", so gates/manifest/the normal
+        # writer-failure transition never apply.
+        return
     artifact_text = _read_artifact(run_dir, node.id)
     gate_results = evaluate_gates(node.gates, artifact_text)
     # §11.10.11: evaluated once per dispatch (deterministic), durable in
@@ -126,6 +183,7 @@ async def review_and_transition_node(
     provider: OpenAICompatibleProvider,
     max_attempts: int,
     log: EventLog,
+    on_node_passed: NodePassedHook | None = None,
 ) -> None:
     """One Reviewer verdict + status transition for a single node —
     ``run_round_loop``'s original ``review`` closure, pulled out for the
@@ -135,6 +193,11 @@ async def review_and_transition_node(
     verdict = review_node(node, artifact_text, provider)
     _write_audit(run_dir, node, verdict)
     _transition_after_review(node, tree, tree_path, verdict, max_attempts, log)
+    if node.status == "passed" and on_node_passed is not None:
+        # PLAN.md §A8.3: this node may be the last outstanding child of a
+        # split parent — see module docstring for why this is a cheap
+        # recheck rather than tracked state.
+        on_node_passed(run_dir, node, tree, tree_path, log)
 
 
 async def run_round_loop(
@@ -150,6 +213,8 @@ async def run_round_loop(
     max_rounds: int = 100,
     max_attempts: int = 3,
     dispatch_policy: DispatchPolicy = "model",
+    split_handler: SplitHandler | None = None,
+    on_node_passed: NodePassedHook | None = None,
 ) -> TaskTree:
     run_dir = Path(run_dir)
     tree = TaskTree.load(tree_path)
@@ -171,11 +236,19 @@ async def run_round_loop(
             manifest=manifest,
             max_attempts=max_attempts,
             log=log,
+            split_handler=split_handler,
         )
 
     async def review(node: TaskNode) -> None:
         await review_and_transition_node(
-            run_dir, node, tree, tree_path, provider=provider, max_attempts=max_attempts, log=log
+            run_dir,
+            node,
+            tree,
+            tree_path,
+            provider=provider,
+            max_attempts=max_attempts,
+            log=log,
+            on_node_passed=on_node_passed,
         )
 
     # Resume in-flight work before asking the orchestrator for anything new.
