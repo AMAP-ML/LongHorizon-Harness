@@ -20,6 +20,20 @@ prompt asks the agent to write a short handoff to
 ``scratch/<node>/promotion.json``. If it doesn't (an older prompt, a model
 that ignores the instruction), the harness falls back to the episode's own
 visible output/log so the cap is still enforced either way.
+
+**The split-proposal hint (PLAN.md §A8/§B5) is conditional, not a standing
+instruction.** ``_inputs_exceed_budget`` recomputes, before every dispatch,
+whether this node's own resolved ``inputs`` already exceed
+``node.budget.tokens`` — the exact same measurement
+``v7/split.py:evaluate_split``'s precondition 1 makes independently (this
+module cannot import that one; see ``v1/round_loop.py``'s docstring for
+the layering reason). Only when it's already true does ``writer_prompt``
+append the split-option instruction: "a node that cannot legally split is
+never told it can" (§B5) — telling every node it may split would invite
+the exact failure mode §A2 invariant 2 exists to forbid (a model splitting
+to avoid work), and ``v7/split.py``'s own gate would reject the proposal
+anyway once it arrived, wasting the attempt this hint is meant to help
+avoid wasting.
 """
 
 from __future__ import annotations
@@ -30,8 +44,9 @@ from pathlib import Path
 from ..adapters.base import AgentAdapter
 from ..environment.base import Environment
 from ..types import EpisodeBudget, EpisodeResult
-from ..v0.run_dir import node_scratch_dir
+from ..v0.run_dir import node_scratch_dir, resolve_stored
 from ..v0.runner import run_node
+from .gates import estimate_tokens
 from .manifest import cap_promotion
 from .tree import TaskNode
 
@@ -51,13 +66,51 @@ _PROMOTION_INSTRUCTION_TEMPLATE = (
     "that it's done."
 )
 
+_SPLIT_INSTRUCTION_TEMPLATE = (
+    "\n\nYour declared inputs already exceed this node's token budget. If you "
+    "genuinely cannot complete the brief within budget, you may instead write "
+    "{split_path} as a JSON object proposing a partition: "
+    '{{"reason": "<why this must split>", "children": ['
+    '{{"id": "<short id>", "brief": "<its own checkable done-condition>", '
+    '"inputs": ["<subset of your own inputs this child covers>"], '
+    '"estimated_calls": <int>}}, ...]}}. Every one of your inputs must be '
+    "claimed by exactly one child, and there must be 2-8 children. The harness "
+    "decides whether the split is accepted — do not assume it will be, and do "
+    "not propose one just because the work feels large; only propose it if you "
+    "cannot produce the artifact within budget."
+)
 
-def writer_prompt(brief_prompt: str, promotion_path: Path) -> str:
-    return (
+
+def writer_prompt(
+    brief_prompt: str, promotion_path: Path, *, split_hint_path: Path | None = None
+) -> str:
+    text = (
         brief_prompt
         + _ARTIFACT_INSTRUCTION
         + _PROMOTION_INSTRUCTION_TEMPLATE.format(promotion_path=promotion_path)
     )
+    if split_hint_path is not None:
+        text += _SPLIT_INSTRUCTION_TEMPLATE.format(split_path=split_hint_path)
+    return text
+
+
+def _inputs_exceed_budget(run_dir: Path, node: TaskNode) -> bool:
+    """Same measurement as ``v7/split.py:evaluate_split``'s precondition 1
+    (module docstring) — joined resolved input text, one ``estimate_tokens``
+    call, compared against the node's own budget."""
+    if not node.inputs:
+        return False
+    joined = "\n".join(
+        _read_resolved(run_dir, ref) for ref in node.inputs
+    )
+    return estimate_tokens(joined) > node.budget.tokens
+
+
+def _read_resolved(run_dir: Path, ref: str) -> str:
+    try:
+        return resolve_stored(run_dir, ref).read_text(encoding="utf-8")
+    except OSError:
+        return ""
 
 
 async def run_writer_node(
@@ -70,7 +123,8 @@ async def run_writer_node(
 ) -> tuple[EpisodeResult, str]:
     """Run (or resume) one Writer node. Returns (episode result, capped promotion)."""
     run_dir = Path(run_dir)
-    promotion_path = node_scratch_dir(run_dir, node.id) / "promotion.json"
+    scratch_dir = node_scratch_dir(run_dir, node.id)
+    promotion_path = scratch_dir / "promotion.json"
     # §11.9: a retry that ignores the promotion instruction must not inherit
     # the previous attempt's handoff — that would put attempt 1's text in
     # this attempt's manifest line. Unlink before dispatch, the same way
@@ -78,8 +132,14 @@ async def run_writer_node(
     if promotion_path.exists():
         promotion_path.unlink()
 
+    split_hint_path = scratch_dir / "split.json" if _inputs_exceed_budget(run_dir, node) else None
     result = await run_node(
-        run_dir, node.id, writer_prompt(prompt, promotion_path), adapter, env, budget
+        run_dir,
+        node.id,
+        writer_prompt(prompt, promotion_path, split_hint_path=split_hint_path),
+        adapter,
+        env,
+        budget,
     )
 
     promotion = _read_promotion(promotion_path)

@@ -31,6 +31,31 @@ failure here on a failed attempt and clears it on success;
 ``pipeline/prompts.py:build_node_prompt`` reads it to render a retry block.
 Purely additive and defaulted, like ``"stale"`` above — every existing
 ``tree.json`` loads unchanged.
+
+``"split"`` and ``parent`` were added for PLAN.md §A8/§B5 (runtime
+recursive decomposition — ``v7/split.py``): a Writer episode that finds its
+own brief too large to complete may propose a partition instead of
+submitting, and once the harness-side split gate (``v7/split.py``) accepts
+it, the node's status becomes ``"split"`` rather than ever reaching
+"passed" — it is a genuine, successful terminal outcome (its artifact
+becomes the script-concatenation of its now-grafted children, PLAN.md
+§A8.3), just not one produced by submitting a document itself. It is
+included in ``_TERMINAL_STATUSES`` (never dispatched again) but is
+*excluded* from ``_IN_FLIGHT_STATUSES`` and, deliberately, treated as
+complete-equivalent by ``TaskTree.is_complete()`` below — a run whose only
+unfinished-looking node is a split parent must not read as permanently
+stuck (``v1/orchestrator.py``'s ``_arbitrate_empty_ready`` would otherwise
+escalate a fully successful run as "no ready nodes and nothing in
+flight"). ``parent`` is the reverse edge, purely additive and defaulted to
+``""`` like ``last_defect``/``stale`` above: a grafted child's own id is
+already ``f"{parent.id}.{child.id}"`` (the same dot-hierarchical scheme
+``v2/planner.py`` uses for recursive planning, which is also what makes the
+split visible in the dashboard's task tree for free — it already groups by
+dot-path), but the id alone doesn't let code distinguish "a genuinely
+independent leaf whose id happens to contain a dot" from "a node grafted by
+a split," and ``v3/checks.py:check_split_parents_derived`` /
+``v7/split.py:maybe_derive_split_parent`` both need that distinction
+explicitly rather than re-deriving it by string-splitting an id.
 """
 
 from __future__ import annotations
@@ -43,13 +68,13 @@ from typing import Any, Literal
 from ..v0.run_dir import write_text_atomic
 
 NodeStatus = Literal[
-    "pending", "dispatched", "awaiting_review", "passed", "failed", "blocked", "stale"
+    "pending", "dispatched", "awaiting_review", "passed", "failed", "blocked", "stale", "split"
 ]
 
 _VALID_STATUSES = {
-    "pending", "dispatched", "awaiting_review", "passed", "failed", "blocked", "stale"
+    "pending", "dispatched", "awaiting_review", "passed", "failed", "blocked", "stale", "split"
 }
-_TERMINAL_STATUSES = {"passed", "blocked", "failed"}
+_TERMINAL_STATUSES = {"passed", "blocked", "failed", "split"}
 _IN_FLIGHT_STATUSES = {"dispatched", "awaiting_review"}
 
 
@@ -80,6 +105,7 @@ class TaskNode:
     status: NodeStatus = "pending"
     attempts: int = 0
     last_defect: str = ""
+    parent: str = ""
 
     def __post_init__(self) -> None:
         _validate_node(self)
@@ -111,6 +137,7 @@ class TaskNode:
             status=data.get("status", "pending"),
             attempts=int(data.get("attempts", 0)),
             last_defect=str(data.get("last_defect", "")),
+            parent=str(data.get("parent", "")),
         )
 
 
@@ -174,6 +201,16 @@ class TaskTree:
                     raise TreeValidationError(
                         f"node {node.id!r} depends_on unknown node {dep!r}"
                     )
+            # PLAN.md §B5: mirrors the depends_on check above for the new
+            # `parent` back-edge (§A8) — a node grafted by a split always
+            # has its parent already in the tree by construction
+            # (v7/split.py:graft_split adds the parent first), so a
+            # dangling parent means a hand-edited or corrupted tree.json,
+            # not a legitimate intermediate state.
+            if node.parent and node.parent not in self.nodes:
+                raise TreeValidationError(
+                    f"node {node.id!r} has parent {node.parent!r} not present in the tree"
+                )
         # §11.7: a depends_on cycle makes every node unready forever and the
         # run escalates naming nothing ("no ready nodes and nothing in
         # flight"). Detect it at load so the failure names the cycle.
@@ -205,6 +242,18 @@ class TaskTree:
         node = self.nodes[node_id]
         if node.status != "pending":
             return False
+        # Deliberately literal "passed" here, not is_complete()'s
+        # ("passed", "split") pair: a dependent of a split parent needs the
+        # parent's *derived* artifact (the concatenation of its children,
+        # §A8.3), which only exists once every child has actually passed
+        # and v7/split.py:maybe_derive_split_parent has written it -- a
+        # dependent that became ready the instant the parent's status
+        # flipped to "split" (before any child ran) could read a stale or
+        # missing artifact. Today this is unreachable in practice: real
+        # depends_on edges pointing at an interior node (§A7) aren't wired
+        # up yet, every planner-built leaf still gets depends_on=[]. Left
+        # as a documented gap rather than silently "fixed" with an
+        # unreachable-and-untested code path.
         return all(self.nodes[dep].status == "passed" for dep in node.depends_on)
 
     def ready_nodes(self) -> list[str]:
@@ -215,7 +264,15 @@ class TaskTree:
         return [node for node in self.nodes.values() if node.status in statuses]
 
     def is_complete(self) -> bool:
-        return all(node.status == "passed" for node in self.nodes.values())
+        # PLAN.md §A8/§B5: a "split" node is a genuine, successful terminal
+        # outcome (module docstring) -- treating it as anything but
+        # complete-equivalent here would make a fully successful run whose
+        # only non-"passed" node is a split parent read as permanently
+        # stuck to v1/orchestrator.py's _arbitrate_empty_ready (not
+        # is_complete() -> not is_blocked() either, since nothing is ready
+        # or in flight -> "escalate: no ready nodes and nothing in
+        # flight", on a run that actually finished correctly).
+        return all(node.status in ("passed", "split") for node in self.nodes.values())
 
     def is_blocked(self) -> bool:
         """No progress possible: not complete, nothing in flight, nothing ready."""

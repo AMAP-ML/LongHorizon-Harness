@@ -20,6 +20,7 @@ from kusudaemon.v3.checks import (  # noqa: E402
     check_artifacts_exist_and_nonempty,
     check_manifest_recorded,
     check_no_gate_drift,
+    check_split_parents_derived,
     run_cross_cutting_checks,
     write_checks_json,
 )
@@ -103,6 +104,72 @@ class ChecksTest(unittest.TestCase):
             # "a" was never appended to manifest.jsonl in this test, so the
             # overall checks payload should report the run as not fully clean.
             self.assertFalse(payload["passed"])
+
+    def test_all_nodes_passed_does_not_flag_a_split_parent(self) -> None:
+        # PLAN.md §A8/§B5: "split" is a genuine terminal, successful status
+        # for a node that never itself reaches "passed" -- excluded from
+        # this check the same way it's excluded from require_complete.
+        tree = TaskTree(nodes={n.id: n for n in [_node("a", status="split"), _node("b")]})
+        result = check_all_nodes_passed(tree)
+        self.assertTrue(result.passed)
+
+
+class SplitParentsDerivedCheckTest(unittest.TestCase):
+    def test_passes_when_the_parent_artifact_matches_its_children(self) -> None:
+        with tempfile.TemporaryDirectory() as root_str:
+            run_dir = create_run_dir(Path(root_str), "run1")
+            parent = TaskNode(
+                id="big", brief="a large node", artifact="out/big.md",
+                gates=["nonempty"], status="split",
+            )
+            child_a = TaskNode(
+                id="big.a", brief="first half", artifact="out/big.a.md",
+                gates=["nonempty"], status="passed", parent="big",
+            )
+            child_b = TaskNode(
+                id="big.b", brief="second half", artifact="out/big.b.md",
+                gates=["nonempty"], status="passed", parent="big",
+            )
+            tree = TaskTree(nodes={n.id: n for n in [parent, child_a, child_b]})
+            node_artifact_path(run_dir, "big.a").write_text("First half body.", encoding="utf-8")
+            node_artifact_path(run_dir, "big.b").write_text("Second half body.", encoding="utf-8")
+            from kusudaemon.v3.assemble import concatenate_artifacts
+
+            derived = concatenate_artifacts(run_dir, tree, node_ids=["big.a", "big.b"])
+            node_artifact_path(run_dir, "big").write_text(derived, encoding="utf-8")
+
+            result = check_split_parents_derived(run_dir, tree)
+            self.assertTrue(result.passed, result.details)
+
+    def test_flags_a_drifted_split_parent_artifact(self) -> None:
+        with tempfile.TemporaryDirectory() as root_str:
+            run_dir = create_run_dir(Path(root_str), "run1")
+            parent = TaskNode(
+                id="big", brief="a large node", artifact="out/big.md",
+                gates=["nonempty"], status="split",
+            )
+            child_a = TaskNode(
+                id="big.a", brief="first half", artifact="out/big.a.md",
+                gates=["nonempty"], status="passed", parent="big",
+            )
+            tree = TaskTree(nodes={n.id: n for n in [parent, child_a]})
+            node_artifact_path(run_dir, "big.a").write_text("First half body.", encoding="utf-8")
+            # The derived artifact was never (re)written -- or was hand
+            # edited afterward. Either way it no longer matches a fresh
+            # concatenation of the children.
+            node_artifact_path(run_dir, "big").write_text("stale, hand-edited content", encoding="utf-8")
+
+            result = check_split_parents_derived(run_dir, tree)
+            self.assertFalse(result.passed)
+            self.assertIn("big", result.details[0])
+
+    def test_ignores_non_split_nodes(self) -> None:
+        with tempfile.TemporaryDirectory() as root_str:
+            run_dir = create_run_dir(Path(root_str), "run1")
+            tree = TaskTree(nodes={n.id: n for n in [_node("a")]})
+            node_artifact_path(run_dir, "a").write_text("content", encoding="utf-8")
+            result = check_split_parents_derived(run_dir, tree)
+            self.assertTrue(result.passed)
 
 
 if __name__ == "__main__":

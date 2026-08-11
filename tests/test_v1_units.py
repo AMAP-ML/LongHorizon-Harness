@@ -206,6 +206,86 @@ class TreeValidationTest(unittest.TestCase):
             with self.assertRaisesRegex(TreeValidationError, "cycle"):
                 TaskTree.load(path)
 
+    def test_split_is_a_valid_status(self) -> None:
+        # PLAN.md §A8/§B5: a split parent's status, purely additive.
+        with tempfile.TemporaryDirectory() as root_str:
+            path = self._write(
+                Path(root_str),
+                [{"id": "big", "brief": "x", "artifact": "out/big.md", "gates": ["nonempty"], "status": "split"}],
+            )
+            tree = TaskTree.load(path)
+            self.assertEqual(tree.nodes["big"].status, "split")
+
+    def test_unknown_status_is_still_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as root_str:
+            path = self._write(
+                Path(root_str),
+                [{"id": "a", "brief": "x", "artifact": "out/a.md", "gates": ["nonempty"], "status": "bogus"}],
+            )
+            with self.assertRaises(TreeValidationError):
+                TaskTree.load(path)
+
+    def test_parent_field_is_additive_and_defaults_empty(self) -> None:
+        node = TaskNode(id="a", brief="x", artifact="out/a.md", gates=["nonempty"])
+        self.assertEqual(node.parent, "")
+
+    def test_parent_round_trips_and_dangling_parent_is_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as root_str:
+            path = self._write(
+                Path(root_str),
+                [
+                    {"id": "big", "brief": "x", "artifact": "out/big.md", "gates": ["nonempty"], "status": "split"},
+                    {
+                        "id": "big.a", "brief": "y", "artifact": "out/big.a.md",
+                        "gates": ["nonempty"], "parent": "big",
+                    },
+                ],
+            )
+            tree = TaskTree.load(path)
+            self.assertEqual(tree.nodes["big.a"].parent, "big")
+
+        with tempfile.TemporaryDirectory() as root_str:
+            path = self._write(
+                Path(root_str),
+                [
+                    {
+                        "id": "orphan", "brief": "y", "artifact": "out/orphan.md",
+                        "gates": ["nonempty"], "parent": "does-not-exist",
+                    },
+                ],
+            )
+            with self.assertRaises(TreeValidationError):
+                TaskTree.load(path)
+
+    def test_a_pre_existing_tree_json_without_parent_or_split_loads_unchanged(self) -> None:
+        # CLAUDE.md's own rule for every additive field: an old tree.json
+        # with no "parent" key and no "split" status anywhere loads exactly
+        # as it always did.
+        with tempfile.TemporaryDirectory() as root_str:
+            path = self._write(
+                Path(root_str), [{"id": "a", "brief": "x", "artifact": "out/a.md", "gates": ["nonempty"]}]
+            )
+            tree = TaskTree.load(path)
+            self.assertEqual(tree.nodes["a"].parent, "")
+
+    def test_is_complete_treats_split_as_complete_equivalent(self) -> None:
+        # PLAN.md §A8/§B5: a run whose only non-"passed" node is a split
+        # parent must not read as stuck.
+        with tempfile.TemporaryDirectory() as root_str:
+            path = self._write(
+                Path(root_str),
+                [
+                    {"id": "big", "brief": "x", "artifact": "out/big.md", "gates": ["nonempty"], "status": "split"},
+                    {
+                        "id": "big.a", "brief": "y", "artifact": "out/big.a.md",
+                        "gates": ["nonempty"], "status": "passed", "parent": "big",
+                    },
+                ],
+            )
+            tree = TaskTree.load(path)
+            self.assertTrue(tree.is_complete())
+            self.assertFalse(tree.is_blocked())
+
 
 class ManifestLineTest(unittest.TestCase):
     def test_empty_gate_results_are_fail_not_pass(self) -> None:
@@ -282,6 +362,92 @@ class WriterPromptTest(unittest.TestCase):
         promotion_path = Path("/tmp/run/scratch/a/promotion.json")
         prompt = writer_prompt("Write the intro.", promotion_path)
         self.assertIn(str(promotion_path), prompt)
+
+    def test_writer_prompt_omits_split_hint_by_default(self) -> None:
+        prompt = writer_prompt("Write the intro.", Path("/tmp/run/scratch/a/promotion.json"))
+        self.assertNotIn("split.json", prompt)
+
+    def test_writer_prompt_includes_split_hint_when_given_a_path(self) -> None:
+        # PLAN.md §B5: "gains the split-proposal option only when the
+        # node's inputs already exceed budget" -- writer_prompt itself just
+        # renders whatever it's handed; the gating is _inputs_exceed_budget
+        # (below), called from run_writer_node.
+        split_path = Path("/tmp/run/scratch/a/split.json")
+        prompt = writer_prompt(
+            "Write the intro.", Path("/tmp/run/scratch/a/promotion.json"), split_hint_path=split_path
+        )
+        self.assertIn(str(split_path), prompt)
+        self.assertIn("2-8 children", prompt)
+
+
+class InputsExceedBudgetTest(unittest.TestCase):
+    """PLAN.md §B5: the split hint appears in a real dispatched prompt only
+    when the node's own resolved inputs already exceed its budget -- "a
+    node that cannot legally split is never told it can." Exercised through
+    ``run_writer_node`` end to end (the fake adapter records the prompt it
+    was given) rather than by calling the private helper directly, so this
+    proves the wiring, not just the predicate."""
+
+    def test_split_hint_absent_when_inputs_fit_budget(self) -> None:
+        with tempfile.TemporaryDirectory() as root_str:
+            run_dir = Path(root_str)
+            (run_dir / "scratch" / "a").mkdir(parents=True)
+            (run_dir / "out").mkdir()
+            input_path = run_dir / "small.md"
+            input_path.write_text("a few words of input text", encoding="utf-8")
+            node = TaskNode(
+                id="a", brief="x", artifact="out/a.md", gates=["nonempty"],
+                inputs=["small.md"],
+            )
+            prompt = _captured_writer_prompt(run_dir, node)
+            self.assertNotIn("split.json", prompt)
+
+    def test_split_hint_present_when_inputs_exceed_budget(self) -> None:
+        from kusudaemon.v1.tree import NodeBudget
+
+        with tempfile.TemporaryDirectory() as root_str:
+            run_dir = Path(root_str)
+            (run_dir / "scratch" / "a").mkdir(parents=True)
+            (run_dir / "out").mkdir()
+            input_path = run_dir / "big.md"
+            input_path.write_text(" ".join(["word"] * 200), encoding="utf-8")
+            node = TaskNode(
+                id="a", brief="x", artifact="out/a.md", gates=["nonempty"],
+                inputs=["big.md"], budget=NodeBudget(tokens=5, calls=15),
+            )
+            prompt = _captured_writer_prompt(run_dir, node)
+            self.assertIn("split.json", prompt)
+            self.assertIn(str(run_dir / "scratch" / "a" / "split.json"), prompt)
+
+
+def _captured_writer_prompt(run_dir: Path, node: TaskNode) -> str:
+    """Runs one Writer episode against a fake adapter that just records the
+    prompt it was handed, and returns it -- the real path
+    ``run_writer_node`` takes, not a direct call to a private helper."""
+    import asyncio
+
+    from kusudaemon.environment.local import LocalEnvironment
+    from kusudaemon.types import EpisodeBudget, EpisodeResult
+
+    class _RecordingAdapter:
+        has_file_tools = True
+        supports_session_resume = False
+
+        def __init__(self) -> None:
+            self.last_prompt = ""
+
+        async def run_episode(self, prompt, env, budget, live_trajectory_path=None, **kwargs):
+            self.last_prompt = prompt
+            return EpisodeResult(status="done", actions_log="", duration_ms=1, metadata={})
+
+    adapter = _RecordingAdapter()
+    asyncio.run(
+        run_writer_node(
+            run_dir, node, "Write the intro.", adapter,
+            LocalEnvironment(tmp_dir=str(run_dir / "tmp")), EpisodeBudget(),
+        )
+    )
+    return adapter.last_prompt
 
 
 class StalePromotionUnlinkTest(unittest.TestCase):

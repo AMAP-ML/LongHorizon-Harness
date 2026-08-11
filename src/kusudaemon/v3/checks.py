@@ -30,6 +30,7 @@ from typing import Any
 from ..v0.run_dir import node_artifact_path
 from ..v1.gates import all_passed, evaluate_gates
 from ..v1.tree import TaskTree
+from .assemble import concatenate_artifacts
 from .run_dir import assembly_checks_path
 
 
@@ -63,7 +64,11 @@ def _read_manifest_by_node(manifest_path: Path) -> dict[str, dict[str, Any]]:
 
 
 def check_all_nodes_passed(tree: TaskTree) -> CheckResult:
-    missing = [n.id for n in tree.nodes.values() if n.status != "passed"]
+    """PLAN.md §A8/§B5: a "split" node never itself becomes "passed" (its
+    children do), but it is a successful terminal outcome, not an
+    incomplete one — excluded from this check the same way it's excluded
+    from ``v3/assemble.py:require_complete``/``TaskTree.is_complete()``."""
+    missing = [n.id for n in tree.nodes.values() if n.status not in ("passed", "split")]
     return CheckResult(
         name="all_nodes_passed",
         passed=not missing,
@@ -117,6 +122,28 @@ def check_manifest_recorded(run_dir: str | Path, manifest_path: str | Path, tree
     )
 
 
+def check_split_parents_derived(run_dir: str | Path, tree: TaskTree) -> CheckResult:
+    """PLAN.md §A8.3: a split parent's artifact is *derived* — script
+    concatenation of its children, never an integrator episode (the same
+    read-only-assembler guardrail §4.6 states for the assembler generally).
+    A parent whose on-disk artifact no longer equals a fresh concatenation
+    of its children (a hand edit, a bad repair, a crash between the last
+    child passing and ``v7/split.py:maybe_derive_split_parent``'s write) is
+    a defect in the same spirit ``check_no_gate_drift`` treats a drifted
+    leaf — something touched ``out/`` since — not a repair opportunity."""
+    run_dir = Path(run_dir)
+    problems = []
+    for node in tree.nodes.values():
+        if node.status != "split":
+            continue
+        child_ids = [n.id for n in tree.nodes.values() if n.parent == node.id]
+        expected = concatenate_artifacts(run_dir, tree, node_ids=child_ids)
+        actual = _read_artifact(run_dir, node.id)
+        if actual.strip() != expected.strip():
+            problems.append(f"{node.id}: derived artifact drifted from its children's concatenation")
+    return CheckResult(name="split_parents_derived", passed=not problems, details=problems)
+
+
 def run_cross_cutting_checks(
     run_dir: str | Path, tree: TaskTree, manifest_path: str | Path
 ) -> list[CheckResult]:
@@ -125,6 +152,7 @@ def run_cross_cutting_checks(
         check_artifacts_exist_and_nonempty(run_dir, tree),
         check_no_gate_drift(run_dir, tree),
         check_manifest_recorded(run_dir, manifest_path, tree),
+        check_split_parents_derived(run_dir, tree),
     ]
 
 

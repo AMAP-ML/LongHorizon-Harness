@@ -59,6 +59,7 @@ from ..v6.tiering import (
     tier_max,
 )
 from ..v6.work_object import WorkObject, survey_workspace, work_object_from_text, work_object_none
+from ..v7.split import handle_split_proposal, maybe_derive_split_parent
 from ..v0.events import EventLog
 from ..v0.run_dir import write_text_atomic
 from ..v0.run_dir import create_run_dir, ensure_node_trace_path, events_path, manifest_path, node_artifact_path, spec_path
@@ -960,12 +961,25 @@ class RecursiveDriver:
           Uses a lower ``max_attempts`` than T2/T3 (§A4.4: "T0/T1 node fails
           gates twice with a size defect -> promote to T2") — see
           ``v6/direct.py:DIRECT_MAX_ATTEMPTS``'s docstring for why 2, not 3.
-        - **T2/T3** — unchanged from pre-§B2 behavior: the round loop over
-          whatever ``tree.json`` planning already produced.
+        - **T2/T3** — unchanged from pre-§B2 behavior save one addition:
+          the round loop over whatever ``tree.json`` planning already
+          produced, but now also wired for runtime split (PLAN.md §A8/
+          §B5) via the ``split_handler``/``on_node_passed`` callables
+          (``v7/split.py``) — never for T1 (single node, its own
+          size-overrun path is ``size_defect_retry`` below, a deliberately
+          different move — replan for real at T2 rather than graft a
+          partial partition onto a tree that's about to be archived) or
+          T0 (no ``tree.json`` to graft into at all). See
+          ``v1/round_loop.py``'s module docstring for why these are
+          injected callables rather than a direct import there.
 
         The size-defect escalation check only applies to T1 (T0's own
         check lives in ``_phase_verify``, since T0 never touches
-        ``tree.json``/``TaskTree.is_blocked()`` at all).
+        ``tree.json``/``TaskTree.is_blocked()`` at all). The
+        ``split_accepted`` escalation trigger (§A4.4's fourth row) only
+        applies to T2 — T3 is already the escalation ceiling that trigger
+        targets (``majority_regenerate``'s own driver-side check gates the
+        same way).
         """
         tier = self._current_tier()
         if tier == "T0":
@@ -986,6 +1000,10 @@ class RecursiveDriver:
             build_single_node_tree(self.options.goal.strip()).save(tree_path(self.run_dir))
 
         max_attempts = DIRECT_MAX_ATTEMPTS if tier == "T1" else self.options.max_attempts
+        # PLAN.md §A8/§B5: runtime split only makes sense against a real,
+        # multi-node-capable tree.json — never T1's code-built single-node
+        # tree (docstring above).
+        enable_split = tier in ("T2", "T3")
         await run_round_loop(
             self.run_dir,
             tree_path(self.run_dir),
@@ -1001,6 +1019,8 @@ class RecursiveDriver:
             max_rounds=self.options.max_rounds,
             max_attempts=max_attempts,
             dispatch_policy=self.options.dispatch_policy,
+            split_handler=handle_split_proposal if enable_split else None,
+            on_node_passed=maybe_derive_split_parent if enable_split else None,
         )
         tree = self._load_tree()
         if tier == "T1" and tree.is_blocked():
@@ -1008,6 +1028,16 @@ class RecursiveDriver:
             if node is not None and is_size_defect(node.last_defect):
                 self._archive_tree_before_replan()
                 self._escalate_tier("size_defect_retry", node_id=node.id)
+                return None
+        if tier == "T2":
+            split_parents = sorted(n.id for n in tree.nodes.values() if n.status == "split")
+            if split_parents:
+                # PLAN.md §A4.4 row 4: "any node's accepted split proposal
+                # -> promote T2 -> T3." One trigger per _phase_execute call
+                # is enough — escalate() is monotone (v6/tiering.py), and
+                # once tier.json says T3 this branch's own `tier == "T2"`
+                # guard stops firing on a later resume.
+                self._escalate_tier("split_accepted", node_id=split_parents[0])
                 return None
         return None if not tree.is_blocked() else False
 
