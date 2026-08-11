@@ -134,6 +134,66 @@ class WriterAdapterHiddenPathsTest(unittest.TestCase):
         self.assertEqual(adapter.hidden_paths, ())
         self.assertEqual(adapter.hidden_path_exceptions, ())
 
+    def test_run_dir_defaults_to_workspace_path_unchanged_from_before(self) -> None:
+        """PLAN.md §A3/§B1: build_writer_adapter grew a `run_dir` kwarg for
+        workspace mode. Omitting it (every pre-§B1 call site, and every
+        corpus-mode dispatch) must produce byte-identical hidden_paths to
+        passing run_dir==workspace_path explicitly -- proving the new
+        parameter is additive, not a behavior change (Part III rule 1)."""
+        node = TaskNode(id="n", brief="b", artifact="out/n.md", gates=["nonempty"])
+        with _EnvGuard():
+            omitted = build_writer_adapter(
+                "gptme", workspace_path="/tmp/ws", prompt_dir="/tmp/prompts", node=node
+            )
+            explicit = build_writer_adapter(
+                "gptme", workspace_path="/tmp/ws", prompt_dir="/tmp/prompts", node=node, run_dir="/tmp/ws"
+            )
+        self.assertEqual(omitted.hidden_paths, explicit.hidden_paths)
+        self.assertEqual(omitted.hidden_path_exceptions, explicit.hidden_path_exceptions)
+        self.assertEqual(omitted.hidden_paths, ("events.jsonl", "approvals.jsonl", "audit/", "scratch/", "out/"))
+
+    def test_workspace_mode_hides_the_nested_run_dir_as_one_subtree(self) -> None:
+        """kind="workspace": workspace_path (work.root) differs from
+        run_dir (nested under it, the default --workspace runs_root). The
+        corpus-mode per-file names ("out/", "scratch/") don't exist
+        relative to that cwd; the whole run dir must be hidden instead,
+        with only this node's own two paths carved back out."""
+        node = TaskNode(id="n", brief="b", artifact="out/n.md", gates=["nonempty"])
+        with _EnvGuard():
+            adapter = build_writer_adapter(
+                "gptme",
+                workspace_path="/tmp/repo",
+                prompt_dir="/tmp/prompts",
+                node=node,
+                run_dir="/tmp/repo/.kusudaemon/runs/r1",
+            )
+        self.assertEqual(adapter.hidden_paths, (".kusudaemon/runs/r1/",))
+        self.assertEqual(
+            adapter.hidden_path_exceptions,
+            (".kusudaemon/runs/r1/out/n.md", ".kusudaemon/runs/r1/scratch/n"),
+        )
+        # Corpus-mode's bare "out/"/"scratch/" names must NOT leak into the
+        # workspace-mode notice -- they'd point at nothing relative to
+        # work.root and give a false sense of coverage.
+        self.assertNotIn("out/", adapter.hidden_paths)
+        self.assertNotIn("scratch/", adapter.hidden_paths)
+
+    def test_run_dir_outside_workspace_needs_no_hidden_entry(self) -> None:
+        """A run dir that isn't nested inside the workspace at all (a
+        custom --runs-root) has nothing of the harness's bookkeeping
+        sitting inside the Writer's cwd to hide."""
+        node = TaskNode(id="n", brief="b", artifact="out/n.md", gates=["nonempty"])
+        with _EnvGuard():
+            adapter = build_writer_adapter(
+                "gptme",
+                workspace_path="/tmp/repo",
+                prompt_dir="/tmp/prompts",
+                node=node,
+                run_dir="/var/other/runs/r1",
+            )
+        self.assertEqual(adapter.hidden_paths, ())
+        self.assertEqual(adapter.hidden_path_exceptions, ())
+
     def test_notice_hides_out_but_excepts_own_artifact(self) -> None:
         # The rendered prompt notice, not just the raw tuples: an agent
         # reading its own prompt must see both "out/ is off limits" and

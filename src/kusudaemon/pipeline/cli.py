@@ -49,10 +49,21 @@ def build_pipeline_parser() -> argparse.ArgumentParser:
     sub = parser.add_subparsers(dest="pipeline_command")
 
     run_parser = sub.add_parser("run", help="Run (or resume) the pipeline.")
-    run_parser.add_argument("--runs-root", default=_RUNS_ROOT_DEFAULT)
+    run_parser.add_argument(
+        "--runs-root",
+        default=None,
+        help=f"Defaults to {_RUNS_ROOT_DEFAULT}, or <workspace>/.kusudaemon/runs "
+        "when --workspace is given.",
+    )
     run_parser.add_argument("--run-id", default=None, help="Reuse an id to resume an existing run dir.")
     run_parser.add_argument("--goal", default="", help="Task goal (or @path).")
     run_parser.add_argument("--source", default="", help="Source document: text, @file, or -.")
+    run_parser.add_argument(
+        "--workspace",
+        default=None,
+        help="Path to a real directory the Writer edits directly "
+        "(PLAN.md §A3 kind=\"workspace\") instead of a materialized corpus.",
+    )
     run_parser.add_argument("--backend", default="gptme", choices=("gptme",))
     run_parser.add_argument("--model", default=None)
     run_parser.add_argument("--compile-command", default=None)
@@ -87,6 +98,14 @@ def build_pipeline_parser() -> argparse.ArgumentParser:
         help="Inline top-k retrieved spans from the node's own spine slice "
         "into its prompt instead of bare input paths (PLAN-zeromem.md §4).",
     )
+    run_parser.add_argument(
+        "--tier",
+        choices=("T0", "T1", "T2", "T3"),
+        default=None,
+        help="Force a tier floor, never a ceiling (PLAN.md §A4.4 invariant "
+        "9): the classifier still runs; the effective tier is "
+        "max(measured, this).",
+    )
     run_parser.add_argument("--detach", action="store_true", help="Run in a background subprocess and return immediately.")
 
     resume_parser = sub.add_parser("resume", help="Resume a run after a halt or crash.")
@@ -111,6 +130,12 @@ def build_pipeline_parser() -> argparse.ArgumentParser:
     amend_parser.add_argument("--reason", default="CLI amendment", help="Attribution shown in the contract.")
     amend_parser.add_argument("--yes", action="store_true", help="Apply the triage without prompting.")
     amend_parser.add_argument("--max-attempts", type=int, default=3)
+
+    escalate_parser = sub.add_parser(
+        "escalate", help="Promote a run's tier by one (PLAN.md §A4.4 operator intervention)."
+    )
+    escalate_parser.add_argument("run_id")
+    escalate_parser.add_argument("--runs-root", default=_RUNS_ROOT_DEFAULT)
 
     serve_parser = sub.add_parser("serve", help="Serve the web dashboard (PLAN.md §11 control surface) over a runs directory.")
     serve_parser.add_argument("--runs-root", default=_RUNS_ROOT_DEFAULT)
@@ -177,13 +202,20 @@ def _expand_source_arg(raw: str) -> str:
 
 def cmd_run_detach(argv: argparse.Namespace) -> int:
     run_id = argv.run_id or _default_run_id()
+    workspace = getattr(argv, "workspace", None)
+    # Same default --workspace -> runs_root rule as run.py's own
+    # run_from_args (kept in sync here because --detach resolves the run
+    # dir itself, below, before run.py ever parses its own argv).
+    runs_root_arg = argv.runs_root or (
+        f"{workspace.rstrip('/')}/.kusudaemon/runs" if workspace else _RUNS_ROOT_DEFAULT
+    )
     # §11.10.8: the corpus must not ride through argv — an inline (non-@file)
     # corpus hits E2BIG well before "corpus-scale". Write it into the run
     # dir once (source.txt is exactly where driver._write_source_and_spec
     # would put it) and pass @path, which run.py then reads instead of argv.
     source_arg = argv.source
     if source_arg and not source_arg.startswith("@"):
-        run_dir = _run_dir(argv.runs_root, run_id)
+        run_dir = _run_dir(runs_root_arg, run_id)
         run_dir.mkdir(parents=True, exist_ok=True)
         resolved = _expand_source_arg(source_arg)
         source_path(run_dir).write_text(resolved, encoding="utf-8")
@@ -192,7 +224,7 @@ def cmd_run_detach(argv: argparse.Namespace) -> int:
         sys.executable,
         "-m",
         "kusudaemon.pipeline.run",
-        "--runs-root", argv.runs_root,
+        "--runs-root", runs_root_arg,
         "--run-id", run_id,
         "--goal", argv.goal,
         "--source", source_arg,
@@ -201,6 +233,10 @@ def cmd_run_detach(argv: argparse.Namespace) -> int:
         "--max-attempts", str(argv.max_attempts),
         "--dispatch-policy", argv.dispatch_policy,
     ]
+    if workspace:
+        command += ["--workspace", workspace]
+    if getattr(argv, "tier", None):
+        command += ["--tier", argv.tier]
     if argv.document_review:
         command += ["--document-review"]
     if argv.survey_mode != "model":
@@ -216,7 +252,7 @@ def cmd_run_detach(argv: argparse.Namespace) -> int:
             command += [flag, value]
     subprocess.Popen(command, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
     print(f"detached pipeline run: run_id={run_id}")
-    print(f"watch with: kusudaemon pipeline status {run_id} --runs-root {argv.runs_root}")
+    print(f"watch with: kusudaemon pipeline status {run_id} --runs-root {runs_root_arg}")
     return 0
 
 
@@ -334,6 +370,17 @@ def cmd_amend(argv: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_escalate(argv: argparse.Namespace) -> int:
+    run_dir = _require_existing_run(argv.runs_root, argv.run_id)
+    if run_dir is None:
+        return 1
+    from .driver import escalate_run
+
+    result = escalate_run(run_dir)
+    print(f"tier: {result['from']} -> {result['to']}")
+    return 0
+
+
 def cmd_resume(argv: argparse.Namespace) -> int:
     # Resume is exactly "run with an existing run-id": the driver converges
     # from durable state (§10), so there is no separate resume code path —
@@ -360,6 +407,8 @@ def dispatch(args: argparse.Namespace) -> int:
         return cmd_approve(args)
     if command == "amend":
         return cmd_amend(args)
+    if command == "escalate":
+        return cmd_escalate(args)
     if command == "serve":
         return cmd_serve(args)
     raise ValueError(f"unknown pipeline command: {command!r}")
@@ -389,7 +438,6 @@ def _writer_factory(options: RunOptions, run_dir: Path):
 
 def _run_argv(argv: argparse.Namespace, *, run_id: str | None) -> list[str]:
     parts = [
-        "--runs-root", argv.runs_root,
         "--goal", argv.goal,
         "--source", argv.source,
         "--backend", argv.backend,
@@ -399,6 +447,12 @@ def _run_argv(argv: argparse.Namespace, *, run_id: str | None) -> list[str]:
     ]
     if run_id:
         parts += ["--run-id", run_id]
+    if getattr(argv, "runs_root", None):
+        parts += ["--runs-root", argv.runs_root]
+    if getattr(argv, "workspace", None):
+        parts += ["--workspace", argv.workspace]
+    if getattr(argv, "tier", None):
+        parts += ["--tier", argv.tier]
     if getattr(argv, "document_review", False):
         parts += ["--document-review"]
     if getattr(argv, "survey_mode", "model") != "model":

@@ -24,6 +24,18 @@ attempt, and clear it on success (PLAN-zeromem.md §9) — a retry's prompt
 (``pipeline/prompts.py:build_node_prompt``) reads it back, so attempts 2
 and 3 carry forward what attempt 1 got wrong instead of resampling an
 identical prompt blind.
+
+``dispatch_node``/``review_and_transition_node`` (PLAN.md §B2) are
+``run_round_loop``'s per-node dispatch/review bodies, pulled out of their
+original inline closures into standalone functions — the *only* change
+this made to this module's own behavior is that they're callable directly.
+This exists so ``v6/direct.py``'s T0 direct-episode path (one gated
+episode, no ``tree.json``) can reuse the exact same Writer-dispatch and
+Reviewer-verdict machinery instead of re-implementing it: T0 hands both
+functions an in-memory, single-node ``TaskTree`` and a JSON path of its own
+choosing (never named ``tree.json`` — PLAN.md §A4.3: "T0 has no
+``tree.json``"), and gets the identical gate-cache-write, manifest-line,
+and status-transition behavior a real round-loop dispatch gets.
 """
 
 from __future__ import annotations
@@ -62,6 +74,69 @@ AdapterFactory = Callable[[TaskNode], AgentAdapter]
 PromptBuilder = Callable[[TaskNode], str]
 
 
+async def dispatch_node(
+    run_dir: str | Path,
+    node: TaskNode,
+    tree: TaskTree,
+    tree_path: str | Path,
+    *,
+    writer_adapter_factory: AdapterFactory,
+    env: Environment,
+    prompt_for_node: PromptBuilder,
+    budget: EpisodeBudget,
+    manifest: str | Path,
+    max_attempts: int,
+    log: EventLog,
+) -> None:
+    """One Writer episode + gate evaluation + manifest line + status
+    transition for a single node — ``run_round_loop``'s original ``dispatch``
+    closure, pulled out so ``v6/direct.py``'s T0 path can call it directly
+    against its own in-memory single-node ``TaskTree`` (module docstring)."""
+    run_dir = Path(run_dir)
+    adapter = writer_adapter_factory(node)
+    result, promotion = await run_writer_node(
+        run_dir, node, prompt_for_node(node), adapter, env, budget
+    )
+    artifact_text = _read_artifact(run_dir, node.id)
+    gate_results = evaluate_gates(node.gates, artifact_text)
+    # §11.10.11: evaluated once per dispatch (deterministic), durable in
+    # the audit file for every consumer; review and the dashboard read
+    # this instead of re-evaluating.
+    audit = ensure_audit_path(run_dir, node.id)
+    write_gate_cache(audit, gate_results)
+    append_manifest_line(
+        manifest,
+        node_id=node.id,
+        artifact_path=str(node_artifact_path(run_dir, node.id)),
+        artifact_text=artifact_text,
+        gate_results=gate_results,
+        promotion=promotion,
+    )
+    _transition_after_writer(
+        node, tree, tree_path, result.status == "done", gate_results, max_attempts, log
+    )
+
+
+async def review_and_transition_node(
+    run_dir: str | Path,
+    node: TaskNode,
+    tree: TaskTree,
+    tree_path: str | Path,
+    *,
+    provider: OpenAICompatibleProvider,
+    max_attempts: int,
+    log: EventLog,
+) -> None:
+    """One Reviewer verdict + status transition for a single node —
+    ``run_round_loop``'s original ``review`` closure, pulled out for the
+    same reason as ``dispatch_node`` above."""
+    run_dir = Path(run_dir)
+    artifact_text = _read_artifact(run_dir, node.id)
+    verdict = review_node(node, artifact_text, provider)
+    _write_audit(run_dir, node, verdict)
+    _transition_after_review(node, tree, tree_path, verdict, max_attempts, log)
+
+
 async def run_round_loop(
     run_dir: str | Path,
     tree_path: str | Path,
@@ -83,35 +158,25 @@ async def run_round_loop(
     default_budget = writer_budget or EpisodeBudget()
 
     async def dispatch(node: TaskNode) -> None:
-        adapter = writer_adapter_factory(node)
         budget = writer_budget_for(node) if writer_budget_for is not None else default_budget
-        result, promotion = await run_writer_node(
-            run_dir, node, prompt_for_node(node), adapter, env, budget
-        )
-        artifact_text = _read_artifact(run_dir, node.id)
-        gate_results = evaluate_gates(node.gates, artifact_text)
-        # §11.10.11: evaluated once per dispatch (deterministic), durable in
-        # the audit file for every consumer; review and the dashboard read
-        # this instead of re-evaluating.
-        audit = ensure_audit_path(run_dir, node.id)
-        write_gate_cache(audit, gate_results)
-        append_manifest_line(
-            manifest,
-            node_id=node.id,
-            artifact_path=str(node_artifact_path(run_dir, node.id)),
-            artifact_text=artifact_text,
-            gate_results=gate_results,
-            promotion=promotion,
-        )
-        _transition_after_writer(
-            node, tree, tree_path, result.status == "done", gate_results, max_attempts, log
+        await dispatch_node(
+            run_dir,
+            node,
+            tree,
+            tree_path,
+            writer_adapter_factory=writer_adapter_factory,
+            env=env,
+            prompt_for_node=prompt_for_node,
+            budget=budget,
+            manifest=manifest,
+            max_attempts=max_attempts,
+            log=log,
         )
 
     async def review(node: TaskNode) -> None:
-        artifact_text = _read_artifact(run_dir, node.id)
-        verdict = review_node(node, artifact_text, provider)
-        _write_audit(run_dir, node, verdict)
-        _transition_after_review(node, tree, tree_path, verdict, max_attempts, log)
+        await review_and_transition_node(
+            run_dir, node, tree, tree_path, provider=provider, max_attempts=max_attempts, log=log
+        )
 
     # Resume in-flight work before asking the orchestrator for anything new.
     for node in list(tree.nodes.values()):
