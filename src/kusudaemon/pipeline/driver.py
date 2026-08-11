@@ -53,6 +53,7 @@ from ..v6.tiering import (
     classify,
     escalate,
     estimate_scope,
+    max_explorers_for,
     measure_signals,
     phases_for,
     tier_max,
@@ -88,8 +89,9 @@ from ..v2.survey import (
 )
 from ..v3.assembly_loop import run_assembly_loop
 from ..v3.revalidate import Triage, apply_revalidation_triage, run_revalidation_pass
-from ..v4.research import ResearchQuery
+from ..v4.research import ResearchQuery, run_research_query
 from ..v4.research_loop import run_research_loop
+from ..v4.run_dir import research_finding_path
 from . import approvals as approval_store
 from .backends import parse_research_plan
 from .liveness import record_driver_start
@@ -244,6 +246,17 @@ class RunReport:
 
 WriterAdapterFactory = Callable[[TaskNode], AgentAdapter]
 ResearchAdapterFactory = Callable[[TaskNode, ResearchQuery], AgentAdapter]
+ProbeAdapterFactory = Callable[[ResearchQuery], AgentAdapter]
+
+# PLAN.md §A6/§B4: the pseudo-node id structural-exploration probes dispatch
+# under. Deliberately not "explore-01" — that's already _phase_survey's own
+# large-corpus reasoning-explainer pseudo-agent id (see that method below);
+# using the same id would collide both dispatch ids (research_node_id's
+# "<id>~research~<slug>" derivation) and, worse, the two pseudo-agents'
+# trace.jsonl files. "explore" (no "-01" suffix) can't collide with either a
+# real Writer node id (planner-built ids are always dot-hierarchical or a
+# leaf id from a partition call, never bare "explore") or explore-01.
+_EXPLORE_PROBE_NODE_ID = "explore"
 
 
 def is_rate_limit_or_busy_error(exc: Exception | str) -> bool:
@@ -278,6 +291,7 @@ class RecursiveDriver:
         env: Environment | None = None,
         writer_adapter_factory: WriterAdapterFactory | None = None,
         research_adapter_factory: ResearchAdapterFactory | None = None,
+        probe_adapter_factory: ProbeAdapterFactory | None = None,
         poll_interval: float = 1.0,
     ) -> None:
         # Resolved, not just wrapped: workspace_path/prompt_dir (below) are
@@ -297,6 +311,7 @@ class RecursiveDriver:
         self.env = env or _local_env(self.run_dir)
         self.writer_adapter_factory = writer_adapter_factory or self._default_writer_factory()
         self.research_adapter_factory = research_adapter_factory or self._default_research_factory()
+        self.probe_adapter_factory = probe_adapter_factory or self._default_probe_adapter_factory()
         self.poll_interval = poll_interval
         create_run_dir(self.run_dir.parent, self.run_dir.name)
         self._write_source_and_spec()
@@ -736,18 +751,18 @@ class RecursiveDriver:
         table actually uses.
 
         §A4.3's "explore? fires only when ``answerable_without_exploration``
-        is false" is written for real agentic probes (PLAN.md §B4 —
-        *not built yet*, a separate, not-yet-started workstream). Until
-        those exist, producing ``spine.json`` is not optional — "plan"
-        needs it unconditionally, at every tier that has a plan phase — so
-        this method always ensures it exists. ``needs_explore`` instead
-        gates the one *additional* thing this harness can currently do that
-        resembles exploration: running v4's research loop early (only when
-        the operator supplied an explicit ``research_plan`` — same gate
-        ``_phase_research`` already uses). This is an honest, documented
-        approximation of "probe episodes," not a claim that §B4 is done —
-        the ≤2/≤6 "explorers" caps in §A4.3's table are not enforced here
-        because nothing dispatches a bounded number of probe episodes yet.
+        is false" gates two things now (PLAN.md §B4): producing
+        ``spine.json`` is *not* itself optional — "plan" needs it
+        unconditionally, at every tier that has a plan phase — so this
+        method always ensures it exists regardless of ``needs_explore``.
+        What ``needs_explore`` actually gates is (1) structural exploration
+        — one bounded probe per top-level ``SpineUnit``, capped by
+        ``max_explorers_for(tier)``, T2+ only (T1 has no "plan" phase to
+        feed a summary into; T0 has no "explore" phase at all) — and (2)
+        running v4's research loop early when the operator supplied an
+        explicit ``research_plan`` (same gate ``_phase_research`` already
+        uses for the "targeted, post-intake" pattern, §A6's second bullet,
+        still carried unchanged from before this workstream).
         """
         if not (self.run_dir / "spine.json").exists():
             await self._phase_survey()
@@ -764,8 +779,90 @@ class RecursiveDriver:
                 }
             )
             return
+        tier = self._current_tier()
+        if tier in ("T2", "T3"):
+            await self._run_structural_exploration(tier)
         if self.options.research_plan:
             await self._phase_research()
+
+    async def _run_structural_exploration(self, tier: Tier) -> None:
+        """PLAN.md §A6 first bullet/§B4: "one probe per top-level unit of
+        the work object, up to ``max_explorers`` (tier cap)". Pre-plan,
+        T2+ only (the caller enforces that). Applies identically whether
+        the work object is a ``kind="workspace"`` repo or a ``kind="text"``
+        corpus — both already have real per-unit content on disk by this
+        point (``survey_workspace``'s members, or corpus mode's
+        materialized ``spine/<unit>.md`` — §A6's table lists both
+        ``workspace`` and ``corpus`` probe kinds explicitly for exactly this
+        reason). Three independent code-side cost fences, all real, none
+        reinvented here (§A6's own words): a per-probe ``EpisodeBudget``
+        (default, same as every other v4 research dispatch); this method's
+        own ``cap`` slice, so a work object with 4 top-level units and one
+        with 400 both dispatch at most ``max_explorers_for(tier)`` probes;
+        and ``run_research_query``'s existing 300-token finding cap.
+
+        **Which units get probed when there are more than the cap**: the
+        largest ``cap`` units by token count (ties broken by id for
+        determinism) — the ones a planner partitioning by size would need
+        the most help with, and the choice that makes the cap's cost bound
+        exact regardless of how the caller orders ``spine.json``.
+
+        Findings land at ``research_finding_path(run_dir, "explore",
+        unit.id)`` — reusing v4's existing finding-path scheme (rather than
+        the literal ``scratch/explore/<unit>.md`` §A6's table shows) so
+        idempotency (a probe with an existing nonempty finding is not
+        re-dispatched) comes for free from ``run_research_query``'s own
+        cache check instead of being reimplemented here.
+        """
+        units = load_spine(self.run_dir)
+        if not units:
+            return
+        cap = max_explorers_for(tier)
+        if cap <= 0:
+            return
+        selected = sorted(units, key=lambda unit: (-unit.tokens, unit.id))[:cap]
+        work = self._effective_work_object()
+        probe_kind = "workspace" if work.kind == "workspace" else "corpus"
+        budget = EpisodeBudget()
+        for unit in selected:
+            query = ResearchQuery(
+                slug=unit.id,
+                kind=probe_kind,
+                question=self._structural_probe_question(unit, work),
+            )
+            adapter = self.probe_adapter_factory(query)
+            await run_research_query(
+                self.run_dir, _EXPLORE_PROBE_NODE_ID, query, adapter, self.env, budget
+            )
+
+    def _structural_probe_question(self, unit: SpineUnit, work: WorkObject) -> str:
+        """The one question every structural-exploration probe answers —
+        generic on purpose (§A6: "a strictly better partition input than
+        the label alone", not a targeted question about run-specific
+        content). ``workspace`` probes get the unit's own member paths (so
+        they know where to point their read-only list/grep tools without
+        having to rediscover the grouping ``survey_workspace`` already
+        computed); ``corpus`` probes get the materialized unit file's path
+        directly, since a corpus probe's allowlist is `read` alone."""
+        if work.kind == "workspace":
+            members = ", ".join(unit.members[:20]) or "(no files)"
+            return (
+                f'This is the "{unit.label}" portion of a codebase a planner '
+                f"is about to partition into work items. Its files (relative "
+                f"to your workspace root) include: {members}. Using your "
+                f"read-only list/grep/read tools, summarize in <=300 tokens: "
+                f"what this part of the codebase does, how it's organized, "
+                f"and anything a planner partitioning work here should know "
+                f"(natural sub-boundaries, risky areas, cross-cutting "
+                f"concerns)."
+            )
+        unit_path = unit_input_path(self.run_dir, unit)
+        return (
+            f'This is the "{unit.label}" unit of a text corpus a planner is '
+            f"about to partition into work items. Read {unit_path} and "
+            f"summarize in <=300 tokens: its structure, purpose, and "
+            f"anything a planner partitioning work here should know."
+        )
 
     async def _phase_plan(self) -> None:
         tree = build_tree(
@@ -773,8 +870,23 @@ class RecursiveDriver:
             self.provider,
             input_path_for=lambda unit: unit_input_path(self.run_dir, unit),
             log=self.log,
+            unit_summary_for=self._explore_summary_for,
         )
         tree.save(tree_path(self.run_dir))
+
+    def _explore_summary_for(self, unit: SpineUnit) -> str:
+        """PLAN.md §A7 point 3/§B4: reads back whatever
+        ``_run_structural_exploration`` wrote for this unit during
+        "explore" — empty when nothing did (T1's escalation path never runs
+        explore's structural-exploration branch; a unit outside the top
+        ``max_explorers_for(tier)`` picks never got probed either).
+        ``plan_level``/``build_tree`` treat an empty string as "no summary
+        line," so this degrades to today's label-only rendering rather than
+        failing."""
+        path = research_finding_path(self.run_dir, _EXPLORE_PROBE_NODE_ID, unit.id)
+        if not path.exists():
+            return ""
+        return path.read_text(encoding="utf-8").strip()
 
     async def _phase_pilot(self) -> None:
         tree = self._load_tree()
@@ -1225,13 +1337,54 @@ class RecursiveDriver:
 
             return build_research_adapter(
                 self.options.backend,
-                workspace_path=self.run_dir,
+                workspace_path=self._probe_workspace_path(query),
                 prompt_dir=self.run_dir / "tmp" / "prompts",
                 query=query,
                 model=self.options.model,
+                run_dir=self.run_dir,
             )
 
         return factory
+
+    def _default_probe_adapter_factory(self) -> ProbeAdapterFactory:
+        """PLAN.md §A6/§B4: builds the adapter for one structural-exploration
+        probe (``_run_structural_exploration``, above). A separate factory
+        from ``research_adapter_factory`` because that one's shape —
+        ``Callable[[TaskNode, ResearchQuery], AgentAdapter]`` — is tied to a
+        real, already-planned ``TaskNode``; a structural-exploration probe
+        runs *before* planning even starts, over a ``SpineUnit``, not a
+        node. Kept as its own overridable driver attribute (not inlined
+        into ``_run_structural_exploration``) so a test can inject a
+        call-counting fake the same way ``writer_adapter_factory``/
+        ``research_adapter_factory`` already can."""
+
+        def factory(query: ResearchQuery) -> AgentAdapter:
+            from .backends import build_research_adapter
+
+            return build_research_adapter(
+                self.options.backend,
+                workspace_path=self._probe_workspace_path(query),
+                prompt_dir=self.run_dir / "tmp" / "prompts",
+                query=query,
+                model=self.options.model,
+                run_dir=self.run_dir,
+            )
+
+        return factory
+
+    def _probe_workspace_path(self, query: ResearchQuery) -> Path:
+        """PLAN.md §A6/§B4: a ``workspace``-kind probe's cwd must actually be
+        (or be able to read into) the work object's root, not the run
+        directory — mirroring ``_default_writer_factory``'s existing
+        ``kind="workspace"`` branch above. Every other kind (``web``,
+        ``corpus``, ``doc_retrieval``) keeps today's behavior: the run
+        directory (``corpus`` reads ``spine/`` there; ``web`` and
+        ``doc_retrieval`` get no filesystem tools at all, so this is moot
+        for them)."""
+        work = self._effective_work_object()
+        if query.kind == "workspace" and work.kind == "workspace" and work.root is not None:
+            return work.root
+        return self.run_dir
 
 
 def _local_env(run_dir: Path) -> Environment:
