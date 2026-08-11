@@ -10,7 +10,10 @@ call site.
 
 from __future__ import annotations
 
+from collections import deque
+import io
 import json
+import re
 from typing import Any, Iterator
 
 CLAUDE_STREAM_JSON = "claude_stream_json"
@@ -117,18 +120,62 @@ def tool_output_view(raw: str) -> str:
     return "\n".join(part for part in parts if part)
 
 
-def parse_trajectory(raw: str) -> list[dict[str, Any]]:
+def runtime_event_view(raw: str) -> str:
+    """Return provider/runtime failures without including task tool output.
+
+    Command output is untrusted task data and may legitimately contain source
+    examples such as ``{"type": "turn.failed"}`` or ``AGENT_TURN_FAILED``.
+    Only top-level CLI protocol events (plus exact legacy wrapper markers) may
+    become hard runtime signals.
+    """
+
+    log_format = detect_format(raw)
+    parts: list[str] = []
+    for line in str(raw or "").splitlines():
+        stripped = line.strip()
+        if not stripped:
+            continue
+        if not stripped.startswith("{"):
+            if re.fullmatch(r"AGENT_EXIT=[1-9]\d*", stripped):
+                parts.append(stripped)
+            elif stripped in {"Connection error.", "response.failed"}:
+                parts.append(stripped)
+            continue
+        try:
+            record = json.loads(stripped)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(record, dict):
+            continue
+        record_type = str(record.get("type") or "")
+        if log_format == CODEX_EXEC_JSON:
+            if record_type == "turn.failed":
+                error = record.get("error")
+                message = error.get("message") if isinstance(error, dict) else error
+                parts.append(f"{TURN_FAILED_SIGNAL}: {message or 'codex turn failed'}")
+            elif record_type == "error":
+                message = record.get("message") or record.get("error")
+                if message:
+                    parts.append(str(message))
+        elif log_format == CLAUDE_STREAM_JSON and record_type == "result" and record.get("is_error"):
+            message = record.get("result") or record.get("error") or record.get("subtype") or "claude response failed"
+            parts.append(f"response.failed: {message}")
+    return "\n".join(parts)
+
+
+def parse_trajectory(raw: str, *, max_steps: int | None = None) -> list[dict[str, Any]]:
     """Turn a raw agent log into ordered, UI-friendly steps.
 
     Step kinds are shared across backends (``session``, ``thinking``, ``text``,
     ``tool_use``, ``tool_result``, ``result``) so the dashboard renders any agent
     without knowing which CLI produced the log.
     """
+    bounded_steps = None if max_steps is None else max(1, int(max_steps))
     log_format = detect_format(raw)
     if log_format == CODEX_EXEC_JSON:
-        return _codex_trajectory(raw)
+        return _codex_trajectory(raw, max_steps=bounded_steps)
     if log_format == CLAUDE_STREAM_JSON:
-        return _claude_trajectory(raw)
+        return _claude_trajectory(raw, max_steps=bounded_steps)
     return []
 
 
@@ -178,12 +225,21 @@ def _codex_tool_output(record: dict[str, Any]) -> list[str]:
     return []
 
 
-def _codex_trajectory(raw: str) -> list[dict[str, Any]]:
-    steps: list[dict[str, Any]] = []
+def _codex_trajectory(raw: str, *, max_steps: int | None = None) -> list[dict[str, Any]]:
+    # A 16 MiB JSONL file can still contain well over 100,000 tiny events.
+    # Keep the newest UI-relevant steps in a ring buffer so a bounded input
+    # cannot expand into an unbounded response/DOM. ``None`` preserves the
+    # complete-parser behavior used outside the dashboard.
+    steps: deque[dict[str, Any]] = deque(maxlen=max_steps)
     # Codex emits `item.started` then `item.completed` for tool items, but a
     # log tailed mid-run can be missing either side; track ids so each action
-    # still renders exactly one call step and at most one result step.
+    # still renders exactly one call step and at most one result step.  The
+    # bounded dashboard path also bounds this bookkeeping set; otherwise a
+    # stream of tiny ``item.started`` records could consume memory even while
+    # the returned step deque stayed small.
     started_ids: set[str] = set()
+    started_order: deque[str] | None = deque() if max_steps is not None else None
+    seen_cap = max(32, (max_steps or 0) * 4) if max_steps is not None else None
     for record in _json_records(raw):
         record_type = record.get("type")
         if record_type == "thread.started":
@@ -237,13 +293,18 @@ def _codex_trajectory(raw: str) -> list[dict[str, Any]]:
         if item_type not in _CODEX_TOOL_ITEMS:
             continue
         if record_type == "item.started" or item_id not in started_ids:
-            started_ids.add(item_id)
+            if item_id not in started_ids:
+                started_ids.add(item_id)
+                if started_order is not None:
+                    started_order.append(item_id)
+                    while len(started_order) > (seen_cap or 0):
+                        started_ids.discard(started_order.popleft())
             steps.append(_codex_tool_use_step(item_id, item_type, item))
         if record_type == "item.completed":
             result = _codex_tool_result_step(item_id, item_type, item)
             if result is not None:
                 steps.append(result)
-    return steps
+    return list(steps)
 
 
 def _codex_tool_use_step(item_id: str, item_type: str, item: dict[str, Any]) -> dict[str, Any]:
@@ -275,7 +336,7 @@ def _codex_tool_result_step(item_id: str, item_type: str, item: dict[str, Any]) 
         text = str(item.get("aggregated_output") or "")
         if exit_code is not None:
             text = f"{text}\n[exit_code={exit_code}]".strip()
-        return _tool_result_step(item_id, text, [], failed or bool(exit_code))
+        return _tool_result_step(item_id, text, [], failed or _nonzero_exit_code(exit_code), status=item.get("status"))
     if item_type == "file_change":
         changes = item.get("changes") or []
         lines = [
@@ -283,16 +344,19 @@ def _codex_tool_result_step(item_id: str, item_type: str, item: dict[str, Any]) 
             for change in changes
             if isinstance(change, dict)
         ]
-        return _tool_result_step(item_id, "\n".join(lines), [], failed)
+        return _tool_result_step(item_id, "\n".join(lines), [], failed, status=item.get("status"))
     if item_type == "mcp_tool_call":
         error = item.get("error")
         if isinstance(error, dict) and error.get("message"):
-            return _tool_result_step(item_id, str(error["message"]), [], True)
+            return _tool_result_step(item_id, str(error["message"]), [], True, status="failed")
         text, images = _content_blocks_to_text(_codex_mcp_content(item))
-        return _tool_result_step(item_id, text, images, failed)
+        return _tool_result_step(item_id, text, images, failed, status=item.get("status"))
     if item_type in {"web_search", "todo_list"}:
-        return None
-    return _tool_result_step(item_id, "", [], failed)
+        # These Codex items often carry no textual result, but item.completed
+        # is still authoritative lifecycle evidence.  Emitting an empty paired
+        # result prevents the UI from showing a permanently spinning tool row.
+        return _tool_result_step(item_id, "", [], failed, status=item.get("status") or "completed")
+    return _tool_result_step(item_id, "", [], failed, status=item.get("status"))
 
 
 def _codex_mcp_content(item: dict[str, Any]) -> Any:
@@ -302,7 +366,7 @@ def _codex_mcp_content(item: dict[str, Any]) -> Any:
     return None
 
 
-def _codex_result_step(record: dict[str, Any], steps: list[dict[str, Any]]) -> dict[str, Any]:
+def _codex_result_step(record: dict[str, Any], steps: Any) -> dict[str, Any]:
     # Reuse the trailing assistant text so the dashboard's duplicate-text drop
     # keeps a single final answer, the same way it does for Claude.
     final_text = ""
@@ -363,8 +427,8 @@ def _claude_tool_output(record: dict[str, Any]) -> list[str]:
     return parts
 
 
-def _claude_trajectory(raw: str) -> list[dict[str, Any]]:
-    steps: list[dict[str, Any]] = []
+def _claude_trajectory(raw: str, *, max_steps: int | None = None) -> list[dict[str, Any]]:
+    steps: deque[dict[str, Any]] = deque(maxlen=max_steps)
     for record in _json_records(raw):
         record_type = record.get("type")
         if record_type == "system":
@@ -422,11 +486,13 @@ def _claude_trajectory(raw: str) -> list[dict[str, Any]]:
             result_text = record.get("result", "") if isinstance(record.get("result"), str) else ""
             # Claude's final `result` copies the last assistant text block, so it
             # would render twice. Drop the duplicate and keep the richer step.
-            for index in range(len(steps) - 1, -1, -1):
-                if steps[index]["kind"] == "text":
-                    if steps[index].get("text", "").strip() == result_text.strip():
-                        steps.pop(index)
+            buffered = list(steps)
+            for index in range(len(buffered) - 1, -1, -1):
+                if buffered[index]["kind"] == "text":
+                    if buffered[index].get("text", "").strip() == result_text.strip():
+                        buffered.pop(index)
                     break
+            steps = deque(buffered, maxlen=max_steps)
             steps.append(
                 {
                     "kind": "result",
@@ -437,7 +503,7 @@ def _claude_trajectory(raw: str) -> list[dict[str, Any]]:
                     "cost_usd": record.get("total_cost_usd"),
                 }
             )
-    return steps
+    return list(steps)
 
 
 # ----------------------------------------------------------------------------
@@ -473,7 +539,10 @@ def _chat_assistant_texts(raw: str) -> list[str]:
 
 
 def _json_records(raw: str) -> Iterator[dict[str, Any]]:
-    for line in str(raw or "").splitlines():
+    # ``splitlines`` allocates a second list containing every line. Streaming
+    # from StringIO keeps peak memory proportional to one record plus the
+    # caller's intentionally bounded step buffer.
+    for line in io.StringIO(str(raw or "")):
         stripped = line.strip()
         if not stripped.startswith("{"):
             continue
@@ -485,8 +554,15 @@ def _json_records(raw: str) -> Iterator[dict[str, Any]]:
             yield record
 
 
-def _tool_result_step(tool_use_id: str, text: str, images: list[str], is_error: bool) -> dict[str, Any]:
-    return {
+def _tool_result_step(
+    tool_use_id: str,
+    text: str,
+    images: list[str],
+    is_error: bool,
+    *,
+    status: Any = None,
+) -> dict[str, Any]:
+    result = {
         "kind": "tool_result",
         "tool_use_id": tool_use_id,
         "text": text,
@@ -494,6 +570,20 @@ def _tool_result_step(tool_use_id: str, text: str, images: list[str], is_error: 
         "has_image": bool(images),
         "is_error": is_error,
     }
+    if status is not None and str(status).strip():
+        result["status"] = str(status)
+    return result
+
+
+def _nonzero_exit_code(value: Any) -> bool:
+    """Interpret numeric exit codes without treating the string ``"0"`` as failure."""
+
+    if isinstance(value, bool) or value is None:
+        return False
+    try:
+        return int(value) != 0
+    except (TypeError, ValueError):
+        return False
 
 
 def _content_blocks_to_text(content: Any) -> tuple[str, list[str]]:

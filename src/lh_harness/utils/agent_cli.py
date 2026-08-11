@@ -15,12 +15,74 @@ import os
 import re
 import shutil
 import subprocess
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 
 # App Execution Aliases live here; they are reparse points, not real programs.
 _WINDOWS_STORE_ALIAS_DIR = os.path.join("Microsoft", "WindowsApps")
 _VERSION_RE = re.compile(r"\d+(?:\.\d+)+\S*")
+
+# The desktop app and the standalone npm CLI can both install a `codex`
+# executable.  The desktop binary carries the same authenticated app-server
+# runtime as the Codex client, while an older PATH entry may reject newer
+# config values (for example `model_reasoning_effort = "ultra"`).  Keep this
+# precedence in one place so adapters, doctor output, and the Web API agree.
+_CODEX_BINARY_ENV_VARS = ("LH_HARNESS_CODEX_BINARY", "CODEX_CLI_PATH")
+_CODEX_DESKTOP_BINARY = "/Applications/ChatGPT.app/Contents/Resources/codex"
+
+
+def resolve_agent_binary(
+    binary: str,
+    *,
+    environ: dict[str, str] | None = None,
+    platform_name: str | None = None,
+) -> str | None:
+    """Resolve an agent executable using the same policy everywhere.
+
+    Explicit Codex overrides are authoritative, even when the target is
+    missing; ``probe_agent_cli`` can then report the concrete path/OS error
+    instead of silently falling back to a different installation.  For
+    ordinary discovery, only an existing executable desktop binary is selected
+    before falling back to ``PATH``.
+    """
+
+    env = os.environ if environ is None else environ
+    if binary == "codex":
+        for name in _CODEX_BINARY_ENV_VARS:
+            value = str(env.get(name) or "").strip()
+            if value:
+                return os.path.expanduser(value)
+
+        if (platform_name or sys.platform) == "darwin":
+            desktop_candidates = (_CODEX_DESKTOP_BINARY,)
+            # A per-user app install is common on macOS and costs nothing to
+            # support while preserving the system /Applications preference.
+            desktop_candidates += (
+                str(Path.home() / "Applications" / "ChatGPT.app" / "Contents" / "Resources" / "codex"),
+            )
+            for candidate in desktop_candidates:
+                path = Path(candidate)
+                if path.is_file() and os.access(path, os.X_OK):
+                    return str(path)
+
+    return shutil.which(binary)
+
+
+def resolve_codex_binary(
+    *,
+    environ: dict[str, str] | None = None,
+    platform_name: str | None = None,
+) -> str | None:
+    """Resolve the Codex executable selected by the harness."""
+
+    return resolve_agent_binary("codex", environ=environ, platform_name=platform_name)
+
+
+def is_agent_binary_available(path: str | None) -> bool:
+    """Return whether a resolved executable can be launched without running it."""
+
+    return bool(path and shutil.which(path))
 
 
 @dataclass(frozen=True)
@@ -41,9 +103,9 @@ class AgentCli:
 
 def probe_agent_cli(binary: str, *, timeout: int = 15) -> AgentCli:
     """Locate `binary` and confirm `--version` succeeds."""
-    path = shutil.which(binary)
+    path = resolve_agent_binary(binary)
     if not path:
-        return AgentCli(binary, problem=f"`{binary}` was not found on PATH")
+        return AgentCli(binary, problem=f"`{binary}` was not found")
 
     store_alias = is_windows_store_alias(path)
     try:

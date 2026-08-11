@@ -7,6 +7,7 @@ import shlex
 
 from ..types import DEFAULT_CODEX_MODEL, DEFAULT_TMP_DIR, DEFAULT_WORKSPACE_PATH
 from ..agent_logs import visible_output as extract_codex_visible_output
+from ..utils.agent_cli import resolve_codex_binary
 from .cli_agent import CommandAgentAdapter
 
 try:
@@ -40,8 +41,12 @@ class CodexAdapter(CommandAgentAdapter):
             env_parts.append(f"OPENAI_API_KEY={quoted_key}")
             env_parts.append(f"CODEX_API_KEY={quoted_key}")
 
+        # Resolve once when an adapter is built.  A LongHorizon run must use
+        # the same authenticated Codex installation as the desktop client when
+        # both the standalone PATH CLI and ChatGPT.app are present.
+        codex_binary = resolve_codex_binary() or "codex"
         command_parts = [
-            "codex",
+            shlex.quote(codex_binary),
             "exec",
             "--json",
             "--skip-git-repo-check",

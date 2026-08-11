@@ -13,6 +13,8 @@ General task-contract rules:
 - Cover: interpretation calibration, verified environment facts, unverified hypotheses, final success state, acceptance constraints, state carrier, authoritative-input closure, state-production process, commit/persistence boundary, candidate-selection and contamination boundary, acceptable evidence, and unacceptable shortcuts.
 - Derive every acceptance constraint directly from the original request and real environment facts. State the source, required condition, verification method, and blocking condition. A plan, model guess, or easier substitute is not an acceptance constraint.
 - Preserve restrictive language such as do not change, keep unchanged, only use, must save, same directory, exact filename, do not omit, do not add, and leave everything else unchanged. A local relaxation may relax only what it modifies, never another independent hard constraint.
+- Calibrate each restriction to its evidence horizon. A final-state restriction such as "leave no extra files" does not silently become a historical guarantee that no temporary action ever occurred. Treat past-process behavior as blocking only when the original request explicitly requires an at-no-time, monitored, security, compliance, or provenance guarantee.
+- Never make an impossible retrospective negative proof a prerequisite. If a past-process guarantee is genuinely required, plan observable evidence (for example an authoritative transaction log or monitoring) before execution; otherwise verify the durable final state and record any unobservable historical possibility only as non-blocking residual risk.
 """,
     "zh": """\
 通用任务契约规则:
@@ -23,6 +25,8 @@ General task-contract rules:
 - 契约应覆盖: 目标解释校准、已验证环境事实、待验证假设、最终成功状态、验收约束、状态载体、权威输入闭包、状态产生流程、提交/持久化边界、候选选择与污染边界、可接受证据、不可接受捷径。
 - `验收约束` 必须从原始任务和真实环境事实直接推出，逐条写清原题依据、必须成立的条件、验证方式和阻断条件；不要用执行计划、模型猜测或更容易完成的替代目标代替验收约束。
 - 原始任务里的限制词也要进入 `验收约束`，包括“不要改变/保持不变/只使用/必须保存/同一目录/精确文件名/不要遗漏/不要多做/其它部分不变”等；修饰性放宽只能放宽它实际修饰的部分，不能吞掉另一个独立硬约束。
+- 每条限制必须校准到正确的证据时间范围。“最终不要留下额外文件”这类最终状态限制，不能被静默加强成“历史上从未发生任何临时动作”。只有原题明确要求“任何时刻都不得”、全过程监控、安全、合规或来源追踪保证时，历史过程才是 blocking 约束。
+- 不能把事后无法完成的历史否定证明设为前置条件。如果确实需要过程保证，应在执行前规划可观察证据（例如权威事务日志或监控）；否则应独立验证持久化最终状态，把无法观察的历史可能性仅记录为非阻断残余风险。
 """,
 }
 
@@ -84,6 +88,7 @@ Current-state rules:
 Dependency rules:
 - After the task contract, include `Dependency assessment:` with Target state, State creator (GUI, CLI, or CLI+GUI), Satisfied prerequisites, Unsatisfied prerequisites, and Routing rationale.
 - Only audited prerequisites are satisfied. If any prerequisite is unsatisfied, the subtask must address one most important prerequisite, not the final deliverable.
+- Respect the supplied round budget. When only one round remains, do not spend it on a prerequisite-only subtask that explicitly postpones the core request; route the most complete executable subtask possible, or use `Next: ask` / `Next: blocked` when the target cannot be completed honestly.
 - If a failed GUI round points to service, data, code, profile, logs, routing, callback, or product constraints, prefer a CLI diagnostic/repair prerequisite.
 
 Output plain natural language, never JSON. Use this exact section order:
@@ -119,6 +124,7 @@ Do not add top-level sections outside this protocol.
 依赖要求:
 - 在任务契约之后输出 `依赖判断:`，包含目标状态、状态创建者（GUI/CLI/CLI+GUI）、已满足前置、未满足前置、本轮路由理由。
 - 只有 auditor 确认的前置才算满足。存在未满足前置时，本轮任务解决一个最关键前置，不能直奔最终交付。
+- 遵守传入的轮次预算。只剩一轮时，不能把最后一轮用于一个明确推迟核心要求的纯前置任务；应路由当前可完成的最完整子任务，无法诚实完成时使用 `下一步: 请示用户` 或 `下一步: 阻塞`。
 - GUI 失败若指向服务、数据、代码、profile、日志、路由、回调或产品限制，优先考虑 CLI 诊断/修复前置。
 
 输出自然语言，不要 JSON。严格按以下顺序输出:
@@ -228,6 +234,11 @@ The report must include `Acceptance-constraint backcheck:` with:
 - `Possible scoring risks:`, `Over-narrow or incorrect interpretation:`, and `Recommended contract revision:`.
 Any blocking unknown requires contract conclusion unknown. Any blocking violation requires needs_revision or invalid. If blocking constraints exist or contract audit is not aligned, status must be incomplete even if the local subtask succeeded.
 Also audit authoritative-input closure, final-state carrier, state-production process, commit/persistence boundary, and candidate contamination; explain not_applicable where appropriate.
+Evidence-horizon rules:
+- Separate durable final-state constraints, observable process constraints, and security/compliance/provenance constraints. Do not strengthen final-state wording into a demand to prove that no transient historical action ever occurred.
+- A missing full executor transcript is not by itself evidence of tampering and must not by itself make integrity suspect. Use suspect or violation only for positive inconsistency, conflicting provenance, fabricated evidence, unexpected artifacts/state, or direct evidence of a forbidden action.
+- An unobservable historical negative is non-blocking residual risk unless the original request explicitly made that exact process guarantee material or the contract arranged authoritative monitoring before execution. Manager-added caution that is not grounded in the original request cannot create a new blocking requirement.
+- Do not request a repeat solely to prove an already-unobservable past non-action. When process evidence truly matters, recommend prospective instrumentation; otherwise independently verify the current persisted state, candidate identity, exact values, and absence of durable contamination.
 """,
     "zh": """\
 不能默认稳定任务契约正确。审计执行结果前，先从原始任务独立重建并挑战验收约束。
@@ -240,6 +251,11 @@ Also audit authoritative-input closure, final-state carrier, state-production pr
 - `可能评分风险:`、`过窄或错误解释:`、`建议契约修订:`。
 任何 blocking unknown 都要求契约结论 unknown；任何 blocking violated 都要求 needs_revision 或 invalid。存在阻断约束或契约审计不是 aligned 时，即使局部子任务成功也必须输出 incomplete。
 还要审计权威输入闭包、最终状态载体、状态产生流程、提交/持久化边界和候选污染；不适用时说明理由。
+证据时间范围规则:
+- 必须区分持久化最终状态约束、可观察过程约束、安全/合规/来源约束；不能把最终状态措辞加强成“必须证明历史上从未发生瞬时动作”。
+- 缺少执行器完整命令记录本身不是篡改证据，也不能单独导致完整性 suspect。只有出现正面矛盾、来源冲突、伪造证据、意外产物/状态或禁用动作的直接证据时，才使用 suspect 或 violation。
+- 事后不可观察的历史否定事实默认只是非阻断残余风险；只有原始任务明确把该过程保证列为重要条件，或契约在执行前安排了权威监控时，才可设为 blocking。任务管理器自行增加、但无法从原题推出的谨慎要求不能制造新的阻断条件。
+- 不得仅为证明已经不可观察的历史“未发生”而要求重复执行。如果过程证据确实重要，应建议后续使用前置监控；否则独立验证当前持久化状态、候选身份、精确值和不存在持久化污染即可。
 """,
 }
 
@@ -249,16 +265,18 @@ FINAL_RESPONSE_INSTRUCTIONS: dict[PromptLanguage, str] = {
 Write the reply to the person who asked for this task. You are the only role that speaks to them directly; every other role wrote for the next role.
 - Answer the request itself. If it asked a question, give the answer, not how it was found. If it asked for a change, state what is true now.
 - Use only the verified state and audit findings below. No tools, no environment checks, nothing a round did not establish.
+- Treat the operator follow-up instructions below as authoritative amendments to the original request. Follow reply-format and reporting requirements exactly; if an amendment asks for unverified state or unfinished work, say so instead of inventing completion.
 - Be honest: name what is unmet, blocked, or unverified, and why. Never present an unfinished result as finished.
 - Plain prose for someone who never saw the run. No JSON, no control headers, no round citations, no protocol section names.
-- Lead with the answer, then only what the reader needs: what changed, where it is, what is left. Skip empty topics. Under 300 words.
+- Lead with the answer, then only what the reader needs: what changed, where it is, what is left. Skip empty topics. When an accepted executor deliverable directly answers the request, preserve every source, citation, figure, and substantive section required by the user instead of replacing it with an abridged summary. Be concise only after preserving those requirements.
 """,
     "zh": """\
 写给提出这个任务的人的回复。你是唯一直接和他对话的角色，其它角色都是写给下一个角色看的。
 - 直接回答任务本身。是问题就给答案，而不是找答案的过程；是改动就说明现在的状态。
 - 只能用下面的已验证状态和审计结论。不要用工具，不要检查环境，不要补充任何没被确认过的结论。
+- 把下面的操作员后续补充指令视为对原始任务的权威修订。精确遵守其中对最终回复格式和内容的要求；如果补充指令要求尚未验证或尚未完成的状态，应如实说明，不能编造完成。
 - 如实说明：哪些没做到、被阻塞或未验证，以及原因。绝不能把没完成的写成完成。
 - 用自然语言写给完全没看过执行过程的人。不要 JSON，不要控制头，不要轮次引用，不要协议小节名。
-- 先给结论，再只写读者需要的：改了什么、在哪里、还剩什么。没内容的部分直接省略。300 字以内。
+- 先给结论，再只写读者需要的：改了什么、在哪里、还剩什么。没内容的部分直接省略。如果已验收的执行器交付正文直接回答原任务，必须保留用户要求的全部来源、引用、数字和实质性章节，不能用删减版摘要替代；先完整保留这些要求，再尽量简洁。
 """,
 }

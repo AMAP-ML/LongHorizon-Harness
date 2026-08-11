@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "lh-harness"
-version = "0.1.3"
+version = "0.1.4"
 description = "Role-orchestrated harness for long-horizon computer-use tasks"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -14,6 +14,9 @@ keywords = ["agent", "long-horizon", "computer-use", "llm"]
 dependencies = [
     "packaging",
     "tomli; python_version < '3.11'",
+    "fastapi>=0.110",
+    "uvicorn[standard]>=0.29",
+    "websockets>=12",
 ]
 
 [project.urls]
@@ -25,6 +28,12 @@ lh-harness = "lh_harness.cli:main"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/lh_harness"]
+# The Web bundle is a build artifact, not source: it is git-ignored and CI
+# builds it before packaging.  ``artifacts`` (unlike ``force-include``) skips a
+# missing path silently, so a checkout without a Node toolchain still installs.
+artifacts = [
+    "/src/lh_harness/_frontend/web/dist/**",
+]
 
 [tool.hatch.build.targets.sdist]
 include = [
@@ -34,3 +43,10 @@ include = [
     "/README.zh-CN.md",
     "/LICENSE",
 ]
+# Ship the built assets so `pip install <sdist>` yields a wheel with the Web UI.
+artifacts = [
+    "/src/lh_harness/_frontend/web/dist/**",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

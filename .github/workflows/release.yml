@@ -24,15 +24,64 @@ jobs:
         with:
           python-version: "3.12"
 
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+          cache-dependency-path: frontend/web/package-lock.json
+
+      - name: 📦 Install Web dependencies
+        run: npm ci --prefix frontend/web
+
+      - name: 🧪 Test shared frontend core
+        # frontend/core has no lockfile of its own; its test script reuses the
+        # esbuild installed for the Web app.
+        run: npm test --prefix frontend/web
+
+      - name: 🖥️ Build Web frontend
+        # Vite writes straight into src/lh_harness/_frontend/web/dist.
+        run: npm run build --prefix frontend/web
+
+      - name: 🔍 Verify the Web bundle was produced
+        run: test -f src/lh_harness/_frontend/web/dist/index.html
+
+      - name: 🧪 Run Python tests
+        run: python -m pip install -e . pytest && python -m pytest -q
+
       - name: 📦 Install build tooling
         # twine >= 7 is required to validate PEP 639 license metadata.
         run: python -m pip install --upgrade build "twine>=7"
 
       - name: 🏗️ Build sdist and wheel
+        # The default flow builds the wheel from the sdist, so this also proves
+        # the git-ignored bundle survives the sdist round-trip.
         run: python -m build
 
       - name: 🔍 Check metadata renders on PyPI
         run: python -m twine check --strict dist/*
+
+      - name: 🔍 Verify the sdist carries the Web bundle
+        run: |
+          python - <<'PY'
+          import glob, tarfile
+          archive = sorted(glob.glob("dist/*.tar.gz"))[0]
+          with tarfile.open(archive) as bundle:
+              names = bundle.getnames()
+          prefix = "src/lh_harness/_frontend/web/dist/"
+          assets = [name for name in names if prefix in name]
+          assert any(name.endswith("/index.html") for name in assets), assets
+          assert len(assets) > 1, assets
+          print(archive, len(assets), "bundled files")
+          PY
+
+      - name: 📦 Smoke-test wheel contents
+        run: |
+          smoke_dir="$(mktemp -d)"
+          trap 'rm -rf "$smoke_dir"' EXIT
+          python -m venv "$smoke_dir/venv"
+          "$smoke_dir/venv/bin/pip" install --no-deps dist/*.whl
+          "$smoke_dir/venv/bin/python" -c 'import lh_harness; print(lh_harness.__version__)'
+          "$smoke_dir/venv/bin/python" -c 'from pathlib import Path; import lh_harness; p=Path(lh_harness.__file__).parent/"_frontend"/"web"/"dist"; assert (p/"index.html").is_file(), p; assert sum(item.is_file() for item in p.rglob("*")) > 1, p; print(p)'
 
       - name: 🏷️ Verify tag matches project version
         if: startsWith(github.ref, 'refs/tags/v')
