@@ -333,6 +333,23 @@ def run_document_review(
             break
 
     if keep_depth_pass and not result.escalated:
+        # PLAN.md §B6: the depth pass deliberately keeps plain
+        # ``cap_artifact_text`` truncation rather than adopting
+        # ``v1/reviewer.py:review_node``'s heading fan-out. Two reasons,
+        # not an oversight: (1) this pass already runs over <=4
+        # shape-median nodes total (``select_pilot_nodes``), so fan-out's
+        # worst case (4 nodes * 6 sections) would roughly 6x this pass's
+        # call count for what is explicitly the *secondary* quality check
+        # — per-leaf ``review_node`` (already fanned out) is the primary
+        # correctness signal for each of these nodes; (2) this pass's own
+        # verdict is attributed to exactly one node (``default_node_ids``
+        # below), so merging N per-section verdicts back into "did this
+        # one representative artifact look thin" would need the same
+        # union-of-items merge ``review_node`` does, duplicated here for a
+        # pass whose whole point is a cheap spot check, not exhaustive
+        # coverage. If shape-median artifacts routinely exceed the cap in
+        # practice, revisit this — it is a documented scope cut, not a
+        # claim that truncation is fine here forever.
         for node in select_pilot_nodes(tree).values():
             artifact_path = resolve_stored(run_dir, node.artifact)
             artifact = ""

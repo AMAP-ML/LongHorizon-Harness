@@ -618,9 +618,22 @@ class ResumeAfterEscalationTest(unittest.TestCase):
                 # run dir, this time with what "plan" actually needs (one
                 # spine unit forces a zero-call leaf, per v2/planner.py) and
                 # a real writer for the new leaf.
+                # PLAN.md §A9/§B6: the escalated tier is T2, so the "review"
+                # phase now runs document_review's 3 windowed cross-leaf
+                # passes unconditionally (not gated behind
+                # RunOptions.document_review) -- one window each, since the
+                # replanned tree has a single passed leaf. Canned pass/pass/
+                # pass responses so this resume proves escalation wiring,
+                # not document-review's own findings.
                 driver2 = RecursiveDriver(
                     run_dir,
-                    provider=FakeProvider([]),  # type: ignore[arg-type]
+                    provider=FakeProvider(  # type: ignore[arg-type]
+                        [
+                            {"items": [], "verdict": "pass"},  # coverage
+                            {"items": [], "verdict": "pass"},  # duplication
+                            {"items": [], "verdict": "pass"},  # contract_compliance
+                        ]
+                    ),
                     options=RunOptions(goal="do the thing", dispatch_policy="document_order"),
                     writer_adapter_factory=_writer_factory(run_dir.resolve()),
                     research_adapter_factory=lambda node, query: (_ for _ in ()).throw(

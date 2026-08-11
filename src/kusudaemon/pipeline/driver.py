@@ -89,7 +89,8 @@ from ..v2.survey import (
     unit_input_path,
 )
 from ..v3.assembly_loop import run_assembly_loop
-from ..v3.revalidate import Triage, apply_revalidation_triage, run_revalidation_pass
+from ..v3.document_review import DocumentReviewResult, run_document_review, serialize_triage
+from ..v3.revalidate import Triage, apply_revalidation_triage, run_revalidation_pass, summarize_triage
 from ..v4.research import ResearchQuery, run_research_query
 from ..v4.research_loop import run_research_loop
 from ..v4.run_dir import research_finding_path
@@ -1097,69 +1098,99 @@ class RecursiveDriver:
         ``v1/round_loop.py``'s dispatch and review are coupled per node (a
         node cannot be reviewed before its own gates pass, and splitting
         that into two fully separate global passes over the whole tree is a
-        larger restructuring than this workstream's scope). This phase is
-        the confirmation checkpoint the table's phase name promises: it
-        spends nothing further, it just reports whether the tree that
-        execute produced is blocked."""
+        larger restructuring than this workstream's scope). For T1/T3 this
+        phase spends nothing further: it just reports whether the tree
+        execute produced is blocked.
+
+        **T2 gets one more thing here, unconditionally (PLAN.md §A9's
+        table row: "T2: gates + review_node per leaf + one cross-leaf
+        consistency pass"):** ``document_review``'s passes 1-3 (coverage,
+        duplication, contract-compliance — already windowed over
+        promotions, never artifact prose) run every T2 execution, not only
+        when the operator opts in via ``RunOptions.document_review``. That
+        flag still gates T3's *additional* depth pass (§A11: "T3: as
+        today") — this is a difference in what tier T2 structurally *is*,
+        not a change to the flag's meaning. ``keep_depth_pass=False`` here
+        is what keeps T2 to exactly the 3 windowed passes the table
+        promises, without T3's extra per-artifact spot check.
+
+        The triage this pass produces is handled the same way T3's
+        flag-gated document review handles its own
+        (``_handle_document_review_triage``, factored out so both callers
+        share the majority-regenerate escalation guard, the repair
+        dispatch, and the audit log line) — except **T2 applies repairs
+        without an operator approval gate.** This mirrors §A10's own
+        reasoning for why the pilot/contract's ``awaiting_approval`` state
+        is T3-only: "a run the operator expected to take four minutes must
+        not silently park overnight waiting for a form." A T2 run is the
+        cheap/fast tier by construction (no pilot, no contract-freeze
+        interview); parking it on a human gate for a check that only ever
+        proposes *scoped, gate-and-review-checked* repairs (same guardrail
+        as every other repair path — snapshot, gates + review, only then
+        overwrite) would reintroduce exactly the overnight-park failure
+        mode §A10 was written to avoid, for a tier whose whole point is
+        that it doesn't need one. T3 keeps asking, unchanged, because a T3
+        run has already paid for a pilot/contract interview and the
+        operator is already in the loop for that run.
+
+        An unattributable cross-leaf defect (``review.escalated`` — a
+        defect ``document_review`` could not pin to any node id) escalates
+        this phase exactly like an unattributable compile failure escalates
+        ``assembly_loop.py`` — the operator's `reopen_node` intervention is
+        the recovery path, not something this phase can resolve on its
+        own.
+        """
         tree = self._load_tree()
-        return None if not tree.is_blocked() else False
-
-    async def _phase_assemble(self) -> None:
-        from ..v3.document_review import serialize_triage
-        from ..v3.revalidate import summarize_triage
-
-        result = await run_assembly_loop(
-            self.run_dir,
-            tree_path(self.run_dir),
-            str(manifest_path(self.run_dir)),
-            writer_adapter_factory=self.writer_adapter_factory,
-            env=self.env,
-            provider=self.provider,
-            compile_command=self.options.compile_command,
-            writer_budget=EpisodeBudget(),
-            max_repairs=3,
-            max_attempts=self.options.max_attempts,
-            document_review=self.options.document_review,
-        )
-        if result.escalated:
+        if tree.is_blocked():
             return False
-        if result.review is not None and result.review.triage:
-            counts = summarize_triage(result.review.triage)
-            # PLAN.md §A4.4: "Reviewer returns class: regenerate on >= half
-            # of a T2 plan's leaves -> promote to T3, re-pilot." Checked
-            # here, not inside v3/document_review.py itself, for the same
-            # reason the size-defect check lives in the driver rather than
-            # v1/round_loop.py — document_review is tier-agnostic and used
-            # by T3 too, where this trigger must never fire (T3 is already
-            # the ceiling). Escalating supersedes this pass's own
-            # repair-approval flow entirely: once tier.json says T3, the
-            # next iteration of run()'s phase loop picks up "pilot" (T2
-            # never ran it) and re-enters execute/review/assemble under the
-            # freshly-frozen contract, so asking approval for a T2-scoped
-            # repair here would just be discarded work.
-            #
-            # Known gap, documented rather than silently glossed over: this
-            # escalates and re-pilots, but does not itself retroactively
-            # re-validate T2's already-"passed" leaves against the new
-            # contract (that is the existing §10 amend/re-validate
-            # machinery, a separate intervention this trigger does not
-            # invoke). The trigger fires and the tier rises correctly; full
-            # retroactive contract enforcement on old leaves is not part of
-            # what §B2 wires.
-            total = sum(counts.values())
-            regenerate = counts.get("regenerate", 0)
-            tier = self._current_tier()
-            if tier == "T2" and total > 0 and regenerate / total >= 0.5:
-                self._escalate_tier(
-                    "majority_regenerate",
-                    regenerate=regenerate,
-                    total=total,
-                )
-                return None
+        if self._current_tier() == "T2":
+            review = run_document_review(
+                self.run_dir, tree, self.provider, keep_depth_pass=False, log=self.log
+            )
+            if review.escalated:
+                return False
+            await self._handle_document_review_triage(
+                review, approval_context="review", require_approval=False
+            )
+        return None
+
+    async def _handle_document_review_triage(
+        self, review: DocumentReviewResult, *, approval_context: str, require_approval: bool
+    ) -> bool:
+        """Shared triage-application half of a document-review pass
+        (PLAN.md §A9/§B6), factored out because two call sites now run the
+        identical windowed cross-leaf pass under different tiers: T2's
+        mandatory ``_phase_review`` above (unconditional, no approval
+        gate) and T3's flag-gated ``_phase_assemble`` below (unchanged:
+        still asks). Handles, in order: the §A4.4 row-3 majority-regenerate
+        escalation (tier-gated to T2 *inside* this method via
+        ``self._current_tier()``, so calling it from T3 is a correct no-op
+        — T3 is already the ceiling that trigger targets); the optional
+        operator approval; and dispatching the repairs via
+        ``apply_triage``.
+
+        Returns ``True`` iff repairs were actually applied (approval
+        granted, or no gate at all) — the one thing that differs between
+        the two callers' next step: T3's caller owns the terminal
+        concatenation/compile gate and re-runs it against the repaired
+        artifacts; T2's caller does not, because ``_phase_assemble`` (which
+        owns that) hasn't run yet this round and will pick up the repaired
+        files naturally when it does.
+        """
+        if not review.triage:
+            return False
+        counts = summarize_triage(review.triage)
+        total = sum(counts.values())
+        regenerate = counts.get("regenerate", 0)
+        tier = self._current_tier()
+        if tier == "T2" and total > 0 and regenerate / total >= 0.5:
+            self._escalate_tier("majority_regenerate", regenerate=regenerate, total=total)
+            return False
+        if require_approval:
             summary = ", ".join(f"{kind}={count}" for kind, count in counts.items())
             sample = "; ".join(
                 f"{node_id} ({triage.classification})"
-                for node_id, triage in sorted(result.review.triage.items())[:8]
+                for node_id, triage in sorted(review.triage.items())[:8]
             )
             approval = self._ask(
                 "document_review",
@@ -1171,39 +1202,92 @@ class RecursiveDriver:
                     "(snapshot, gates + review, only then overwrite). Reply "
                     "'no' to leave defects in place."
                 ),
-                context={"phase": "assemble"},
+                context={"phase": approval_context},
             )
             if approval.user_input.strip().lower() in ("n", "no", "abort", "halt"):
-                return None
-            repaired = await apply_triage(
-                self.run_dir,
-                triage=serialize_triage(result.review.triage),
-                writer_adapter_factory=self.writer_adapter_factory,
-                env=self.env,
-                provider=self.provider,
-                max_attempts=self.options.max_attempts,
+                return False
+        repaired = await apply_triage(
+            self.run_dir,
+            triage=serialize_triage(review.triage),
+            writer_adapter_factory=self.writer_adapter_factory,
+            env=self.env,
+            provider=self.provider,
+            max_attempts=self.options.max_attempts,
+        )
+        self._log(
+            {
+                "node_id": "-",
+                "role": "harness",
+                "round": 0,
+                "type": "document_review_repairs",
+                "repaired": repaired,
+            }
+        )
+        return True
+
+    async def _phase_assemble(self) -> None:
+        """PLAN.md §A11: T2's assembly is unchanged ("concatenation + index
+        + checks + compile, as today") — its cross-leaf consistency pass
+        already ran, unconditionally, inside ``_phase_review`` above, so
+        asking ``run_assembly_loop`` to run ``document_review`` again here
+        for T2 would be a redundant second pass, and worse, one that
+        defaults to the depth-pass-enabled shape this table only grants
+        T3. Only T3 ever asks ``document_review`` to run from this phase,
+        and only when the operator opted in via
+        ``RunOptions.document_review`` — byte-identical to pre-§B6
+        behavior for T3."""
+        run_full_document_review = (
+            self.options.document_review and self._current_tier() == "T3"
+        )
+        result = await run_assembly_loop(
+            self.run_dir,
+            tree_path(self.run_dir),
+            str(manifest_path(self.run_dir)),
+            writer_adapter_factory=self.writer_adapter_factory,
+            env=self.env,
+            provider=self.provider,
+            compile_command=self.options.compile_command,
+            writer_budget=EpisodeBudget(),
+            max_repairs=3,
+            max_attempts=self.options.max_attempts,
+            document_review=run_full_document_review,
+        )
+        if result.escalated:
+            return False
+        if result.review is not None:
+            # PLAN.md §A4.4's majority-regenerate trigger (checked inside
+            # ``_handle_document_review_triage``) never fires from here in
+            # practice — ``run_full_document_review`` above is only ever
+            # True when the tier is already T3, the ceiling that trigger
+            # targets — but the guard lives in the shared helper, not
+            # duplicated here, so this stays correct even if that
+            # precondition ever changes.
+            #
+            # Known gap, documented rather than silently glossed over: were
+            # this trigger ever to fire from T3 it would be a no-op by
+            # construction (escalate() cannot rise above T3); the real
+            # majority-regenerate escalation path (T2 -> T3) lives in
+            # _phase_review now, and does not itself retroactively
+            # re-validate any node already "passed" under T2 against a new
+            # contract (that is the existing §10 amend/re-validate
+            # machinery, a separate intervention this trigger does not
+            # invoke).
+            applied = await self._handle_document_review_triage(
+                result.review, approval_context="assemble", require_approval=True
             )
-            result = await run_assembly_loop(
-                self.run_dir,
-                tree_path(self.run_dir),
-                str(manifest_path(self.run_dir)),
-                writer_adapter_factory=self.writer_adapter_factory,
-                env=self.env,
-                provider=self.provider,
-                compile_command=self.options.compile_command,
-                writer_budget=EpisodeBudget(),
-                max_repairs=3,
-                max_attempts=self.options.max_attempts,
-            )
-            self._log(
-                {
-                    "node_id": "-",
-                    "role": "harness",
-                    "round": 0,
-                    "type": "document_review_repairs",
-                    "repaired": repaired,
-                }
-            )
+            if applied:
+                result = await run_assembly_loop(
+                    self.run_dir,
+                    tree_path(self.run_dir),
+                    str(manifest_path(self.run_dir)),
+                    writer_adapter_factory=self.writer_adapter_factory,
+                    env=self.env,
+                    provider=self.provider,
+                    compile_command=self.options.compile_command,
+                    writer_budget=EpisodeBudget(),
+                    max_repairs=3,
+                    max_attempts=self.options.max_attempts,
+                )
         return None if not result.escalated else False
 
     # ------------------------------------------------------------------
