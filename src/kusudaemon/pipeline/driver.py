@@ -228,7 +228,18 @@ class RecursiveDriver:
         research_adapter_factory: ResearchAdapterFactory | None = None,
         poll_interval: float = 1.0,
     ) -> None:
-        self.run_dir = Path(run_dir)
+        # Resolved, not just wrapped: workspace_path/prompt_dir (below) are
+        # both derived from this and fed into a shell command shaped
+        # `cd {workspace_path} && ... < {prompt_path}` (cli_agent.py). If
+        # run_dir stays relative (the dashboard's default runs_root is
+        # "./.kusudaemon/runs"), prompt_path -- which already has run_dir's
+        # own prefix baked in via prompt_dir -- gets re-resolved relative to
+        # the *new* cwd after `cd`, doubling that prefix and pointing at a
+        # path that was never created there: "/bin/sh: .../tmp/prompts/
+        # episode_trace_*.md: No such file or directory" on every single
+        # Writer dispatch, which is also why every episode looked like it
+        # never started (no trace.jsonl line ever gets written).
+        self.run_dir = Path(run_dir).resolve()
         self.provider = provider
         self.options = options
         self.env = env or _local_env(self.run_dir)

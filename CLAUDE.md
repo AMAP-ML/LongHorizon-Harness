@@ -560,7 +560,24 @@ prompt, not that node's own handoff).
   `dispatch_policy`, `document_review`, `survey_mode`, `inline_spans`, …) and
   `RecursiveDriver`, a phase machine over
   `intake, survey, plan, pilot, research, execute, assemble`. Construction
-  never touches the network; only `async run()` does. **Phase skip on resume
+  never touches the network; only `async run()` does. **`run_dir` is
+  `.resolve()`d, not just wrapped in `Path()` (2026-08-10 fix, and the real
+  root cause behind that day's "no thinking at all" / every artifact empty
+  / every subagent stuck on "waiting for trace" reports):** it flows
+  straight into `workspace_path`/`prompt_dir` (`_default_writer_factory`,
+  below), which `cli_agent.py`'s command template embeds as `cd
+  {workspace_path} && ... < {prompt_path}`. `prompt_path` already carries
+  `run_dir`'s own prefix (via `prompt_dir = run_dir / "tmp" / "prompts"`),
+  so a *relative* `run_dir` — and the dashboard's default `runs_root` is
+  the relative `"./.kusudaemon/runs"` — made the shell re-resolve that
+  already-prefixed path relative to the *new* cwd after `cd`, doubling the
+  prefix and pointing at a file that was never created there: `/bin/sh:
+  .../tmp/prompts/episode_trace_*.md: No such file or directory` on
+  literally every single Writer dispatch. Because the gptme worker
+  subprocess never even started, no `trace.jsonl` line was ever written —
+  which is why this looked like a dashboard rendering bug (nothing to
+  show) rather than what it was (nothing ran).
+  **Phase skip on resume
   is decided by artifact existence, not by `phase.json`'s word**
   (`## Goal` in `spec.md`, `spine.json`, `tree.json`, `contract.md`);
   research/execute/assemble always re-run, which is safe because v4's cache,

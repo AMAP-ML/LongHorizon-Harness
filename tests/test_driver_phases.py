@@ -8,6 +8,7 @@ against a scripted subclass so no provider call or writer dispatch is made.
 from __future__ import annotations
 
 import json
+import os
 import sys
 import tempfile
 import unittest
@@ -37,6 +38,30 @@ class _ScriptedDriver(RecursiveDriver):
             ),
             **kwargs,
         )
+
+
+class RunDirResolvedTest(unittest.TestCase):
+    """A relative run_dir (the dashboard's default runs_root is the
+    relative "./.kusudaemon/runs") used to flow straight into
+    workspace_path/prompt_dir, which cli_agent.py's command template embeds
+    as `cd {workspace_path} && ... < {prompt_path}` -- since prompt_path
+    already carries run_dir's own prefix, a relative run_dir made the shell
+    re-resolve it relative to the *new* cwd after `cd`, doubling the prefix
+    and 404ing on every single Writer dispatch. RecursiveDriver.run_dir
+    must always be absolute so that can't happen."""
+
+    def test_relative_run_dir_is_resolved_to_absolute(self) -> None:
+        with tempfile.TemporaryDirectory() as root_str:
+            root = Path(root_str)
+            cwd = Path.cwd()
+            try:
+                os.chdir(root)
+                relative = Path("relruns") / "rec123"
+                driver = _ScriptedDriver(relative)
+                self.assertTrue(driver.run_dir.is_absolute())
+                self.assertEqual(driver.run_dir, (root / relative).resolve())
+            finally:
+                os.chdir(cwd)
 
 
 class PhaseDetailPreservationTest(unittest.TestCase):
