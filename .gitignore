@@ -16,6 +16,16 @@ env/
 build/
 dist/
 *.egg-info/
+node_modules/
+
+# Vite builds the Web bundle into the package. It is never committed; the
+# release workflow builds it before packaging.
+src/lh_harness/_frontend/
+
+# package-lock.json is the authority used by CI; bun may be used locally but
+# its lockfile is not committed so the two cannot drift.
+bun.lock
+bun.lockb
 
 # Local run outputs
 .lh-harness/
@@ -35,3 +45,4 @@ env.local.sh
 .DS_Store
 .idea/
 .vscode/
+.lh-harness-quickstart/

@@ -36,8 +36,8 @@ LongHorizon-Harness 是一套面向长程任务的执行、状态管理和结果
 
 ## ✨ News
 
+- **[v0.1.4 · 2026-08-11]** 新版 Dashboard 已上线：基于 React/FastAPI 的工作台，全部操作都能在浏览器里完成——发起任务、为每个角色分别选择后端和模型、处理审批、运行中追加指令、停止或重启任务。用 `lh-harness web` 启动，见[在网页上运行任务](#4-在网页上运行任务推荐)。
 - **[2026-08-10]** 补充了 Terminal-Bench 2.1 评测。
-- **[2026-08-07]** 我们正在开发新版 Dashboard，交互会更友好，敬请期待。
 - **[v0.1.3 · 2026-08-07]** 每次运行结束都会输出一份自然语言回复，只依据已验证状态回答你的任务；任务默认作用于你启动命令的目录，控制台也会实时打印每一轮进展。
 - **[2026-08-06]** LongHorizon-Harness 登上 [Hugging Face Daily Papers 周榜](https://huggingface.co/papers/week/2026-W32)**第 1 名**。
 - **[v0.1.2 · 2026-08-06]** 新增统一的 computer-use 插件管理，强化 Auditor 只读校验、角色隔离和进程清理，并扩展 `doctor` 环境检查。见[管理 computer-use 插件](#管理-computer-use-插件)。
@@ -166,7 +166,7 @@ LongHorizon-Harness 不只展示了几个精心挑选的成功案例。
 
 ### 安装
 
-第 1–2 步每台机器只需做一次，第 3–4 步针对每个项目。
+第 1–2 步每台机器只需做一次，第 3 步针对每个项目。之后在网页上运行任务（第 4 步）或用命令行运行（第 5 步）。
 
 #### 环境要求
 
@@ -216,7 +216,15 @@ lh-harness init
 
 该命令会生成 `./.lh-harness/config.toml`，默认不会覆盖已有文件；需要重新生成时用 `lh-harness init --force`。打开它按需修改，每个字段的说明见[配置字段说明](#配置字段说明)。
 
-#### 4. 运行任务
+#### 4. 在网页上运行任务（推荐）
+
+```bash
+lh-harness web --workspace-root .
+```
+
+该命令在 `http://127.0.0.1:8799/` 打开工作台，所有操作都在这里完成：发起任务、为每个角色分别选择后端和模型、处理审批请求、在运行中追加指令、停止或重启任务。`--workspace-root` 指定在工作台中创建任务时的默认工作目录，其余参数见 [Dashboard 命令](#dashboard-命令)。
+
+#### 5. 也可以用命令行运行任务
 
 ```bash
 TASK="检查当前目录并总结其中的文件。"
@@ -404,7 +412,19 @@ lh-harness run --task @task.md --agent codex \
 ```bash
 lh-harness run --task @task.md --dashboard      # 监控正在运行的任务
 lh-harness dashboard                            # 浏览已完成和正在运行的任务
+lh-harness web --workspace-root .               # 为指定目录启动工作台
 ```
+
+`dashboard` 和 `web` 启动的是同一个工作台，参数也完全一致；当目的就是打开工作台、而不是伴随某次 run 时，用 `web` 语义更直接。
+
+| 参数 | 说明 |
+|---|---|
+| `--workspace-root` | 从工作台创建任务时的默认工作区（默认：当前目录） |
+| `--runs-root` | 存放运行记录的根目录（默认：`./.lh-harness/runs`） |
+| `--log-dir` | 固定查看某一次运行的日志目录，不再浏览 `--runs-root` |
+| `--host` / `--port` | 监听地址（默认 `127.0.0.1:8799`）；`--port 0` 由系统分配 |
+| `--auth-token` | Bearer token，绑定非本机 `--host` 时必须提供（也可用 `LH_HARNESS_WEB_TOKEN`） |
+| `--no-open` | 不自动在浏览器中打开 |
 
 ### 常用 CLI 参数
 

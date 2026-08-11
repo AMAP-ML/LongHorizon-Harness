@@ -2,13 +2,19 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import json
+import os
 import platform
 import re
+import stat
 import sys
+import threading
 import time
+import traceback
 import uuid
+import webbrowser
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Awaitable
 
 from . import HOMEPAGE, ISSUES_URL, __version__
 from .config import (
@@ -20,11 +26,19 @@ from .config import (
 from .types import (
     DEFAULT_CLAUDE_MODEL,
     DEFAULT_CODEX_MODEL,
+    DEFAULT_MAX_ROUNDS,
     DEFAULT_WORKSPACE_PATH,
+    MAX_ROUNDS,
     EpisodeBudget,
     HarnessConfig,
 )
 from .utils.agent_cli import probe_agent_cli
+from .supervisor.control_bus import (
+    _append_jsonl as _append_jsonl_nofollow,
+    _atomic_bytes_write,
+    _ensure_dir_nofollow,
+    _open_nofollow,
+)
 
 if TYPE_CHECKING:
     from .utils import UpdateCheckResult
@@ -33,7 +47,8 @@ _EPILOG = f"Homepage: {HOMEPAGE}\nFound a bug? Please open an issue: {ISSUES_URL
 
 # Runs are project-scoped.
 _DEFAULT_RUNS_ROOT = "./.lh-harness/runs"
-_DEFAULT_MAX_ROUNDS = 30
+_DEFAULT_MAX_ROUNDS = DEFAULT_MAX_ROUNDS
+_MAX_TASK_FILE_BYTES = 100_000
 
 # Agent backends as (choice, CLI binary, default model).
 _AGENTS = (
@@ -68,10 +83,10 @@ _ROLE_SCOPES = {role: scope for role, _, scope in _ROLE_OPTIONS}
 # Per-role episode budgets as (dest prefix, timeout seconds). The
 # executors get the long task timeout; the scheduler and auditors get the short one.
 _BUDGET_OPTIONS = (
-    ("manager", 600),
+    ("manager", 300),
     ("gui_executor", 1800),
     ("cli_executor", 1800),
-    ("auditor", 600),
+    ("auditor", 300),
 )
 
 
@@ -89,9 +104,22 @@ def _flag(prefix: str, suffix: str) -> str:
 
 
 def _positive_int(value: str) -> int:
-    parsed = int(value)
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError) as exc:
+        raise argparse.ArgumentTypeError("must be an integer") from exc
     if parsed < 1:
         raise argparse.ArgumentTypeError("must be at least 1")
+    # Only the run-count option uses this helper with a dedicated wrapper
+    # below; episode timeout values remain positive without inheriting a
+    # surprisingly small round ceiling.
+    return parsed
+
+
+def _max_rounds(value: str) -> int:
+    parsed = _positive_int(value)
+    if parsed > MAX_ROUNDS:
+        raise argparse.ArgumentTypeError(f"must be at most {MAX_ROUNDS}")
     return parsed
 
 
@@ -100,6 +128,237 @@ def _port(value: str) -> int:
     if not 0 <= parsed <= 65535:
         raise argparse.ArgumentTypeError("must be between 0 and 65535")
     return parsed
+
+
+def _reserve_run_dir(runs_root: str | Path, requested_run_id: str | None) -> tuple[str, Path]:
+    """Reserve an isolated run directory without ever reusing old state."""
+
+    root = Path(runs_root).expanduser().resolve()
+    root.mkdir(parents=True, exist_ok=True)
+    explicit = requested_run_id is not None
+    candidate = str(requested_run_id or "").strip()
+    if explicit and (
+        not candidate
+        or candidate in {".", ".."}
+        or "/" in candidate
+        or "\\" in candidate
+        or "\x00" in candidate
+    ):
+        raise ValueError("run id must be a non-empty single path component")
+
+    for _ in range(8):
+        run_id = candidate if explicit else f"{time.strftime('%Y%m%dT%H%M%SZ', time.gmtime())}_{uuid.uuid4().hex[:8]}"
+        run_dir = root / run_id
+        try:
+            resolved = run_dir.resolve(strict=False)
+            resolved.relative_to(root)
+        except (OSError, RuntimeError, ValueError) as exc:
+            raise ValueError("run id resolves outside the configured runs root") from exc
+        try:
+            run_dir.mkdir(parents=False, exist_ok=False)
+        except FileExistsError:
+            if explicit:
+                raise ValueError(f"run already exists: {run_id}") from None
+            continue
+        return run_id, run_dir
+    raise ValueError("could not reserve a unique run id")
+
+
+def _read_supervised_record(
+    path: Path,
+    *,
+    unavailable_message: str,
+    invalid_message: str,
+    too_large_message: str,
+) -> dict[str, object]:
+    """Read supervisor-owned metadata without following any path symlink."""
+
+    fd: int | None = None
+    try:
+        fd = _open_nofollow(path)
+        metadata = os.fstat(fd)
+        if not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1:
+            raise ValueError(invalid_message)
+        if metadata.st_size > 256 * 1024:
+            raise ValueError(too_large_message)
+        raw = bytearray()
+        remaining = 256 * 1024 + 1
+        while remaining:
+            chunk = os.read(fd, min(remaining, 64 * 1024))
+            if not chunk:
+                break
+            raw.extend(chunk)
+            remaining -= len(chunk)
+        if len(raw) > 256 * 1024:
+            raise ValueError(too_large_message)
+        value = json.loads(bytes(raw).decode("utf-8"))
+    except FileNotFoundError as exc:
+        raise ValueError(unavailable_message) from exc
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ValueError(invalid_message) from exc
+    except ValueError:
+        raise
+    except OSError as exc:
+        raise ValueError(invalid_message) from exc
+    finally:
+        if fd is not None:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+    if not isinstance(value, dict):
+        raise ValueError(invalid_message)
+    return value
+
+
+def _adopt_supervised_run_dir(
+    runs_root: str | Path,
+    requested_run_id: str | None,
+    *,
+    task: str | None,
+    agent: str,
+    model: str | None,
+    workspace: str | Path | None,
+    max_rounds: int,
+    role_configs: dict[str, dict[str, str | None]] | None = None,
+) -> tuple[str, Path]:
+    """Take over the reservation created by :class:`RunSupervisor`.
+
+    The supervisor deliberately creates the run directory and writes an owner
+    reservation *before* spawning the worker.  A normal CLI reservation would
+    therefore reject the worker with ``run already exists``.  ``--supervised``
+    is an internal capability, so it may only adopt a directory whose durable
+    owner record proves that this exact child process was reserved for this
+    request.  This also prevents a user from using the hidden flag to attach a
+    random process to an arbitrary old run.
+    """
+
+    root = Path(runs_root).expanduser().resolve()
+    if requested_run_id is None:
+        raise ValueError("supervised runs require an explicit run id")
+    candidate = str(requested_run_id).strip()
+    if (
+        not candidate
+        or candidate in {".", ".."}
+        or "/" in candidate
+        or "\\" in candidate
+        or "\x00" in candidate
+    ):
+        raise ValueError("run id must be a non-empty single path component")
+    run_dir = root / candidate
+    try:
+        resolved = run_dir.resolve(strict=False)
+        resolved.relative_to(root)
+    except (OSError, RuntimeError, ValueError) as exc:
+        raise ValueError("run id resolves outside the configured runs root") from exc
+    if run_dir.is_symlink() or not run_dir.is_dir():
+        raise ValueError("supervised run reservation is missing")
+
+    owner = _read_supervised_record(
+        run_dir / "control" / "owner.json",
+        unavailable_message="supervised run reservation is incomplete",
+        invalid_message="supervised run reservation is invalid",
+        too_large_message="supervised reservation metadata is too large",
+    )
+    status = _read_supervised_record(
+        run_dir / "control" / "status.json",
+        unavailable_message="supervised run reservation is incomplete",
+        invalid_message="supervised run reservation is invalid",
+        too_large_message="supervised reservation metadata is too large",
+    )
+    if str(owner.get("run_id") or "") != candidate:
+        raise ValueError("supervised run reservation has the wrong run id")
+    # The owner PID is assigned before Popen. Requiring the current process
+    # identity closes the obvious arbitrary-adoption hole while still matching
+    # the supervisor's child exactly.
+    try:
+        owner_pid = int(owner.get("pid", 0) or 0)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("supervised run reservation has an invalid owner pid") from exc
+    if owner_pid not in {0, os.getpid()}:
+        raise ValueError("supervised run reservation belongs to another process")
+    if owner_pid == 0:
+        # There is a small, legitimate window between Popen() returning and
+        # the supervisor promoting the reservation with the child PID. Bind
+        # that window to the recorded parent supervisor, never to an arbitrary
+        # caller that happens to know the run id.
+        try:
+            reservation_parent = int(owner.get("supervisor_pid", 0) or 0)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("supervised run reservation has an invalid parent pid") from exc
+        if reservation_parent <= 0 or reservation_parent != os.getppid():
+            raise ValueError("supervised run reservation is not owned by this worker")
+    if str(status.get("run_id") or candidate) != candidate:
+        raise ValueError("supervised run status has the wrong run id")
+    lifecycle = str(status.get("status") or owner.get("state") or "").strip().lower()
+    if lifecycle in {"completed", "complete", "failed", "cancelled", "canceled", "blocked", "incomplete"}:
+        raise ValueError("supervised run reservation is already terminal")
+
+    expected_task = str(owner.get("task") or "").strip()
+    if task is not None and expected_task and expected_task != task.strip():
+        raise ValueError("supervised run task does not match its reservation")
+    if str(owner.get("agent") or agent) != agent:
+        raise ValueError("supervised run agent does not match its reservation")
+    expected_model = owner.get("model")
+    if (str(expected_model).strip() if expected_model is not None else None) != (model.strip() if isinstance(model, str) else model):
+        raise ValueError("supervised run model does not match its reservation")
+    expected_roles = owner.get("role_configs")
+    expected_roles = expected_roles if isinstance(expected_roles, dict) and expected_roles else None
+    if expected_roles != role_configs:
+        raise ValueError("supervised run role configuration does not match its reservation")
+    try:
+        reserved_rounds = int(owner.get("max_rounds", max_rounds))
+    except (TypeError, ValueError) as exc:
+        raise ValueError("supervised run reservation has invalid max_rounds") from exc
+    if reserved_rounds != max_rounds:
+        raise ValueError("supervised run max_rounds does not match its reservation")
+    if workspace is not None and owner.get("workspace"):
+        try:
+            requested_workspace = Path(workspace).expanduser().resolve(strict=False)
+            reserved_workspace = Path(str(owner["workspace"])).expanduser().resolve(strict=False)
+        except (OSError, RuntimeError) as exc:
+            raise ValueError("supervised run workspace is invalid") from exc
+        if requested_workspace != reserved_workspace:
+            raise ValueError("supervised run workspace does not match its reservation")
+    return candidate, run_dir
+
+
+def _claim_supervised_owner(run_id: str, run_dir: Path) -> None:
+    """Claim the pre-Popen reservation as soon as the worker starts."""
+
+    control = run_dir / "control"
+    owner_path = control / "owner.json"
+    value = _read_supervised_record(
+        owner_path,
+        unavailable_message="supervised run owner metadata is unavailable",
+        invalid_message="supervised run owner metadata is unavailable",
+        too_large_message="supervised run owner metadata is too large",
+    )
+    if str(value.get("run_id") or "") != run_id:
+        raise ValueError("supervised run owner metadata is invalid")
+    try:
+        existing_pid = int(value.get("pid", 0) or 0)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("supervised run owner pid is invalid") from exc
+    if existing_pid not in {0, os.getpid()}:
+        raise ValueError("supervised run owner belongs to another process")
+    if existing_pid == os.getpid():
+        return
+    try:
+        parent_pid = int(value.get("supervisor_pid", 0) or 0)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("supervised run parent pid is invalid") from exc
+    if parent_pid != os.getppid():
+        raise ValueError("supervised run parent does not match its reservation")
+    from .supervisor.control_bus import ControlBus
+
+    ControlBus(run_dir).write_owner({
+        **value,
+        "state": "running",
+        "pid": os.getpid(),
+        "pgid": os.getpid(),
+        "signal_mode": "pgid",
+    })
 
 
 def _fallback_hint(role: str, suffix: str) -> str:
@@ -196,7 +455,7 @@ def main(argv: list[str] | None = None) -> int:
     run_parser.add_argument(
         "--log-dir",
         default=run_default("log_dir"),
-        help="Override the log directory. Defaults to <runs-root>/<run-id>/logs.",
+        help="Override the log directory. Defaults to <runs-root>/<run-id>/lh_harness.",
     )
     # Credentials are handed to the agent CLI as its own env vars; each adapter
     # maps them to its backend (ANTHROPIC_* for claude_code, OPENAI_* plus a
@@ -237,9 +496,9 @@ def main(argv: list[str] | None = None) -> int:
     )
     run_parser.add_argument(
         "--max-rounds",
-        type=_positive_int,
+        type=_max_rounds,
         default=run_default("max_rounds"),
-        help=f"Maximum number of manage-execute-audit rounds. If omitted, uses {_DEFAULT_MAX_ROUNDS}.",
+        help=f"Maximum number of manage-execute-audit rounds (1-{MAX_ROUNDS}). If omitted, uses {_DEFAULT_MAX_ROUNDS}.",
     )
     for role, timeout in _BUDGET_OPTIONS:
         scope = _ROLE_SCOPES[role]
@@ -261,8 +520,36 @@ def main(argv: list[str] | None = None) -> int:
         default=run_default("dashboard_port", 0),
         help="Dashboard port; 0 lets the OS pick a free one.",
     )
+    run_parser.add_argument(
+        "--dashboard-host",
+        default="127.0.0.1",
+        help="Dashboard bind host (default: 127.0.0.1).",
+    )
+    run_parser.add_argument(
+        "--dashboard-no-open",
+        action="store_true",
+        help="Do not open the dashboard URL in a browser.",
+    )
+    run_parser.add_argument(
+        "--dashboard-auth-token",
+        default=os.environ.get("LH_HARNESS_WEB_TOKEN"),
+        help="Bearer token when binding the live dashboard beyond localhost.",
+    )
+    run_parser.add_argument(
+        "--keep-dashboard",
+        action="store_true",
+        help="Keep the dashboard alive after any run; Dashboard Stop/Abort already keeps it alive.",
+    )
+    run_parser.add_argument(
+        "--supervised",
+        action="store_true",
+        help=argparse.SUPPRESS,
+    )
 
-    dash_parser = add_command("dashboard", "Serve the dashboard to browse runs / a run log directory")
+    dash_parser = add_command(
+        "dashboard",
+        "Serve the Web workbench",
+    )
     dash_parser.add_argument(
         "--runs-root",
         default=_DEFAULT_RUNS_ROOT,
@@ -273,7 +560,36 @@ def main(argv: list[str] | None = None) -> int:
         default=None,
         help="Pin one run's log directory instead of browsing --runs-root.",
     )
-    dash_parser.add_argument("--port", type=_port, default=0, help="Dashboard port; 0 lets the OS pick a free one.")
+    dash_parser.add_argument(
+        "--workspace-root",
+        default=".",
+        help="Default workspace for runs created from the Web workbench (default: current directory).",
+    )
+    dash_parser.add_argument("--host", default="127.0.0.1", help="Bind host (default: 127.0.0.1).")
+    dash_parser.add_argument("--port", type=_port, default=8799, help="Dashboard port; 0 lets the OS pick a free one.")
+    dash_parser.add_argument("--no-open", action="store_true", help="Do not open the dashboard URL in a browser.")
+    dash_parser.add_argument(
+        "--auth-token",
+        default=os.environ.get("LH_HARNESS_WEB_TOKEN"),
+        help="Bearer token for remote dashboard/API access (also LH_HARNESS_WEB_TOKEN).",
+    )
+
+    web_parser = add_command("web", "Serve the FastAPI Web control API")
+    web_parser.add_argument("--runs-root", default=_DEFAULT_RUNS_ROOT, help="Base directory holding runs.")
+    web_parser.add_argument(
+        "--workspace-root",
+        default=".",
+        help="Default workspace for runs created from the Web workbench (default: current directory).",
+    )
+    web_parser.add_argument("--log-dir", default=None, help="Pin one run's log directory instead of browsing runs.")
+    web_parser.add_argument("--host", default="127.0.0.1", help="Bind host (default: 127.0.0.1).")
+    web_parser.add_argument("--port", type=_port, default=8799, help="API port; 0 lets the OS pick a free one.")
+    web_parser.add_argument("--no-open", action="store_true", help="Do not open the API URL in a browser.")
+    web_parser.add_argument(
+        "--auth-token",
+        default=os.environ.get("LH_HARNESS_WEB_TOKEN"),
+        help="Bearer token for remote/API access (also LH_HARNESS_WEB_TOKEN).",
+    )
 
     add_command("doctor", "Check the local environment and report computer-use plugin state")
 
@@ -331,6 +647,8 @@ def main(argv: list[str] | None = None) -> int:
         return _run_command(args)
     if args.command == "dashboard":
         return _dashboard_command(args)
+    if args.command == "web":
+        return _web_command(args)
     if args.command == "doctor":
         return _doctor_command()
     if args.command == "plugin":
@@ -428,7 +746,7 @@ _MIN_NODE_MAJOR = 20
 
 
 def _doctor_node_toolchain() -> int:
-    """Report the Node/npm toolchain the npm-distributed plugins need."""
+    """Report the Node/npm toolchain used by npm plugins."""
     from .plugins import node_version, npm_binary, npm_version
 
     warnings = 0
@@ -445,14 +763,22 @@ def _doctor_node_toolchain() -> int:
 
     node = node_version()
     if not node:
-        _doctor_line("WARN", "Node.js", "`node --version` was unreadable; install Node.js 20 or later")
+        _doctor_line(
+            "WARN",
+            "Node.js",
+            "`node --version` was unreadable; npm plugins need Node.js 20+",
+        )
         return warnings + 1
     major_match = re.match(r"(\d+)", node)
     major = int(major_match.group(1)) if major_match else 0
     if major >= _MIN_NODE_MAJOR:
         _doctor_line("OK", "Node.js", node)
     else:
-        _doctor_line("WARN", "Node.js", f"{node} is older than {_MIN_NODE_MAJOR}; plugins may fail")
+        _doctor_line(
+            "WARN",
+            "Node.js",
+            f"{node} is older than {_MIN_NODE_MAJOR}; npm plugins may fail",
+        )
         warnings += 1
     return warnings
 
@@ -810,22 +1136,232 @@ def _report_update_result(result: UpdateCheckResult | None) -> bool:
     return False
 
 
-def _dashboard_command(args: argparse.Namespace) -> int:
-    from .dashboard import start_dashboard
+def _load_web_server_runner():
+    """Import the Web server, keeping the cost off CLI-only invocations."""
 
-    if args.log_dir:
-        handle = start_dashboard(args.log_dir, port=args.port)
-        print(f"Dashboard serving {args.log_dir} at {handle.url}")
-    else:
-        handle = start_dashboard(runs_root=args.runs_root, port=args.port)
-        print(f"Dashboard browsing runs under {args.runs_root} at {handle.url}")
-        print("Use the run selector in the top bar to switch between runs.")
-    print("Press Ctrl+C to stop.")
+    from .webapi.server import run_web_server
+
+    # server.py imports Uvicorn lazily. Check it before opening the browser so
+    # a broken install cannot send the user to a dead endpoint.
+    __import__("uvicorn")
+    return run_web_server
+
+
+def _broken_install_message(exc: ImportError) -> str:
+    return (
+        "Web dependencies are missing from this installation. "
+        "Reinstall with `pip install --force-reinstall lh-harness`. "
+        f"({exc})"
+    )
+
+
+def _dashboard_command(args: argparse.Namespace) -> int:
+    """Run the React/FastAPI workbench."""
+
     try:
-        handle.serve_forever_blocking()
-    except KeyboardInterrupt:
-        handle.shutdown()
-    return 0
+        run_web_server = _load_web_server_runner()
+    except ImportError as exc:
+        print(_broken_install_message(exc), file=sys.stderr)
+        return 2
+    return _serve_web_workbench(args, run_web_server)
+
+
+def _web_command(args: argparse.Namespace) -> int:
+    """Run the FastAPI/WebSocket control plane in the foreground."""
+
+    try:
+        run_web_server = _load_web_server_runner()
+    except ImportError as exc:
+        print(_broken_install_message(exc), file=sys.stderr)
+        return 2
+    return _serve_web_workbench(args, run_web_server)
+
+
+def _serve_web_workbench(args: argparse.Namespace, run_web_server) -> int:
+    """Apply shared CLI policy and run the Web workbench in the foreground."""
+
+    if args.host not in {"127.0.0.1", "localhost", "::1"} and not args.auth_token:
+        print(
+            "Refusing remote Web control API without --auth-token or "
+            "LH_HARNESS_WEB_TOKEN.",
+            file=sys.stderr,
+        )
+        return 2
+    url = f"http://127.0.0.1:{args.port}/" if args.host in {"0.0.0.0", "::"} else f"http://{args.host}:{args.port}/"
+    if not args.no_open and args.port:
+        # ``run_web_server`` blocks in Uvicorn. Open from a waiter thread, but
+        # only after the root page actually responds; opening before bind/start
+        # races the browser into a connection-error page on slower machines.
+        threading.Thread(
+            target=_open_browser_when_ready,
+            args=(url,),
+            name="lh-harness-browser-opener",
+            daemon=True,
+        ).start()
+    elif not args.no_open:
+        print("API port is assigned by the OS; automatic browser opening is disabled until the port is known.")
+    try:
+        return run_web_server(
+            runs_root=args.runs_root,
+            log_dir=args.log_dir,
+            host=args.host,
+            port=args.port,
+            workspace_root=args.workspace_root,
+            auth_token=args.auth_token,
+        )
+    except (KeyboardInterrupt, ValueError) as exc:
+        if isinstance(exc, ValueError):
+            print(str(exc), file=sys.stderr)
+            return 2
+        print("Web API stopped.")
+        return 0
+
+
+def _open_browser(url: str) -> None:
+    try:
+        opened = webbrowser.open(url, new=2)
+        if not opened:
+            print(f"Open this URL in a browser: {url}")
+    except Exception as exc:  # browser integration must never break a run
+        print(f"Could not open browser automatically: {exc}; open {url}", file=sys.stderr)
+
+
+def _wait_for_dashboard_ready(url: str, *, timeout: float = 10.0, poll_interval: float = 0.05) -> bool:
+    """Return only after the Dashboard root page accepts an HTTP request."""
+
+    from urllib.error import HTTPError, URLError
+    from urllib.request import urlopen
+
+    deadline = time.monotonic() + max(0.0, timeout)
+    while time.monotonic() < deadline:
+        remaining = max(0.01, deadline - time.monotonic())
+        try:
+            with urlopen(url, timeout=min(0.5, remaining)) as response:  # noqa: S310 - caller supplies the local Dashboard URL
+                if 200 <= int(response.status) < 500:
+                    return True
+        except HTTPError as exc:
+            # Authentication/other client errors still prove the HTTP server
+            # is ready; the browser can render the corresponding UI response.
+            if 400 <= exc.code < 500:
+                return True
+        except (OSError, TimeoutError, URLError):
+            pass
+        time.sleep(min(poll_interval, max(0.0, deadline - time.monotonic())))
+    return False
+
+
+def _open_browser_when_ready(url: str) -> None:
+    if _wait_for_dashboard_ready(url):
+        _open_browser(url)
+        return
+    print(f"Dashboard did not become ready in time; open {url} manually.", file=sys.stderr)
+
+
+def _write_dashboard_endpoint(path: Path, handle: object, *, run_id: str, log_dir: str) -> None:
+    """Write best-effort endpoint discovery metadata next to a run."""
+    try:
+        endpoint = {
+            "service": "lh-harness",
+            "run_id": run_id,
+            "url": str(getattr(handle, "url")),
+            "host": str(getattr(handle, "host", "127.0.0.1")),
+            "port": int(getattr(handle, "port")),
+            "pid": os.getpid(),
+            "log_dir": str(Path(log_dir).resolve()),
+            "started_at": time.time(),
+        }
+        _atomic_bytes_write(
+            path,
+            (json.dumps(endpoint, ensure_ascii=False, indent=2) + "\n").encode("utf-8"),
+        )
+    except (OSError, TypeError, ValueError) as exc:
+        print(f"Warning: could not write dashboard endpoint file: {exc}", file=sys.stderr)
+
+
+def _finalize_embedded_supervisor(
+    supervisor: object | None,
+    run_id: str,
+    *,
+    report: dict[str, object] | None = None,
+    returncode: int | None = 0,
+    reason: str = "",
+) -> None:
+    """Best-effort durable owner cleanup for an in-process dashboard.
+
+    Dashboard cleanup must never hide the manager's real result, so startup or
+    shutdown errors are reported to stderr while the run itself remains the
+    source of truth.
+    """
+
+    if supervisor is None:
+        return
+    try:
+        finalize = getattr(supervisor, "finalize_attached_run")
+        finalize(run_id, report=report, returncode=returncode, reason=reason)
+    except (AttributeError, OSError, RuntimeError, TypeError, ValueError) as exc:
+        print(f"Warning: could not finalize embedded dashboard owner: {exc}", file=sys.stderr)
+
+
+def _should_keep_embedded_dashboard(
+    run_dir: Path,
+    *,
+    explicitly_requested: bool,
+    report: dict[str, object] | None,
+) -> bool:
+    """Separate stopping a run from shutting down its embedded Web server."""
+
+    if explicitly_requested and report is not None:
+        return True
+    try:
+        from .supervisor.control_bus import ControlBus
+
+        requested_action = str(ControlBus(run_dir).read_status().get("requested_action") or "").strip().lower()
+    except (OSError, RuntimeError, TypeError, ValueError):
+        return False
+    return requested_action in {"stop", "abort", "cancel"}
+
+
+async def _run_with_attached_control(
+    worker: Awaitable[dict[str, object]],
+    *,
+    run_dir: Path,
+    enabled: bool,
+    poll_interval: float = 0.1,
+) -> dict[str, object]:
+    """Cancel an embedded Manager task from its durable lifecycle request.
+
+    The FastAPI server runs in a background thread of the same process as the
+    Manager. Its Stop/Abort routes therefore persist an intent instead of
+    signalling the hosting PID. This watcher crosses that thread boundary via
+    the run's ControlBus and performs cancellation in the asyncio event loop.
+    """
+
+    manager_task = asyncio.create_task(worker)
+    if not enabled:
+        return await manager_task
+
+    from .supervisor.control_bus import ControlBus
+
+    bus = ControlBus(run_dir)
+
+    async def watch_control() -> None:
+        while not manager_task.done():
+            status = bus.read_status()
+            action = str(status.get("requested_action") or "").strip().lower()
+            if action in {"stop", "abort"}:
+                manager_task.cancel()
+                return
+            await asyncio.sleep(poll_interval)
+
+    watcher = asyncio.create_task(watch_control())
+    try:
+        return await manager_task
+    finally:
+        watcher.cancel()
+        try:
+            await watcher
+        except asyncio.CancelledError:
+            pass
 
 
 def _run_command(args: argparse.Namespace) -> int:
@@ -845,26 +1381,92 @@ def _run_command(args: argparse.Namespace) -> int:
             )
             return 1
 
-    task = _read_task(args.task)
     max_rounds = args.max_rounds
     if max_rounds is None:
         max_rounds = _DEFAULT_MAX_ROUNDS
         print(f"--max-rounds was not set; using the default of {max_rounds} rounds.")
+    if isinstance(max_rounds, bool) or not isinstance(max_rounds, int) or not 1 <= max_rounds <= MAX_ROUNDS:
+        print(f"Cannot start run: max_rounds must be an integer from 1 to {MAX_ROUNDS}", file=sys.stderr)
+        return 2
 
-    # Run bookkeeping (logs, prompts, harness state) is isolated under
-    # <runs-root>/<run-id>/ so it stays out of the user's project.
-    run_id = args.run_id or f"{time.strftime('%Y%m%dT%H%M%SZ', time.gmtime())}_{uuid.uuid4().hex[:8]}"
-    run_dir = Path(args.runs_root).expanduser() / run_id
-    run_dir.mkdir(parents=True, exist_ok=True)
+    # Validate the supervisor reservation before opening any task reference.
+    # Otherwise a malformed ``--supervised --task=@...`` invocation could make
+    # this worker read an arbitrary regular file even though adoption would
+    # later be rejected by the owner/status checks.
+    pre_adopted: tuple[str, Path] | None = None
+    try:
+        if getattr(args, "supervised", False):
+            pre_adopted = _adopt_supervised_run_dir(
+                args.runs_root,
+                args.run_id,
+                task=None,
+                agent=args.agent,
+                model=args.model,
+                role_configs=_public_role_configs_from_args(args),
+                workspace=workspace,
+                max_rounds=max_rounds,
+            )
+            task = _read_supervised_task(args.task, run_dir=pre_adopted[1])
+        else:
+            task = _read_task(args.task)
+    except (OSError, UnicodeError, ValueError) as exc:
+        print(f"Cannot start run: {exc}", file=sys.stderr)
+        return 2
 
-    log_dir = str(Path(args.log_dir).expanduser() if args.log_dir else run_dir / "logs")
-    prompt_dir = str((run_dir / "tmp" / "prompts").resolve())
+    # Each run is fully isolated under <runs-root>/<run-id>/ so a new run never
+    # mixes with a previous run's tmp/log/workspace data (and the dashboard shows
+    # only the current run).
+    try:
+        if getattr(args, "supervised", False):
+            # The supervisor has already reserved this directory and bound its
+            # owner PID. Do not call _reserve_run_dir(), which would correctly
+            # reject an existing directory for ordinary CLI invocations.
+            run_id, run_dir = _adopt_supervised_run_dir(
+                args.runs_root,
+                args.run_id,
+                task=task,
+                agent=args.agent,
+                model=args.model,
+                role_configs=_public_role_configs_from_args(args),
+                workspace=workspace,
+                max_rounds=max_rounds,
+            )
+            if pre_adopted is not None and run_id != pre_adopted[0]:
+                raise ValueError("supervised run reservation changed during bootstrap")
+            _claim_supervised_owner(run_id, run_dir)
+        else:
+            run_id, run_dir = _reserve_run_dir(args.runs_root, args.run_id)
+    except ValueError as exc:
+        print(f"Cannot start run: {exc}", file=sys.stderr)
+        return 2
+
+    log_dir = str(Path(args.log_dir).expanduser() if args.log_dir else run_dir / "lh_harness")
+    if getattr(args, "supervised", False):
+        # Supervisor workers always write into their reservation. A hidden flag
+        # must not turn into a way to redirect logs/metadata elsewhere.
+        try:
+            run_root = run_dir.resolve()
+            Path(log_dir).expanduser().resolve(strict=False).relative_to(run_root)
+        except (OSError, RuntimeError, ValueError):
+            print("Cannot start run: supervised log directory escapes the run reservation", file=sys.stderr)
+            return 2
+    prompt_path = run_dir / "tmp" / "prompts"
+    prompt_dir = str(prompt_path)
     harness_dir = (
         str(Path(args.harness_dir).expanduser())
         if args.harness_dir
         else str((run_dir / "harness").resolve())
     )
-    Path(log_dir).mkdir(parents=True, exist_ok=True)
+    try:
+        Path(workspace).mkdir(parents=True, exist_ok=True)
+        # Logs, prompts, and task scratch space are part of the run boundary.
+        # An agent must not be able to redirect any of them through a swapped
+        # parent-directory symlink during worker bootstrap.
+        _ensure_dir_nofollow(Path(log_dir))
+        _ensure_dir_nofollow(prompt_path)
+    except OSError as exc:
+        print(f"Cannot start run: unsafe run directory layout: {exc}", file=sys.stderr)
+        return 2
 
     # The workspace is the user's own directory, so the run's bookkeeping may sit
     # inside it. Hide those paths from the agents and from the auditor read-only
@@ -899,13 +1501,86 @@ def _run_command(args: argparse.Namespace) -> int:
     # The dashboard starts before agent creation so startup status is visible.
     dashboard_handle = None
     human_hook = None
-    if getattr(args, "dashboard", False):
-        from .dashboard import make_human_hook, start_dashboard
+    dashboard_supervisor = None
+    if getattr(args, "supervised", False):
+        from .dashboard import make_human_hook
+        from .dashboard.state import DashboardState
 
-        dashboard_handle = start_dashboard(log_dir, port=args.dashboard_port, task=task)
+        # A Worker has no HTTP server of its own. It still needs the same
+        # durable human gate adapter so a separate Supervisor/API process can
+        # resolve approvals and queue instructions through the run control bus.
+        worker_state = DashboardState(log_dir, task=task, control_enabled=True)
+        human_hook = make_human_hook(worker_state)
+    if getattr(args, "dashboard", False):
+        from .dashboard import make_human_hook
+
+        try:
+            from .webapi.server import start_web_server
+            from .supervisor.service import RunSupervisor
+
+            # This invocation owns the worker process itself (there is no
+            # parent ``Popen`` handle), so attach a restricted supervisor to
+            # the current run.  It enables safe stop/abort and status
+            # projection while deliberately disallowing create/resume of
+            # unrelated workers from the embedded dashboard.
+            dashboard_supervisor = RunSupervisor(
+                args.runs_root,
+                workspace_root=workspace,
+                attached_only=True,
+            )
+            dashboard_supervisor.attach_run(
+                run_id=run_id,
+                pid=os.getpid(),
+                task=task,
+                agent=args.agent,
+                model=args.model,
+                role_configs=_public_role_configs_from_args(args),
+                workspace=workspace,
+                max_rounds=max_rounds,
+                prompt_language=args.prompt_language,
+                command=[sys.executable, *sys.argv],
+            )
+
+            dashboard_handle = start_web_server(
+                log_dir=log_dir,
+                runs_root=args.runs_root,
+                run_id=run_id,
+                task=task,
+                control_enabled=bool(task),
+                workspace_root=workspace,
+                host=args.dashboard_host,
+                port=args.dashboard_port,
+                supervisor=dashboard_supervisor,
+                auth_token=args.dashboard_auth_token,
+            )
+        except ValueError as exc:
+            # attach_run may have written an owner before a bind/auth failure.
+            # Do not leave an embedded dashboard advertising a live worker when
+            # no server was actually started.
+            _finalize_embedded_supervisor(
+                dashboard_supervisor,
+                run_id,
+                report={"status": "failed"},
+                returncode=2,
+                reason="embedded dashboard refused to start",
+            )
+            print(f"Dashboard refused to start: {exc}", file=sys.stderr)
+            return 2
+        except (ImportError, RuntimeError) as exc:
+            _finalize_embedded_supervisor(
+                dashboard_supervisor,
+                run_id,
+                report={"status": "failed"},
+                returncode=2,
+                reason=f"dashboard startup failed: {exc}",
+            )
+            print(f"Dashboard failed to start: {exc}", file=sys.stderr)
+            return 2
         human_hook = make_human_hook(dashboard_handle.state)
         print(f"Dashboard live at {dashboard_handle.url} (log dir: {log_dir})")
-        _open_dashboard(dashboard_handle.url)
+        _write_dashboard_endpoint(run_dir / "dashboard.json", dashboard_handle, run_id=run_id, log_dir=log_dir)
+        if not args.dashboard_no_open:
+            _open_browser_when_ready(dashboard_handle.url)
 
     agent_cache: dict[tuple[str, str, str | None], object] = {}
     plugin_mcp_cache: dict[str, str | None] = {}
@@ -939,7 +1614,7 @@ def _run_command(args: argparse.Namespace) -> int:
         # permission role is part of the cache key: two Claude roles using the
         # same model must never share a differently privileged adapter.
         name = _resolve_role_option(args, role, "agent")
-        model = _resolve_role_option(args, role, "model")
+        model = _resolve_role_model(args, role)
         effective_permission_role = permission_role or role
         key = (effective_permission_role, name, model)
         if key not in agent_cache:
@@ -957,28 +1632,72 @@ def _run_command(args: argparse.Namespace) -> int:
             )
         return agent_cache[key]
 
-    role_agents = {
-        "manager_agent": build_role_agent("manager"),
-        "gui_executor_agent": build_role_agent("gui_executor"),
-        "cli_executor_agent": build_role_agent("cli_executor"),
-        "gui_auditor_agent": build_role_agent("gui_auditor"),
-        "cli_auditor_agent": build_role_agent("cli_auditor"),
-        "final_response_agent": build_role_agent("final_response"),
-    }
+    try:
+        role_agents = {
+            "manager_agent": build_role_agent("manager"),
+            "gui_executor_agent": build_role_agent("gui_executor"),
+            "cli_executor_agent": build_role_agent("cli_executor"),
+            "gui_auditor_agent": build_role_agent("gui_auditor"),
+            "cli_auditor_agent": build_role_agent("cli_auditor"),
+            # Format repair sees only the previous auditor text and has no tools.
+            # It inherits the selected auditor backend/model, but never its audit
+            # permissions.
+            "auditor_format_repair_agent": build_role_agent(
+                "auditor",
+                permission_role="auditor_format_repair",
+            ),
+            "final_response_agent": build_role_agent("final_response"),
+        }
+    except BaseException as exc:
+        _write_bootstrap_failure(log_dir, task, exc, max_rounds=max_rounds)
+        print(f"Worker failed during agent setup: {exc}", file=sys.stderr)
+        _finalize_embedded_supervisor(
+            dashboard_supervisor,
+            run_id,
+            report={"status": "failed"},
+            returncode=1,
+            reason="worker bootstrap failure",
+        )
+        if dashboard_handle is not None:
+            dashboard_handle.shutdown()
+        return 1
 
     from .manager import run
 
-    report: dict | None = None
+    report: dict[str, object] | None = None
     try:
         report = asyncio.run(
-            run(
-                task=task,
-                env=env,
-                config=config,
-                human_hook=human_hook,
-                progress=_print_progress,
-                **role_agents,
+            _run_with_attached_control(
+                run(
+                    task=task,
+                    env=env,
+                    config=config,
+                    human_hook=human_hook,
+                    progress=_print_progress,
+                    **role_agents,
+                ),
+                run_dir=run_dir,
+                enabled=dashboard_supervisor is not None,
             )
+        )
+    except BaseException as exc:
+        _finalize_embedded_supervisor(
+            dashboard_supervisor,
+            run_id,
+            report={"status": "failed"},
+            returncode=1,
+            reason=f"worker failed: {exc}",
+        )
+        raise
+    else:
+        # A hosted dashboard keeps this same PID alive after Manager returns;
+        # finalize before entering that serving loop so the right panel and
+        # later API clients see a terminal run immediately.
+        _finalize_embedded_supervisor(
+            dashboard_supervisor,
+            run_id,
+            report=report,
+            returncode=0,
         )
     finally:
         # The summary is printed before the dashboard blocks, so the outcome is
@@ -986,13 +1705,21 @@ def _run_command(args: argparse.Namespace) -> int:
         if report is not None:
             _print_run_summary(report, log_dir=log_dir, workspace=workspace)
         if dashboard_handle is not None:
-            print(f"\nDashboard still live at {dashboard_handle.url}; press Ctrl+C to exit.")
-            try:
-                dashboard_handle.serve_forever_blocking()
-            except KeyboardInterrupt:
+            if _should_keep_embedded_dashboard(
+                run_dir,
+                explicitly_requested=bool(args.keep_dashboard),
+                report=report,
+            ):
+                print(f"\nDashboard still live at {dashboard_handle.url}; press Ctrl+C to exit.")
+                try:
+                    dashboard_handle.serve_forever_blocking()
+                except KeyboardInterrupt:
+                    dashboard_handle.shutdown()
+            else:
                 dashboard_handle.shutdown()
 
-    return 0 if report.get("completion_satisfied") else 1
+    final_report = report or {"status": "failed", "completion_satisfied": False}
+    return 0 if final_report.get("completion_satisfied") else 1
 
 
 def _outermost_paths(*paths: str | Path) -> tuple[str, ...]:
@@ -1082,9 +1809,136 @@ def _resolve_role_option(args: argparse.Namespace, role: str, suffix: str):
     return getattr(args, suffix)
 
 
+def _resolve_role_model(args: argparse.Namespace, role: str) -> str | None:
+    """Resolve a model without crossing an explicit backend switch.
+
+    Agent and model overrides have parallel fallback chains, but a Claude role
+    must never inherit the global Codex model merely because only its agent was
+    overridden.  A model set at or below the nearest explicit agent boundary
+    remains valid; otherwise the selected provider gets its own default.
+    """
+
+    current: str | None = role
+    while current:
+        value = getattr(args, f"{current}_model", None)
+        if value:
+            return value
+        if getattr(args, f"{current}_agent", None):
+            return None
+        current = _ROLE_PARENTS[current]
+    return getattr(args, "model", None)
+
+
+def _public_role_configs_from_args(
+    args: argparse.Namespace,
+) -> dict[str, dict[str, str | None]] | None:
+    """Return effective Manager/Executor/Auditor bindings when overridden."""
+
+    public_roles = ("manager", "executor", "auditor")
+    if not any(
+        getattr(args, f"{role}_{field}", None)
+        for role in public_roles
+        for field in ("agent", "model")
+    ):
+        return None
+    defaults = {
+        "codex": DEFAULT_CODEX_MODEL,
+        "claude_code": DEFAULT_CLAUDE_MODEL,
+    }
+    result: dict[str, dict[str, str | None]] = {}
+    for role in public_roles:
+        role_agent = _resolve_role_option(args, role, "agent")
+        result[role] = {
+            "agent": role_agent,
+            "model": _resolve_role_model(args, role) or defaults[role_agent],
+        }
+    return result
+
+
+def _write_bootstrap_failure(log_dir: str, task: str, exc: BaseException, *, max_rounds: int) -> None:
+    """Persist a terminal report when agent construction fails before Manager."""
+
+    root = Path(log_dir)
+    role_dir = root / "role_orchestration"
+    trace = "".join(traceback.format_exception(type(exc), exc, exc.__traceback__))
+    report = {
+        "schema_version": 2,
+        "status": "failed",
+        "task": task,
+        "completion_satisfied": False,
+        "completion_authority": "manager_with_role_auditors",
+        "rounds_run": 0,
+        "max_rounds": max_rounds,
+        "abort_reason": "worker_bootstrap_failure",
+        "error": str(exc),
+        "exception_type": type(exc).__name__,
+        "traceback_tail": trace[-12000:],
+    }
+    encoded = json.dumps(report, ensure_ascii=False, indent=2) + "\n"
+    for target in (root / "report.json", role_dir / "report.json"):
+        try:
+            _atomic_bytes_write(target, encoded.encode("utf-8"))
+        except OSError:
+            pass
+    events = role_dir / "events.jsonl"
+    try:
+        _append_jsonl_nofollow(events, {
+            "schema_version": 1,
+            "event": "role_harness_failed",
+            "status": "failed",
+            "ts": time.time(),
+            "reason": str(exc),
+            "exception_type": type(exc).__name__,
+            "traceback_tail": trace[-4000:],
+        })
+    except OSError:
+        pass
+
+
+def _read_supervised_task(raw: str, *, run_dir: Path) -> str:
+    """Read only the supervisor's reserved ``tmp/task.md`` contract.
+
+    ``_read_task`` deliberately supports arbitrary ``@path`` values for the
+    public CLI.  A supervised worker is different: its command is generated
+    by the supervisor and must never become a confused-deputy file reader if
+    someone invokes the hidden flag manually or tampers with its argv.
+    """
+
+    if not raw.startswith("@"):
+        raise ValueError("supervised workers require a @task-file reference")
+    expected = (run_dir / "tmp" / "task.md").absolute()
+    supplied = Path(raw[1:]).expanduser()
+    supplied = Path(os.path.abspath(os.fspath(supplied)))
+    if supplied != expected:
+        raise ValueError("supervised task file must be the reserved run/tmp/task.md")
+    return _read_task(raw)
+
+
 def _read_task(raw: str) -> str:
     if raw.startswith("@"):
-        return Path(raw[1:]).read_text(encoding="utf-8").strip()
+        path = Path(raw[1:]).expanduser()
+        fd: int | None = None
+        try:
+            # Supervisor-created task files live below a worker-writable run
+            # tree.  Read through an anchored descriptor so a replacement of
+            # ``tmp`` or ``task.md`` between launch and bootstrap cannot make
+            # the worker consume a different file (or an external secret).
+            fd = _open_nofollow(path)
+            metadata = os.fstat(fd)
+            if not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1:
+                raise ValueError("task file is not a private regular file")
+            if metadata.st_size > _MAX_TASK_FILE_BYTES:
+                raise ValueError("task file is too large")
+            raw_bytes = os.read(fd, _MAX_TASK_FILE_BYTES + 1)
+            if len(raw_bytes) > _MAX_TASK_FILE_BYTES:
+                raise ValueError("task file is too large")
+            return raw_bytes.decode("utf-8").strip()
+        finally:
+            if fd is not None:
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
     return raw
 
 

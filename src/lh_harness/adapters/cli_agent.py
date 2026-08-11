@@ -102,6 +102,7 @@ class CommandAgentAdapter:
             duration_ms=duration_ms,
             metadata={
                 "command": redact_secrets(command),
+                "workspace": self.workspace_path,
                 "prompt_path": prompt_path,
                 "exit_code": result.exit_code,
                 "termination_reason": result.termination_reason,

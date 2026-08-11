@@ -36,8 +36,8 @@ LongHorizon-Harness is an execution, state-management, and result-verification s
 
 ## ✨ News
 
+- **[v0.1.4 · 2026-08-11]** The new Dashboard has landed: a React/FastAPI workbench you can drive entirely from the browser. Start a task, choose a backend and model per role, answer approvals, send an instruction mid-run, and stop or restart a run. Launch it with `lh-harness web`; see [Run a task in the browser](#4-run-a-task-in-the-browser-recommended).
 - **[2026-08-10]** Added the Terminal-Bench 2.1 evaluation.
-- **[2026-08-07]** A new, more user-friendly Dashboard is in the works. Stay tuned.
 - **[v0.1.3 · 2026-08-07]** Every run now ends with a plain-language reply that answers your task from the verified state alone. Tasks act on the directory you launched from by default, and the console reports each round as it happens.
 - **[2026-08-06]** LongHorizon-Harness reaches **#1** on the [Hugging Face Daily Papers weekly ranking](https://huggingface.co/papers/week/2026-W32).
 - **[v0.1.2 · 2026-08-06]** Adds unified computer-use plugin management, stronger auditor read-only checks and role isolation, reliable process cleanup, and expanded `doctor` diagnostics. See [Manage computer-use plugins](#manage-computer-use-plugins).
@@ -166,7 +166,7 @@ Full result tables and case trajectories are available on the [LongHorizon-Harne
 
 ### Installation
 
-Steps 1–2 are once per machine; steps 3–4 are once per project.
+Steps 1–2 are once per machine; step 3 is once per project. Then run tasks from the browser (step 4) or the command line (step 5).
 
 #### Requirements
 
@@ -216,7 +216,15 @@ lh-harness init
 
 This creates `./.lh-harness/config.toml` without replacing an existing file; use `lh-harness init --force` to regenerate. Open it and adjust the defaults. Every field is documented in [Configuration reference](#configuration-reference).
 
-#### 4. Run a task
+#### 4. Run a task in the browser (recommended)
+
+```bash
+lh-harness web --workspace-root .
+```
+
+This opens the workbench at `http://127.0.0.1:8799/`. Everything happens there: start a task, pick a backend and model per role, answer approval requests, send an instruction mid-run, and stop or restart a run. `--workspace-root` sets the default working directory for tasks created there; the remaining options are listed under [Dashboard commands](#dashboard-commands).
+
+#### 5. Or run a task from the command line
 
 ```bash
 TASK="Inspect the current directory and summarize its files."
@@ -404,7 +412,19 @@ Prefer letting the server read API keys from its environment over writing them i
 ```bash
 lh-harness run --task @task.md --dashboard      # Monitor a live run
 lh-harness dashboard                            # Browse completed and active runs
+lh-harness web --workspace-root .               # Serve the workbench for another directory
 ```
+
+`dashboard` and `web` start the same workbench and accept the same options; `web` reads as the plain service entry point when the workbench is what you want, not a side effect of a run.
+
+| Option | Description |
+|---|---|
+| `--workspace-root` | Default workspace for runs created from the workbench (default: current directory) |
+| `--runs-root` | Base directory holding runs (default: `./.lh-harness/runs`) |
+| `--log-dir` | Pin one run's log directory instead of browsing `--runs-root` |
+| `--host` / `--port` | Bind address (default: `127.0.0.1:8799`); `--port 0` lets the OS pick |
+| `--auth-token` | Bearer token, required for any non-loopback `--host` (also `LH_HARNESS_WEB_TOKEN`) |
+| `--no-open` | Do not open the URL in a browser |
 
 ### Common CLI options
 

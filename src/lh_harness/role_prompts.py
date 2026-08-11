@@ -47,10 +47,13 @@ def build_role_manager_prompt(
     round_index: int,
     task_state: str = "",
     task_contract: str = "",
+    round_budget: int | None = None,
     language: str = "en",
     max_history_chars: int = 36_000,
 ) -> str:
     lang = normalize_prompt_language(language)
+    configured_budget = max(round_index, int(round_budget or round_index))
+    remaining_rounds = max(1, configured_budget - round_index + 1)
     auditor_reports = format_verified_intermediate_context(
         rounds, max_chars=max_history_chars, language=lang
     )
@@ -82,7 +85,13 @@ Historical auditor reports by round (authority for trusted intermediate state):
 Harness management feedback (not an audit; only for protocol/completion correction):
 {harness_feedback or "(No harness feedback.)"}
 
-This is management round {round_index}. Output only the next management result.
+Round budget:
+- Current management round: {round_index}
+- Configured round limit: {configured_budget}
+- Rounds remaining, including this one: {remaining_rounds}
+- If only one round remains, do not schedule a prerequisite-only subtask that deliberately postpones core requirements. Route the most complete executable subtask possible, or ask/block when completion is impossible.
+
+Output only the next management result.
 """
     return f"""\
 {MANAGER_INSTRUCTIONS[lang].strip()}
@@ -110,7 +119,13 @@ This is management round {round_index}. Output only the next management result.
 harness 任务管理反馈（不是审计，只用于协议或完成请求修正）:
 {harness_feedback or "(没有 harness 反馈。)"}
 
-现在是任务管理第 {round_index} 轮。只输出下一步任务管理结果。
+轮次预算:
+- 当前任务管理轮次: {round_index}
+- 配置的轮次上限: {configured_budget}
+- 包含本轮在内的剩余轮次: {remaining_rounds}
+- 如果只剩一轮，不得安排一个明确推迟核心要求的纯前置子任务；应路由当前可完成的最完整子任务，无法完成时使用 ask 或 blocked。
+
+只输出下一步任务管理结果。
 """
 
 
@@ -122,6 +137,7 @@ def build_role_executor_prompt(
     task_state: str = "",
     task_contract: str = "",
     related_auditor_reports: str = "",
+    workspace_path: str = "",
     language: str = "en",
 ) -> str:
     lang = normalize_prompt_language(language)
@@ -148,6 +164,11 @@ Current task state (manager-maintained; facts must come from auditors):
 
 Stable task contract:
 {task_contract.strip() or "(No separate contract was maintained; use the Task contract section in the assigned plan.)"}
+
+Real task state and deliverables:
+- Workspace root: {workspace_path.strip() or "(Use the executor environment's current workspace.)"}
+- Durable files belong in that workspace (or in the explicitly requested target application), not in the harness run-record directory.
+- Report exact paths and observable target-application state so the Auditor can independently verify them. Harness prompts, trajectories, and role output logs are execution records, not proof that the task succeeded.
 
 Assigned {role_name} subtask contract:
 {plan_text.rstrip()}
@@ -177,6 +198,11 @@ Complete only this subtask. Treat audited state and the stable contract as the t
 稳定任务契约:
 {task_contract.strip() or "(没有单独契约；以分配计划中的任务契约段为准。)"}
 
+真实任务状态和交付物:
+- Workspace 根目录: {workspace_path.strip() or "(使用 executor 环境的当前 workspace。)"}
+- 持久文件应写入该 Workspace（或任务明确指定的目标应用），不要把 harness 运行记录目录当成交付目录。
+- 报告准确路径和可观察的目标应用状态，供 Auditor 独立核验。prompt、trajectory 和角色输出日志只是运行记录，不是任务完成证明。
+
 分配的 {role_name} 子任务合同:
 {plan_text.rstrip()}
 
@@ -196,6 +222,7 @@ def build_role_auditor_prompt(
     task_state: str = "",
     task_contract: str = "",
     related_auditor_reports: str = "",
+    workspace_path: str = "",
     max_executor_output_chars: int = 24_000,
     language: str = "en",
 ) -> str:
@@ -218,6 +245,12 @@ Current task state (background only; audit only this subtask):
 
 Stable task contract (primary target reference, but do not assume it is correct):
 {task_contract.strip() or "(No separate contract was maintained; use the Task contract section in the assigned plan.)"}
+
+Independent evidence boundary:
+- Real workspace root: {workspace_path.strip() or "(Use the auditor environment's current workspace.)"}
+- Independently inspect claimed files, commands/tests/logs/services, and the current target GUI/application when relevant. Executor text is only a claim.
+- Harness prompts, trajectories, role outputs, and prior reports are run records, not task deliverables or standalone completion evidence. Do not require every subtask to create a file when its consumed result is legitimately application state, a user-facing response, or independently observable external state.
+- If the Executor deliberately saved a screenshot or visual artifact in the real task environment, inspect that artifact and its current source state. Private Dashboard trajectory images are operator run records and are not injected as audit evidence.
 
 Just-finished {role_name} subtask:
 {plan_text.rstrip()}
@@ -246,6 +279,12 @@ Audit only whether this subtask truly completed, stayed within its dominant boun
 
 稳定任务契约（主要目标依据，但不能默认它正确）:
 {task_contract.strip() or "(没有单独契约；以分配计划中的任务契约段为准。)"}
+
+独立证据边界:
+- 真实 Workspace 根目录: {workspace_path.strip() or "(使用 auditor 环境的当前 workspace。)"}
+- 独立检查声明的文件、命令/测试/日志/服务，以及相关时的当前 GUI/目标应用状态；Executor 文本只是一项声明。
+- prompt、trajectory、角色输出和历史报告只是运行记录，不是任务交付物或可单独成立的完成证据。若子任务的真实结果本来就是应用状态、面向用户的回复或可独立观察的外部状态，不要机械要求每个子任务必须创建文件。
+- 如果 Executor 有意在真实任务环境中保存了截图或视觉产物，应检查该产物及其当前来源状态。Dashboard 的私有 trajectory 图片只是给操作者查看的运行记录，不会作为审计证据注入。
 
 刚完成的 {role_name} 子任务:
 {plan_text.rstrip()}
@@ -310,11 +349,27 @@ def build_role_final_response_prompt(
     status: str,
     abort_reason: str,
     task_state: str,
+    operator_instructions: str = "",
     language: str = "en",
     max_evidence_chars: int = 6_000,
+    max_deliverable_chars: int = 24_000,
 ) -> str:
     lang = normalize_prompt_language(language)
     findings = format_audit_findings(rounds, max_chars=max_evidence_chars, language=lang)
+    # A successful completion is grounded in the latest clean/complete/aligned
+    # auditor report. Give the response writer the corresponding executor output
+    # as well as the condensed audit: the audit often confirms links, figures, or
+    # other required details without repeating the whole user-facing deliverable.
+    verified_deliverable = ""
+    if status == "complete":
+        verified_deliverable = next(
+            (
+                item.executor_output.strip()
+                for item in reversed(rounds)
+                if item.executor_output.strip() and item.auditor_report.strip()
+            ),
+            "",
+        )[:max_deliverable_chars]
     if lang == "en":
         outcome = f"Run outcome: {status}"
         if abort_reason:
@@ -325,6 +380,9 @@ def build_role_final_response_prompt(
 Original request:
 {task.rstrip()}
 
+Authoritative operator follow-up instructions:
+{operator_instructions.strip() or "(None.)"}
+
 {outcome}
 
 Verified state:
@@ -332,6 +390,9 @@ Verified state:
 
 Audit findings:
 {findings or "(No audit was produced.)"}
+
+Verified deliverable from the accepted executor:
+{verified_deliverable or "(No standalone deliverable was produced.)"}
 
 Write the reply now. Output only the reply.
 """
@@ -344,6 +405,9 @@ Write the reply now. Output only the reply.
 原始任务:
 {task.rstrip()}
 
+操作员后续补充的权威指令:
+{operator_instructions.strip() or "(无。)"}
+
 {outcome}
 
 已验证状态:
@@ -351,6 +415,9 @@ Write the reply now. Output only the reply.
 
 审计结论:
 {findings or "(没有产生审计结论。)"}
+
+已通过验收的执行器交付正文:
+{verified_deliverable or "(没有独立的交付正文。)"}
 
 现在写这份回复。只输出回复本身。
 """
@@ -414,6 +481,11 @@ def format_audit_findings(
 def parse_role_manager_next_step(text: str) -> RoleNextStep:
     for line in str(text or "").splitlines():
         normalized = line.strip().strip("*").replace(" ", "").replace("　", "").lower()
+        # Models commonly append a short rationale after the required route,
+        # e.g. `Next: done — all constraints passed`. Treat only an explicitly
+        # delimited suffix as commentary so prose such as `Next: done later`
+        # remains invalid.
+        normalized = re.split(r"(?:—|–|--|//|#|[（(])", normalized, maxsplit=1)[0]
         if normalized in {"下一步:gui任务", "下一步：gui任务", "next:gui"}:
             return MANAGER_NEXT_GUI
         if normalized in {"下一步:cli任务", "下一步：cli任务", "next:cli"}:

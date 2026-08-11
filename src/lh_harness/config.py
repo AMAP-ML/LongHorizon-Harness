@@ -4,6 +4,8 @@ import importlib
 from pathlib import Path
 from typing import Any
 
+from .types import MAX_ROUNDS
+
 try:
     tomllib = importlib.import_module("tomllib")
 except ModuleNotFoundError:
@@ -65,7 +67,7 @@ runs_root = "./.lh-harness/runs"
 # Agents work in the directory lh-harness was started from unless set here.
 # workspace = "./workspace"
 # harness_dir = "./.lh-harness/runs/<run-id>/harness"
-# log_dir = "./logs"
+# log_dir = "./lh_harness"
 
 # base_url = "https://api.example.com/v1"
 
@@ -75,15 +77,18 @@ prompt_language = "en"
 # codex_mcp_config = "/path/to/mcp.toml"
 mcp_add_dirs = []
 
-max_rounds = 30
+max_rounds = 25
 dashboard = true
+# Embedded dashboards use an OS-assigned port by default so concurrent runs
+# cannot accidentally share or race a fixed listener. Standalone `web` keeps
+# its explicit 8799 default for the operator-facing control plane.
 dashboard_port = 0
 
 [run.timeouts]
-manager = 600
+manager = 300
 gui_executor = 1800
 cli_executor = 1800
-auditor = 600
+auditor = 300
 
 [run.roles.manager]
 # agent = "codex"
@@ -237,6 +242,8 @@ def _choice(value: Any, name: str, choices: set[str]) -> str:
 def _positive_int(value: Any, name: str) -> int:
     if isinstance(value, bool) or not isinstance(value, int) or value < 1:
         raise ProjectConfigError(f"{name} must be an integer of at least 1")
+    if name.endswith("max_rounds") and value > MAX_ROUNDS:
+        raise ProjectConfigError(f"{name} must be at most {MAX_ROUNDS}")
     return value
 
 

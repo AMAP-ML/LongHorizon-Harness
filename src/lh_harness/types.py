@@ -25,11 +25,18 @@ def _launch_directory() -> str:
 DEFAULT_STATE_ROOT = str(Path.home() / ".lh-harness")
 DEFAULT_WORKSPACE_PATH = _launch_directory()
 DEFAULT_HARNESS_DIR = f"{DEFAULT_STATE_ROOT}/harness"
-DEFAULT_LOG_DIR = f"{DEFAULT_STATE_ROOT}/logs"
+DEFAULT_LOG_DIR = f"{DEFAULT_STATE_ROOT}/lh_harness"
 DEFAULT_TMP_DIR = f"{DEFAULT_STATE_ROOT}/tmp"
 
 DEFAULT_CLAUDE_MODEL = "claude-opus-5"
 DEFAULT_CODEX_MODEL = "gpt-5.6-sol"
+
+# A run is intentionally bounded at every ingress point.  Without a shared
+# ceiling, a malformed Web/CLI request can reserve an effectively unbounded
+# amount of work and disk/event pressure.  Keep this in the protocol-adjacent
+# types module so CLI, config, supervisor, and Web validation use one value.
+MAX_ROUNDS = 1000
+DEFAULT_MAX_ROUNDS = 25
 
 RoleNextStep = Literal["gui", "cli", "done", "blocked", "invalid", "ask"]
 PromptLanguage = Literal["en", "zh"]
@@ -90,6 +97,7 @@ class ManagedRound:
     task_state: str = ""
     task_contract: str = ""
     related_report_refs: list[str] = field(default_factory=list)
+    manager_status: dict[str, Any] = field(default_factory=dict)
     executor_status: dict[str, Any] = field(default_factory=dict)
     auditor_status: dict[str, Any] = field(default_factory=dict)
 
@@ -98,12 +106,12 @@ class ManagedRound:
 class HarnessConfig:
     max_total_episodes: int = 4
     manager_budget: EpisodeBudget = field(
-        default_factory=lambda: EpisodeBudget(max_duration_seconds=600)
+        default_factory=lambda: EpisodeBudget(max_duration_seconds=300)
     )
     gui_executor_budget: EpisodeBudget = field(default_factory=EpisodeBudget)
     cli_executor_budget: EpisodeBudget = field(default_factory=EpisodeBudget)
     auditor_budget: EpisodeBudget = field(
-        default_factory=lambda: EpisodeBudget(max_duration_seconds=600)
+        default_factory=lambda: EpisodeBudget(max_duration_seconds=300)
     )
     workspace_path: str = DEFAULT_WORKSPACE_PATH
     harness_dir: str = DEFAULT_HARNESS_DIR

@@ -2,15 +2,15 @@ from __future__ import annotations
 
 import re
 
-from .agent_logs import TURN_FAILED_SIGNAL, tool_output_view
+from .agent_logs import TURN_FAILED_SIGNAL, runtime_event_view, tool_output_view
 
-_CRASH_PATTERNS = (
+_HARD_RUNTIME_PATTERNS = (
     re.compile(r"AGENT_EXIT=([1-9]\d*)"),
     re.compile(re.escape(TURN_FAILED_SIGNAL)),
-    re.compile(r"Traceback \(most recent call last\)"),
     re.compile(r"Connection error\."),
     re.compile(r"response\.failed"),
 )
+_DIAGNOSTIC_TOOL_PATTERNS = (re.compile(r"Traceback \(most recent call last\)"),)
 
 # A Traceback can legitimately appear in tool output (an agent running a script
 # that raises), so only signals that mean the agent runtime itself died count as
@@ -20,12 +20,17 @@ _HARD_SIGNAL_VALUES = frozenset({"Connection error.", "response.failed"})
 
 
 def detect_runtime_signals(log: str) -> list[dict[str, str]]:
-    runtime_log = tool_output_view(log)
+    runtime_events = runtime_event_view(log)
+    tool_output = tool_output_view(log)
     signals: list[dict[str, str]] = []
-    for pattern in _CRASH_PATTERNS:
-        match = pattern.search(runtime_log)
+    for pattern in _HARD_RUNTIME_PATTERNS:
+        match = pattern.search(runtime_events)
         if match:
-            signals.append({"signal": match.group(0), "evidence": _near(runtime_log, match.start())})
+            signals.append({"signal": match.group(0), "evidence": _near(runtime_events, match.start())})
+    for pattern in _DIAGNOSTIC_TOOL_PATTERNS:
+        match = pattern.search(tool_output)
+        if match:
+            signals.append({"signal": match.group(0), "evidence": _near(tool_output, match.start())})
     return signals
 
 
