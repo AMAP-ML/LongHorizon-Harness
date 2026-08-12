@@ -317,6 +317,15 @@ Safe donors, permissive: LongHorizon-Harness, gptme, OpenCode, OpenHands
 (all MIT), playwright-mcp and the Agent Skills reference lib (Apache-2.0).
 Read-only, do not vendor: BUSL/BSL projects (Loki Mode, AgentsMesh).
 
+**Vendored, not just read:** `dashboard/static/morphdom.js`
+(`patrick-steele-idem/morphdom`, MIT) — the dashboard's DOM-diffing
+dependency, §PERF (2026-08-11). The "no build step" framing that used to
+describe `dashboard/static/` was never a same-origin/licensing rule, just a
+default; it doesn't rule out a small, permissively-licensed, dependency-free
+single-file library earning its keep the way hand-rolled reconciliation
+wasn't going to. Still no bundler: it's loaded by a plain `<script>` tag,
+same as `app.js` itself.
+
 **Avoid entirely as donors:** Claude Code is source-available, not open
 source — and several popular repos (Claw Code, claw-code-agent, Free Code)
 openly derive from a March 2026 Claude Code source leak. Whatever license
@@ -1085,9 +1094,17 @@ new dispatch pattern — structural exploration, scheduled pre-plan at T2+.**
   `max_concurrent_runs` instead of silently queueing a run the operator
   will think is running. Python 3.13 note: `Morsel.set(key, val, coded)`
   needs all three args — the two-arg call raised `TypeError` on attach.
-- `dashboard/static/` — dependency-free vanilla JS, no build step, SSE with a
-  2s poll fallback. **`render()` has no diffing** — every update tears down
-  and rebuilds `#app`. Consequence, and the live constraint: **every
+- `dashboard/static/` — vanilla JS, no bundler/compile step (`node --check`
+  is still the syntax gate, per §12), SSE with a 2s poll fallback. **§PERF
+  (2026-08-11) superseded the "render() has no diffing, every update tears
+  down and rebuilds #app" framing below** — every `patch*` function now
+  morphs in place via a vendored library rather than `replaceChildren`ing
+  a fresh subtree; see the dated §PERF entry at the end of this section for
+  the mechanism and why it was worth a real dependency instead of hand-
+  rolling reconciliation. The rest of this section (drafts living in
+  `state`, focus/scroll restore, the full history of UI passes below) still
+  describes real, load-bearing behavior — only the "no diffing" premise
+  changed. Consequence, and the live constraint: **every
   free-text field's value must live in `state`** (`promptText`, `newRun`,
   `interjectDrafts`/`reopenDrafts`/`approvalDrafts` keyed by id), with focus
   and selection restored on top for cursor continuity. A field whose value
@@ -1391,6 +1408,123 @@ new dispatch pattern — structural exploration, scheduled pre-plan at T2+.**
    prompt bar) — superseded by this pass; deviating scope cuts from the
    spec are itemized at the end of `DASHBOARD-UX.md` §13 rather than
    silently dropped.
+
+   **§PERF (2026-08-11): the dashboard was unusably slow — typing lagged
+   seconds behind keystrokes, buttons took seconds to visibly respond, and
+   starting a workspace-mode run took up to a minute — even on a run with
+   only one or two tree nodes, which ruled out per-node tree-size costs as
+   the cause. Root-caused to three independent bugs, all fixed, plus one
+   real architectural gap (client-side full-region rebuilds) closed with a
+   vendored library rather than hand-rolled reconciliation:**
+   - **`GET /api/node/<id>/thinking` re-parsed the entire trace.jsonl from
+     scratch on every call** (`rendering.parse_trace`, no caching at all),
+     and the client calls this route after *every* SSE snapshot push
+     (`_STREAM_INTERVAL` = 1.5s) for as long as an episode runs. Because
+     `_emit_assistant_content` re-diffs every historical save/patch on each
+     full reparse, a long-running single episode's trace got *slower to
+     parse* the longer it ran, and the CPU-bound reparse (Python's GIL) and
+     the client's own JSON.parse/stringify of the response competed with
+     the operator's own typing/clicks for the same threads. Fixed by an
+     offset-based incremental parser (`dashboard/state.py`'s
+     `_parse_trace_incremental`/`_TraceCacheEntry`, `rendering.py`'s
+     `parse_trace_lines`) — same "parse only the bytes appended since last
+     tick" pattern `pipeline/approvals.py`'s `_ApprovalScanner` already
+     used, keyed per resolved trace path with a truncation/rewrite safety
+     net. Verified against `rendering.parse_trace` byte-for-byte across
+     incremental appends, not just "doesn't crash."
+   - **`_tree_summary`'s `_artifact_count` (the old helper, since inlined)
+     bypassed `cached_read` entirely** — a fresh, uncached full read of
+     every node's artifact file (via `_has_content`) plus a fresh
+     `.versions/<node>/` directory `iterdir()`, per node, on every
+     `snapshot()` call (every SSE tick), on top of the *separate* cached
+     read `artifact_tokens` already did for the same file. Fixed: one
+     cached read backs both `artifact_tokens` and the `artifact_count`
+     content check, and the versions listing is cached the same way, keyed
+     on the versions directory's own stat stamp.
+   - **`start_run` measured a workspace synchronously in the HTTP request
+     thread** — `_options_from_body` called `v6.work_object.measure_
+     workspace` (reads and token-counts every included file in the target
+     repo) before `POST /api/runs` ever returned, so the operator's "start
+     run" click blocked on a full-repo read. Fixed: only the cheap
+     `is_dir()` validation happens synchronously now; the measurement
+     moves into the background host thread, right before driver
+     construction. Verified with a monkeypatched driver/host: `start_run`
+     now returns in under a millisecond regardless of workspace size, and
+     the background thread's measured `WorkObject` matches a direct
+     `measure_workspace` call exactly.
+   - **Client-side, `snapshotFingerprint`'s "unchanged snapshot → skip the
+     9-region rebuild" short-circuit was silently dead** — `elapsed` is
+     wall-clock seconds-since-first-event, recomputed fresh server-side on
+     every call, so it differs on essentially every poll of a running
+     attached run; excluded now (`elapsed`'s own display was already
+     independently driven by the boot-time clock ticker, so this only
+     changes change-*detection*, not what's shown).
+   - **Every `patch*` function `replaceChildren()`'d its whole region on
+     every tick**, discarding and rebuilding DOM (and, worse, discarding
+     and recreating `addEventListener`-attached click/input handlers) even
+     when most of a region's content hadn't changed. This one *is* the
+     "needs a diffing mechanism" gap the earlier framing in this section
+     described as a deliberate tradeoff — on reflection, given a poll every
+     1.5s for the life of a run, it wasn't one worth re-deriving by hand.
+     **Vendored `morphdom`** (MIT, `patrick-steele-idem/morphdom` — fits
+     the §15 permissive-donor policy; `/static/morphdom.js`, ~600 lines, no
+     transitive dependencies, no bundler needed, loaded by a second
+     `<script>` tag in `index.html` before `app.js`) instead of hand-
+     rolling a keyed-list reconciler blind: it's a single self-contained
+     file, and getting DOM reconciliation edge cases (reordering,
+     mismatched matches, detached-node references) right without a real
+     browser to test against is exactly the kind of thing a widely-used
+     library has already had wrung out of it. Two real correctness traps
+     this integration had to close, not just wire up:
+     - **`el()`'s `on*` handlers moved from `addEventListener` to property
+       assignment** (`node.onclick = fn`, not `node.addEventListener(
+       "click", fn)`), and the ~8 remaining raw `addEventListener("input"/
+       "keydown", ...)` call sites (command bar, filter inputs, pilot
+       editor, approval drafts, auth overlay) were converted the same way.
+       morphdom only diffs HTML *attributes* — it has no visibility into an
+       addEventListener-attached closure, so an element it decides to keep
+       (rather than replace) would otherwise keep whichever render's
+       closure happened to create it, forever. `MORPH_OPTS.onBeforeElUpdated`
+       copies the fixed set of `on*` properties this codebase actually uses
+       (`onclick`, `onchange`, `oncontextmenu`, `oninput`, `onkeydown`) from
+       the freshly-rendered node onto the kept one on every matched pair,
+       so a kept element always ends up bound to the *current* render's
+       closure. Verified (see below): a button kept across two morphs
+       fires the second render's closure, not the first's.
+     - **`renderTreeBranch` returns a *nested* array**, not a flat sibling
+       list, whenever a node has dot-hierarchical children (planner
+       recursion depth >1, or a `v7/split.py` grafted child) — `[row].
+       concat(kids.map(renderTreeBranch))` only flattens one level, so a
+       node with descendants produced `[row, [childRow, ...], ...]`. The
+       old `listHost.replaceChildren(...t2.map(renderTreeBranch))` would
+       have handed raw JS arrays to `replaceChildren` for any such node —
+       likely inert/stringified garbage rather than real rows, latent
+       because most runs have no dot-hierarchical nesting to trigger it.
+       `refreshList` now flattens (`.flat(Infinity)`) before reconciling;
+       fixed as a side effect of wiring `morphChildrenInto` in, not a
+       separate change. Verified against a real hierarchical tree (parent
+       + two dot-id children + a sibling) via jsdom: correct depth-first
+       row order, real Elements, no stringified-array text.
+     - `morphInto`/`morphChildrenInto` (DOM helpers, next to `el()`) wrap
+       `morphdom` for the two shapes every `patch*` function needs: one
+       persistent host with a single child root (`morphInto`, falls back
+       to a plain replace on first render or a root-tag change), and one
+       host whose children are itself the reconciled list (`morphChildrenInto`,
+       via morphdom's `childrenOnly` option against a throwaway wrapper).
+       Rows given `dataset.key` (task tree branches, keyed by tree-node id)
+       reconcile by key via `MORPH_OPTS.getNodeKey`; everything else falls
+       back to morphdom's default positional matching.
+   No real browser was available to test any of this end-to-end (per
+   top-of-file instructions, browser verification is the operator's own
+   step) — correctness was instead verified against a real DOM via a
+   throwaway `jsdom` sandbox (installed only in a scratch directory outside
+   the repo, never added as a project dependency): node-identity
+   preservation across an unchanged morph, focus/cursor/value survival on a
+   live-focused input across a re-render, the stale-closure fix (a kept
+   button fires the *new* render's handler), keyed reordering/add/remove on
+   a sibling list, and the tree-flattening fix, all asserted against actual
+   `Element`/`Node` behavior rather than reasoned about blind. The Python
+   suite (689 tests) and `node --check` both stay green throughout.
 
 ## v6 — the work object (v6/)
 

@@ -310,12 +310,14 @@ def _get_node_trace(handler: "DashboardRequestHandler", match: Any, body: dict) 
 
 @_route("GET", r"^/api/node/([^/]+)/thinking$")
 def _get_node_thinking(handler: "DashboardRequestHandler", match: Any, body: dict) -> tuple[int, Any]:
-    """The "Thinking" tab: ``trace.jsonl`` parsed into role-tagged entries
-    (``rendering.parse_trace``) — the same pure function the deleted TUI
-    used, just serialized to JSON here instead of a ``rich.Text``."""
-    raw = handler.state.trace(unquote(match.group(1))) or ""
-    entries = [{"role": e.role, "text": e.text} for e in rendering.parse_trace(raw)]
-    return 200, {"entries": entries}
+    """The "Thinking" tab: ``trace.jsonl`` parsed into role-tagged entries.
+    §PERF: goes through ``RunState.trace_entries``'s incremental parse
+    cache rather than ``rendering.parse_trace`` on the raw text — this
+    route is polled every ~1.5s (after every SSE snapshot push) for as
+    long as an episode runs, so re-parsing the whole trace from scratch on
+    every call got slower every tick as the trace grew."""
+    entries = handler.state.trace_entries(unquote(match.group(1))) or []
+    return 200, {"entries": [{"role": e.role, "text": e.text} for e in entries]}
 
 
 @_route("GET", r"^/api/node/([^/]+)/version/([^/]+)$")

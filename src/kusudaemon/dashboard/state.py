@@ -33,6 +33,7 @@ import os
 import threading
 import time
 import uuid
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable
 
@@ -70,6 +71,8 @@ from ..pipeline.run_dir import (
     tree_path,
 )
 from . import gptme_queue
+from . import rendering
+from .rendering import TraceEntry
 
 _DEFAULT_RUN_ID_PREFIX = "rec"
 
@@ -77,6 +80,16 @@ _DEFAULT_RUN_ID_PREFIX = "rec"
 # server watches many runs for days, and one entry per file per run must
 # not become one entry per hour of run activity.
 _CACHE_MAX_ENTRIES = 256
+
+
+@dataclass
+class _TraceCacheEntry:
+    """Incremental-parse state for one trace.jsonl file — see
+    ``RunState._parse_trace_incremental``."""
+
+    offset: int = 0
+    entries: list[TraceEntry] = field(default_factory=list)
+    file_state: dict[str, str] = field(default_factory=dict)
 
 
 def _now() -> float:
@@ -109,6 +122,16 @@ class RunState:
         # append-only invariant — see _cached_read. Bounded (§11.10.15) and
         # guarded by _cache_lock.
         self._file_cache: dict[str, tuple[Any, Any]] = {}
+        # §PERF: incremental trace-parse cache, keyed by resolved trace file
+        # path -> _TraceCacheEntry (bytes-consumed offset, accumulated
+        # TraceEntry list, accumulated file_state for cross-turn diffing).
+        # trace.jsonl is append-only (same invariant _cached_read documents
+        # for events.jsonl), so re-parsing only the bytes appended since the
+        # last call is safe and turns an O(total trace size) cost the
+        # dashboard was paying on *every* poll (every ~1.5s, for as long as
+        # an episode runs) into O(bytes appended since the last poll).
+        # Bounded and locked the same way as ``_file_cache``.
+        self._trace_cache: dict[str, "_TraceCacheEntry"] = {}
 
     def _cached_read(self, path: Path, loader: Callable[[], Any]) -> Any:
         """``loader()`` result cached until the file's (st_size, st_mtime_ns)
@@ -456,6 +479,7 @@ class RunState:
             return None, "invalid run_id"
         run_dir = self.runs_root / run_id if run_id else None
         resuming = run_dir is not None and run_spec_path(run_dir).exists()
+        workspace_root: Path | None = None
         if resuming:
             options = RunOptions.from_spec(_read_json(run_spec_path(run_dir)) or {})
         else:
@@ -466,17 +490,41 @@ class RunState:
                 run_id = f"{_DEFAULT_RUN_ID_PREFIX}{int(_now())}{uuid.uuid4().hex[:6]}"
             run_dir = self.runs_root / run_id
             try:
-                options = self._options_from_body(body, goal)
+                # §PERF: `measure_workspace_now=False` — measuring a real
+                # workspace reads and token-counts every included file
+                # (v6/work_object.py's `_iter_included_files`), which for a
+                # real repo can take tens of seconds. Doing that here, in
+                # the HTTP request thread, blocked the `POST /api/runs`
+                # response (and so the operator's "start run" click) on the
+                # full measurement. Only the cheap `is_dir()` validation
+                # happens synchronously now; the actual measurement moves
+                # into the background host thread below.
+                options, workspace_root = self._options_from_body(body, goal, measure_workspace_now=False)
             except (ValueError, OSError) as exc:
                 return None, str(exc)
         from ..v0.run_dir import create_run_dir
 
         create_run_dir(self.runs_root, run_id)
         if driver is None:
-            driver = self._default_driver(run_dir, options)
-        thread = threading.Thread(
-            target=_host_driver, args=(run_dir, driver), name=f"kusudaemon-dashboard-{run_id}", daemon=True
-        )
+            if workspace_root is not None:
+                def _build_and_host(run_dir=run_dir, options=options, workspace_root=workspace_root) -> None:
+                    from ..v6.work_object import measure_workspace
+
+                    options.work_object = measure_workspace(workspace_root)
+                    _host_driver(run_dir, self._default_driver(run_dir, options))
+
+                thread = threading.Thread(
+                    target=_build_and_host, name=f"kusudaemon-dashboard-{run_id}", daemon=True
+                )
+            else:
+                driver = self._default_driver(run_dir, options)
+                thread = threading.Thread(
+                    target=_host_driver, args=(run_dir, driver), name=f"kusudaemon-dashboard-{run_id}", daemon=True
+                )
+        else:
+            thread = threading.Thread(
+                target=_host_driver, args=(run_dir, driver), name=f"kusudaemon-dashboard-{run_id}", daemon=True
+            )
         with self._lock:
             self._hosts[run_id] = thread
             self._attached = run_id
@@ -484,28 +532,39 @@ class RunState:
         return run_id, ""
 
     @staticmethod
-    def _options_from_body(body: dict[str, Any], goal: str) -> RunOptions:
+    def _options_from_body(
+        body: dict[str, Any], goal: str, *, measure_workspace_now: bool = True
+    ) -> tuple[RunOptions, Path | None]:
         """§DASHBOARD-UX §11: the new-run form is now the full RunOptions
         surface — every option ``pipeline run`` accepts on the CLI, plus
         ``workspace`` (PLAN.md §A3 kind="workspace": a real directory the
         Writer edits directly) and ``tier_override`` (the §A4.4 floor, never
         a ceiling). A bad ``workspace`` path or a non-T0..T3
-        ``tier_override`` raises — the route surfaces the message."""
+        ``tier_override`` raises — the route surfaces the message.
+
+        Returns ``(options, workspace_root)``: ``workspace_root`` is the
+        validated (but, unless ``measure_workspace_now``, not yet measured)
+        workspace path, or ``None`` when no workspace was given — the
+        caller's signal for whether measurement still needs to happen."""
         from ..pipeline.run import _read_text_arg
-        from ..v6.work_object import measure_workspace
 
         work_object = None
+        workspace_root: Path | None = None
         workspace = str(body.get("workspace") or "").strip()
         if workspace:
             root = Path(workspace).expanduser().resolve()
             if not root.is_dir():
                 raise ValueError(f"workspace path is not a directory: {workspace}")
-            work_object = measure_workspace(root)
+            workspace_root = root
+            if measure_workspace_now:
+                from ..v6.work_object import measure_workspace
+
+                work_object = measure_workspace(root)
         tier_override = str(body.get("tier_override") or "").strip().upper() or None
         if tier_override not in (None, "T0", "T1", "T2", "T3"):
             raise ValueError(f"invalid tier_override: {tier_override!r} (want T0-T3 or blank)")
 
-        return RunOptions(
+        options = RunOptions(
             goal=_read_text_arg(goal),
             backend=str(body.get("backend") or _default_backend()),
             model=body.get("model") or None,
@@ -523,6 +582,7 @@ class RunState:
             tier_override=tier_override,
             auto_probe_plan=bool(body.get("auto_probe_plan", True)),
         )
+        return options, workspace_root
 
     def _default_driver(self, run_dir: Path, options: RunOptions) -> RecursiveDriver:
         from ..v1.provider import OpenAICompatibleProvider, RATE_LIMIT_BACKOFFS
@@ -863,35 +923,106 @@ class RunState:
         return _read_text(target)
 
     def trace(self, node_id: str) -> str | None:
+        path = self._resolve_trace_path(node_id)
+        return _read_text(path) if path is not None else None
+
+    def _resolve_trace_path(self, node_id: str) -> Path | None:
+        """Which trace.jsonl a given node id actually reads from — split out
+        of the old ``trace()`` so ``trace_entries()`` can key its
+        incremental parse cache on the same resolved path. For "main" (no
+        node-scoped trace of its own until a subagent actually runs), the
+        fallback chases the current phase's pseudo-trace, then a live
+        subagent's, then whichever ``traces/*.jsonl`` was written to most
+        recently — unchanged from the original ``trace()`` logic, just
+        returning a path instead of already-read text."""
         run_dir = self._attached_dir()
         if run_dir is None or not _safe_node_id(node_id):
             return None
-        text = _read_text(node_trace_path(run_dir, node_id))
+        own_path = node_trace_path(run_dir, node_id)
+        text = _read_text(own_path)
         if text and text.strip():
-            return text
+            return own_path
         if node_id in {"main", "root", "harness"}:
             snap = self.snapshot()
             current_phase = snap.get("phase")
             if current_phase:
-                phase_text = _read_text(node_trace_path(run_dir, current_phase))
+                phase_path = node_trace_path(run_dir, current_phase)
+                phase_text = _read_text(phase_path)
                 if phase_text and phase_text.strip():
-                    return phase_text
+                    return phase_path
             subagents = snap.get("subagents") or []
             for sub in subagents:
                 if sub.get("live"):
                     sub_id = sub.get("id")
                     if sub_id:
-                        sub_text = _read_text(node_trace_path(run_dir, sub_id))
+                        sub_path = node_trace_path(run_dir, sub_id)
+                        sub_text = _read_text(sub_path)
                         if sub_text and sub_text.strip():
-                            return sub_text
+                            return sub_path
             traces_dir = run_dir / "traces"
             if traces_dir.exists():
                 trace_files = sorted(traces_dir.glob("*.jsonl"), key=lambda p: p.stat().st_mtime, reverse=True)
                 for tf in trace_files:
                     txt = _read_text(tf)
                     if txt and txt.strip():
-                        return txt
-        return text
+                        return tf
+        return own_path
+
+    def trace_entries(self, node_id: str) -> list[TraceEntry] | None:
+        """The "Thinking" tab's data, via the incremental trace-parse cache
+        (§PERF): resolves the same path ``trace()`` would read, then parses
+        only the bytes appended since the last call instead of re-parsing
+        the whole file. Returns ``None`` exactly when ``trace()`` would —
+        no run attached, an unsafe node id — so callers can keep the same
+        404-vs-200-empty-list distinction."""
+        path = self._resolve_trace_path(node_id)
+        if path is None:
+            return None
+        return self._parse_trace_incremental(path)
+
+    def _parse_trace_incremental(self, path: Path) -> list[TraceEntry]:
+        key = str(path)
+        try:
+            size = path.stat().st_size
+        except OSError:
+            with self._cache_lock:
+                self._trace_cache.pop(key, None)
+            return []
+        with self._cache_lock:
+            cached = self._trace_cache.get(key)
+        # A smaller file than last time means it was truncated or rewritten
+        # in place (not append-only after all, or a fresh episode reusing a
+        # stale cache entry after eviction+recreation) -- reparse from
+        # scratch rather than trust a file_state/entries prefix that no
+        # longer corresponds to what's on disk.
+        if cached is None or size < cached.offset:
+            cached = _TraceCacheEntry()
+        if size > cached.offset:
+            with path.open("rb") as fh:
+                fh.seek(cached.offset)
+                chunk = fh.read()
+            if chunk.endswith(b"\n"):
+                consumed = cached.offset + len(chunk)
+                new_raw = chunk.decode("utf-8", errors="replace")
+            else:
+                nl = chunk.rfind(b"\n")
+                if nl == -1:
+                    # No complete line arrived yet this tick -- a torn
+                    # trailing line is re-read whole next tick, same rule
+                    # pipeline/approvals.py's _ApprovalScanner documents.
+                    consumed = cached.offset
+                    new_raw = ""
+                else:
+                    consumed = cached.offset + nl + 1
+                    new_raw = chunk[: nl + 1].decode("utf-8", errors="replace")
+            if new_raw:
+                rendering.parse_trace_lines(new_raw, cached.entries, cached.file_state)
+            cached.offset = consumed
+        with self._cache_lock:
+            if key not in self._trace_cache and len(self._trace_cache) >= _CACHE_MAX_ENTRIES:
+                del self._trace_cache[next(iter(self._trace_cache))]
+            self._trace_cache[key] = cached
+        return list(cached.entries)
 
     def spec_text(self) -> str:
         run_dir = self._attached_dir()
@@ -1150,10 +1281,22 @@ def _tree_summary(run_dir: Path, tree: TaskTree, *, cached_read: Callable[[Path,
         audit_file = run_dir / "audit" / f"{node.id}.json"
         gate_results = read(audit_file, lambda p=audit_file: _read_gate_cache_any(p))
         artifact_file = node_artifact_path(run_dir, node.id)
-        artifact_tokens = read(
-            artifact_file,
-            lambda p=artifact_file: estimate_tokens(_read_text(p) or ""),
-        )
+        # §PERF: both artifact_tokens and artifact_count used to each read
+        # this same file from disk independently, and artifact_count's read
+        # (via the old `_artifact_count` -> `_has_content` -> `_read_text`)
+        # bypassed `cached_read` entirely -- a full, uncached re-read of
+        # every node's artifact on every single snapshot() call (every SSE
+        # tick, ~every 1.5s). One cached read now backs both fields.
+        artifact_text = read(artifact_file, lambda p=artifact_file: _read_text(p) or "")
+        artifact_tokens = estimate_tokens(artifact_text)
+        # §PERF: the versions directory listing (`_list_versions`, an
+        # `iterdir()` + sort) was likewise uncached and done fresh per node
+        # per snapshot. Cached the same way, keyed on the directory's own
+        # (size, mtime_ns) stamp -- which changes when a version file is
+        # added, same invalidation contract `cached_read` already documents.
+        versions_directory = versions_dir(run_dir, node.id)
+        version_names = read(versions_directory, lambda p=run_dir, nid=node.id: _list_versions(p, nid))
+        artifact_count = (1 if artifact_text.strip() else 0) + len(version_names)
         rows.append(
             {
                 "id": node.id,
@@ -1166,21 +1309,12 @@ def _tree_summary(run_dir: Path, tree: TaskTree, *, cached_read: Callable[[Path,
                 "gate_results": gate_results,
                 "attempts": node.attempts,
                 "depends_on": node.depends_on,
-                "artifact_count": _artifact_count(run_dir, node.id),
+                "artifact_count": artifact_count,
                 "artifact_tokens": artifact_tokens,
                 "parent": node.parent,
             }
         )
     return rows
-
-
-def _artifact_count(run_dir: Path, node_id: str) -> int:
-    """How many artifact files this node has produced: the current
-    ``out/<node>.md`` (if non-empty) plus every pre-repair snapshot under
-    ``out/.versions/<node>/`` -- shown on each Task Tree row per the
-    dashboard's node-level artifact count."""
-    count = 1 if _has_content(node_artifact_path(run_dir, node_id)) else 0
-    count += len(_list_versions(run_dir, node_id))
     return count
 
 

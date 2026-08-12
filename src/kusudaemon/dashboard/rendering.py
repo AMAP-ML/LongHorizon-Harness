@@ -288,6 +288,21 @@ def _emit_assistant_content(entries: list[TraceEntry], content: str, file_state:
 def parse_trace(raw: str) -> list[TraceEntry]:
     entries: list[TraceEntry] = []
     file_state: dict[str, str] = {}
+    parse_trace_lines(raw, entries, file_state)
+    return entries
+
+
+def parse_trace_lines(raw: str, entries: list[TraceEntry], file_state: dict[str, str]) -> None:
+    """The body of ``parse_trace``, split out so a caller can resume parsing
+    a growing trace file against previously-accumulated ``entries``/
+    ``file_state`` instead of re-parsing the whole file from scratch on
+    every call — the whole-file cost is O(total trace size) and, because
+    ``_emit_assistant_content`` redoes every historical save/patch diff on
+    each full reparse, a long-running episode's trace gets *slower to
+    parse* the longer it runs. ``dashboard/state.py``'s incremental trace
+    cache is the only caller that passes non-empty starting state; every
+    other caller (including ``parse_trace`` itself) starts fresh, so
+    behavior there is unchanged."""
     for line in (raw or "").splitlines():
         line = line.strip()
         if not line:
@@ -328,7 +343,6 @@ def parse_trace(raw: str) -> list[TraceEntry]:
                 entries.append(TraceEntry(role_out, text))
             continue
         entries.append(TraceEntry("raw", json.dumps(record)))
-    return entries
 
 
 def role_style(role: str) -> str:

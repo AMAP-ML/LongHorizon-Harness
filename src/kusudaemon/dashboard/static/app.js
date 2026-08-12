@@ -198,8 +198,17 @@ function resumeRun() {
 }
 
 /* ------------------- live SSE stream / polling ------------------- */
+// §PERF: `elapsed` is wall-clock seconds-since-first-event, recomputed
+// fresh every snapshot() call server-side -- it is virtually never equal
+// across two polls of a running attached run, which silently defeated the
+// whole "unchanged snapshot -> skip the 9-region rebuild" short-circuit in
+// applySnapshot() below: every ~1.5s SSE tick looked "changed" even when
+// nothing an operator could see had moved. `elapsed`'s own live display is
+// already driven independently by the boot-time setInterval clock ticker
+// (search "rail-a40" in this file), so dropping it from the fingerprint
+// only affects change-detection, never what's shown.
 function snapshotFingerprint(snap) {
-  const { server_time, ...rest } = snap || {};
+  const { server_time, elapsed, ...rest } = snap || {};
   return JSON.stringify(rest);
 }
 
@@ -309,11 +318,19 @@ function startPolling() {
 }
 
 /* --------------------------- DOM helpers --------------------------- */
+// §PERF: `on*` handlers are assigned as DOM properties (`node.onclick = v`),
+// not attached via addEventListener. This is what lets morphdom (see
+// MORPH_OPTS below) safely keep a "morphed" element across renders: onclick
+// etc. are native IDL properties morphdom's onBeforeElUpdated hook can read
+// straight off the freshly-built node and copy onto the kept one. An
+// addEventListener-attached closure has no such visible hook — morphdom
+// would keep the *old* listener (and its stale closure) forever on any
+// element it decides to reuse rather than replace.
 function el(tag, attrs, children) {
   const node = document.createElement(tag);
   for (const [k, v] of Object.entries(attrs || {})) {
     if (k === "class") node.className = v;
-    else if (k.startsWith("on") && typeof v === "function") node.addEventListener(k.slice(2), v);
+    else if (k.startsWith("on") && typeof v === "function") node[k] = v;
     else if (v !== null && v !== undefined) node.setAttribute(k, v);
   }
   for (const child of [].concat(children || [])) {
@@ -321,6 +338,66 @@ function el(tag, attrs, children) {
     node.appendChild(typeof child === "string" || typeof child === "number" ? document.createTextNode(child) : child);
   }
   return node;
+}
+
+// §PERF: morphdom (vendored, MIT — /static/morphdom.js) reconciles a live
+// DOM subtree against a freshly-rendered one in place, instead of
+// destroying and rebuilding it (what every `patch*` function below used to
+// do via `replaceChildren`). This is what actually saves work on a poll
+// where most of a region's content is unchanged: unchanged elements keep
+// their identity (so focus, scroll position, and CSS transition state
+// survive a tick), and only the parts that actually differ get touched.
+//
+// `onBeforeElUpdated` is required, not optional decoration: whenever
+// morphdom decides two elements are "the same" and keeps the *old* one
+// (`fromEl`) rather than swapping in the freshly-built one (`toEl`), it
+// only diffs HTML attributes -- it has no idea `el()` above attached
+// `onclick`/`oninput`/etc. as DOM properties, so without this hook a kept
+// element would carry whichever render's closures happened to create it,
+// forever. Copying the fixed set of handler properties this codebase
+// actually uses (see the `on[a-z]+:` / addEventListener grep this was
+// built from) onto the kept node is what keeps clicks/typing bound to the
+// *current* render's state instead of a stale one.
+const _MORPH_HANDLER_PROPS = ["onclick", "onchange", "oncontextmenu", "oninput", "onkeydown"];
+const MORPH_OPTS = {
+  getNodeKey(node) {
+    return node.dataset && node.dataset.key !== undefined ? node.dataset.key : undefined;
+  },
+  onBeforeElUpdated(fromEl, toEl) {
+    for (const prop of _MORPH_HANDLER_PROPS) {
+      if (fromEl[prop] !== toEl[prop]) fromEl[prop] = toEl[prop];
+    }
+    return true;
+  },
+};
+
+// Morphs `host`'s single child in place to match `freshChild`. Falls back
+// to a plain replace on first render (nothing to morph against yet) or a
+// root tag change (morphdom morphs an element's *content*, not swapping
+// its own tag -- a differing root tag needs a real replace).
+function morphInto(host, freshChild) {
+  if (!host) return;
+  const current = host.firstElementChild;
+  if (!current || current.tagName !== freshChild.tagName) {
+    host.replaceChildren(freshChild);
+    return;
+  }
+  morphdom(current, freshChild, MORPH_OPTS);
+}
+
+// Reconciles `host`'s own children against `freshChildren` (siblings, not
+// wrapped in a root of their own) -- the shape `listHost.replaceChildren(
+// ...items)` used to rebuild from scratch every call. morphdom's
+// `childrenOnly` diffs just the child list of a throwaway wrapper against
+// `host`'s real children, without needing `host` itself to have a
+// matching counterpart.
+function morphChildrenInto(host, freshChildren) {
+  if (!host) return;
+  const wrapper = document.createElement(host.tagName);
+  for (const child of freshChildren) {
+    if (child != null) wrapper.appendChild(child);
+  }
+  morphdom(host, wrapper, Object.assign({ childrenOnly: true }, MORPH_OPTS));
 }
 
 function badge(status) {
@@ -531,7 +608,7 @@ function renderApprovalEntry(a, snap, isTakeover) {
           const inputEl = el("input", { type: "text", "data-key": `approval-q-${a.approval_id}-${q.id}`, placeholder: (q.default_assumption ? `accept default: ${q.default_assumption}` : "answer…"), style: "margin-top:4px;" });
           const draftKey = `${a.approval_id}::${q.id}`;
           inputEl.value = state.approvalAnswerDrafts[draftKey] || "";
-          inputEl.addEventListener("input", () => { state.approvalAnswerDrafts[draftKey] = inputEl.value; });
+          inputEl.oninput = () => { state.approvalAnswerDrafts[draftKey] = inputEl.value; };
           row.appendChild(inputEl);
           return row;
         }))
@@ -552,7 +629,7 @@ function renderApprovalEntry(a, snap, isTakeover) {
     if (a.allow_input) {
       const inputEl = el("input", { type: "text", "data-key": `approval-input-${a.approval_id}`, placeholder: a.input_label || "Provide response details or leave blank for default...", style: "margin-top:8px;" });
       inputEl.value = state.approvalDrafts[a.approval_id] || "";
-      inputEl.addEventListener("input", () => { state.approvalDrafts[a.approval_id] = inputEl.value; });
+      inputEl.oninput = () => { state.approvalDrafts[a.approval_id] = inputEl.value; };
       parts.push(inputEl);
       actionBtns.push(
         el("button", { class: "primary", disabled: state.busy ? "" : null, onclick: () => guarded(async () => {
@@ -850,7 +927,7 @@ function renderCommandBar() {
     host.replaceChildren(...(isCommand ? commandSuggestions() : []));
   };
   let sugTimer = null;
-  textEl.addEventListener("input", () => {
+  textEl.oninput = () => {
     state.promptText = textEl.value;
     const nowCmd = textEl.value.trim().startsWith(">");
     if (nowCmd && state.promptMode !== "command") state.promptMode = "command";
@@ -859,13 +936,13 @@ function renderCommandBar() {
     // cmdbar — typing stays live.
     if (sugTimer) clearTimeout(sugTimer);
     sugTimer = setTimeout(() => renderSuggestionsInto(suggestionsHost), 80);
-  });
-  textEl.addEventListener("keydown", (e) => {
+  };
+  textEl.onkeydown = (e) => {
     if (e.key === "Enter" && !e.shiftKey) {
       e.preventDefault();
       handlePromptSubmit(e);
     }
-  });
+  };
   renderSuggestionsInto(suggestionsHost);
 
   const subs = state.snapshot.subagents || [];
@@ -1441,7 +1518,7 @@ function renderPilotEditor() {
   }) }, "Approve as-is");
   const editor = el("textarea", { class: "pilot-editor", "data-key": `pilot-${draftKey}`, rows: "10" });
   editor.value = state.pilotDrafts[draftKey] || "";
-  editor.addEventListener("input", () => { state.pilotDrafts[draftKey] = editor.value; });
+  editor.oninput = () => { state.pilotDrafts[draftKey] = editor.value; };
   return el("div", null, [
     el("div", { class: "sub-hdr" }, "✏️ PILOT EDIT — frozen original (left) vs your edit (right)"),
     el("div", { class: "pilot-editor-panes" }, [
@@ -1549,10 +1626,14 @@ function renderTreeBranch(key, depth, visible) {
     artSpan,
     livePill,
   ]);
+  row.dataset.key = key; // §PERF: lets morphChildrenInto (see DOM helpers) match this row across renders by tree-node key rather than by DOM position
   const kids = entry.children.filter((c) => {
     if (state.treeFilter) return c.includes(state.treeFilter);
     return !state.treeCollapsed[key];
   });
+  // Note: this is a *nested* array when `key` has descendants (`[row,
+  // [childRow, ...grandchildren], ...]`), not a flat sibling list --
+  // refreshList() below flattens it before handing it to morphChildrenInto.
   return [row].concat(kids.map((c) => renderTreeBranch(c, depth + 1, visible)));
 }
 
@@ -1572,14 +1653,19 @@ function renderTaskTreeTab() {
   const refreshList = () => {
     const { tops: t2 } = buildNodeTreeIndex();
     const vis = [];
-    listHost.replaceChildren(...t2.map((t) => renderTreeBranch(t, 0, vis)));
+    // §PERF: renderTreeBranch nests a node's return value with its own
+    // children rather than returning flat siblings (see its own comment) --
+    // flatten before reconciling, then keyed-diff in place instead of
+    // tearing the whole list down on every filter keystroke / snapshot tick.
+    const rows = t2.map((t) => renderTreeBranch(t, 0, vis)).flat(Infinity);
+    morphChildrenInto(listHost, rows);
   };
   let filterTimer = null;
-  filterInput.addEventListener("input", () => {
+  filterInput.oninput = () => {
     state.treeFilter = filterInput.value;
     if (filterTimer) clearTimeout(filterTimer);
     filterTimer = setTimeout(refreshList, 60);  // §Responsive: typing filters the list in place; the input keeps focus
-  });
+  };
   refreshList();
   return el("div", { class: "tree-tab" }, [
     el("div", { class: "tree-hdr" }, [
@@ -1717,7 +1803,7 @@ function renderNewRunModal() {
   const input = (key, type, ph) => {
     const el2 = el("input", { type: type || "text", placeholder: ph });
     el2.value = state.newRun[key] || "";
-    el2.addEventListener("input", () => set(key, el2.value));
+    el2.oninput = () => set(key, el2.value);
     return el2;
   };
   const form = el("div", { class: "form-grid" }, [
@@ -1782,8 +1868,8 @@ function renderAuthOverlay() {
   if (!state.authRequired) return null;
   const input = el("input", { type: "password", "data-key": "authDraft", placeholder: "dashboard auth token", style: "width:100%;" });
   input.value = state.authDraft || "";
-  input.addEventListener("input", () => { state.authDraft = input.value; });
-  input.addEventListener("keydown", (e) => { if (e.key === "Enter") { e.preventDefault(); submitAuth(); } });
+  input.oninput = () => { state.authDraft = input.value; };
+  input.onkeydown = (e) => { if (e.key === "Enter") { e.preventDefault(); submitAuth(); } };
   return el("div", { class: "overlay auth-overlay" }, [
     el("div", { class: "panel auth-panel" }, [
       el("div", { class: "panel-hdr" }, "🔐 Dashboard auth required"),
@@ -1851,38 +1937,38 @@ function buildChrome() {
 }
 
 // Region patchers — each rebuilds only its own container's subtree.
-function patchRail() { if (els.cmrail) els.cmrail.replaceChildren(renderRail()); }
-function patchHeader() { if (els.header) els.header.replaceChildren(renderHeaderRow()); }
-function patchNav() { if (els.nav) els.nav.replaceChildren(renderNav()); }
-function patchCenter() { if (els.center) els.center.replaceChildren(renderCenterStream()); }
-function patchInspector() { if (els.inspector) els.inspector.replaceChildren(renderRightWorkbench()); }
-function patchCmdbar() { if (els.cmdbar) els.cmdbar.replaceChildren(renderCommandBar()); }
+function patchRail() { if (els.cmrail) morphInto(els.cmrail, renderRail()); }
+function patchHeader() { if (els.header) morphInto(els.header, renderHeaderRow()); }
+function patchNav() { if (els.nav) morphInto(els.nav, renderNav()); }
+function patchCenter() { if (els.center) morphInto(els.center, renderCenterStream()); }
+function patchInspector() { if (els.inspector) morphInto(els.inspector, renderRightWorkbench()); }
+function patchCmdbar() { if (els.cmdbar) morphInto(els.cmdbar, renderCommandBar()); }
 function patchJobs() {
   if (!els.jobs) return;
   const running = (state.snapshot.jobs || []).filter((j) => j.status === "running" || j.status === "queued");
-  if (!running.length) { els.jobs.replaceChildren(); return; }
-  els.jobs.replaceChildren(el("div", { class: "jobs-strip" }, running.map((j) =>
+  if (!running.length) { morphChildrenInto(els.jobs, []); return; }
+  morphChildrenInto(els.jobs, [el("div", { class: "jobs-strip" }, running.map((j) =>
     el("div", { class: "job-chip" }, [
       el("span", null, `${j.kind || "job"} ${j.job_id || ""}`),
       el("button", { class: "btn-tiny", disabled: !state.snapshot.control_enabled ? "" : null, onclick: () => guarded(() => apiPost(`/api/jobs/${encodeURIComponent(j.job_id || "")}/cancel`, {}).then(() => showToast("job cancel requested"))) }, "✕"),
     ])
-  )));
+  ))]);
 }
 function patchOverlays() {
   if (!els.overlays) return;
-  els.overlays.replaceChildren(
+  morphChildrenInto(els.overlays, [
     renderContextMenu(),
     renderRunSwitcher(),
     renderNewRunModal(),
     renderAuthOverlay(),
     renderHelpModal(),
-  );
+  ]);
 }
 function patchToast() {
   if (!els.toast) return;
-  els.toast.replaceChildren(
+  morphChildrenInto(els.toast, [
     state.toast ? el("div", { class: "toast" + (state.toast.isError ? " err" : ""), onclick: () => { state.toast = null; patchToast(); } }, state.toast.message) : null
-  );
+  ]);
 }
 
 // Coalesce a burst of region patches into one rAF flush. Multiple
