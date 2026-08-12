@@ -249,6 +249,39 @@ body::before {
   gap: 10px;
 }
 
+.hdr-live-agent-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  background: rgba(168, 85, 247, 0.18);
+  color: #c084fc;
+  border: 1px solid rgba(168, 85, 247, 0.4);
+  padding: 3px 10px;
+  border-radius: 12px;
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 0.5px;
+  cursor: pointer;
+  box-shadow: 0 0 12px rgba(168, 85, 247, 0.35);
+  transition: all 0.2s ease;
+}
+
+.hdr-live-agent-badge:hover {
+  background: rgba(168, 85, 247, 0.28);
+  border-color: rgba(168, 85, 247, 0.6);
+}
+
+.hdr-live-agent-badge .pulse-dot {
+  color: #a855f7;
+  font-size: 12px;
+  animation: pulse-glow 1.2s infinite alternate;
+}
+
+@keyframes pulse-glow {
+  0% { opacity: 0.4; transform: scale(0.9); }
+  100% { opacity: 1; transform: scale(1.3); }
+}
+
 /* ==========================================================================
    Badges & Buttons (Doppelrand & Micro Physics)
    ========================================================================== */

@@ -864,10 +864,19 @@ function renderHeaderRow() {
     title: esc.map((e) => `${e.from} → ${e.to} · ${e.trigger}${e.node_id ? " · " + e.node_id : ""}`).join("\n"),
   }, `⇡${esc.length}`) : null;
   const tierChip = tier ? el("span", { class: "hdr-tier-badge", title: `measured ${snap.measured_tier}${snap.tier_override ? ` · --tier ${snap.tier_override}` : ""}` }, tier) : null;
+  const liveSub = (snap.subagents || []).find((s) => s.live);
+  const liveSubBadge = liveSub ? el("span", {
+    class: "hdr-live-agent-badge",
+    title: `Subagent ${liveSub.id} is running — click to view live thinking stream`,
+    onclick: () => openNode(liveSub.id, "chat"),
+  }, [
+    el("span", { class: "pulse-dot" }, "●"),
+    ` AGENT THINKING LIVE (${liveSub.id})`,
+  ]) : null;
   return el("div", { class: "hdr-run" }, [
     el("div", { class: "hdr-run-id" }, [
       el("span", { class: "runId", style: "cursor:pointer;", title: "switch run", onclick: () => { state.runSwitcherOpen = true; render(); } }, snap.run_id),
-      tierChip, escChip,
+      tierChip, escChip, liveSubBadge,
       snap.halted ? el("span", { class: "hdr-tier-badge hdr-halt-badge" }, "⏸ halted") : null,
     ]),
     el("div", { class: "hdr-goal", title: snap.goal }, snap.goal || "—"),

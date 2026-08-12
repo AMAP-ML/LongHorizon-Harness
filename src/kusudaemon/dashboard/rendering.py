@@ -327,7 +327,11 @@ def parse_trace_lines(raw: str, entries: list[TraceEntry], file_state: dict[str,
         if rtype in ("thinking", "thought", "reasoning"):
             content = record.get("content") or record.get("text") or record.get("thinking") or record.get("reasoning")
             if content:
-                entries.append(TraceEntry("thinking", content if isinstance(content, str) else json.dumps(content)))
+                str_content = content if isinstance(content, str) else json.dumps(content)
+                if entries and entries[-1].role == "thinking":
+                    entries[-1] = TraceEntry("thinking", entries[-1].text + str_content)
+                else:
+                    entries.append(TraceEntry("thinking", str_content))
             continue
         if rtype == "message":
             role = str(record.get("role") or "raw")

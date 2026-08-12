@@ -146,6 +146,38 @@ def assemble(
     output_path = assembly_output_path(run_dir, filename)
     output_path.write_text(output_text, encoding="utf-8")
 
+    export_workspace_artifacts(run_dir)
+
     return AssemblyOutput(
         index_path=index_path, output_path=output_path, index=entries, text=output_text
     )
+
+
+def export_workspace_artifacts(run_dir: str | Path) -> list[Path]:
+    """Extract code blocks/files from node artifacts into the workspace directory."""
+    import re
+    run_dir = Path(run_dir)
+    workspace_root = run_dir.parent.parent if (run_dir.parent.name == "runs" and run_dir.parent.parent.name == ".kusudaemon") else Path.cwd()
+    if workspace_root.name == ".kusudaemon":
+        workspace_root = workspace_root.parent
+
+    exported: list[Path] = []
+    out_dir = run_dir / "out"
+    if not out_dir.is_dir():
+        return exported
+
+    header_re = re.compile(
+        r"(?:^|\n)#+\s*[`'\"]?([\w\.\-\/]+\.[a-zA-Z0-9]+)[`'\"]?\s*\n+```[^\n]*\n(.*?)```",
+        re.DOTALL,
+    )
+    for art_path in sorted(out_dir.glob("*.md")):
+        content = art_path.read_text(encoding="utf-8", errors="replace")
+        for match in header_re.finditer(content):
+            fn, code = match.group(1).strip(), match.group(2)
+            fname = Path(fn).name
+            if fname and "." in fname and not fname.startswith("."):
+                dest = workspace_root / fname
+                dest.write_text(code if code.endswith("\n") else code + "\n", encoding="utf-8")
+                exported.append(dest)
+    return exported
+
