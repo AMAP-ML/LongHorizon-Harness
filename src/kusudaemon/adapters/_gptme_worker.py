@@ -105,6 +105,47 @@ def main() -> int:
                     return _safe_exec
 
                 tool.execute = _make_safe(orig_exec)
+        import gptme.llm
+        orig_stream = gptme.llm._stream
+
+        def _thinking_stream_wrapper(*a, **kw):
+            stream_obj = orig_stream(*a, **kw)
+            orig_gen = stream_obj.gen
+
+            def _gen_wrapper():
+                in_think = False
+                for chunk in orig_gen:
+                    if not chunk:
+                        yield chunk
+                        continue
+                    if "<think>" in chunk or "<thinking>" in chunk:
+                        in_think = True
+                        tag = "<think>" if "<think>" in chunk else "<thinking>"
+                        parts = chunk.split(tag, 1)
+                        if len(parts) > 1 and parts[1]:
+                            if "</think>" in parts[1] or "</thinking>" in parts[1]:
+                                end_tag = "</think>" if "</think>" in parts[1] else "</thinking>"
+                                t_text = parts[1].split(end_tag, 1)[0]
+                                if t_text:
+                                    print(json.dumps({"type": "thinking", "content": t_text}), flush=True)
+                                in_think = False
+                            else:
+                                print(json.dumps({"type": "thinking", "content": parts[1]}), flush=True)
+                    elif "</think>" in chunk or "</thinking>" in chunk:
+                        end_tag = "</think>" if "</think>" in chunk else "</thinking>"
+                        parts = chunk.split(end_tag, 1)
+                        if parts[0]:
+                            print(json.dumps({"type": "thinking", "content": parts[0]}), flush=True)
+                        in_think = False
+                    elif in_think:
+                        print(json.dumps({"type": "thinking", "content": chunk}), flush=True)
+                    yield chunk
+
+            stream_obj.gen = _gen_wrapper()
+            return stream_obj
+
+        gptme.llm._stream = _thinking_stream_wrapper
+
         initial_msgs = gptme.get_prompt(
             tools=tools,
             tool_format=args.tool_format,
@@ -118,7 +159,7 @@ def main() -> int:
             logdir=logdir,
             workspace=workspace,
             model=args.model,
-            stream=False,
+            stream=True,
             no_confirm=True,
             interactive=False,
             tool_allowlist=allowlist,

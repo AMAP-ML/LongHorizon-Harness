@@ -232,8 +232,10 @@ def _emit_assistant_content(entries: list[TraceEntry], content: str, file_state:
     diffs against the prior turn's content rather than showing the whole
     file as newly added every time."""
     content, thoughts = _extract_thinking(content)
-    for thought in thoughts:
-        entries.append(TraceEntry("thinking", thought))
+    has_live_thinking = any(e.role == "thinking" for e in entries[-50:])
+    if not has_live_thinking:
+        for thought in thoughts:
+            entries.append(TraceEntry("thinking", thought))
 
     pos = 0
     for match in _CODEBLOCK_RE.finditer(content):

@@ -455,6 +455,39 @@ class ConfigFilePathTest(_EnvIsolatedTest):
             os.chdir(old)
         self.assertEqual(settings.model, "deepseek-v4-flash-free")
 
+    def test_multiple_models_per_provider(self) -> None:
+        from kusudaemon.provider_config import list_available_models
+        config = {
+            "default": "nvidia",
+            "providers": {
+                "opencode": {
+                    "base_url": "https://opencode.ai/zen/v1",
+                    "model": "opencode/deepseek-v4-flash-free",
+                    "models": ["opencode/deepseek-v4-flash-free", "opencode/llama-3.3-70b-instruct"],
+                    "api_key_env": "OPENAI_API_KEY",
+                },
+                "nvidia": {
+                    "base_url": "https://integrate.api.nvidia.com/v1",
+                    "models": ["deepseek-ai/deepseek-v4-flash-0731", "meta/llama-3.3-70b-instruct"],
+                    "api_key_env": "NVIDIA_API_KEY",
+                },
+            },
+        }
+        self._write_config(config)
+        old = Path.cwd()
+        try:
+            os.chdir(self._tmp.name)
+            models = list_available_models()
+            self.assertIn("opencode/llama-3.3-70b-instruct", models)
+            self.assertIn("meta/llama-3.3-70b-instruct", models)
+
+            # Resolving with a model matching non-default provider matches provider
+            settings = resolve(model="opencode/llama-3.3-70b-instruct")
+            self.assertEqual(settings.base_url, "https://opencode.ai/zen/v1")
+            self.assertEqual(settings.model, "opencode/llama-3.3-70b-instruct")
+        finally:
+            os.chdir(old)
+
 
 if __name__ == "__main__":
     unittest.main()

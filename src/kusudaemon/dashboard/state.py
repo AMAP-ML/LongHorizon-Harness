@@ -78,6 +78,22 @@ from .rendering import TraceEntry
 
 _DEFAULT_RUN_ID_PREFIX = "rec"
 
+
+def _available_models_and_default() -> tuple[list[str], str]:
+    try:
+        from ..provider_config import list_available_models, resolve
+        models = list_available_models()
+        default_m = ""
+        try:
+            default_m = resolve().model
+        except Exception:
+            if models:
+                default_m = models[0]
+        return models, default_m
+    except Exception:
+        return [], ""
+
+
 # §11.10.15: the process-lifetime file cache is bounded — a dashboard
 # server watches many runs for days, and one entry per file per run must
 # not become one entry per hour of run activity.
@@ -278,11 +294,14 @@ class RunState:
     # Snapshots (always read fresh; the disk is authoritative)
     # ------------------------------------------------------------------
     def snapshot(self) -> dict[str, Any]:
+        models, default_model = _available_models_and_default()
         run_dir = self._attached_dir()
         if run_dir is None:
             return {
                 "attached": False,
                 "runs": self.list_runs(),
+                "models": models,
+                "default_model": default_model,
                 "server_time": _now(),
             }
         spec = _read_json(run_spec_path(run_dir)) or {}
@@ -338,6 +357,8 @@ class RunState:
             "has_spec": _has_content(spec_path(run_dir)),
             "has_contract": contract_path(run_dir).exists(),
             "has_assembly": assembly_output_path(run_dir).exists(),
+            "models": models,
+            "default_model": default_model,
             "server_time": _now(),
         }
 

@@ -187,12 +187,24 @@ def read_config_file(path: Path | None = None) -> dict[str, object]:
     return {"default": DEFAULT_PROVIDER, "providers": {DEFAULT_PROVIDER: _normalize_entry(data, target)}}
 
 
-def _normalize_entry(entry: object, target: Path) -> dict[str, str]:
+def _normalize_entry(entry: object, target: Path) -> dict[str, object]:
     if not isinstance(entry, dict):
         raise ProviderConfigError(f"provider config {target}: each provider must be an object")
+    raw_models = entry.get("models")
+    models_list: list[str] = []
+    if isinstance(raw_models, (list, tuple)):
+        models_list = [str(m).strip() for m in raw_models if str(m).strip()]
+    elif isinstance(raw_models, str) and raw_models.strip():
+        models_list = [raw_models.strip()]
+
+    primary_model = str(entry.get("model") or "").strip()
+    if primary_model and primary_model not in models_list:
+        models_list.insert(0, primary_model)
+
     return {
         "base_url": str(entry.get("base_url") or ""),
-        "model": str(entry.get("model") or ""),
+        "model": primary_model or (models_list[0] if models_list else ""),
+        "models": models_list,
         "api_key_env": str(entry.get("api_key_env") or entry.get("api_key") or DEFAULT_API_KEY_ENV),
     }
 
@@ -336,13 +348,18 @@ def resolve(*, provider: str = "", api_key: str = "", base_url: str = "", model:
     acceptable.
     """
     file_data = read_config_file()
-    providers: dict[str, dict[str, str]] = file_data.get("providers") or {}  # type: ignore[assignment]
-    name = (
-        provider
-        or os.getenv("KUSUDAEMON_PROVIDER")
-        or str(file_data.get("default") or "")
-        or DEFAULT_PROVIDER
-    )
+    providers: dict[str, dict[str, object]] = file_data.get("providers") or {}  # type: ignore[assignment]
+    name = provider or os.getenv("KUSUDAEMON_PROVIDER")
+    if not name and model:
+        for p_name, p_entry in providers.items():
+            if isinstance(p_entry, dict):
+                p_m = str(p_entry.get("model") or "")
+                p_ms = p_entry.get("models") or []
+                if model == p_m or (isinstance(p_ms, (list, tuple)) and model in p_ms):
+                    name = p_name
+                    break
+    if not name:
+        name = str(file_data.get("default") or "") or DEFAULT_PROVIDER
     if not providers:
         # No config file at all: the built-in opencode default applies only
         # as the last-resort fallback, so generic OPENAI_* env vars still
@@ -413,3 +430,29 @@ def require(settings: ProviderSettings) -> ProviderSettings:
         f"  Add it to the .env file (e.g. OPENAI_API_KEY=...) or set "
         "OPENAI_API_KEY / KUSUDAEMON_PROVIDER_API_KEY in the environment."
     )
+
+
+def list_available_models() -> list[str]:
+    """Collect all model names across all defined providers in provider config."""
+    models: list[str] = []
+    file_data = read_config_file()
+    providers: dict[str, dict[str, object]] = file_data.get("providers") or {}  # type: ignore[assignment]
+    for p_info in providers.values():
+        if isinstance(p_info, dict):
+            m = str(p_info.get("model") or "").strip()
+            if m and m not in models:
+                models.append(m)
+            ms = p_info.get("models")
+            if isinstance(ms, (list, tuple)):
+                for item in ms:
+                    item_str = str(item).strip()
+                    if item_str and item_str not in models:
+                        models.append(item_str)
+    try:
+        res = resolve()
+        if res.model and res.model not in models:
+            models.insert(0, res.model)
+    except Exception:
+        if DEFAULT_MODEL not in models:
+            models.append(DEFAULT_MODEL)
+    return models

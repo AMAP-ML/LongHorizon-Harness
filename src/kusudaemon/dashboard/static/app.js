@@ -447,6 +447,10 @@ const MORPH_OPTS = {
 // its own tag -- a differing root tag needs a real replace).
 function morphInto(host, freshChild) {
   if (!host) return;
+  if (!freshChild) {
+    host.replaceChildren();
+    return;
+  }
   const current = host.firstElementChild;
   if (!current || current.tagName !== freshChild.tagName) {
     host.replaceChildren(freshChild);
@@ -692,7 +696,7 @@ function renderApprovalEntry(a, snap) {
           const inputEl = el("input", { type: "text", id: `approval-q-${a.approval_id}-${q.id}`, name: `q-${q.id}`, "data-key": `approval-q-${a.approval_id}-${q.id}`, placeholder: (q.default_assumption ? `accept default: ${q.default_assumption}` : "answer…"), style: "margin-top:4px;" });
           const draftKey = `${a.approval_id}::${q.id}`;
           inputEl.value = state.approvalAnswerDrafts[draftKey] || "";
-          inputEl.oninput = () => { state.approvalAnswerDrafts[draftKey] = inputEl.value; };
+          inputEl.oninput = (e) => { state.approvalAnswerDrafts[draftKey] = e.target.value; };
           row.appendChild(inputEl);
           return row;
         }))
@@ -713,7 +717,7 @@ function renderApprovalEntry(a, snap) {
     if (a.allow_input) {
       const inputEl = el("input", { type: "text", name: `approval-input-${a.approval_id}`, "aria-label": a.input_label || "response details (or leave blank for default)", "data-key": `approval-input-${a.approval_id}`, placeholder: a.input_label || "Provide response details or leave blank for default...", style: "margin-top:8px;" });
       inputEl.value = state.approvalDrafts[a.approval_id] || "";
-      inputEl.oninput = () => { state.approvalDrafts[a.approval_id] = inputEl.value; };
+      inputEl.oninput = (e) => { state.approvalDrafts[a.approval_id] = e.target.value; };
       parts.push(inputEl);
       actionBtns.push(
         el("button", { class: "primary", disabled: state.busy ? "" : null, onclick: () => guarded(async () => {
@@ -1036,8 +1040,9 @@ function renderCenterStream() {
   // §scroll: the feed pins to the newest entry until the operator scrolls
   // up; morphing preserves the element (and scrollTop) across ticks, so the
   // pin only re-applies while the operator is at the bottom.
-  feed.onscroll = () => {
-    state.chatFeedPinned = feed.scrollHeight - feed.scrollTop - feed.clientHeight < 60;
+  feed.onscroll = (e) => {
+    const f = e.currentTarget;
+    state.chatFeedPinned = f.scrollHeight - f.scrollTop - f.clientHeight < 60;
   };
 
   return el("main", { class: "chat-stream-panel" }, [
@@ -1078,18 +1083,34 @@ function renderCommandBar() {
   textEl.value = state.promptText;
   const suggestionsHost = el("div", { class: "cmd-suggestions" });
   const renderSuggestionsInto = (host) => {
-    host.replaceChildren(...(isCommand ? commandSuggestions() : []));
+    // Read live state, not the render-time `isCommand` — this closure may
+    // run (via the debounce below) after the mode flipped mid-typing.
+    host.replaceChildren(...(state.promptText.trim().startsWith(">") ? commandSuggestions() : []));
   };
   let sugTimer = null;
-  textEl.oninput = () => {
-    state.promptText = textEl.value;
-    const nowCmd = textEl.value.trim().startsWith(">");
+  // §PERF/stale-closure: the handler reads `e.target.value`, never the
+  // captured `textEl` — morphdom KEEPS the in-DOM textarea across renders
+  // and copies this handler onto it (MORPH_OPTS.onBeforeElUpdated), so a
+  // closure reading the captured element would read the *detached fresh
+  // twin*'s value (always empty/stale), silently wiping state.promptText
+  // on every keystroke and making Enter a no-op ("typing does nothing").
+  // Same rule for the debounced suggestions refresh: resolve the *live*
+  // suggestions host out of the event's currentTarget instead of the
+  // captured (detached-twin) `suggestionsHost`.
+  textEl.oninput = (e) => {
+    const v = e.target.value;
+    state.promptText = v;
+    const nowCmd = v.trim().startsWith(">");
     if (nowCmd && state.promptMode !== "command") state.promptMode = "command";
     else if (!nowCmd && state.promptMode === "command") state.promptMode = "msg_agent";
     // §Responsive: refresh only the suggestions list, debounced, never the
     // cmdbar — typing stays live.
     if (sugTimer) clearTimeout(sugTimer);
-    sugTimer = setTimeout(() => renderSuggestionsInto(suggestionsHost), 80);
+    sugTimer = setTimeout(() => {
+      const host = e.currentTarget && e.currentTarget.closest(".cmdbar");
+      const list = host && host.querySelector(".cmd-suggestions");
+      if (list) renderSuggestionsInto(list);
+    }, 80);
   };
   textEl.onkeydown = (e) => {
     if (e.key === "Enter" && !e.shiftKey) {
@@ -1746,7 +1767,7 @@ function renderPilotEditor() {
   }) }, "Approve as-is");
   const editor = el("textarea", { class: "pilot-editor", "data-key": `pilot-${draftKey}`, name: `pilot-edit-${draftKey}`, "aria-label": "edited pilot artifact — the frozen original is shown for comparison", rows: "10" });
   editor.value = state.pilotDrafts[draftKey] || "";
-  editor.oninput = () => { state.pilotDrafts[draftKey] = editor.value; };
+  editor.oninput = (e) => { state.pilotDrafts[draftKey] = e.target.value; };
   return el("div", null, [
     el("div", { class: "sub-hdr" }, "✏️ PILOT EDIT — frozen original (left) vs your edit (right)"),
     el("div", { class: "pilot-editor-panes" }, [
@@ -1875,8 +1896,8 @@ function renderTaskTreeTab() {
     morphChildrenInto(listHost, rows);
   };
   let filterTimer = null;
-  filterInput.oninput = () => {
-    state.treeFilter = filterInput.value;
+  filterInput.oninput = (e) => {
+    state.treeFilter = e.target.value;
     if (filterTimer) clearTimeout(filterTimer);
     filterTimer = setTimeout(refreshList, 60);  // §Responsive: typing filters the list in place; the input keeps focus
   };
@@ -2023,21 +2044,34 @@ function renderNewRunModal() {
   const input = (key, type, ph) => {
     const el2 = el("input", { type: type || "text", placeholder: ph });
     el2.value = state.newRun[key] || "";
-    el2.oninput = () => set(key, el2.value);
+    el2.oninput = (e) => set(key, e.target.value);
     return el2;
   };
   const area = (key, rows, ph) => {
     const el2 = el("textarea", { rows: String(rows || 6), placeholder: ph });
     el2.value = state.newRun[key] || "";
-    el2.oninput = () => set(key, el2.value);
+    el2.oninput = (e) => set(key, e.target.value);
     return el2;
   };
+  const snapModels = (state.snapshot && state.snapshot.models && state.snapshot.models.length) ? state.snapshot.models : [];
+  const defaultModel = (state.snapshot && state.snapshot.default_model) || snapModels[0] || "";
+  const modelOptions = snapModels.slice();
+  if (state.newRun.model && !modelOptions.includes(state.newRun.model)) {
+    modelOptions.unshift(state.newRun.model);
+  }
+  const selectedModel = state.newRun.model || defaultModel;
+  if (!state.newRun.model && defaultModel) {
+    state.newRun.model = defaultModel;
+  }
+
   const form = el("div", { class: "form-grid" }, [
     f("goal", "Goal", area("goal", 6, "one or more sentences — the more specific the better (audience, what counts, what to exclude)")),
     f("run_id", "Run id", input("runId", "text", "e.g. monads-01")),
     f("source", "source.txt path or @path", input("source", "text", "@/path/to/corpus.txt or leave empty (workspace)")),
     f("workspace", "workspace root (optional, overrides source)", input("workspace", "text", "@/path/to/repo")),
-    f("model", "model", input("model", "text", "provider model id")),
+    f("model", "model",
+      el("select", { onchange: (e) => set("model", e.target.value) },
+        modelOptions.map((v) => el("option", { value: v, selected: selectedModel === v ? "selected" : null }, v)))),
     f("compile", "compile command", input("compile", "text", "e.g. python3 -m unittest")),
     f("tier", "tier floor (0-3)", input("tier", "text", "")),
     f("dispatch", "dispatch policy",
@@ -2101,7 +2135,7 @@ function renderAuthOverlay() {
   if (!state.authRequired) return null;
   const input = el("input", { type: "password", name: "auth-token", "aria-label": "dashboard auth token", "data-key": "authDraft", placeholder: "dashboard auth token", style: "width:100%;" });
   input.value = state.authDraft || "";
-  input.oninput = () => { state.authDraft = input.value; };
+  input.oninput = (e) => { state.authDraft = e.target.value; };
   input.onkeydown = (e) => { if (e.key === "Enter") { e.preventDefault(); submitAuth(); } };
   return el("div", { class: "overlay auth-overlay" }, [
     el("div", { class: "panel auth-panel" }, [
