@@ -1546,5 +1546,50 @@ class PhaseResearchAutoProbePlanTest(unittest.TestCase):
         asyncio.run(scenario())
 
 
+class RateLimitBackoffEventWiringTest(unittest.TestCase):
+    """§D11: ``pipeline.run._log_rate_limit_backoff_for`` is the seam that
+    turns the provider ladder's in-process ``on_backoff`` callback into one
+    ``rate_limit_backoff`` line per rung on ``events.jsonl`` -- the
+    observability that makes a multi-hour mid-call wait legible on the
+    dashboard instead of a silent ``in_progress``."""
+
+    def test_callback_appends_one_event_per_rung_to_events_jsonl(self) -> None:
+        from kusudaemon.pipeline.run import _log_rate_limit_backoff_for
+        from kusudaemon.v1.provider import RATE_LIMIT_BACKOFFS
+
+        with tempfile.TemporaryDirectory() as tmp:
+            run_dir = Path(tmp)
+            create_run_dir(run_dir, "r")
+            callback = _log_rate_limit_backoff_for(run_dir)
+            # Fire twice, as a two-rung retry would.
+            callback(1, RATE_LIMIT_BACKOFFS[0])
+            callback(2, RATE_LIMIT_BACKOFFS[1])
+            events = EventLog(events_path(run_dir)).read_all()
+            self.assertEqual(len(events), 2)
+            self.assertEqual([e["type"] for e in events], ["rate_limit_backoff", "rate_limit_backoff"])
+            self.assertEqual(events[0]["attempt"], 1)
+            self.assertEqual(events[1]["attempt"], 2)
+            self.assertEqual(events[0]["delay_s"], RATE_LIMIT_BACKOFFS[0])
+            self.assertEqual(events[1]["delay_s"], RATE_LIMIT_BACKOFFS[1])
+            self.assertEqual(events[0]["rungs"], len(RATE_LIMIT_BACKOFFS))
+            # Same harness fields every other event carries (events.py §10).
+            for e in events:
+                self.assertEqual(e["node_id"], "-")
+                self.assertEqual(e["role"], "harness")
+                self.assertIn("ts", e)
+
+    def test_callback_writes_nothing_until_first_fire(self) -> None:
+        # A run that never hits a 429 pays nothing for the wiring: the run
+        # dir's events.jsonl exists (create_run_dir touches it) but stays
+        # empty -- the EventLog is only constructed on first callback fire.
+        from kusudaemon.pipeline.run import _log_rate_limit_backoff_for
+
+        with tempfile.TemporaryDirectory() as tmp:
+            run_dir = Path(tmp) / "deeper" / "r"
+            create_run_dir(run_dir.parent, run_dir.name)
+            _log_rate_limit_backoff_for(run_dir)
+            self.assertEqual(EventLog(events_path(run_dir)).read_all(), [])
+
+
 if __name__ == "__main__":
     unittest.main()
