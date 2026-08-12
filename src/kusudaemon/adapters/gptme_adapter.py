@@ -49,11 +49,13 @@ def _gptme_model(model: str) -> str:
     OpenAI-compatible endpoint. The model id itself is unchanged: only the
     routing prefix is added.
     """
-    if "/" in model:
-        if model.startswith(("local/", "openai/")):
-            return model
-        return f"local/{model.split('/', 1)[1]}"
+    if model.startswith(("local/", "openai/")):
+        return model
+    if model.startswith("opencode/"):
+        return f"local/{model[len('opencode/'):]}"
     return f"local/{model}"
+
+
 
 
 class GptmeAdapter(CommandAgentAdapter):

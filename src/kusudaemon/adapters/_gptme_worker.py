@@ -104,7 +104,11 @@ def main() -> int:
 
                     return _safe_exec
 
-                tool.execute = _make_safe(orig_exec)
+                try:
+                    tool.execute = _make_safe(orig_exec)
+                except Exception:
+                    object.__setattr__(tool, "execute", _make_safe(orig_exec))
+
         import gptme.llm
         orig_stream = gptme.llm._stream
 
