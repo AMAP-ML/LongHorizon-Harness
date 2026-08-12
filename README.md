@@ -41,15 +41,8 @@ LongHorizon-Harness turns existing agents into long-running computer-use systems
 - **[v0.1.3 · 2026-08-07]** Every run now ends with a plain-language reply that answers your task from the verified state alone. Tasks act on the directory you launched from by default, and the console reports each round as it happens.
 - **[2026-08-06]** LongHorizon-Harness reaches **#1** on the [Hugging Face Daily Papers weekly ranking](https://huggingface.co/papers/week/2026-W32).
 - **[v0.1.2 · 2026-08-06]** Adds unified computer-use plugin management, stronger auditor read-only checks and role isolation, reliable process cleanup, and expanded `doctor` diagnostics. See [Manage computer-use plugins](#manage-computer-use-plugins).
-- **[2026-08-06]** The WeChat group is open. Scan the QR code below to join.
 
 > 🚀 We’re iterating rapidly. Stay tuned!
-
-<div align="center">
-<img src="assets/wechat_group.JPG" alt="WeChat group QR code" width="240">
-<br>
-<sub>The QR code is refreshed periodically. If it has expired, open an issue and we will post a new one.</sub>
-</div>
 
 ## Video Demo
 
