@@ -58,4 +58,6 @@ artifacts = [
 ]
 
 [tool.pytest.ini_options]
+# The package is not installed in a plain checkout, so tests import it from src.
+pythonpath = ["src"]
 testpaths = ["tests"]

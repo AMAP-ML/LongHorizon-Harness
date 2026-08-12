@@ -189,7 +189,7 @@ Steps 1–2 are once per machine; step 3 is once per project. Then run tasks fro
 | One agent runtime on `PATH`: [`codex`](https://github.com/openai/codex#installing-and-running-codex-cli) or [`claude`](https://docs.anthropic.com/en/docs/claude-code/getting-started) | Actually executing the work. Install both if you want to mix them across roles. |
 | [Node.js](https://nodejs.org) 20 or later | Only the npm-distributed computer-use plugins. Not needed for `codex-computer-use` or CLI-only tasks. |
 
-> **Platform status:** Currently tested on macOS. Windows support is included but has not yet been thoroughly tested.
+> **Platform status:** Tested on macOS and Windows. Agent CLIs are launched as plain subprocesses — no shell is involved — so command construction behaves identically on every platform. On Windows the harness also escapes the 260-character `MAX_PATH` limit automatically, which run directories reach easily on a deep project path.
 
 Run `lh-harness doctor` at any point to check all of the above; see [Verify the environment](#verify-the-environment).
 
@@ -322,7 +322,7 @@ cli_auditor  → auditor  → [run].agent / [run].model
 | Section | Falls back to | Covers |
 |---|---|---|
 | `[run.roles.manager]` | `[run]` | The scheduler role |
-| `[run.roles.executor]` | `[run]` | Both executor roles |
+| `[run.roles.executor]` | `[run]` | Every executor role and tier |
 | `[run.roles.gui_executor]` | `executor` | GUI/visual subtasks |
 | `[run.roles.cli_executor]` | `executor` | CLI/non-GUI subtasks |
 | `[run.roles.auditor]` | `[run]` | Both auditor roles |
@@ -331,6 +331,103 @@ cli_auditor  → auditor  → [run].agent / [run].model
 | `[run.roles.final_response]` | `manager` | The closing reply written for you |
 
 Every field above also has a CLI flag (`--agent`, `--max-rounds`, `--gui-executor-model`, `--auditor-timeout`, and so on) that overrides it for a single run. Run `lh-harness run --help` for the full list.
+
+##### Executor tiers
+
+An executor has two independent properties: its **type** (`gui` or `cli`, decided by the Manager's route) and its **tier** (`cheap` or `strong`, how much model capability the subtask is worth). Giving each executor role a `cheap` and a `strong` sub-table lets routine work run on a cheaper backend while harder subtasks get a stronger one:
+
+```toml
+[run.roles.executor.cheap]
+agent = "codex"
+model = "gpt-5.6-sol"
+
+[run.roles.executor.strong]
+agent = "claude_code"
+model = "claude-opus-5"
+```
+
+Tiers work through the same agent abstraction as every other role, so any supported backend can serve any tier, and a Manager on one backend can dispatch to executors on another.
+
+| Section | Falls back to | Covers |
+|---|---|---|
+| `[run.roles.executor.cheap]` | `executor` | The cheap tier of both executor types |
+| `[run.roles.executor.strong]` | `executor` | The strong tier of both executor types |
+| `[run.roles.gui_executor.cheap]` | `executor.cheap`, then `gui_executor` | GUI + cheap only |
+| `[run.roles.gui_executor.strong]` | `executor.strong`, then `gui_executor` | GUI + strong only |
+| `[run.roles.cli_executor.cheap]` | `executor.cheap`, then `cli_executor` | CLI + cheap only |
+| `[run.roles.cli_executor.strong]` | `executor.strong`, then `cli_executor` | CLI + strong only |
+
+Naming a tier is a deliberate cost decision, so it outranks the older type-level section. The full chain for a GUI subtask on the cheap tier is:
+
+```
+gui_executor.cheap → executor.cheap → gui_executor → executor → [run].agent / [run].model
+```
+
+Tiers are optional. A configuration that defines no tier tables resolves every tier to the same executor it uses today, so existing single-executor projects keep working unchanged.
+
+##### `[run.executor_routing]`
+
+Which tier runs a subtask, and when the harness overrides that choice itself.
+
+```toml
+[run.executor_routing]
+default_tier = "cheap"
+escalate_after_failures = 1
+escalate_after_stalled_rounds = 3
+escalation_tier = "strong"
+```
+
+| Field | Default | Description |
+|---|---|---|
+| `default_tier` | `"cheap"` | Tier used when the Manager names none, so most work stays on the cheaper backend. |
+| `escalate_after_failures` | `1` | Consecutive audits reporting a real problem before switching to `escalation_tier`. `0` disables this signal. |
+| `escalate_after_stalled_rounds` | `3` | Consecutive clean rounds that keep reporting the same unclosed gap. `0` disables this signal. |
+| `escalation_tier` | `"strong"` | Tier used once either threshold is reached. |
+| `escalation_briefing` | `true` | Tell the escalated executor what the previous tier tried and why the Auditor rejected it. |
+
+##### What counts as a failure
+
+This matters more than it looks. Auditors are instructed to report `incomplete` whenever the *whole* contract is unsatisfied — "even if the local subtask succeeded" — so a perfectly good mid-run round normally comes back `Status: incomplete · Integrity: clean · Contract audit: aligned`. Treating that as a failure would escalate on round one of nearly every task and throw away the saving.
+
+So escalation reads two distinct signals:
+
+| Signal | Counts toward | What it means |
+|---|---|---|
+| `Status: blocked`, `Integrity: suspect`/`violation`, `Contract audit: needs_revision`/`invalid`, or an executor episode that errored or timed out | `escalate_after_failures` | The round actually went wrong |
+| Consecutive clean rounds whose Auditor keeps naming the same outstanding gap | `escalate_after_stalled_rounds` | The cheap tier is spinning without closing anything |
+| `Status: incomplete` with clean integrity and an aligned contract, and a *new* gap each round | neither | Ordinary forward progress on a multi-round task |
+
+A passing audit (`complete` + `clean` + `aligned`) clears both counters.
+
+The Manager may name a tier per subtask by adding one `Executor tier: cheap` or `Executor tier: strong` line after its route. It decides from the subtask in front of it, not from a fixed list of task categories.
+
+Because a Manager can misjudge difficulty before the work happens, failed audits escalate on their own:
+
+```
+cheap executor → Auditor → FAIL → strong executor → Auditor
+```
+
+Escalation never bypasses verification: the strong executor's result goes through the normal Auditor flow. A passing audit clears the escalation, so routing returns to the default tier and the expensive model is only used while a run is actually struggling.
+
+##### Tuning the two knobs together
+
+`escalate_after_failures` and `escalation_briefing` interact, and are worth setting as a pair.
+
+Each role episode is a fresh agent session — the CLIs are invoked one-shot, with no conversation carried between rounds. An **escalated** executor is therefore briefed with what the previous tier attempted and the Auditor's findings on it. Prior executor output is labelled as an unverified claim, keeping the Auditor the only authority on what is true. The Manager is told about the escalation too, since repeated failure can mean the decomposition is wrong rather than the executor being too weak.
+
+A **same-tier retry** gets no such briefing. It sees only the Manager's `Current task state:` and whatever reports the Manager chose to cite, so it can repeat the approach that was just rejected.
+
+That is why the default threshold is `1`: with no briefing to work from, a second cheap attempt is largely a wasted round. Raising the threshold trades latency for cost:
+
+| `escalate_after_failures` | Behaviour |
+|---|---|
+| `1` (default) | Straight to the strong tier on the first audit that reports a real problem. Fastest; the strong model runs more often. |
+| `2` or more | Retries on the cheap tier first. Cheaper when the retry succeeds, but those retry rounds are unbriefed. |
+| `0` | Never escalates on problems. `escalate_after_stalled_rounds` still applies. |
+
+Because a merely-incomplete round is not a failure, `1` here does **not** mean "escalate on round one" — a task that progresses cleanly stays on the cheap tier for as long as it keeps making progress.
+
+The selected tier appears in the console (`tier=cheap`), in the Dashboard as a badge next to the route, and in `report.json` per round plus an `executor_routing` summary of what routing actually did.
 
 #### Manage computer-use plugins
 
@@ -446,6 +543,9 @@ lh-harness web --workspace-root .               # Serve the workbench for anothe
 | `--agent` | `claude_code` or `codex` |
 | `--env` | `local` |
 | `--max-rounds` | Maximum number of Manage-Execute-Audit rounds; the CLI default is 30 |
+| `--executor-cheap-agent` / `--executor-strong-agent` | Backend for one executor tier; `--*-model` sets its model |
+| `--executor-default-tier` | Tier for subtasks where the Manager names none; defaults to `cheap` |
+| `--executor-escalate-after-failures` | Failed audits before escalating; `0` disables it |
 | `--dashboard` | Start live monitoring and human intervention |
 | `--no-dashboard` | Disable a Dashboard enabled by the project configuration |
 

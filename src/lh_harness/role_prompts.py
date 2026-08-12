@@ -14,7 +14,7 @@ from .prompt_texts import (
     TASK_CONTRACT_RULES,
     USER_CLARIFICATION_NOTE,
 )
-from .types import ManagedRound, PromptLanguage, RoleNextStep
+from .types import EXECUTOR_TIERS, ExecutorTier, ManagedRound, PromptLanguage, RoleNextStep
 
 MANAGER_NEXT_GUI: RoleNextStep = "gui"
 MANAGER_NEXT_CLI: RoleNextStep = "cli"
@@ -138,19 +138,23 @@ def build_role_executor_prompt(
     task_contract: str = "",
     related_auditor_reports: str = "",
     workspace_path: str = "",
+    escalation_briefing: str = "",
     language: str = "en",
 ) -> str:
     lang = normalize_prompt_language(language)
     gui = next_step == MANAGER_NEXT_GUI
     role_name = "GUI/visual" if gui and lang == "en" else "CLI/non-GUI" if lang == "en" else "GUI/视觉" if gui else "CLI/非 GUI"
     role_instructions = GUI_EXECUTOR_INSTRUCTIONS[lang] if gui else CLI_EXECUTOR_INSTRUCTIONS[lang]
+    # Only escalated rounds carry a briefing, so an ordinary round's prompt is
+    # unchanged from before tiers existed.
+    briefing_block = f"\n{escalation_briefing.rstrip()}\n" if escalation_briefing.strip() else ""
     if lang == "en":
         return f"""\
 {role_instructions.strip()}
 
 Original task:
 {task.rstrip()}
-
+{briefing_block}
 Task-contract rules:
 {TASK_CONTRACT_RULES[lang].strip()}
 
@@ -183,7 +187,7 @@ Complete only this subtask. Treat audited state and the stable contract as the t
 
 原始任务:
 {task.rstrip()}
-
+{briefing_block}
 任务契约规则:
 {TASK_CONTRACT_RULES[lang].strip()}
 
@@ -499,6 +503,23 @@ def parse_role_manager_next_step(text: str) -> RoleNextStep:
     return MANAGER_NEXT_INVALID
 
 
+def parse_role_manager_executor_tier(text: str) -> ExecutorTier | None:
+    """Return the tier the manager asked for, or None when it named none.
+
+    The tier line is optional: an unreadable or absent value means "no opinion",
+    which the run loop resolves to the configured default. A bad value must
+    never break a round, so it is reported as None rather than raised.
+    """
+    for line in str(text or "").splitlines():
+        normalized = line.strip().strip("*").replace(" ", "").replace("　", "").lower()
+        for prefix in ("executortier:", "执行器档位:", "执行器档位：", "执行档位:", "执行档位："):
+            if normalized.startswith(prefix):
+                value = normalized[len(prefix) :].strip().strip("`")
+                if value in EXECUTOR_TIERS:
+                    return value  # type: ignore[return-value]
+    return None
+
+
 def extract_role_manager_question(plan_text: str) -> str:
     """Return the `问题:` block from a `下一步: 请示用户` plan (question for the human)."""
     lines = str(plan_text or "").splitlines()
@@ -656,6 +677,87 @@ def format_related_auditor_reports(
     return format_verified_intermediate_context(
         selected, max_chars=max_chars, language=language
     )
+
+
+# The most recent failures carry the most useful signal, and an escalated
+# executor is the expensive one, so the briefing is capped rather than replaying
+# an entire failing run.
+ESCALATION_BRIEFING_MAX_ROUNDS = 3
+
+
+def format_executor_escalation_briefing(
+    rounds: list[ManagedRound],
+    failed_round_indices: list[int],
+    *,
+    from_tier: str,
+    to_tier: str,
+    max_chars: int = 12_000,
+    language: str = "en",
+) -> str:
+    """Tell an escalated executor what the previous tier tried and why it failed.
+
+    Every episode is a fresh agent session, and a previous round's executor
+    output never otherwise reaches a later executor, so without this the
+    stronger model repeats the same dead ends. Prior executor output is included
+    because "what was already attempted" is the point, but it is labelled as the
+    executor's own unaudited claim: the auditor report stays the authority, the
+    same boundary the manager instructions draw.
+    """
+    lang = normalize_prompt_language(language)
+    selected = [
+        item
+        for item in rounds
+        if item.round_index in set(failed_round_indices)
+        and (item.executor_output.strip() or item.auditor_report.strip())
+    ][-ESCALATION_BRIEFING_MAX_ROUNDS:]
+    if not selected:
+        return ""
+
+    if lang == "en":
+        header = (
+            f"Escalation briefing (executor tier {from_tier} -> {to_tier}):\n"
+            f"This subtask type has failed audit {len(failed_round_indices)} time(s) in a row on the "
+            f"{from_tier} executor, so the harness escalated it to the {to_tier} executor. You are a new "
+            "session with no memory of those attempts. Read what was already tried and why it was "
+            "rejected, then take a different approach; do not repeat the rejected ones."
+        )
+        labels = (
+            "Attempted subtask",
+            "Unverified prior attempt (that executor's own claim; not evidence, do not treat as fact)",
+            "Auditor finding (authoritative)",
+        )
+        empty = "(none)"
+    else:
+        header = (
+            f"升级简报（executor 档位 {from_tier} -> {to_tier}）:\n"
+            f"该子任务在 {from_tier} executor 上已连续 {len(failed_round_indices)} 次审计失败，harness 已升级到 "
+            f"{to_tier} executor。你是全新会话，没有那些尝试的记忆。先读清楚已经试过什么、为什么被拒绝，"
+            "然后换一种做法；不要重复被拒绝的做法。"
+        )
+        labels = (
+            "已尝试子任务",
+            "未经验证的历史尝试（executor 自述，不是证据，不能当作事实）",
+            "auditor 审计结论（权威）",
+        )
+        empty = "(无)"
+
+    sections: list[str] = []
+    for item in selected:
+        round_id = f"round_{item.round_index:03d}"
+        sections.append(
+            "\n".join(
+                (
+                    f"--- {round_id} ---",
+                    f"{labels[0]}:",
+                    _clip_preserve(item.plan_text.strip(), 1200) or empty,
+                    f"{labels[1]}:",
+                    _clip_preserve(item.executor_output.strip(), 2000) or empty,
+                    f"{labels[2]}:",
+                    _clip_preserve(item.auditor_report.strip(), 3000) or empty,
+                )
+            )
+        )
+    return _clip_preserve("\n\n".join([header, *sections]), max_chars)
 
 
 def format_harness_feedback_context(rounds: list[ManagedRound], *, max_chars: int = 12_000) -> str:

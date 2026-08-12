@@ -26,10 +26,16 @@ from .config import (
 from .types import (
     DEFAULT_CLAUDE_MODEL,
     DEFAULT_CODEX_MODEL,
+    DEFAULT_ESCALATE_AFTER_FAILURES,
+    DEFAULT_ESCALATE_AFTER_STALLED_ROUNDS,
+    DEFAULT_ESCALATION_TIER,
+    DEFAULT_EXECUTOR_TIER,
     DEFAULT_MAX_ROUNDS,
     DEFAULT_WORKSPACE_PATH,
+    EXECUTOR_TIERS,
     MAX_ROUNDS,
     EpisodeBudget,
+    ExecutorRouting,
     HarnessConfig,
 )
 from .utils.agent_cli import probe_agent_cli
@@ -64,21 +70,38 @@ _MCP_CONFIG_DESTS = {"claude_code": "claude_mcp_config", "codex": "codex_mcp_con
 _CODEX_GUI_PLUGIN = "codex-computer-use"
 _PLUGIN_CHOICES = (_CODEX_GUI_PLUGIN, "open-computer-use", "clawdcursor")
 
-# Role options as (dest prefix, broader option it falls back to, help scope).
-# Each entry gets a matching `--<role>-agent` and `--<role>-model` flag;
-# resolution walks the fallback chain and ends at the global --agent / --model.
+# Role options as (dest prefix, ordered fallbacks, help scope). Each entry gets a
+# matching `--<role>-agent` and `--<role>-model` flag; resolution walks the
+# fallback chain in order and ends at the global --agent / --model.
+#
+# Executor tier roles fall back on two axes. Tier comes first: naming a tier is a
+# deliberate cost decision, so `[run.roles.executor.cheap]` outranks the older
+# type-level `[run.roles.gui_executor]`.
 _ROLE_OPTIONS = (
-    ("manager", None, "the scheduler role"),
-    ("executor", None, "both executor roles"),
-    ("gui_executor", "executor", "GUI/visual subtasks"),
-    ("cli_executor", "executor", "CLI/non-GUI subtasks"),
-    ("auditor", None, "both auditor roles"),
-    ("gui_auditor", "auditor", "GUI audit"),
-    ("cli_auditor", "auditor", "CLI audit"),
-    ("final_response", "manager", "the closing reply written for you"),
+    ("manager", (), "the scheduler role"),
+    ("executor", (), "every executor role and tier"),
+    ("executor_cheap", ("executor",), "the cheap tier of both executor roles"),
+    ("executor_strong", ("executor",), "the strong tier of both executor roles"),
+    ("gui_executor", ("executor",), "GUI/visual subtasks"),
+    ("gui_executor_cheap", ("executor_cheap", "gui_executor"), "cheap-tier GUI subtasks"),
+    ("gui_executor_strong", ("executor_strong", "gui_executor"), "strong-tier GUI subtasks"),
+    ("cli_executor", ("executor",), "CLI/non-GUI subtasks"),
+    ("cli_executor_cheap", ("executor_cheap", "cli_executor"), "cheap-tier CLI subtasks"),
+    ("cli_executor_strong", ("executor_strong", "cli_executor"), "strong-tier CLI subtasks"),
+    ("auditor", (), "both auditor roles"),
+    ("gui_auditor", ("auditor",), "GUI audit"),
+    ("cli_auditor", ("auditor",), "CLI audit"),
+    ("final_response", ("manager",), "the closing reply written for you"),
 )
-_ROLE_PARENTS = {role: parent for role, parent, _ in _ROLE_OPTIONS}
+_ROLE_PARENTS = {role: parents for role, parents, _ in _ROLE_OPTIONS}
 _ROLE_SCOPES = {role: scope for role, _, scope in _ROLE_OPTIONS}
+# The executor role each (type, tier) cell resolves through.
+_EXECUTOR_TIER_ROLES = {
+    ("gui", "cheap"): "gui_executor_cheap",
+    ("gui", "strong"): "gui_executor_strong",
+    ("cli", "cheap"): "cli_executor_cheap",
+    ("cli", "strong"): "cli_executor_strong",
+}
 
 # Per-role episode budgets as (dest prefix, timeout seconds). The
 # executors get the long task timeout; the scheduler and auditors get the short one.
@@ -120,6 +143,13 @@ def _max_rounds(value: str) -> int:
     parsed = _positive_int(value)
     if parsed > MAX_ROUNDS:
         raise argparse.ArgumentTypeError(f"must be at most {MAX_ROUNDS}")
+    return parsed
+
+
+def _non_negative_int(value: str) -> int:
+    parsed = int(value)
+    if parsed < 0:
+        raise argparse.ArgumentTypeError("must be 0 or more")
     return parsed
 
 
@@ -359,15 +389,47 @@ def _claim_supervised_owner(run_id: str, run_dir: Path) -> None:
         "pgid": os.getpid(),
         "signal_mode": "pgid",
     })
+def _fallback_chain(role: str) -> list[str]:
+    """Roles to consult, in order, starting with `role` itself.
+
+    Breadth-ordered so a role's own fallbacks are all tried before their
+    fallbacks: `gui_executor_cheap` prefers `executor_cheap`, then
+    `gui_executor`, then `executor`.
+    """
+    chain: list[str] = []
+    queue = [role]
+    while queue:
+        current = queue.pop(0)
+        if current in chain:
+            continue
+        chain.append(current)
+        queue.extend(_ROLE_PARENTS[current])
+    return chain
 
 
 def _fallback_hint(role: str, suffix: str) -> str:
-    parent = _ROLE_PARENTS[role]
-    chain = ([_flag(parent, suffix)] if parent else []) + [f"--{suffix}"]
-    return ", then ".join(chain)
+    parents = _fallback_chain(role)[1:]
+    return ", then ".join([_flag(parent, suffix) for parent in parents] + [f"--{suffix}"])
+
+
+def _use_utf8_console() -> None:
+    """Stop a legacy console codec from mangling harness output.
+
+    Windows still defaults stdout to cp1252, which turns the routing summary's
+    separators into `?` and makes Chinese prompt output unprintable.
+    """
+    for stream in (sys.stdout, sys.stderr):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if reconfigure is None:
+            continue
+        try:
+            reconfigure(encoding="utf-8", errors="replace")
+        except (OSError, ValueError):
+            pass
 
 
 def main(argv: list[str] | None = None) -> int:
+    _use_utf8_console()
     raw_argv = list(sys.argv[1:] if argv is None else argv)
     run_defaults: dict[str, object] = {}
     config_error: ProjectConfigError | None = None
@@ -424,6 +486,38 @@ def main(argv: list[str] | None = None) -> int:
             default=run_default(f"{role}_model"),
             help=f"Model for {scope}; defaults to {_fallback_hint(role, 'model')}.",
         )
+    run_parser.add_argument(
+        "--executor-default-tier",
+        default=run_default("executor_default_tier", DEFAULT_EXECUTOR_TIER),
+        choices=EXECUTOR_TIERS,
+        help="Executor tier for subtasks where the manager names none.",
+    )
+    run_parser.add_argument(
+        "--executor-escalate-after-failures",
+        type=_non_negative_int,
+        default=run_default("executor_escalate_after_failures", DEFAULT_ESCALATE_AFTER_FAILURES),
+        help="Consecutive failed audits before the harness switches to the escalation tier. 0 disables escalation.",
+    )
+    run_parser.add_argument(
+        "--executor-escalate-after-stalled-rounds",
+        type=_non_negative_int,
+        default=run_default(
+            "executor_escalate_after_stalled_rounds", DEFAULT_ESCALATE_AFTER_STALLED_ROUNDS
+        ),
+        help="Consecutive clean-but-incomplete rounds reporting the same gap before escalating. 0 disables this signal.",
+    )
+    run_parser.add_argument(
+        "--executor-escalation-tier",
+        default=run_default("executor_escalation_tier", DEFAULT_ESCALATION_TIER),
+        choices=EXECUTOR_TIERS,
+        help="Executor tier used once the failure threshold is reached.",
+    )
+    run_parser.add_argument(
+        "--executor-escalation-briefing",
+        action=argparse.BooleanOptionalAction,
+        default=run_default("executor_escalation_briefing", True),
+        help="Tell an escalated executor what the previous tier tried and why it was rejected.",
+    )
     # Only the local backend is implemented; kept as a flag so existing
     # `--env local` invocations keep working and future backends can slot in.
     run_parser.add_argument(
@@ -1491,6 +1585,13 @@ def _run_command(args: argparse.Namespace) -> int:
         gui_executor_budget=EpisodeBudget(max_duration_seconds=args.gui_executor_timeout),
         cli_executor_budget=EpisodeBudget(max_duration_seconds=args.cli_executor_timeout),
         auditor_budget=EpisodeBudget(max_duration_seconds=args.auditor_timeout),
+        executor_routing=ExecutorRouting(
+            default_tier=args.executor_default_tier,
+            escalate_after_failures=args.executor_escalate_after_failures,
+            escalate_after_stalled_rounds=args.executor_escalate_after_stalled_rounds,
+            escalation_tier=args.executor_escalation_tier,
+            escalation_briefing=args.executor_escalation_briefing,
+        ),
         workspace_path=workspace,
         harness_dir=harness_dir,
         log_dir=log_dir,
@@ -1632,11 +1733,28 @@ def _run_command(args: argparse.Namespace) -> int:
             )
         return agent_cache[key]
 
+    # Executor tiers reuse the executor permission role, so a tier only changes
+    # which backend/model runs, never what the executor is allowed to do. The
+    # adapter cache is keyed on the resolved agent+model, so tiers that resolve
+    # to the same backend share one adapter instead of spawning another.
     try:
+        executor_agents = {
+            executor_type: {
+                tier: build_role_agent(
+                    _EXECUTOR_TIER_ROLES[(executor_type, tier)],
+                    permission_role=f"{executor_type}_executor",
+                )
+                for tier in EXECUTOR_TIERS
+            }
+            for executor_type in ("gui", "cli")
+        }
         role_agents = {
             "manager_agent": build_role_agent("manager"),
-            "gui_executor_agent": build_role_agent("gui_executor"),
-            "cli_executor_agent": build_role_agent("cli_executor"),
+            # The per-type adapters are the loop's fallback for any tier cell it
+            # is not given; the default tier is what it would have picked anyway.
+            "gui_executor_agent": executor_agents["gui"][config.executor_routing.default_tier],
+            "cli_executor_agent": executor_agents["cli"][config.executor_routing.default_tier],
+            "executor_agents": executor_agents,
             "gui_auditor_agent": build_role_agent("gui_auditor"),
             "cli_auditor_agent": build_role_agent("cli_auditor"),
             # Format repair sees only the previous auditor text and has no tools.
@@ -1661,6 +1779,7 @@ def _run_command(args: argparse.Namespace) -> int:
         if dashboard_handle is not None:
             dashboard_handle.shutdown()
         return 1
+    _print_executor_routing(args, config.executor_routing)
 
     from .manager import run
 
@@ -1722,6 +1841,33 @@ def _run_command(args: argparse.Namespace) -> int:
     return 0 if final_report.get("completion_satisfied") else 1
 
 
+def _print_executor_routing(args: argparse.Namespace, routing: ExecutorRouting) -> None:
+    """Show the resolved policy and which backend each (type, tier) cell landed on.
+
+    The manager loop only ever sees adapters, so this is the one place the run
+    reports which agent and model a tier actually resolved to.
+    """
+    triggers = []
+    if routing.escalate_after_failures:
+        triggers.append(f"{routing.escalate_after_failures} audit failure(s)")
+    if routing.escalate_after_stalled_rounds:
+        triggers.append(f"{routing.escalate_after_stalled_rounds} stalled round(s)")
+    escalation = (
+        f"escalate after {' or '.join(triggers)} -> {routing.escalation_tier}"
+        if triggers
+        else "escalation disabled"
+    )
+    print(f"Executor routing: default={routing.default_tier} · {escalation}")
+    for (executor_type, tier), role in sorted(_EXECUTOR_TIER_ROLES.items()):
+        agent = _resolve_role_option(args, role, "agent")
+        model = _resolve_role_option(args, role, "model") or _default_model_for(agent)
+        print(f"  {executor_type}/{tier:<6} {agent} / {model}")
+
+
+def _default_model_for(agent: str) -> str:
+    return next((model for name, _, model in _AGENTS if name == agent), "(agent default)")
+
+
 def _outermost_paths(*paths: str | Path) -> tuple[str, ...]:
     """Resolve paths and drop any that sit inside another, keeping the parents."""
     resolved = sorted({Path(item).expanduser().resolve() for item in paths}, key=lambda p: len(p.parts))
@@ -1754,11 +1900,19 @@ def _print_progress(event: str, payload: dict) -> None:
         if payload.get("role") == "final_response":
             print("\n── Writing reply ──", flush=True)
         print(f"  [{payload.get('role')}] running...", flush=True)
+    elif event == "executor_escalation":
+        print(
+            f"  Executor escalation: {payload.get('from_tier')} -> {payload.get('to_tier')} "
+            f"({payload.get('reason')}, threshold {payload.get('threshold')})",
+            flush=True,
+        )
     elif event == "role_done":
         parts = [str(payload.get("status"))]
         duration_ms = payload.get("duration_ms")
         if isinstance(duration_ms, int):
             parts.append(f"{duration_ms / 1000:.1f}s")
+        if payload.get("executor_tier"):
+            parts.append(f"tier={payload['executor_tier']}")
         if payload.get("next_step"):
             parts.append(f"next={payload['next_step']}")
         if payload.get("audit_status"):
@@ -1801,11 +1955,10 @@ def _indent(text: str, prefix: str = "  ") -> str:
 
 def _resolve_role_option(args: argparse.Namespace, role: str, suffix: str):
     """Walk a role's fallback chain up to the global `--agent` / `--model`."""
-    while role:
-        value = getattr(args, f"{role}_{suffix}", None)
+    for candidate in _fallback_chain(role):
+        value = getattr(args, f"{candidate}_{suffix}", None)
         if value:
             return value
-        role = _ROLE_PARENTS[role]
     return getattr(args, suffix)
 
 

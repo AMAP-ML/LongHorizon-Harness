@@ -4,7 +4,7 @@ import importlib
 from pathlib import Path
 from typing import Any
 
-from .types import MAX_ROUNDS
+from .types import EXECUTOR_TIERS, MAX_ROUNDS
 
 try:
     tomllib = importlib.import_module("tomllib")
@@ -24,7 +24,17 @@ _ROLE_NAMES = {
     "cli_auditor",
     "final_response",
 }
+# Executor roles may additionally carry per-tier sub-tables, so
+# `[run.roles.executor.cheap]` flattens to the `executor_cheap` role.
+_TIERED_ROLE_NAMES = {"executor", "gui_executor", "cli_executor"}
 _TIMEOUT_NAMES = {"manager", "gui_executor", "cli_executor", "auditor"}
+_EXECUTOR_ROUTING_KEYS = {
+    "default_tier",
+    "escalate_after_failures",
+    "escalate_after_stalled_rounds",
+    "escalation_tier",
+    "escalation_briefing",
+}
 _RUN_KEYS = {
     "agent",
     "model",
@@ -43,6 +53,7 @@ _RUN_KEYS = {
     "dashboard_port",
     "roles",
     "timeouts",
+    "executor_routing",
 }
 _STRING_KEYS = {
     "model",
@@ -90,6 +101,27 @@ gui_executor = 1800
 cli_executor = 1800
 auditor = 300
 
+# Which executor tier runs a subtask. The manager may ask for one; otherwise
+# default_tier applies. After escalate_after_failures consecutive failed audits
+# the harness switches to escalation_tier itself, and drops back to the default
+# once an audit passes. Set escalate_after_failures = 0 to turn that off.
+[run.executor_routing]
+default_tier = "cheap"
+# Audits that report a real problem: blocked, suspect/violated integrity, or a
+# contract needing revision. An audit that is merely `incomplete` with clean
+# integrity is normal mid-run progress and is NOT counted here. 1 escalates on
+# the first such failure; raising it retries on the cheap tier first, which costs
+# less but is slower -- and a same-tier retry is NOT briefed on what just failed
+# (only the escalated executor is), so it may well repeat it.
+escalate_after_failures = 1
+# The other shape of trouble: clean rounds that keep reporting the same
+# outstanding gap without closing it. Escalates after this many in a row.
+escalate_after_stalled_rounds = 3
+escalation_tier = "strong"
+# Tell the escalated executor what the previous tier already tried and why it
+# was rejected. Each episode is a fresh session, so without this it starts blind.
+# escalation_briefing = true
+
 [run.roles.manager]
 # agent = "codex"
 # model = "gpt-5.6-sol"
@@ -98,13 +130,30 @@ auditor = 300
 # agent = "codex"
 # model = "gpt-5.6-sol"
 
+# Per-tier executors. Leave them out to run every tier on the same backend,
+# which is what a configuration without tiers does today.
+[run.roles.executor.cheap]
+# agent = "codex"
+# model = "gpt-5.6-sol"
+
+[run.roles.executor.strong]
+# agent = "claude_code"
+# model = "claude-opus-5"
+
 [run.roles.gui_executor]
 # agent = "codex"
 # model = "gpt-5.6-sol"
 
+# Tier overrides for one executor type only; these win over [run.roles.executor.*].
+# [run.roles.gui_executor.cheap]
+# [run.roles.gui_executor.strong]
+
 [run.roles.cli_executor]
 # agent = "codex"
 # model = "gpt-5.6-sol"
+
+# [run.roles.cli_executor.cheap]
+# [run.roles.cli_executor.strong]
 
 [run.roles.auditor]
 # agent = "codex"
@@ -197,23 +246,71 @@ def _flatten_run_table(run: dict[str, Any]) -> dict[str, Any]:
         raise ProjectConfigError("[run.roles] must be a TOML table")
     unknown_roles = set(roles) - _ROLE_NAMES
     if unknown_roles:
+        # The CLI spells a tier `--executor-cheap-agent`, so the flat role name is
+        # an easy guess. Point at the nested table rather than just rejecting it.
+        flattened = sorted(
+            name
+            for name in unknown_roles
+            if any(name == f"{role}_{tier}" for role in _TIERED_ROLE_NAMES for tier in EXECUTOR_TIERS)
+        )
+        if flattened:
+            suggestions = ", ".join(
+                f"[run.roles.{name.rsplit('_', 1)[0]}.{name.rsplit('_', 1)[1]}]" for name in flattened
+            )
+            raise ProjectConfigError(
+                f"unknown role(s): {_names(unknown_roles)}; write executor tiers as a "
+                f"nested table instead: {suggestions}"
+            )
         raise ProjectConfigError(f"unknown role(s): {_names(unknown_roles)}")
     for role, values in roles.items():
         if not isinstance(values, dict):
             raise ProjectConfigError(f"[run.roles.{role}] must be a TOML table")
-        unknown_role_keys = set(values) - {"agent", "model"}
-        if unknown_role_keys:
+        # A tier sub-table is the only nested form; everything else at this
+        # level is still just agent/model.
+        tiers = {key: value for key, value in values.items() if isinstance(value, dict)}
+        if tiers and role not in _TIERED_ROLE_NAMES:
             raise ProjectConfigError(
-                f"unknown [run.roles.{role}] key(s): {_names(unknown_role_keys)}"
+                f"[run.roles.{role}] does not take executor tiers; "
+                f"tiers apply to: {_names(_TIERED_ROLE_NAMES)}"
             )
-        if "agent" in values:
-            defaults[f"{role}_agent"] = _choice(
-                values["agent"], f"run.roles.{role}.agent", _AGENT_CHOICES
+        unknown_tiers = set(tiers) - set(EXECUTOR_TIERS)
+        if unknown_tiers:
+            raise ProjectConfigError(
+                f"unknown [run.roles.{role}] tier(s): {_names(unknown_tiers)}; "
+                f"expected: {', '.join(EXECUTOR_TIERS)}"
             )
-        if "model" in values:
-            defaults[f"{role}_model"] = _string(
-                values["model"], f"run.roles.{role}.model"
+        for tier, tier_values in tiers.items():
+            _flatten_role_table(defaults, f"{role}_{tier}", f"run.roles.{role}.{tier}", tier_values)
+        _flatten_role_table(
+            defaults,
+            role,
+            f"run.roles.{role}",
+            {key: value for key, value in values.items() if key not in tiers},
+        )
+
+    routing = run.get("executor_routing", {})
+    if not isinstance(routing, dict):
+        raise ProjectConfigError("[run.executor_routing] must be a TOML table")
+    unknown_routing = set(routing) - _EXECUTOR_ROUTING_KEYS
+    if unknown_routing:
+        raise ProjectConfigError(
+            f"unknown [run.executor_routing] key(s): {_names(unknown_routing)}"
+        )
+    for key in ("default_tier", "escalation_tier"):
+        if key in routing:
+            defaults[f"executor_{key}"] = _choice(
+                routing[key], f"run.executor_routing.{key}", set(EXECUTOR_TIERS)
             )
+    for key in ("escalate_after_failures", "escalate_after_stalled_rounds"):
+        if key in routing:
+            # 0 is meaningful here: it turns that escalation signal off.
+            defaults[f"executor_{key}"] = _non_negative_int(
+                routing[key], f"run.executor_routing.{key}"
+            )
+    if "escalation_briefing" in routing:
+        defaults["executor_escalation_briefing"] = _boolean(
+            routing["escalation_briefing"], "run.executor_routing.escalation_briefing"
+        )
 
     timeouts = run.get("timeouts", {})
     if not isinstance(timeouts, dict):
@@ -224,6 +321,24 @@ def _flatten_run_table(run: dict[str, Any]) -> dict[str, Any]:
     for role, value in timeouts.items():
         defaults[f"{role}_timeout"] = _positive_int(value, f"run.timeouts.{role}")
     return defaults
+
+
+def _flatten_role_table(
+    defaults: dict[str, Any],
+    dest_prefix: str,
+    name: str,
+    values: dict[str, Any],
+) -> None:
+    """Flatten one role (or role tier) table into `<prefix>_agent` / `<prefix>_model`."""
+    unknown_role_keys = set(values) - {"agent", "model"}
+    if unknown_role_keys:
+        raise ProjectConfigError(f"unknown [{name}] key(s): {_names(unknown_role_keys)}")
+    if "agent" in values:
+        defaults[f"{dest_prefix}_agent"] = _choice(
+            values["agent"], f"{name}.agent", _AGENT_CHOICES
+        )
+    if "model" in values:
+        defaults[f"{dest_prefix}_model"] = _string(values["model"], f"{name}.model")
 
 
 def _string(value: Any, name: str) -> str:
@@ -244,6 +359,12 @@ def _positive_int(value: Any, name: str) -> int:
         raise ProjectConfigError(f"{name} must be an integer of at least 1")
     if name.endswith("max_rounds") and value > MAX_ROUNDS:
         raise ProjectConfigError(f"{name} must be at most {MAX_ROUNDS}")
+    return value
+
+
+def _non_negative_int(value: Any, name: str) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise ProjectConfigError(f"{name} must be an integer of 0 or more")
     return value
 
 

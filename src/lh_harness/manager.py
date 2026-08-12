@@ -8,9 +8,11 @@ import json
 import logging
 import os
 import stat as stat_module
+import sys
 import time
 from dataclasses import asdict, dataclass, field
 import traceback
+from difflib import SequenceMatcher
 from pathlib import Path
 from typing import Any, Awaitable, Callable
 
@@ -24,6 +26,7 @@ from .environment.remote_files import ensure_remote_dir, write_remote_text
 from .runtime_signals import hard_signal_labels
 from .provider_errors import classify_agent_runtime_failure
 from .trajectory_artifacts import persist_trajectory_artifacts
+from .utils import paths as long_paths
 from .role_prompts import (
     MANAGER_NEXT_BLOCKED,
     MANAGER_NEXT_DONE,
@@ -41,13 +44,19 @@ from .role_prompts import (
     extract_role_manager_question,
     extract_role_task_contract,
     extract_role_task_state,
+    format_executor_escalation_briefing,
     format_related_auditor_reports,
     format_management_history,
+    parse_role_manager_executor_tier,
     parse_role_manager_next_step,
 )
 from .types import (
+    EXECUTOR_TIERS,
+    AuditReport,
     EpisodeBudget,
     EpisodeResult,
+    ExecutorRouting,
+    ExecutorTier,
     HarnessConfig,
     ManagedRound,
     RoleNextStep,
@@ -66,6 +75,7 @@ from .auditor_agent import (
     audit_report_from_episode_result,
 )
 
+IS_WINDOWS = sys.platform == "win32"
 ROLE_VARIANT = "lh_harness_role_managed"
 logger = logging.getLogger(__name__)
 _MAX_SAVED_TRAJECTORY_BYTES = 16 * 1024 * 1024
@@ -112,6 +122,174 @@ def _invalid_plan_feedback(language: str) -> str:
         "缺口: 输出一个主目标明确的 GUI/CLI 子任务，或明确请示用户/完成/阻塞。\n"
         "下一步: 使用 `下一步: GUI任务`、`下一步: CLI任务`、`下一步: 请示用户`、`下一步: 完成` 或 `下一步: 阻塞` 重新管理。"
     )
+
+
+def _escalation_feedback(
+    language: str, *, from_tier: str, to_tier: str, reason: str, rounds: list[int]
+) -> str:
+    """Tell the manager the harness re-routed execution, and why."""
+    listed = ", ".join(f"round_{index:03d}" for index in rounds) or "-"
+    stalled = reason == "no_progress_threshold_reached"
+    if language == "en":
+        cause = (
+            f"those rounds kept reporting the same outstanding gap without closing it ({listed})"
+            if stalled
+            else f"the audits for those rounds reported real problems ({listed})"
+        )
+        return (
+            f"Executor escalation: {from_tier} -> {to_tier}\n"
+            f"Reason: {reason} — {cause}.\n"
+            "This is a harness routing change, not an audit. The next subtask runs on the stronger "
+            "executor and is still audited normally. Repeated failure may also mean the subtask "
+            "decomposition or the task contract is wrong, not only that the executor was too weak; "
+            "reconsider both, and cite those rounds in `Related audit reports:`."
+        )
+    cause = (
+        f"这些轮次反复报告同一个未闭合的缺口（{listed}）"
+        if stalled
+        else f"这些轮次的审计报告了真实问题（{listed}）"
+    )
+    return (
+        f"executor 档位升级: {from_tier} -> {to_tier}\n"
+        f"原因: {reason} —— {cause}。\n"
+        "这是 harness 的路由调整，不是审计结论。下一个子任务会交给更强的 executor，并且仍然正常接受审计。"
+        "反复失败也可能说明子任务拆解或任务契约有问题，而不只是 executor 能力不足；请同时重新审视这两点，"
+        "并在 `相关审计报告:` 中引用这些 round。"
+    )
+
+
+@dataclass
+class _ExecutorRouter:
+    """Chooses the executor tier for each round and escalates on repeated audit failure.
+
+    The manager may name a tier, but it is guessing at difficulty before the work
+    happens. Failed audits are the harness's own evidence that the guess (or the
+    default) was wrong, so past a threshold the router overrides it. A passing
+    audit clears that state, which keeps the expensive tier scoped to the stretch
+    of the run that is actually struggling.
+
+    Two signals feed it, because "the audit was not a pass" is far too broad in
+    this harness — see `_audit_reports_a_problem`. A round that reports an actual
+    problem counts against `escalate_after_failures`; a clean round that leaves
+    the same gap open counts against `escalate_after_stalled_rounds`.
+    """
+
+    routing: ExecutorRouting
+    consecutive_audit_failures: int = 0
+    # Consecutive rounds that came back clean but did not close the same gap.
+    stalled_rounds: int = 0
+    last_gap: str = ""
+    escalated: bool = False
+    # Tier the failing work actually ran on, for the briefing and the log line.
+    escalated_from: str = ""
+    failed_round_indices: list[int] = field(default_factory=list)
+    tier_counts: dict[str, int] = field(default_factory=dict)
+    # Every escalation this run made. `escalated` is cleared by a passing audit,
+    # so without this the final report of a run that escalated and then
+    # recovered would show no sign that it ever happened.
+    escalations: list[dict[str, Any]] = field(default_factory=list)
+
+    def select(self, requested: ExecutorTier | None) -> tuple[ExecutorTier, str]:
+        """Return this round's ``(tier, why)``; escalation outranks a manager hint."""
+        if self.escalated:
+            return self.routing.escalation_tier, "escalated"
+        if requested in EXECUTOR_TIERS:
+            return requested, "manager"  # type: ignore[return-value]
+        return self.routing.default_tier, "default"
+
+    def count(self, tier: str) -> None:
+        self.tier_counts[tier] = self.tier_counts.get(tier, 0) + 1
+
+    def record_audit(
+        self,
+        report: AuditReport,
+        round_index: int,
+        tier: str,
+        *,
+        executor_failed: bool = False,
+    ) -> dict[str, Any] | None:
+        """Fold this round's audit into both signals; return any escalation it fires.
+
+        A clean, contract-aligned round that is merely ``incomplete`` is progress,
+        not a failure — but only if it moved the gap. Repeating the same gap is
+        the stall signal.
+        """
+        if _audit_is_clean_complete(report):
+            self._reset()
+            return None
+
+        gap = _audit_gap_fingerprint(report)
+        if executor_failed or _audit_reports_a_problem(report):
+            self.consecutive_audit_failures += 1
+            self.failed_round_indices.append(round_index)
+            self.stalled_rounds = 0
+            reason = "audit_failure_threshold_reached"
+            count, threshold = self.consecutive_audit_failures, self.routing.escalate_after_failures
+        elif _same_gap(gap, self.last_gap):
+            self.stalled_rounds += 1
+            self.failed_round_indices.append(round_index)
+            reason = "no_progress_threshold_reached"
+            count, threshold = self.stalled_rounds, self.routing.escalate_after_stalled_rounds
+        else:
+            # Incomplete but advancing: a new gap means the round moved things on.
+            self.stalled_rounds = 1
+            self.consecutive_audit_failures = 0
+            self.failed_round_indices = [round_index]
+            self.last_gap = gap
+            return None
+        self.last_gap = gap
+
+        # Nothing to escalate to when the failing work already ran on the
+        # escalation tier, so the router keeps counting but makes no claim.
+        if (
+            not threshold
+            or self.escalated
+            or count < threshold
+            or tier == self.routing.escalation_tier
+        ):
+            return None
+        self.escalated = True
+        self.escalated_from = tier
+        escalation = {
+            "round": round_index,
+            "from_tier": tier,
+            "to_tier": self.routing.escalation_tier,
+            "reason": reason,
+            "consecutive_audit_failures": self.consecutive_audit_failures,
+            "stalled_rounds": self.stalled_rounds,
+            "threshold": threshold,
+            "failed_rounds": list(self.failed_round_indices),
+        }
+        self.escalations.append(escalation)
+        return escalation
+
+    def _reset(self) -> None:
+        self.consecutive_audit_failures = 0
+        self.stalled_rounds = 0
+        self.failed_round_indices = []
+        self.last_gap = ""
+        self.escalated = False
+        self.escalated_from = ""
+
+
+def _resolve_executor_agents(
+    executor_agents: dict[str, dict[str, AgentAdapter]] | None,
+    *,
+    gui_executor_agent: AgentAdapter,
+    cli_executor_agent: AgentAdapter,
+) -> dict[str, dict[str, AgentAdapter]]:
+    """Fill every (type, tier) cell, defaulting to that type's single adapter.
+
+    A caller that passes only the per-type adapters — which is every caller that
+    predates tiers — gets the same adapter in both tiers, so routing runs but
+    nothing about the run changes.
+    """
+    provided = executor_agents or {}
+    resolved: dict[str, dict[str, AgentAdapter]] = {}
+    for executor_type, fallback in (("gui", gui_executor_agent), ("cli", cli_executor_agent)):
+        by_tier = provided.get(executor_type) or {}
+        resolved[executor_type] = {tier: by_tier.get(tier) or fallback for tier in EXECUTOR_TIERS}
+    return resolved
 
 
 async def run(*args: Any, **kwargs: Any) -> dict[str, Any]:
@@ -161,6 +339,7 @@ async def _run_impl(
     manager_agent: AgentAdapter | None = None,
     gui_executor_agent: AgentAdapter | None = None,
     cli_executor_agent: AgentAdapter | None = None,
+    executor_agents: dict[str, dict[str, AgentAdapter]] | None = None,
     gui_auditor_agent: AgentAdapter | None = None,
     cli_auditor_agent: AgentAdapter | None = None,
     auditor_format_repair_agent: AgentAdapter | None = None,
@@ -173,6 +352,14 @@ async def _run_impl(
     The default `agent` can back every role, which is how Codex or Claude Code
     adapters start. Callers with stronger role controls can pass distinct
     adapters for manager, GUI task, CLI task, GUI auditor, and CLI auditor.
+
+    ``executor_agents`` optionally splits each executor type by cost tier, as
+    ``{"gui"|"cli": {"cheap"|"strong": adapter}}``. Any cell left out falls back
+    to that type's single adapter, so callers that pass only
+    ``gui_executor_agent`` / ``cli_executor_agent`` behave exactly as before.
+    Which tier runs is decided by ``config.executor_routing``: the manager may
+    name one, otherwise the default tier applies, and repeated audit failures
+    escalate. The escalated executor is still audited normally.
 
     ``human_hook`` is a single optional human-in-the-loop callback (used by the
     dashboard for approval / instruction injection). It runs at the END of every
@@ -221,6 +408,15 @@ async def _run_impl(
     ):
         raise ValueError("Every role needs an agent, or a default agent must be provided")
 
+    # Executor type (gui/cli) and cost tier (cheap/strong) are independent, so
+    # the executor is looked up per (type, tier) cell rather than per type.
+    executor_by_type_and_tier = _resolve_executor_agents(
+        executor_agents,
+        gui_executor_agent=gui_executor_agent,
+        cli_executor_agent=cli_executor_agent,
+    )
+    router = _ExecutorRouter(routing=config.executor_routing)
+
     # Every role reads one explicit budget. Keeping the resolved budgets in the
     # config avoids the previous episode/auditor alias chain, where duplicate
     # fields made it unclear which timeout values actually won.
@@ -251,6 +447,7 @@ async def _run_impl(
             "workspace_path": config.workspace_path,
             "harness_dir": config.harness_dir,
             "max_rounds": config.max_total_episodes,
+            "executor_routing": asdict(config.executor_routing),
             "manager_budget": _budget_to_dict(manager_budget),
             "gui_executor_budget": _budget_to_dict(gui_executor_budget),
             "cli_executor_budget": _budget_to_dict(cli_executor_budget),
@@ -543,10 +740,15 @@ async def _run_impl(
                 break
             continue
 
+        # The tier is chosen before the executor runs; the failure count that can
+        # escalate it is updated after this round's audit, so a first failure
+        # never re-routes the round it happened in.
+        executor_tier, tier_source = router.select(parse_role_manager_executor_tier(plan_text))
+        router.count(executor_tier)
         executor_agent, executor_budget = _executor_binding(
             next_step=next_step,
-            gui_executor_agent=gui_executor_agent,
-            cli_executor_agent=cli_executor_agent,
+            executor_tier=executor_tier,
+            executor_agents=executor_by_type_and_tier,
             gui_executor_budget=gui_executor_budget,
             cli_executor_budget=cli_executor_budget,
         )
@@ -557,6 +759,21 @@ async def _run_impl(
             max_chars=config.role_verified_context_chars,
             language=config.prompt_language,
         )
+        # An escalated executor is a brand-new session, possibly on another
+        # backend, and no earlier executor output otherwise reaches it. Without
+        # this it would re-run the approaches the cheap tier already failed with.
+        escalation_briefing = ""
+        if tier_source == "escalated" and config.executor_routing.escalation_briefing:
+            escalation_briefing = format_executor_escalation_briefing(
+                rounds,
+                router.failed_round_indices,
+                from_tier=router.escalated_from or config.executor_routing.default_tier,
+                to_tier=executor_tier,
+                max_chars=config.escalation_briefing_chars,
+                language=config.prompt_language,
+            )
+            if escalation_briefing:
+                _write_local(round_dir / "executor_escalation_briefing.txt", escalation_briefing)
 
         # Task prompts receive the manager-maintained state plus only the
         # auditor reports explicitly referenced by the current subtask contract.
@@ -568,16 +785,31 @@ async def _run_impl(
             task_contract=current_task_contract,
             related_auditor_reports=related_auditor_reports,
             workspace_path=config.workspace_path,
+            escalation_briefing=escalation_briefing,
             language=config.prompt_language,
         )
         _write_local(round_dir / "executor_prompt.txt", executor_prompt)
+        _write_local(round_dir / "executor_tier.txt", executor_tier)
         await _write_remote_round_text(env, config, round_index, "executor_prompt.txt", executor_prompt)
         _append_event(
             events_path,
             "executor_role_start",
-            {"round": round_index, "role": next_step, "prompt_chars": len(executor_prompt), "budget": _budget_to_dict(executor_budget)},
+            {
+                "round": round_index,
+                "role": next_step,
+                "executor_tier": executor_tier,
+                "tier_source": tier_source,
+                "escalation_briefing_chars": len(escalation_briefing),
+                "prompt_chars": len(executor_prompt),
+                "budget": _budget_to_dict(executor_budget),
+            },
         )
-        emit("role_start", round=round_index, role=f"{next_step}_executor")
+        emit(
+            "role_start",
+            round=round_index,
+            role=f"{next_step}_executor",
+            executor_tier=executor_tier,
+        )
 
         executor_result = await _run_role_episode(
             executor_agent,
@@ -608,6 +840,7 @@ async def _run_impl(
                 round_index=round_index,
                 next_step=next_step,
                 plan_text=plan_text,
+                executor_tier=executor_tier,
                 executor_output=executor_output,
                 task_state=current_task_state,
                 task_contract=current_task_contract,
@@ -679,6 +912,8 @@ async def _run_impl(
             {
                 "round": round_index,
                 "role": next_step,
+                "executor_tier": executor_tier,
+                "tier_source": tier_source,
                 "output_chars": len(executor_output),
                 **_episode_event_fields(executor_result, event_status="completed"),
             },
@@ -689,6 +924,7 @@ async def _run_impl(
             role=f"{next_step}_executor",
             status=executor_result.status,
             duration_ms=executor_result.duration_ms,
+            executor_tier=executor_tier,
         )
 
         # The auditor audits only the just-finished subtask. Its natural
@@ -741,6 +977,7 @@ async def _run_impl(
                 round_index=round_index,
                 next_step=next_step,
                 plan_text=plan_text,
+                executor_tier=executor_tier,
                 executor_output=executor_output,
                 task_state=current_task_state,
                 task_contract=current_task_contract,
@@ -827,6 +1064,7 @@ async def _run_impl(
                 round_index=round_index,
                 next_step=next_step,
                 plan_text=plan_text,
+                executor_tier=executor_tier,
                 executor_output=executor_output,
                 task_state=current_task_state,
                 task_contract=current_task_contract,
@@ -851,12 +1089,41 @@ async def _run_impl(
         _write_local(round_dir / "auditor_report.txt", auditor_report)
         await _write_remote_round_text(env, config, round_index, "auditor_report.txt", auditor_report)
 
+        # The audit verdict drives the escalation counter, so it is parsed before
+        # the round is recorded and any escalation notice goes into this round's
+        # harness feedback, which the next manager prompt reads.
+        audit = parse_audit_report(auditor_report, round_index, language=config.prompt_language)
+        escalation = router.record_audit(
+            audit,
+            round_index,
+            executor_tier,
+            # An executor that errored or timed out is a failure on its own, even
+            # if the auditor could not tell from the output alone.
+            executor_failed=executor_result.status != "done"
+            or bool(_hard_runtime_signal_labels(executor_result)),
+        )
+        escalation_notice = ""
+        if escalation:
+            escalation_notice = _escalation_feedback(
+                config.prompt_language,
+                from_tier=escalation["from_tier"],
+                to_tier=escalation["to_tier"],
+                reason=escalation["reason"],
+                rounds=escalation["failed_rounds"],
+            )
+            _write_local(round_dir / "harness_feedback.txt", escalation_notice)
+            await _write_remote_round_text(
+                env, config, round_index, "harness_feedback.txt", escalation_notice
+            )
+
         record = ManagedRound(
             round_index=round_index,
             next_step=next_step,
             plan_text=plan_text,
+            executor_tier=executor_tier,
             executor_output=executor_output,
             auditor_report=auditor_report,
+            harness_feedback=escalation_notice,
             task_state=current_task_state,
             task_contract=current_task_contract,
             related_report_refs=related_report_refs,
@@ -875,7 +1142,9 @@ async def _run_impl(
                 **_episode_event_fields(auditor_result, event_status="completed"),
             },
         )
-        audit = parse_audit_report(auditor_report, round_index, language=config.prompt_language)
+        if escalation:
+            _append_event(events_path, "executor_escalation", escalation)
+            emit("executor_escalation", **escalation)
         emit(
             "role_done",
             round=round_index,
@@ -902,6 +1171,7 @@ async def _run_impl(
         elapsed_seconds=elapsed,
         final_response=gate.final_response,
         failure_reason=gate.failure_reason,
+        executor_routing=_executor_routing_report(router),
     )
     _write_local(role_dir / "report.json", json.dumps(final, ensure_ascii=False, indent=2) + "\n")
     _write_local(log_dir / "report.json", json.dumps(final, ensure_ascii=False, indent=2) + "\n")
@@ -1091,14 +1361,16 @@ async def _human_gate(ctx: _GateContext, outcome: str, round_index: int, task_st
 def _executor_binding(
     *,
     next_step: RoleNextStep,
-    gui_executor_agent: AgentAdapter,
-    cli_executor_agent: AgentAdapter,
+    executor_tier: str,
+    executor_agents: dict[str, dict[str, AgentAdapter]],
     gui_executor_budget: EpisodeBudget,
     cli_executor_budget: EpisodeBudget,
 ) -> tuple[AgentAdapter, EpisodeBudget]:
+    # The budget stays per executor type: a tier changes which model does the
+    # work, not how long a GUI or CLI subtask is allowed to take.
     if next_step == MANAGER_NEXT_GUI:
-        return gui_executor_agent, gui_executor_budget
-    return cli_executor_agent, cli_executor_budget
+        return executor_agents["gui"][executor_tier], gui_executor_budget
+    return executor_agents["cli"][executor_tier], cli_executor_budget
 
 
 async def _run_role_episode(
@@ -1271,7 +1543,7 @@ async def _write_final_response(
     # Stored per round, like the other roles, so a discarded reply keeps its own
     # artifacts and the dashboard's round trajectory viewer can reach them.
     round_dir = ctx.role_dir / "rounds" / f"round_{round_index:03d}"
-    round_dir.mkdir(parents=True, exist_ok=True)
+    long_paths.makedirs(round_dir)
     _write_local(round_dir / "final_response_input.txt", prompt)
     _append_event(
         ctx.events_path,
@@ -1394,6 +1666,52 @@ def _auditor_report_text(
     )
 
 
+def _audit_is_clean_complete(report: AuditReport) -> bool:
+    """The one definition of a passing audit: complete, clean, and contract-aligned."""
+    return (
+        report.status == "complete"
+        and report.integrity_status == "clean"
+        and report.contract_audit_status == "aligned"
+    )
+
+
+def _audit_reports_a_problem(report: AuditReport) -> bool:
+    """Whether an audit says something went wrong, as opposed to "not done yet".
+
+    Auditors are instructed to report `incomplete` whenever the whole contract is
+    not yet satisfied, "even if the local subtask succeeded", so nearly every
+    mid-run round is incomplete. Only these signals mean the round itself was
+    bad, which is what escalation should react to.
+    """
+    return (
+        report.status == "blocked"
+        or report.integrity_status in {"suspect", "violation"}
+        or report.contract_audit_status in {"needs_revision", "invalid"}
+    )
+
+
+def _audit_gap_fingerprint(report: AuditReport) -> str:
+    """Normalized text of the gap an audit is still asking to close."""
+    for candidate in (report.action_guidance, report.state_summary, report.report_text):
+        text = " ".join(str(candidate or "").lower().split())
+        if text:
+            return text
+    return ""
+
+
+# Auditors reword the same finding between rounds, so the stall check compares
+# similarity rather than requiring an exact repeat.
+_STALL_SIMILARITY = 0.85
+
+
+def _same_gap(current: str, previous: str) -> bool:
+    if not current or not previous:
+        return False
+    if current == previous:
+        return True
+    return SequenceMatcher(None, current, previous).ratio() >= _STALL_SIMILARITY
+
+
 def _latest_auditor_is_clean_complete(rounds: list[ManagedRound], *, language: str = "en") -> bool:
     for item in reversed(rounds):
         if item.auditor_status.get("invalid_completion") or item.auditor_status.get("invalid_plan"):
@@ -1401,11 +1719,7 @@ def _latest_auditor_is_clean_complete(rounds: list[ManagedRound], *, language: s
         if not item.auditor_report.strip():
             continue
         report = parse_audit_report(item.auditor_report, item.round_index, language=language)
-        return (
-            report.status == "complete"
-            and report.integrity_status == "clean"
-            and report.contract_audit_status == "aligned"
-        )
+        return _audit_is_clean_complete(report)
     return False
 
 
@@ -1422,6 +1736,7 @@ def _final_report(
     elapsed_seconds: float,
     final_response: str = "",
     failure_reason: str = "",
+    executor_routing: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     # Final status is a harness-level decision, not the last executor agent's self
     # claim. The auditor artifact remains the natural-language audit report.
@@ -1438,7 +1753,8 @@ def _final_report(
         else "incomplete"
     )
     return {
-        "schema_version": 2,
+        # 3 adds `executor_tier` to each round and the `executor_routing` block.
+        "schema_version": 3,
         "variant": ROLE_VARIANT,
         "mode": "role_orchestration",
         "status": status,
@@ -1454,6 +1770,7 @@ def _final_report(
         "current_task_state": task_state,
         "current_task_contract": task_contract,
         "latest_auditor_report": latest_report_text,
+        "executor_routing": executor_routing or {},
         "final_response": final_response,
         "rounds": [asdict(item) for item in rounds],
         "elapsed_seconds": round(elapsed_seconds, 3),
@@ -1591,6 +1908,19 @@ def _read_jsonl_local(path: Path) -> list[dict[str, Any]]:
         if isinstance(value, dict):
             result.append(value)
     return result
+def _executor_routing_report(router: _ExecutorRouter) -> dict[str, Any]:
+    """Routing policy plus what it actually did, for the run report."""
+    return {
+        **asdict(router.routing),
+        # `escalated` is the state the run ended in; `escalations` is what it did
+        # along the way, which a recovering run would otherwise not show.
+        "escalated": router.escalated,
+        "escalated_from": router.escalated_from,
+        "escalations": list(router.escalations),
+        "consecutive_audit_failures": router.consecutive_audit_failures,
+        "stalled_rounds": router.stalled_rounds,
+        "rounds_by_tier": dict(router.tier_counts),
+    }
 
 
 def _latest_auditor_report_text(rounds: list[ManagedRound]) -> str:
@@ -2158,8 +2488,47 @@ def _budget_to_dict(budget: EpisodeBudget) -> dict[str, int]:
     }
 
 
+def _event_record(path: Path, event: str, payload: dict[str, Any], sequence: int) -> dict[str, Any]:
+    run_id = path.parents[2].name if len(path.parents) > 2 else "local"
+    return {
+        "schema_version": 1,
+        "event_id": f"{run_id}:{sequence:06d}",
+        "ts": time.time(),
+        "event": event,
+        **_json_safe(payload),
+    }
+
+
+def _append_event_windows(path: Path, event: str, payload: dict[str, Any]) -> None:
+    """Append one event on Windows, which has no O_NOFOLLOW/dir_fd/flock.
+
+    Same record shape and same sequence-derived event id as the POSIX path. The
+    difference is the locking: a single process owns this log for the run, so
+    the sequence is read and written under one handle rather than an advisory
+    lock.
+    """
+
+    if path.is_symlink():
+        raise OSError(f"refusing to follow a reparse point: {path}")
+    target = long_paths.os_path(path)
+    with open(target, "a+", encoding="utf-8", newline="") as fh:
+        fh.seek(0)
+        sequence = sum(1 for line in fh if line.strip()) + 1
+        fh.seek(0, 2)
+        fh.write(
+            json.dumps(_event_record(path, event, payload, sequence), ensure_ascii=False, sort_keys=True)
+            + "\n"
+        )
+        fh.flush()
+        with contextlib.suppress(OSError):
+            os.fsync(fh.fileno())
+
+
 def _append_event(path: Path, event: str, payload: dict[str, Any]) -> None:
     _ensure_dir_nofollow(path.parent)
+    if IS_WINDOWS:
+        _append_event_windows(path, event, payload)
+        return
     # Event ids are assigned while holding the file lock, so the same absolute
     # id survives snapshot truncation, REST replay, and a reconnect after an
     # API restart.  The legacy ``event`` field remains for old readers.

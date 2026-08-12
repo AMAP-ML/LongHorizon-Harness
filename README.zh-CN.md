@@ -190,7 +190,7 @@ LongHorizon-Harness 不只展示了几个精心挑选的成功案例。
 | `PATH` 上有一个 Agent 运行时：[`codex`](https://github.com/openai/codex#installing-and-running-codex-cli) 或 [`claude`](https://docs.anthropic.com/en/docs/claude-code/getting-started) | 真正执行任务。想按角色混用两个后端就都装上。 |
 | [Node.js](https://nodejs.org) 20 或更高版本 | 只有 npm 分发的 computer-use 插件需要。用 `codex-computer-use` 或纯 CLI 任务时不需要。 |
 
-> **平台状态：** 目前只在 macOS 上完成了测试；Windows 已支持，但尚未经过详细测试。
+> **平台状态：** 已在 macOS 和 Windows 上测试。Agent CLI 以普通子进程方式启动，不经过 shell，因此命令构造在所有平台上行为一致。在 Windows 上还会自动绕开 260 字符的 `MAX_PATH` 限制——项目路径较深时，运行目录很容易超过这个长度。
 
 以上都可以用 `lh-harness doctor` 一次性检查，见[检查运行环境](#检查运行环境)。
 
@@ -323,7 +323,7 @@ cli_auditor  → auditor  → [run].agent / [run].model
 | 配置段 | 回退到 | 作用范围 |
 |---|---|---|
 | `[run.roles.manager]` | `[run]` | 调度角色 |
-| `[run.roles.executor]` | `[run]` | 两个 executor 角色 |
+| `[run.roles.executor]` | `[run]` | 所有 executor 角色和档位 |
 | `[run.roles.gui_executor]` | `executor` | GUI/视觉子任务 |
 | `[run.roles.cli_executor]` | `executor` | CLI/非 GUI 子任务 |
 | `[run.roles.auditor]` | `[run]` | 两个 auditor 角色 |
@@ -332,6 +332,103 @@ cli_auditor  → auditor  → [run].agent / [run].model
 | `[run.roles.final_response]` | `manager` | 写给你的最终回复 |
 
 上述每个字段都有对应的 CLI 参数（`--agent`、`--max-rounds`、`--gui-executor-model`、`--auditor-timeout` 等）可以对单次运行覆盖。完整列表见 `lh-harness run --help`。
+
+##### executor 档位
+
+executor 有两个彼此独立的属性：**类型**（`gui` 或 `cli`，由任务管理器的路由决定）和**档位**（`cheap` 或 `strong`，表示这个子任务值得多强的模型能力）。给 executor 角色配置 `cheap` 和 `strong` 子表，就能让常规工作跑在更便宜的后端上，只在更难的子任务上使用更强的后端：
+
+```toml
+[run.roles.executor.cheap]
+agent = "codex"
+model = "gpt-5.6-sol"
+
+[run.roles.executor.strong]
+agent = "claude_code"
+model = "claude-opus-5"
+```
+
+档位复用与其它角色相同的 agent 抽象，因此任何受支持的后端都可以承担任何档位，任务管理器也可以把子任务派发给另一个后端上的 executor。
+
+| 配置段 | 回退到 | 覆盖范围 |
+|---|---|---|
+| `[run.roles.executor.cheap]` | `executor` | 两种 executor 类型的 cheap 档位 |
+| `[run.roles.executor.strong]` | `executor` | 两种 executor 类型的 strong 档位 |
+| `[run.roles.gui_executor.cheap]` | `executor.cheap`，然后 `gui_executor` | 仅 GUI + cheap |
+| `[run.roles.gui_executor.strong]` | `executor.strong`，然后 `gui_executor` | 仅 GUI + strong |
+| `[run.roles.cli_executor.cheap]` | `executor.cheap`，然后 `cli_executor` | 仅 CLI + cheap |
+| `[run.roles.cli_executor.strong]` | `executor.strong`，然后 `cli_executor` | 仅 CLI + strong |
+
+指定档位是明确的成本决定，因此它优先于按类型配置的旧配置段。GUI 子任务在 cheap 档位上的完整回退链是：
+
+```
+gui_executor.cheap → executor.cheap → gui_executor → executor → [run].agent / [run].model
+```
+
+档位是可选的。没有配置任何档位子表时，每个档位都会解析到与今天相同的 executor，因此已有的单 executor 项目配置可以继续正常工作。
+
+##### `[run.executor_routing]`
+
+决定哪个档位执行子任务，以及 harness 在什么情况下自己覆盖这个选择。
+
+```toml
+[run.executor_routing]
+default_tier = "cheap"
+escalate_after_failures = 1
+escalate_after_stalled_rounds = 3
+escalation_tier = "strong"
+```
+
+| 字段 | 默认值 | 说明 |
+|---|---|---|
+| `default_tier` | `"cheap"` | 任务管理器没有指定档位时使用的档位，让大部分工作留在更便宜的后端上。 |
+| `escalate_after_failures` | `1` | 切换到 `escalation_tier` 前允许的、报告真实问题的连续审计次数；`0` 表示关闭该信号。 |
+| `escalate_after_stalled_rounds` | `3` | 连续多少轮结果干净但反复报告同一个未闭合缺口时升级；`0` 表示关闭该信号。 |
+| `escalation_tier` | `"strong"` | 任一阈值达到后使用的档位。 |
+| `escalation_briefing` | `true` | 告诉升级后的 executor 上一个档位试过什么、为什么被 auditor 拒绝。 |
+
+##### 什么才算“失败”
+
+这一点比看上去重要。auditor 被要求：只要**整体**契约尚未满足就报告 `incomplete`——“即使局部子任务成功也是如此”。因此一个完全正常的中间轮次通常返回 `状态: incomplete · 完整性: clean · 契约审计: aligned`。如果把它当成失败，几乎每个任务都会在第一轮就升级，成本优势也就没有了。
+
+所以升级读取两个不同的信号：
+
+| 信号 | 计入 | 含义 |
+|---|---|---|
+| `状态: blocked`、`完整性: suspect`/`violation`、`契约审计: needs_revision`/`invalid`，或 executor 调用报错/超时 | `escalate_after_failures` | 这一轮确实出了问题 |
+| 连续多轮结果干净，但 auditor 反复指出同一个未闭合缺口 | `escalate_after_stalled_rounds` | cheap 档位在空转，没有推进 |
+| `状态: incomplete` 且 clean/aligned，每轮缺口都在变化 | 都不计入 | 多轮任务的正常推进 |
+
+审计通过（`complete` + `clean` + `aligned`）会同时清零两个计数器。
+
+任务管理器可以在路由之后加一行 `执行器档位: cheap` 或 `执行器档位: strong` 来为单个子任务指定档位。它根据眼前这个子任务判断，而不是依据固定的任务类别清单。
+
+由于任务管理器是在工作发生之前预判难度，可能判断错误，审计失败会自动触发升级：
+
+```
+cheap executor → auditor → 失败 → strong executor → auditor
+```
+
+升级绝不会绕过验证：strong executor 的结果同样要走正常的 auditor 流程。审计通过后升级状态会被清除，路由回到默认档位，因此更贵的模型只在运行确实卡住的阶段被使用。
+
+##### 两个参数要一起调
+
+`escalate_after_failures` 和 `escalation_briefing` 是相互影响的，建议成对设置。
+
+每次角色调用都是全新的 agent 会话——agent CLI 都是一次性调用，轮次之间不保留对话。因此**升级后**的 executor 会收到一份简报，说明上一个档位尝试过什么以及 auditor 的审计结论；其中历史 executor 输出会被明确标注为未经验证的自述，auditor 仍然是唯一的事实权威。升级也会通知任务管理器，因为反复失败可能意味着子任务拆解有问题，而不只是 executor 能力不足。
+
+但**同档位重试**不会收到这份简报。它只能看到任务管理器维护的 `当前任务状态:` 以及任务管理器主动引用的报告，因此可能重复刚刚被拒绝的做法。
+
+这就是默认阈值为 `1` 的原因：在没有简报的情况下，第二次 cheap 尝试基本是浪费一轮。提高阈值是用延迟换成本：
+
+| `escalate_after_failures` | 行为 |
+|---|---|
+| `1`（默认） | 第一次报告真实问题的审计之后直接升级到 strong 档位。最快，但 strong 模型使用频率更高。 |
+| `2` 或更大 | 先在 cheap 档位重试。重试成功时更省钱，但这些重试轮次没有简报。 |
+| `0` | 不因问题而升级；`escalate_after_stalled_rounds` 仍然生效。 |
+
+由于“仅仅 incomplete”不算失败，这里的 `1` **并不意味着**“第一轮就升级”——只要任务在干净地推进，就会一直留在 cheap 档位。
+
+选中的档位会显示在控制台（`tier=cheap`）、Dashboard 中路由徽章旁边，以及 `report.json` 里每一轮的记录和 `executor_routing` 汇总中。
 
 #### 管理 computer-use 插件
 
@@ -447,6 +544,9 @@ lh-harness web --workspace-root .               # 为指定目录启动工作台
 | `--agent` | `claude_code` 或 `codex` |
 | `--env` | `local` |
 | `--max-rounds` | Manage-Execute-Audit 循环的最大轮数；CLI 默认为 30 |
+| `--executor-cheap-agent` / `--executor-strong-agent` | 指定某个 executor 档位的后端；`--*-model` 指定其模型 |
+| `--executor-default-tier` | 任务管理器未指定档位时使用的档位，默认 `cheap` |
+| `--executor-escalate-after-failures` | 触发升级前允许的审计失败次数；`0` 表示关闭 |
 | `--dashboard` | 启动实时监控和人工介入功能 |
 | `--no-dashboard` | 关闭项目配置中默认启用的 Dashboard |
 

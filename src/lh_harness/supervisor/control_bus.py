@@ -10,12 +10,15 @@ from __future__ import annotations
 import json
 import os
 import stat
+import sys
 import threading
 import time
 import uuid
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Callable, Iterator
+
+_IS_WINDOWS = sys.platform == "win32"
 
 
 _MAX_CONTROL_RECORD_BYTES = 512 * 1024
@@ -106,6 +109,27 @@ def _open_nofollow(path: str | Path, *, directory: bool = False) -> int:
         raise
 
 
+def _ensure_dir_windows(path: str | Path) -> None:
+    """Build a directory chain on Windows, refusing reparse points."""
+
+    from ..utils import paths as long_paths
+
+    absolute = _absolute_anchored_path(path)
+    current = Path(absolute.anchor)
+    for component in absolute.parts[1:]:
+        if component in {"", ".", ".."}:
+            raise OSError("unsafe control-bus directory component")
+        current = current / component
+        if current.is_symlink():
+            raise OSError(f"refusing to traverse a reparse point: {current}")
+        try:
+            long_paths.makedirs(current, exist_ok=True)
+        except FileExistsError:
+            pass
+        if not current.is_dir():
+            raise OSError(f"control-bus path component is not a directory: {current}")
+
+
 def _ensure_dir_fd_nofollow(path: str | Path, *, mode: int = 0o700) -> int:
     """Create/validate a directory chain and return its anchored descriptor.
 
@@ -173,8 +197,20 @@ def _ensure_dir_fd_nofollow(path: str | Path, *, mode: int = 0o700) -> int:
 
 
 def _ensure_dir_nofollow(path: str | Path, *, mode: int = 0o700) -> None:
-    """Create/validate a directory chain without traversing symlinks."""
+    """Create/validate a directory chain without traversing symlinks.
 
+    Windows has no ``O_NOFOLLOW`` and no directory descriptors, so the anchored
+    POSIX walk cannot run there at all. Callers still need the directory, so it
+    gets the closest available guarantee: build the chain component by
+    component, refusing any existing component that is a reparse point
+    (symlinks and junctions both surface that way). The unavoidable difference
+    is that the check is not anchored, so a sufficiently privileged local actor
+    could still win a check-then-use race.
+    """
+
+    if _IS_WINDOWS:
+        _ensure_dir_windows(path)
+        return None
     fd = _ensure_dir_fd_nofollow(path, mode=mode)
     try:
         return None
@@ -266,10 +302,43 @@ def _open_unique_temp(parent_fd: int, *, prefix: str, suffix: str) -> tuple[int,
     raise FileExistsError("could not allocate a unique control-bus temporary file")
 
 
+def _atomic_bytes_write_windows(path: Path, payload: bytes) -> None:
+    from ..utils import paths as long_paths
+
+    _ensure_dir_windows(path.parent)
+    if path.is_symlink():
+        raise OSError(f"refusing to follow a reparse point: {path}")
+    temporary = path.with_name(f".{path.name}.{uuid.uuid4().hex[:12]}.tmp")
+    target_tmp = long_paths.os_path(temporary)
+    try:
+        with open(target_tmp, "wb") as handle:
+            handle.write(payload)
+            handle.flush()
+            try:
+                os.fsync(handle.fileno())
+            except OSError:
+                pass
+        os.replace(target_tmp, long_paths.os_path(path))
+    except BaseException:
+        try:
+            os.unlink(target_tmp)
+        except OSError:
+            pass
+        raise
+
+
 def _atomic_bytes_write(path: Path, payload: bytes, *, mode: int = 0o600) -> None:
-    """Atomically write bytes below an anchored, no-follow parent directory."""
+    """Atomically write bytes below an anchored, no-follow parent directory.
+
+    The Windows branch keeps the atomic write-then-replace guarantee (which
+    ``os.replace`` provides there too) and the reparse-point refusal; only the
+    anchored-descriptor part is unavailable on that platform.
+    """
 
     path = Path(path)
+    if _IS_WINDOWS:
+        _atomic_bytes_write_windows(path, payload)
+        return
     parent_fd = _ensure_dir_fd_nofollow(path.parent)
     fd: int | None = None
     temporary_name: str | None = None
@@ -331,6 +400,16 @@ def _append_jsonl(path: Path, record: dict[str, Any]) -> None:
     # ``Path.open('a')`` follows a final symlink.  Commands and receipts are
     # control-plane data, so fail closed unless the whole parent chain and
     # final file can be opened with anchored no-follow semantics.
+    if _IS_WINDOWS:
+        # No anchored descriptors on Windows; refuse reparse points instead and
+        # append through a long-path-safe handle.
+        from ..utils import paths as long_paths
+
+        _ensure_dir_windows(path.parent)
+        if path.is_symlink():
+            raise OSError(f"refusing to follow a reparse point: {path}")
+        long_paths.append_line(path, line)
+        return
     fd: int | None = None
     parent_fd: int | None = None
     try:

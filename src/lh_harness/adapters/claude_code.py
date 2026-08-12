@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import os
-import shlex
 from pathlib import Path
 
 from ..agent_logs import visible_output as extract_claude_visible_output
@@ -39,22 +38,21 @@ class ClaudeCodeAdapter(CommandAgentAdapter):
         hidden_paths: tuple[str, ...] = (),
     ) -> None:
         policy = policy_for_role(role)
-        env_parts: list[str] = []
+        env_overrides: dict[str, str] = {}
         if api_key:
-            quoted_key = shlex.quote(api_key)
-            env_parts.append(f"ANTHROPIC_API_KEY={quoted_key}")
-            env_parts.append(f"ANTHROPIC_AUTH_TOKEN={quoted_key}")
+            env_overrides["ANTHROPIC_API_KEY"] = api_key
+            env_overrides["ANTHROPIC_AUTH_TOKEN"] = api_key
         if base_url:
             raw_url = base_url.rstrip("/")
             if raw_url.endswith("/v1"):
                 raw_url = raw_url[:-3]
-            env_parts.append(f"ANTHROPIC_BASE_URL={shlex.quote(raw_url)}")
-        env_parts.extend(
-            [
-                "CLAUDE_CODE_DISABLE_AUTO_MEMORY=1",
-                "CLAUDE_CODE_SKIP_PROMPT_HISTORY=1",
-                f"LH_HARNESS_CLAUDE_ROLE={shlex.quote(role)}",
-            ]
+            env_overrides["ANTHROPIC_BASE_URL"] = raw_url
+        env_overrides.update(
+            {
+                "CLAUDE_CODE_DISABLE_AUTO_MEMORY": "1",
+                "CLAUDE_CODE_SKIP_PROMPT_HISTORY": "1",
+                "LH_HARNESS_CLAUDE_ROLE": role,
+            }
         )
 
         # MCP support remains opt-in. --strict-mcp-config keeps unrelated
@@ -77,16 +75,15 @@ class ClaudeCodeAdapter(CommandAgentAdapter):
             )
 
         if is_auditor_role(role):
-            env_parts.extend(
-                [
-                    "GIT_OPTIONAL_LOCKS=0",
-                    "GIT_PAGER=cat",
-                    "PAGER=cat",
-                ]
+            env_overrides.update(
+                {
+                    "GIT_OPTIONAL_LOCKS": "0",
+                    "GIT_PAGER": "cat",
+                    "PAGER": "cat",
+                }
             )
 
-        env_prefix = (" ".join(env_parts) + " ") if env_parts else ""
-        command_parts = [
+        argv = [
             "claude",
             "--print",
             "--output-format",
@@ -96,17 +93,18 @@ class ClaudeCodeAdapter(CommandAgentAdapter):
         ]
         deny_tools = [*policy.disallowed_tools, *path_deny_rules(hidden_paths)]
         if deny_tools:
-            command_parts.append("--disallowedTools")
-            command_parts.extend(shlex.quote(tool) for tool in deny_tools)
+            argv.append("--disallowedTools")
+            argv.extend(deny_tools)
         self.computer_mcp_configured = bool(policy.load_computer_mcp and mcp_config)
         if self.computer_mcp_configured:
-            command_parts.extend(["--mcp-config", shlex.quote(mcp_config)])
-        command_parts.extend(["--model", shlex.quote(model)])
+            argv.extend(["--mcp-config", mcp_config])
+        argv.extend(["--model", model])
 
         self.role = role
         self.policy = policy
         super().__init__(
-            command_template=f"{env_prefix}{' '.join(command_parts)} < {{prompt_path}}",
+            argv=argv,
+            env=env_overrides,
             prompt_dir=prompt_dir,
             workspace_path=workspace_path,
             visible_output_parser=extract_claude_visible_output,

@@ -1,15 +1,13 @@
 from __future__ import annotations
 
-import posixpath
 import re
-import shlex
+import shutil
 import time
 import uuid
-from collections.abc import Callable
-from pathlib import PurePath
+from collections.abc import Mapping, Sequence
+from pathlib import Path, PurePath
 
 from ..environment.base import Environment
-from ..environment.remote_files import write_remote_text
 from ..runtime_signals import detect_runtime_signals
 from ..types import DEFAULT_TMP_DIR, DEFAULT_WORKSPACE_PATH, EpisodeBudget, EpisodeResult
 
@@ -29,20 +27,42 @@ def redact_secrets(text: str) -> str:
 
 
 class CommandAgentAdapter:
+    """Drives an agent CLI as a plain subprocess.
+
+    There is deliberately no shell involved. The workspace is passed as the
+    child's working directory, credentials as environment overrides, and the
+    prompt down the child's stdin -- so nothing has to be quoted for sh or
+    cmd.exe, the harness behaves identically on every platform, and no
+    model-supplied value can reach a shell parser.
+    """
+
     def __init__(
         self,
         *,
-        command_template: str,
+        argv: Sequence[str],
+        env: Mapping[str, str] | None = None,
         prompt_dir: str = f"{DEFAULT_TMP_DIR}/prompts",
         workspace_path: str = DEFAULT_WORKSPACE_PATH,
-        visible_output_parser: Callable[[str], str] | None = None,
+        visible_output_parser=None,
         hidden_paths: tuple[str, ...] = (),
     ) -> None:
-        self.command_template = command_template
-        self.prompt_dir = prompt_dir.rstrip("/") or "."
-        self.workspace_path = workspace_path.rstrip("/")
+        self.argv = list(argv)
+        self.env = dict(env or {})
+        self.prompt_dir = prompt_dir
+        self.workspace_path = str(workspace_path).rstrip("/\\") or workspace_path
         self.visible_output_parser = visible_output_parser
         self.hidden_paths = tuple(hidden_paths)
+
+    def resolved_argv(self) -> list[str]:
+        """Argv with the CLI resolved to a real path.
+
+        `shutil.which` also picks up the `.CMD`/`.EXE` shims the agent CLIs
+        install on Windows, which a bare name would only find via PATHEXT.
+        """
+        if not self.argv:
+            return []
+        resolved = shutil.which(self.argv[0])
+        return [resolved or self.argv[0], *self.argv[1:]]
 
     async def run_episode(
         self,
@@ -52,30 +72,26 @@ class CommandAgentAdapter:
         live_trajectory_path: str | None = None,
     ) -> EpisodeResult:
         start = time.monotonic()
-        # Never reuse one global prompt.md. A run owns its prompt directory and
-        # every role episode gets a distinct filename, so concurrent harnesses
-        # (and future concurrent roles within one harness) cannot overwrite the
-        # input while an agent CLI is still reading it.
-        prompt_path = posixpath.join(
-            self.prompt_dir,
-            f"{_episode_prompt_label(live_trajectory_path)}_{uuid.uuid4().hex[:12]}.md",
+        prompt_text = prompt + _hidden_paths_notice(self.hidden_paths)
+        # The prompt reaches the CLI over stdin, so this copy exists purely as an
+        # audit artifact. A run owns its prompt directory and every role episode
+        # gets a distinct filename, so concurrent harnesses cannot overwrite it.
+        prompt_path = str(
+            Path(self.prompt_dir)
+            / f"{_episode_prompt_label(live_trajectory_path)}_{uuid.uuid4().hex[:12]}.md"
         )
-        await write_remote_text(env, prompt_path, prompt + _hidden_paths_notice(self.hidden_paths))
-        # Substituted by explicit replace, not str.format: templates embed literal
-        # braces (e.g. Codex passes inline-TOML `-c` overrides) that format() would
-        # try to interpret as placeholders.
-        command_body = self.command_template
-        for placeholder, value in (
-            ("{prompt_path}", shlex.quote(prompt_path)),
-            ("{timeout}", str(budget.max_duration_seconds)),
-        ):
-            command_body = command_body.replace(placeholder, value)
-        command = f"cd {shlex.quote(self.workspace_path)} && {command_body}"
-        # When a live path is given (local runs), the environment mirrors stdout
-        # to that file line-by-line so the dashboard shows the trajectory live.
-        result = await env.exec(
-            command,
+        await env.write_text(prompt_path, prompt_text)
+
+        argv = self.resolved_argv()
+        result = await env.run(
+            argv,
             timeout=budget.max_duration_seconds,
+            cwd=self.workspace_path,
+            env=self.env,
+            stdin=prompt_text,
+            # When a live path is given (local runs), the environment mirrors
+            # stdout to that file line-by-line so the dashboard shows the
+            # trajectory live.
             tee_path=live_trajectory_path,
         )
         duration_ms = int((time.monotonic() - start) * 1000)
@@ -101,8 +117,11 @@ class CommandAgentAdapter:
             error=error,
             duration_ms=duration_ms,
             metadata={
-                "command": redact_secrets(command),
+                # A list, which downstream readers already accept: it keeps the
+                # exact arguments inspectable instead of a re-quoted string.
+                "command": [redact_secrets(part) for part in argv],
                 "workspace": self.workspace_path,
+                "env_overrides": sorted(self.env),
                 "prompt_path": prompt_path,
                 "exit_code": result.exit_code,
                 "termination_reason": result.termination_reason,
