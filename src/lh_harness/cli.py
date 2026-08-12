@@ -14,7 +14,7 @@ import traceback
 import uuid
 import webbrowser
 from pathlib import Path
-from typing import TYPE_CHECKING, Awaitable
+from typing import TYPE_CHECKING, Awaitable, Iterable
 
 from . import HOMEPAGE, ISSUES_URL, __version__
 from .config import (
@@ -498,6 +498,17 @@ def main(argv: list[str] | None = None) -> int:
         action="append",
         default=None,
         help="Extra directory to expose to the agent. May be repeated.",
+    )
+    run_parser.add_argument(
+        "--guard-exclude-path",
+        action="append",
+        default=run_default("guard_exclude_path"),
+        help=(
+            "Volatile workspace path the auditor read-only guard skips while "
+            "snapshotting (build outputs and similar churn). Relative paths "
+            "resolve against the workspace; agents may still read them. "
+            "May be repeated."
+        ),
     )
     run_parser.add_argument(
         "--max-rounds",
@@ -1489,10 +1500,38 @@ def _run_command(args: argparse.Namespace) -> int:
         prompt_dir,
     )
 
+    # Volatile workspace paths the read-only guard skips while snapshotting.
+    # Unlike hidden_paths these stay readable to the agents: excluding them
+    # only stops the guard from racing a directory that legitimately churns
+    # (build outputs) during an audit window.
+    try:
+        guard_exclude_paths = _resolve_guard_exclude_paths(
+            args.guard_exclude_path or [],
+            workspace=Path(workspace),
+            protected=(
+                Path(p)
+                for p in (
+                    PROJECT_CONFIG_PATH.parent,
+                    args.runs_root,
+                    run_dir,
+                    log_dir,
+                    harness_dir,
+                    prompt_dir,
+                )
+            ),
+        )
+    except ValueError as exc:
+        print(f"Cannot start run: {exc}", file=sys.stderr)
+        return 2
+
     print(f"Run id:    {run_id}")
     print(f"Run dir:   {run_dir.resolve()}")
     print(f"Workspace: {workspace}")
     print(f"Log dir:   {Path(log_dir).resolve()}")
+    if guard_exclude_paths:
+        # Make the audit's reduced coverage part of the run's console record;
+        # each audited episode also carries the list in its metadata.
+        print(f"Guard excludes: {', '.join(guard_exclude_paths)}")
 
     config = HarnessConfig(
         max_total_episodes=max_rounds,
@@ -1640,6 +1679,7 @@ def _run_command(args: argparse.Namespace) -> int:
                 mcp_config=resolve_mcp_config(name),
                 mcp_add_dirs=args.mcp_add_dir,
                 hidden_paths=hidden_paths,
+                guard_exclude_paths=guard_exclude_paths,
             )
         return agent_cache[key]
 
@@ -1741,6 +1781,60 @@ def _outermost_paths(*paths: str | Path) -> tuple[str, ...]:
         if not any(path.is_relative_to(parent) for parent in kept):
             kept.append(path)
     return tuple(str(path) for path in kept)
+
+
+def _resolve_guard_exclude_paths(
+    raw: list[str],
+    *,
+    workspace: Path,
+    protected: Iterable[str | Path],
+) -> tuple[str, ...]:
+    """Resolve and validate the auditor guard's snapshot exclusions.
+
+    The guard is the only witness of workspace mutations, and the agents keep
+    Bash access to excluded paths, so every exclusion is a hole in the audit.
+    Constrain the holes: an exclusion must stay inside the workspace, must not
+    disable the guard wholesale, and must not cover a path the audit exists to
+    protect - the VCS history and the harness's own control/state directories.
+    Raises ValueError with an operator-facing message on the first violation.
+    """
+
+    workspace = workspace.expanduser().resolve()
+    protected_paths = {Path(item).expanduser().resolve() for item in protected}
+    resolved: list[str] = []
+    for item in raw:
+        candidate = Path(item).expanduser()
+        if not candidate.is_absolute():
+            candidate = workspace / candidate
+        candidate = candidate.resolve()
+        if not candidate.is_relative_to(workspace):
+            raise ValueError(
+                f"guard exclude path escapes the workspace: {item!r} resolves to {candidate}"
+            )
+        if candidate == workspace:
+            raise ValueError(
+                f"guard exclude path would disable the read-only guard entirely: {item!r}"
+            )
+        if ".git" in candidate.relative_to(workspace).parts:
+            raise ValueError(
+                f"guard exclude path may not touch version-control state: {item!r}"
+            )
+        clashing = next(
+            (
+                shielded
+                for shielded in protected_paths
+                if shielded.is_relative_to(candidate) or candidate.is_relative_to(shielded)
+            ),
+            None,
+        )
+        if clashing is not None:
+            raise ValueError(
+                f"guard exclude path may not cover harness state ({clashing}): {item!r}"
+            )
+        value = str(candidate)
+        if value not in resolved:
+            resolved.append(value)
+    return tuple(resolved)
 
 
 def _open_dashboard(url: str) -> None:
@@ -1975,6 +2069,7 @@ def _build_agent(
     mcp_config: str | None = None,
     mcp_add_dirs: list[str] | None = None,
     hidden_paths: tuple[str, ...] = (),
+    guard_exclude_paths: tuple[str, ...] = (),
 ):
     if name == "codex":
         from .adapters.codex import CodexAdapter
@@ -2003,6 +2098,9 @@ def _build_agent(
             add_dirs=mcp_add_dirs,
             role=role,
             hidden_paths=hidden_paths,
+            # The Codex adapter has no auditor snapshot guard, so the
+            # exclusions are a Claude-Code-only concern for now.
+            guard_exclude_paths=guard_exclude_paths,
         )
         if model is not None:
             kwargs["model"] = model
