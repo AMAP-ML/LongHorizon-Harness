@@ -2,11 +2,11 @@
 
 # LongHorizon-Harness
 
-### Advancing Long-Horizon Agents for Real-World Tasks
+### 面向 Computer-Use Agent 的 Loop Engineering
 
-**像人一样操作整台计算机。跨桌面 App 与命令行持续工作数十个小时。**
+**只需向 Claude Code 或 Codex 给出一次目标，即可让它跨桌面 App 与终端持续工作数十个小时。**
 
-**状态不漂移。进度可验证。复杂任务做到底。**
+**规划 → 执行 → 验证 → 保存或恢复 → 重复，直到任务真正完成。**
 
 <p align="center">
 <a href="https://lh-harness.pages.dev"><img src="https://img.shields.io/badge/🌐-Website-1f6feb.svg?style=flat-square" alt="Website" /></a>
@@ -21,18 +21,18 @@
 [![Agents](https://img.shields.io/badge/backends-Claude%20Code%20|%20Codex-8A2BE2)](#任意模型任意-agent-后端)
 [![Benchmarks](https://img.shields.io/badge/benchmarks-WeaveBench%20|%20OSWorld%202.0%20|%20Terminal--Bench%202.1-orange)](#数百个真实任务规模化验证)
 
-[Usage](#一条命令全程可见) · [What You Get](#桌面-app-与命令行一个连续任务) · [How It Works](#三个角色一份可信状态) · [Results](#数百个真实任务规模化验证) · [Project Website](https://lh-harness.pages.dev) · [English](README.md)
+[Usage](#一条命令全程可见) · [The Loop](#面向真实电脑环境的-loop-engineering) · [Computer Use](#桌面-app-与命令行一个连续任务) · [Results](#数百个真实任务规模化验证) · [Project Website](https://lh-harness.pages.dev) · [English](README.md)
 
 <br>
 <img src="assets/quickstart.gif" alt="Install and run LongHorizon-Harness from the command line" width="720">
 
 </div>
 
-> **模型决定 Agent 一轮能做什么。LongHorizon-Harness 决定这些工作能否被验证、保存并持续积累，直到任务真正完成。**
+> **模型决定 Agent 一轮能做什么。LongHorizon-Harness 负责工程化模型外部的执行闭环：下一步做什么、如何在真实电脑中验证、哪些进度可以保存，以及在失败或上下文刷新后如何继续。**
 
-**支持 Claude Code 和 Codex。一条命令安装，开箱即用。**
+**一套面向 Claude Code 和 Codex 的 Loop Engineering 系统。一条命令安装，开箱即用。**
 
-LongHorizon-Harness 是一套面向长程任务的执行、状态管理和结果验证系统。它不训练新模型，也不替换现有 Agent，而是运行在 Codex、Claude Code 等系统之上，帮助 Agent 在真实电脑环境中长时间自主运行，持续推进复杂任务。
+LongHorizon-Harness 将现有 Agent 变成可长期运行的 computer-use 系统。它在桌面 App 与终端 CLI 之间持续恢复目标和已验证状态、选择下一项有明确边界的工作、用全新上下文执行、检查真实结果，再保存通过验收的进度，或把失败证据带入下一轮。它不训练新模型，也不替换现有 Agent，而是为现有 Agent 提供一套可持续运行的执行闭环。
 
 ## ✨ News
 
@@ -57,17 +57,36 @@ https://github.com/user-attachments/assets/ca8b77ce-9220-4d85-a272-b346009b2454
 
 <p align="center"><a href="assets/promotional_video_1440p.mp4"><strong>打开宣传视频（1440p MP4）</strong></a></p>
 
-## 三个角色。一份可信状态。
+## 面向真实电脑环境的 Loop Engineering
 
-LongHorizon-Harness 将规划、执行和验收彼此分离，避免让同一个不断增长的上下文同时承担所有工作。
+向 LongHorizon-Harness 给出一个目标。它会不断把剩余工作拆成一项边界明确的任务，在正确的电脑界面中执行，检查真实结果，并把通过验证的进度带入下一轮。
 
-| | 角色 | 唯一职责 |
+```mermaid
+flowchart LR
+    S["原始目标 +<br/>已验证状态"] --> P["规划下一项<br/>边界明确的任务"]
+    P --> A["使用全新上下文<br/>操作桌面 App 或 CLI"]
+    A --> V["在真实环境中检查<br/>文件、界面、日志和测试"]
+    V -->|通过| C["保存<br/>已验证进度"]
+    V -->|未通过| R["记录证据<br/>并恢复"]
+    C --> D{"任务完成？"}
+    R --> S
+    D -->|否| S
+    D -->|是| F["已验证结果"]
+```
+
+这就是 **Loop Engineering**：工程化 Agent 外部的执行、验证、纠错与恢复闭环，而不只是优化单轮 Prompt。
+
+### 一个闭环，三种专注职责
+
+三个角色是同一执行闭环内的职责边界，并不是三个各自维护不同任务版本的 Agent。
+
+| 闭环职责 | 角色 | 负责内容 |
 |---|---|---|
-| 🧭 | **Manager** | 维护最初目标、可信进度和下一步计划 |
-| ⚡ | **Executor** | 每轮使用全新上下文，专注完成一项明确任务 |
-| 🔍 | **Auditor** | 独立检查真实环境中的文件、界面、日志和测试 |
+| 🧭 **状态与下一步** | **Manager** | 每轮从原始目标、已验证进度、失败证据和剩余工作中恢复任务，并确定下一步 |
+| ⚡ **执行** | **Executor** | 使用全新上下文，在桌面 App 或 CLI 中只完成一项边界明确的任务 |
+| 🔍 **真实依据** | **Auditor** | 独立检查真实文件、界面、日志和测试，不直接相信 Executor 对结果的描述 |
 
-只有通过独立验收的结果才会进入长期状态。即使上下文刷新、操作失败或交付不合格，系统仍会保留此前已经验证的进展，并从缺失部分继续推进。
+只有通过独立验证的结果才能成为可信任务状态。被拒绝的结果只作为证据，不会被记作进度。即使上下文刷新、操作失败或交付不合格，下一轮也会从原始目标和最后一个已验证检查点重新开始，继续完成剩余工作。
 
 ## 桌面 App 与命令行。一个连续任务。
 
