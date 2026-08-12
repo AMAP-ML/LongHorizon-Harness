@@ -40,6 +40,24 @@ _DEFAULT_STRUCTURED_RETRIES = 2
 _DEFAULT_HTTP_RETRIES = 3
 _DEFAULT_CONCURRENCY = 4
 
+# §D11 (2026-08-11): the rate-limit retry ladder — the operator-specified
+# schedule for when a provider call comes back 429. Six rungs, in order:
+# 1 m, 5 m, 30 m, 1 h, 3 h, 5 h. ``_call`` makes an initial attempt, then on
+# each 429 sleeps the rung indexed by how many rate-limit retries have
+# already happened and tries again — seven HTTP attempts in total when every
+# one fails, after which the next 429 re-raises ``ProviderHTTPError``. That
+# exception propagates through ``complete_json`` (which only swallows 400s)
+# and out of whichever phase made the call; the driver's ``_run_phase`` then
+# marks the phase ``error`` and ``run()`` breaks out of its phase loop —
+# i.e. the task stops. A later ``resume`` re-enters that phase with a fresh
+# ladder, which is the intended shape for a patient retry against a free-tier
+# endpoint whose cooldown window may be measured in hours.
+#
+# Five hundred errors are *not* routed through this ladder: a transient 5xx
+# is a server problem, not a rate limit, and waiting an hour to retry a 500
+# is wrong. They keep the short exponential loop below.
+RATE_LIMIT_BACKOFFS = (60.0, 300.0, 1800.0, 3600.0, 10800.0, 18000.0)
+
 
 class ProviderError(RuntimeError):
     pass
@@ -52,7 +70,7 @@ class ProviderHTTPError(ProviderError):
     a 400 without `response_format`) instead of string-matching messages
     (PLAN-zeromem.md §11.3). ``retry_after`` carries the endpoint's
     ``Retry-After`` header (seconds) when the failed response had one, so
-    the §11.10.3 backoff can honor it.
+    the §11.10.3 / §D11 backoff paths can honor it.
     """
 
     def __init__(self, status: int, message: str, retry_after: float | None = None) -> None:
@@ -92,6 +110,7 @@ class OpenAICompatibleProvider:
         base_retry_delay: float = 1.0,
         concurrency: int = _DEFAULT_CONCURRENCY,
         sleep: Callable[[float], None] = time.sleep,
+        on_backoff: Callable[[int, float], None] | None = None,
     ) -> None:
         resolved = resolve(api_key=api_key or "", base_url=base_url or "", model=model or "")
         self.model = resolved.model
@@ -109,6 +128,16 @@ class OpenAICompatibleProvider:
         self._max_http_retries = max_http_retries
         self._base_retry_delay = base_retry_delay
         self._sleep = sleep
+        # §D11: callbacks fired with (1-based attempt number, delay seconds)
+        # just before each rung of the rate-limit ladder sleeps — purely an
+        # observability seam: a phase stuck mid-call for up to five hours
+        # otherwise shows as a silent ``in_progress`` with nothing explaining
+        # what's happening. The driver wires it through to ``events.jsonl`` at
+        # its construction sites (the main CLI ``run`` and a hosted run's
+        # ``_default_driver``). Default ``None`` keeps behavior byte-identical
+        # otherwise; the ladder runs regardless of whether anyone's told about
+        # it.
+        self._on_backoff = on_backoff
         # §11.10.3: concurrent callers (parallel tests, the dashboard, two
         # drivers on one endpoint) share one throttle, so a 429 storm from
         # one run can't starve the endpoint for the other.
@@ -215,10 +244,12 @@ class OpenAICompatibleProvider:
         headers = {"Content-Type": "application/json", "User-Agent": "kusudaemon/1.0 (Python)"}
         if self.api_key:
             headers["Authorization"] = f"Bearer {self.api_key}"
-        # §11.10.3: backoff for the throttles §12 says free tier exercises.
-        # 429 and 5xx are retryable; honor Retry-After when present, else
-        # exponential with jitter. Other 4xx is a caller bug and surfaces
-        # immediately.
+        # §D11: 429 (rate limit) is the patient ladder case; 5xx keeps the
+        # short exponential loop. Other 4xx is a caller bug and surfaces
+        # immediately. §11.10.3's Retry-After honor survives in both branches:
+        # on the 429 branch it can only *extend* a rung (never shrink it
+        # below the operator-specified schedule), capped at the ladder's own
+        # ceiling; on the 5xx branch it stays capped at 60s as before.
         attempt = 0
         while True:
             try:
@@ -227,6 +258,22 @@ class OpenAICompatibleProvider:
             except ProviderHTTPError as exc:
                 if exc.status == 400 or (exc.status < 500 and exc.status != 429):
                     raise
+                if exc.status == 429:
+                    # ``attempt`` indexes the ladder rung we're about to
+                    # sleep on (0-based); six rungs means seven HTTP attempts
+                    # total when every one fails, and the rung-6 failure
+                    # re-raises — the provider caller's phase machinery then
+                    # stops the task (PLAN.md §10: error at a phase boundary).
+                    if attempt >= len(RATE_LIMIT_BACKOFFS):
+                        raise
+                    delay = RATE_LIMIT_BACKOFFS[attempt]
+                    if exc.retry_after is not None:
+                        delay = max(delay, min(exc.retry_after, RATE_LIMIT_BACKOFFS[-1]))
+                    if self._on_backoff is not None:
+                        self._on_backoff(attempt + 1, delay)
+                    self._sleep(delay * random.uniform(0.8, 1.2))
+                    attempt += 1
+                    continue
                 if attempt >= self._max_http_retries:
                     raise
                 if exc.retry_after is not None:

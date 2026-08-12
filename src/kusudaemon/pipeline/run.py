@@ -16,12 +16,14 @@ import sys
 import time
 import uuid
 from pathlib import Path
+from typing import Callable
 
 from ..environment.base import Environment
-from ..v1.provider import OpenAICompatibleProvider
+from ..v0.events import EventLog
+from ..v1.provider import OpenAICompatibleProvider, RATE_LIMIT_BACKOFFS
 from .backends import parse_research_plan
 from .driver import RunOptions, RecursiveDriver
-from .run_dir import resolve_runs_root, run_spec_path
+from .run_dir import resolve_runs_root, run_spec_path, events_path
 
 _RUNS_ROOT_DEFAULT = "./.kusudaemon/runs"
 
@@ -136,6 +138,34 @@ def _parse_plan(raw: str | None) -> dict:
     return parse_research_plan(json.loads(text))
 
 
+def _log_rate_limit_backoff_for(run_dir: Path) -> Callable[[int, float], None]:
+    """§D11: return the ``on_backoff`` callback the provider fires before
+    each rung of the rate-limit ladder sleeps. Appends one
+    ``rate_limit_backoff`` line to ``events.jsonl`` so an operator watching
+    the dashboard sees *why* a phase is sitting mid-call for up to five
+    hours, instead of a silent ``in_progress``. The ``EventLog`` is built
+    lazily on first fire (most runs never hit a 429, so never pay for it);
+    once built it's reused across the run's retries."""
+    log: list[EventLog] = []  # one-slot cache so the EventLog is created at most once
+
+    def _on_backoff(attempt: int, delay_s: float) -> None:
+        if not log:
+            log.append(EventLog(events_path(run_dir)))
+        log[0].append(
+            {
+                "node_id": "-",
+                "role": "harness",
+                "round": 0,
+                "type": "rate_limit_backoff",
+                "attempt": attempt,
+                "delay_s": delay_s,
+                "rungs": len(RATE_LIMIT_BACKOFFS),
+            }
+        )
+
+    return _on_backoff
+
+
 def run_from_args(argv: list[str] | None = None, *, env: Environment | None = None) -> int:
     from ..provider_config import load_env_file
 
@@ -202,7 +232,16 @@ def run_from_args(argv: list[str] | None = None, *, env: Environment | None = No
         # §11.9: on a bare `resume <id>` argv supplies no --model; the
         # provider must honor the model recorded in run.spec.json, not
         # silently fall back to the config default mid-run.
-        provider=OpenAICompatibleProvider(model=options.model),
+        # §D11: ``on_backoff`` wires the rate-limit ladder's per-wait
+        # observability into ``events.jsonl`` — a phase stuck mid-call for
+        # up to five hours otherwise shows as a silent ``in_progress`` with
+        # nothing explaining it. (The run dir already exists by this point:
+        # ``create_run_dir`` runs in ``RecursiveDriver.__init__`` before
+        # any provider call happens.)
+        provider=OpenAICompatibleProvider(
+            model=options.model,
+            on_backoff=_log_rate_limit_backoff_for(run_dir),
+        ),
         options=options,
         env=env,
     )

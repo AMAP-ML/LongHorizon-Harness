@@ -622,6 +622,56 @@ here so nobody re-reads the spec and "fixes" them):
 (§9.4's no-build-step rule); the dashboard JS assertions run in
 `test_dashboard_server.py`. Full suite: 683 tests, all passing.
 
+**Second pass, 2026-08-11 (verification against this document):** every
+§11 row checked against the server; the routes were all present, the gaps
+were in the frontend. What shipped in this pass, all in `static/app.js` +
+`static/style.css` (backend untouched):
+
+- **Tree-row live pill works** (§5.1): a row whose node id or
+  `~`-derived ids match a live subagent renders a clickable `●` that opens
+  that subagent's Chat; attempts marker `a{N}` (warm ≥2 / warm-red) from
+  `attempts`, artifact count `📁N` from `artifact_count` (the old `versions`
+  reference was broken and removed).
+- **`g a` resolves** the top pending approval with its first option (§7.3,
+  was a documented no-op); toast when nothing is pending.
+- **Stalled is a first-class state** (§10): stalled rail gets `☠ STALLED`
+  segment + red underline (`rail.stalled`), the stream shows a
+  `stalled-banner` with `stalled_reason` and a worked `▶ Resume`, and the
+  header row swaps its halt/resume button for `☠ Resume` (all three resume
+  the attached run via `POST /api/runs {run_id}` — the palette's old
+  `resume` command hit a nonexistent `/api/resume` and 404'd, now fixed).
+- **Terminal tab is the §5.5 events tail** (was duplicate PROGRESS/TREE
+  tables): newest-first event stream, type-filter `<select>` with per-type
+  counts (`terminalFilter` state survives re-render), node-carrying events
+  link into that node, 200-row cap, and a "LAST UI ACTION → CLI" line —
+  every resolving control records the CLI equivalent
+  (`kusudaemon approve <run-id>` / `amend --text` / `escalate` / …) with a
+  copy button.
+- **Assembly tab renders `details[]`** of each check with clickable
+  offending-node chips (`node-04: …` → `openNode`) instead of `c.detail`'s
+  undefined text (v3 writes `details`).
+- **Gates tab** shows `⚠ truncated` on the verdict (`d.truncated`), not
+  only Overview.
+- **Doc tab's contract view** gets `✏️ amend…` next to the meter
+  (switch to amend mode + focus the bar, §5.3).
+- **Keys**: `h`/`l` collapse/expand the focused folder row in the task
+  tree; `⌘/Ctrl+L` focuses the command bar. Keymap fixed to not overstate —
+  the removed `⌘1..9` claim no longer renders, and `g p` is labeled "cycle
+  doc tabs".
+- **No-run-attached chrome makes sense** (§10): stream shows a centered
+  `＋ New run…` CTA (opens the New Run modal), nav renders the runs section
+  only, inspector shows an empty placeholder — no fake chrome.
+- **Empty artifact** renders an explicit `∅ empty` state instead of blank
+  space; **nav rows** left-truncate long ids via the existing `ltrunc`
+  (`run-…a4f`); **halted rail** desaturates (`rail.halted`).
+- **Node header density** (§5.2): the agent panel header now carries
+  `attempt n · shape · <K>/<K> tok · child of <parent>` derived from
+  `nodeDetail`, label-free behind the id.
+
+Unchanged from §13's deviations: no drag-resize (2), no `⌘1..9` (3),
+approvals don't steal the inspector (4). The `g p` label correction above
+retires deviation 3's last overstatement while keeping its substance.
+
 ---
 
 ## §12 Non-goals

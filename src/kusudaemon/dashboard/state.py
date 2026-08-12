@@ -525,9 +525,33 @@ class RunState:
         )
 
     def _default_driver(self, run_dir: Path, options: RunOptions) -> RecursiveDriver:
-        from ..v1.provider import OpenAICompatibleProvider
+        from ..v1.provider import OpenAICompatibleProvider, RATE_LIMIT_BACKOFFS
 
-        return RecursiveDriver(run_dir, provider=OpenAICompatibleProvider(model=options.model), options=options)
+        # §D11: same ``on_backoff`` wiring as ``pipeline/run.py`` — a
+        # dashboard-hosted run's provider ladder waits are visible on the
+        # same event stream the dashboard already reads.
+        log: list[EventLog] = []
+
+        def _on_backoff(attempt: int, delay_s: float) -> None:
+            if not log:
+                log.append(EventLog(events_path(run_dir)))
+            log[0].append(
+                {
+                    "node_id": "-",
+                    "role": "harness",
+                    "round": 0,
+                    "type": "rate_limit_backoff",
+                    "attempt": attempt,
+                    "delay_s": delay_s,
+                    "rungs": len(RATE_LIMIT_BACKOFFS),
+                }
+            )
+
+        return RecursiveDriver(
+            run_dir,
+            provider=OpenAICompatibleProvider(model=options.model, on_backoff=_on_backoff),
+            options=options,
+        )
 
     def is_hosted(self, run_id: str | None = None) -> bool:
         with self._lock:

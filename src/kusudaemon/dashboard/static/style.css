@@ -2136,3 +2136,64 @@ input:focus, textarea:focus, select:focus {
 }
 .toast.err { border-color: var(--accent-red); color: var(--accent-red); }
 @keyframes toast-in { from { opacity: 0; transform: translate(-50%, 8px); } to { opacity: 1; transform: translate(-50%, 0); } }
+
+/* DASHBOARD-UX §10: stalled / halted rail states --------------------- */
+.rail.stalled { border-bottom: 2px solid var(--accent-red); }
+.rail.halted { filter: grayscale(0.9); opacity: 0.65; }
+.stalled-banner {
+  display: flex; align-items: center; gap: 10px;
+  margin: 8px 14px 0; padding: 8px 12px;
+  background: rgba(244, 63, 94, 0.12); border: 1.5px solid rgba(244, 63, 94, 0.55);
+  color: var(--accent-red); border-radius: 6px; font-size: 12px;
+  animation: rail-stall 1.2s infinite;
+}
+
+/* §5.1 tree row: attempts marker + artifact count + live pill --------- */
+.row-attempts {
+  font-size: 10px; color: var(--text-muted);
+  font-variant-numeric: tabular-nums;
+}
+.row-attempts.warm { color: var(--accent-amber); font-weight: 700; }
+.row-attempts.warn { color: var(--accent-red); font-weight: 800; }
+.tree-live {
+  color: #4ade80; font-size: 12px; cursor: pointer;
+  width: 14px; text-align: center; flex-shrink: 0;
+  animation: live-pulse 1.2s infinite;
+}
+@keyframes live-pulse { 50% { opacity: 0.4; } }
+
+/* §5.2 gates tab: truncated verdict chip ------------------------------ */
+.truncated-chip {
+  display: inline-block; margin-left: 8px;
+  color: var(--accent-amber); font-weight: 800; font-size: 10px;
+  background: rgba(245, 158, 11, 0.12); border: 1px solid rgba(245, 158, 11, 0.5);
+  border-radius: 4px; padding: 1px 6px;
+}
+
+/* §5.3 doc tab: amend button sits beside the contract meter ----------- */
+.contract-meter { display: flex; align-items: center; gap: 12px; }
+.contract-meter .meter { flex: 1; }
+
+/* §5.4 assembly tab: per-check detail lines with clickable node chips -- */
+.asm-check { flex-direction: column; align-items: stretch; gap: 2px; }
+.asm-details { display: flex; flex-direction: column; gap: 1px; padding: 0 12px; }
+.asm-detail { display: flex; gap: 8px; font-size: 12px; align-items: baseline; }
+
+/* §5.5 terminal tab: events tail + filter + CLI line ------------------- */
+.term-events { display: flex; flex-direction: column; gap: 1px; max-height: 52vh; overflow-y: auto; }
+.term-event .term-glyph { width: 18px; }
+.term-event { display: flex; align-items: baseline; gap: 8px; }
+.term-filter { margin-left: auto; background: var(--bg-tertiary); color: var(--text-bright); border: 1px solid var(--border-color); border-radius: 4px; font-size: 11px; padding: 2px 6px; }
+.term-cli {
+  display: flex; align-items: center; gap: 10px;
+  background: var(--bg-tertiary); border-radius: 6px; padding: 8px 10px;
+  font-size: 12px; margin-top: 6px;
+}
+.term-cli code { color: var(--accent-cyan); font-size: 11px; }
+
+/* §10 empty artifact --------------------------------------------------- */
+.empty-artifact {
+  display: flex; flex-direction: column; align-items: center; gap: 8px;
+  padding: 40px 20px; color: var(--text-muted); font-size: 13px;
+  border: 1px dashed var(--border-color); border-radius: 8px;
+}

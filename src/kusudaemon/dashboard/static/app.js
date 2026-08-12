@@ -174,6 +174,36 @@ async function guarded(fn) {
   }
 }
 
+// §5.5: every mutating UI action records the equivalent CLI command, shown
+// on the Terminal tab — the escape-hatch-and-teaching-device line.
+function recordCli(kind, detail) {
+  const runId = state.snapshot ? state.snapshot.run_id : "";
+  const forms = {
+    approve: () => `kusudaemon approve ${runId}`,
+    amend: () => `kusudaemon amend ${runId} --text "${(detail || "").slice(0, 60)}"`,
+    reopen: () => `kusudaemon reopen ${runId} --node ${detail} --defect "…"`,
+    redispatch: () => `kusudaemon reopen ${runId} --node ${detail}`,
+    escalate: () => `kusudaemon escalate ${runId}`,
+    halt: () => `kusudaemon run --run-id ${runId}  (set halt.flag)`,
+    pilot: () => `kusudaemon approve ${runId} --file out/.versions/${detail}/pilot-original.md`,
+    interject: () => `kusudaemon pipeline interject ${runId} ${detail} "…"`,
+  };
+  state.lastCliCommand = (forms[kind] || (() => ""))();
+  render();
+}
+
+// §10 Stalled banner + palette: resume a (possibly dead-driver) run the way
+// §11's inventory says — `POST /api/runs` with an existing run id, which
+// re-hosts it (run.spec.json on disk is authoritative for a resume).
+function resumeRun() {
+  const id = state.snapshot && state.snapshot.run_id;
+  if (!id) { showToast("No run attached", true); return; }
+  recordCli("halt", "");
+  apiPost("/api/runs", { run_id: id })
+    .then(() => showToast("Resume requested"))
+    .catch((err) => showToast(String(err.message || err), true));
+}
+
 /* ------------------- live SSE stream / polling ------------------- */
 function snapshotFingerprint(snap) {
   const { server_time, ...rest } = snap || {};
@@ -479,7 +509,7 @@ function renderApprovalEntry(a, snap, isTakeover) {
           el("button", {
             class: opt.style === "primary" ? "primary" : "",
             disabled: state.busy ? "" : null,
-            onclick: () => guarded(() => apiPost(`/api/approvals/${encodeURIComponent(a.approval_id)}/resolve`, { action: opt.value }).then(() => showToast("Approval resolved"))),
+            onclick: () => guarded(() => apiPost(`/api/approvals/${encodeURIComponent(a.approval_id)}/resolve`, { action: opt.value }).then(() => { recordCli("approve"); showToast("Approval resolved"); })),
           }, `[${i + 1}] ${opt.label}`)
         );
       });
@@ -507,6 +537,7 @@ function renderApprovalEntry(a, snap, isTakeover) {
             delete state.approvalAnswerDrafts[`${a.approval_id}::${q.id}`];
           });
           await apiPost(`/api/approvals/${encodeURIComponent(a.approval_id)}/resolve`, { action: "answer", answers });
+          recordCli("approve");
           showToast("Answers submitted");
         }) }, "Submit Answers")
       );
@@ -520,6 +551,7 @@ function renderApprovalEntry(a, snap, isTakeover) {
         el("button", { class: "primary", disabled: state.busy ? "" : null, onclick: () => guarded(async () => {
           const val = state.approvalDrafts[a.approval_id] || "";
           await apiPost(`/api/approvals/${encodeURIComponent(a.approval_id)}/resolve`, { action: "answer", user_input: val });
+          recordCli("approve");
           delete state.approvalDrafts[a.approval_id];
           showToast("Submitted answer");
         }) }, "Submit Input")
@@ -527,6 +559,7 @@ function renderApprovalEntry(a, snap, isTakeover) {
       actionBtns.push(
         el("button", { disabled: state.busy ? "" : null, onclick: () => guarded(async () => {
           await apiPost(`/api/approvals/${encodeURIComponent(a.approval_id)}/resolve`, { action: "answer", user_input: "" });
+          recordCli("approve");
           delete state.approvalDrafts[a.approval_id];
           showToast("Accepted default");
         }) }, "Use Default")
@@ -578,21 +611,33 @@ function renderRail() {
       el("div", { class: "rail-right" }, [el("span", { class: "rail-a40" }, "no run attached")]),
     ]);
   }
+  // §10 Stalled: a stalled run and a run mid-provider-call must never look
+  // alike. When liveness says stalled, ☠ replaces the phase glyph entirely
+  // and the rail's bottom border turns red (handled in CSS via .rail.stalled).
+  const stalled = !!snap.stalled;
   const segClass = {
     done: "seg-passed pass", in_progress: "seg-running run", failed: "seg-fail fail",
     error: "seg-fail fail", awaiting_approval: "seg-paused paused", escalated: "seg-escalated esc",
     halted: "seg-paused paused", stalled: "seg-stalled stalled", pending: "pass", created: "pass",
   };
-  const segs = PHASES_ALL.filter((p) => (snap.phases || {})[p]).map((p) => {
-    const st = (snap.phases || {})[p];
-    const label = { in_progress: "RUN", done: "DONE", failed: "FAIL", error: "ERR", awaiting_approval: "WAIT", escalated: "ESC", halted: "HLT", stalled: "STALL", pending: "PEND", created: "" }[st] || st.toUpperCase();
-    return el("div", { class: "rail-seg " + (segClass[st] || ""), title: `${p} — ${st}` }, [
-      el("span", { class: "segglyph" }, PHASE_GLYPH[st] || "·"),
-      el("span", { class: "segval" }, label),
-    ]);
-  });
+  let segs;
+  if (stalled) {
+    segs = [el("div", { class: "rail-seg stalled", title: `stalled — ${snap.stalled_reason || "driver appears dead"}` }, [
+      el("span", { class: "segglyph" }, "☠"),
+      el("span", { class: "segval" }, "STALLED"),
+    ])];
+  } else {
+    segs = PHASES_ALL.filter((p) => (snap.phases || {})[p]).map((p) => {
+      const st = (snap.phases || {})[p];
+      const label = { in_progress: "RUN", done: "DONE", failed: "FAIL", error: "ERR", awaiting_approval: "WAIT", escalated: "ESC", halted: "HLT", stalled: "STALL", pending: "PEND", created: "" }[st] || st.toUpperCase();
+      return el("div", { class: "rail-seg " + (segClass[st] || ""), title: `${p} — ${st}` }, [
+        el("span", { class: "segglyph" }, PHASE_GLYPH[st] || "·"),
+        el("span", { class: "segval" }, label),
+      ]);
+    });
+  }
   const liveNow = (snap.hosted || snap.phase_status === "in_progress");
-  return el("div", { class: "rail" }, [
+  return el("div", { class: "rail" + (stalled ? " stalled" : "") + (snap.halted ? " halted" : "") }, [
     el("div", { class: "rail-left" }, segs.length ? segs : [el("span", { class: "rail-no-phase" }, "—")]),
     el("div", { class: "rail-right" }, [
       el("span", { class: "rail-hosted", title: `${snap.hosted_count || 0} runs hosted · cap ${snap.max_concurrent_runs}` }, `${snap.hosted_count || 0}/${snap.max_concurrent_runs}`),
@@ -626,11 +671,12 @@ function renderHeaderRow() {
       el("span", { class: "dim" }, snap.phase_detail || ""),
     ]),
     el("div", { class: "hdr-buttons" }, [
-      snap.control_enabled && tier !== "T3" ? el("button", { class: "btn-tiny", onclick: () => { if (confirm("Escalate tier (+1, T3 max)?") ) guarded(() => apiPost("/api/escalate", {}).then(() => showToast("Tier escalated"))); } }, "⇡ escalate") : null,
-      snap.control_enabled && (snap.phase_status === "error" || snap.halted || snap.phase_status === "failed" || snap.phase_status === "escalated" || snap.phase_status === "blocked" || snap.phase_status === "paused")
+      snap.control_enabled && tier !== "T3" ? el("button", { class: "btn-tiny", onclick: () => { if (confirm("Escalate tier (+1, T3 max)?") ) guarded(() => apiPost("/api/escalate", {}).then(() => { recordCli("escalate"); showToast("Tier escalated"); })); } }, "⇡ escalate") : null,
+      snap.stalled ? el("button", { class: "btn-tiny", style: "color:var(--accent-red);", onclick: () => guarded(resumeRun) }, "☠ Resume") : null,
+      snap.control_enabled && !snap.stalled && (snap.phase_status === "error" || snap.halted || snap.phase_status === "failed" || snap.phase_status === "escalated" || snap.phase_status === "blocked" || snap.phase_status === "paused")
         ? el("button", { class: "btn-tiny", onclick: () => guarded(() => apiPost("/api/halt", { value: false }).then(() => showToast("Resume requested"))) }, "▶ Resume")
         : null,
-      snap.control_enabled ? el("button", { class: "btn-tiny", onclick: () => guarded(() => apiPost("/api/halt", { value: snap.halted ? false : true }).then(() => showToast(snap.halted ? "Resume requested" : "Halting after current phase"))) }, snap.halted ? "▶" : "⏸") : null,
+      snap.control_enabled ? el("button", { class: "btn-tiny", onclick: () => guarded(() => apiPost("/api/halt", { value: snap.halted ? false : true }).then(() => { recordCli("halt"); showToast(snap.halted ? "Resume requested" : "Halting after current phase"); })) }, snap.halted ? "▶" : "⏸") : null,
     ]),
   ]);
 }
@@ -673,6 +719,8 @@ function renderNavSection(key, title, rows) {
 }
 
 // §3 nav — right column. keyboard: j/k moves, ↩ attaches the focused run.
+// §10 "no run attached": Nav shows runs only — no subagents/phases chrome
+// pretending to have data.
 function renderNav() {
   const snap = state.snapshot;
   const runRows = (snap.runs || []).map((r) => el("div", {
@@ -681,7 +729,7 @@ function renderNav() {
     oncontextmenu: (e) => { e.preventDefault(); openRunMenu(e, r.id); },
   }, [
     el("span", { class: "row-glyph" }, r.attached ? "✅" : "·"),
-    el("span", { class: "row-id" }, r.id),
+    el("span", { class: "row-id", title: r.id }, ltrunc(r.id, 18)),
     el("span", { class: "row-pip" }, r.pending_approvals ? `⏸${r.pending_approvals}` : (r.hosted ? "●" : "")),
     el("span", { class: "row-status" }, PHASE_GLYPH[r.status] || "·"),
   ]));
@@ -691,7 +739,7 @@ function renderNav() {
     onclick: () => openNode(s.id, "chat"),
   }, [
     el("span", { class: "row-glyph" }, SUB_GLYPH[s.status] || "·"),
-    el("span", { class: "row-id" }, s.id),
+    el("span", { class: "row-id", title: s.id }, ltrunc(s.id, 18)),
     el("span", { class: "row-pip" }, s.live ? "●" : ""),
   ]));
   const phaseRows = Object.entries(snap.phases || {}).map(([p, st]) => el("div", { class: "nav-row" }, [
@@ -699,12 +747,13 @@ function renderNav() {
     el("span", { class: "row-id" }, p),
     el("span", { class: "row-status" }, st),
   ]));
+  const sections = [renderNavSection("runs", "RUNS", runRows)];
+  if (snap.attached) {
+    sections.push(renderNavSection("subagents", "SUBAGENTS", subRows));
+    sections.push(renderNavSection("phases", "PHASES", phaseRows));
+  }
   return el("div", { class: "sidebar-nav" }, [
-    el("div", { class: "nav-section-group" }, [
-      renderNavSection("runs", "RUNS", runRows),
-      renderNavSection("subagents", "SUBAGENTS", subRows),
-      renderNavSection("phases", "PHASES", phaseRows),
-    ]),
+    el("div", { class: "nav-section-group" }, sections),
   ]);
 }
 
@@ -712,6 +761,17 @@ function renderNav() {
 
 function renderCenterStream() {
   const snap = state.snapshot;
+  if (!snap.attached) {
+    // §10 "No run attached": the stream shows a single centered "+ new run"
+    // CTA — no dashboard chrome pretending to have data.
+    return el("main", { class: "chat-stream-panel" }, [
+      el("div", { class: "empty-state" }, [
+        el("div", { class: "dim", style: "font-size:13px; margin-bottom:14px;" }, "no run attached"),
+        el("button", { class: "primary", onclick: () => { state.newRunOpen = true; render(); } }, "＋ New run…"),
+        el("div", { class: "dim", style: "font-size:11px; margin-top:14px;" }, "or pick one from the runs list on the left"),
+      ]),
+    ]);
+  }
   const feedEntries = [];
   const evList = snap.events || [];
   const lastEvents = evList.slice(-20).map((ev, i) => ({ sort: ev.ts || 0, node: renderEventEntry(ev) }));
@@ -730,11 +790,20 @@ function renderCenterStream() {
 
   const approvalFeed = (snap.pending_approvals || []).map((a) => renderApprovalEntry(a, snap, false));
 
+  // §10 Stalled: never a bare "running" badge next to a dead driver — a
+  // red banner with the reason and a Resume button, pinned above the feed.
+  const stalledBanner = snap.stalled ? el("div", { class: "stalled-banner" }, [
+    el("span", { style: "font-weight:800;" }, "☠ STALLED"),
+    el("span", { class: "dim", style: "flex:1;" }, snap.stalled_reason || "the driver process appears dead (liveness check failed)"),
+    snap.control_enabled ? el("button", { class: "btn-tiny", onclick: () => guarded(resumeRun) }, "▶ Resume") : null,
+  ]) : null;
+
   return el("main", { class: "chat-stream-panel" }, [
     el("div", { class: "chat-header" }, [
       el("div", { class: "title" }, ["💬 Run Stream", snap.halted ? badge("halted") : null]),
       el("button", { class: "btn-tiny", onclick: () => { loadMainAgentThinking(); render(); } }, "refresh"),
     ]),
+    stalledBanner,
     pinnedHeader,
     el("div", { class: "chat-feed", id: "chat-feed" }, feedEntries.map((e) => e.node)),
     approvalFeed.length ? el("div", { class: "pending-approvals-block" }, [
@@ -884,9 +953,9 @@ function _memo(lazy) {
 }
 
 async function cmdResume() {
-  const c = COMMANDS && COMMANDS.resume;
-  if (c) await c.run();
-  else if (state.snapshot.attached) await apiPost("/api/halt", { value: false });
+  // §11: "Resume run — POST /api/runs w/ existing id". No /api/resume route
+  // exists; an old version of this command posted to it and always 404'd.
+  await resumeRun();
 }
 async function cmdHelp() {
   state.keymapOpen = true;
@@ -903,6 +972,7 @@ async function cmdRuns() {
 async function cmdEscalate() {
   if (confirm("Escalate tier (+1, T3 max)?")) {
     await apiPost("/api/escalate", {});
+    recordCli("escalate");
     showToast("Tier escalated");
   }
 }
@@ -930,15 +1000,13 @@ async function cmdToggleControl() { /* control flag is server-side */ }
 
 async function _redispatchAction(nodeId) {
   await apiPost(`/api/node/${encodeURIComponent(nodeId)}/redispatch`, {});
+  recordCli("redispatch", nodeId);
   showToast("Redispatch approval queued");
 }
 
 function buildCommands() {
   const commands = {
-    resume: { key: "resume", trigger: "resume", label: "Resume", usage: "> resume", timeout: 20, run: (async () => {
-      if (!state.snapshot.attached) { showToast("No run attached", true); return; }
-      await apiPost("/api/resume", {}).then((d) => showToast(d.status || d.detail || "Resume requested"));
-    }) },
+    resume: { key: "resume", trigger: "resume", label: "Resume", usage: "> resume", timeout: 20, run: cmdResume },
     "task-tree": { key: "task-tree", trigger: "tree", label: "Task tree", usage: "> tree", timeout: 20, run: cmdTaskTree },
     doc: { key: "doc", trigger: "doc", label: "Documents", usage: "> doc", timeout: 20, run: cmdDoc },
     asm: { key: "asm", trigger: "asm", label: "assembly", usage: "> asm", timeout: 20, run: cmdAsm },
@@ -955,6 +1023,7 @@ function buildCommands() {
       const nodeArg = split[3] ? split.slice(3).join(" ") : "";
       const target = state.targetAgentManual ? state.targetAgentId : "main";
       const resp = await apiPost("/api/amend", { text: rule + (nodeArg ? " " + nodeArg : ""), reason: "web amendment", target });
+      recordCli("amend", rule + (nodeArg ? " " + nodeArg : ""));
       showToast(resp.detail || "Contract amendment queued");
     } },
     reopen: { key: "reopen", trigger: "reopen", label: "Reopen node", usage: "> reopen <reason> <node>", timeout: 20, run: async (text) => {
@@ -966,12 +1035,14 @@ function buildCommands() {
       const reason = isTreeNode ? split.slice(0, -1).join(" ") : text;
       if (!nodeArg) { showToast("reopen needs a node id (select a node first)", true); return; }
       await apiPost("/api/reopen", { node_id: nodeArg, defect: reason, is_manual: true });
+      recordCli("reopen", nodeArg);
       showToast("Node reopened");
     } },
     interject: { key: "interject", trigger: "interject", label: "Message agent", usage: "> interject <text> or just type below", timeout: 20, run: async (text) => {
       const target = state.targetAgentManual ? state.targetAgentId : (liveSubId() || "main");
       if (!target) { showToast("No live agent", true); return; }
       await apiPost(`/api/node/${encodeURIComponent(target)}/interject`, { content: text });
+      recordCli("interject", target);
       showToast("Message sent");
       loadThinkingIfNeeded(true);
     } },
@@ -1036,8 +1107,8 @@ function renderPalette() {
 function renderKeymap() {
   if (!state.keymapOpen) return null;
   const groups = [
-    { title: "Global", keys: [["ctrl/cmd+K", "command palette"], ["g then r / p / t / a", "reopen / pilot / tree / approve (g-key prefixes)"], ["esc", "close palette/menu/takeover/prompt-mode"], ["?  or  >help", "this"] ] },
-    { title: "Focus move", keys: [["⌘+1..9", "workbench tabs 1-8 (click area first)"], ["⌘+L", "command bar"], ["ctrl+]  /  [", "cycle workbench tabs"], ["j / k", "move in task tree"], ["h / l", "tree row: collapse/expand"], ["Enter", "open focused tree row"]] },
+    { title: "Global", keys: [["ctrl/cmd+K", "command palette"], ["g then r / p / t / a", "reopen / doc tabs / tree / approve (g-key prefixes)"], ["esc", "close palette/menu/takeover/prompt-mode"], ["?  or  >help", "this"] ] },
+    { title: "Focus move", keys: [["⌘+L", "command bar"], ["ctrl+]  /  [", "cycle workbench tabs"], ["j / k", "move in task tree"], ["h / l", "tree row: collapse/expand"], ["Enter", "open focused tree row"]] },
     { title: "Run", keys: [["g r", "reopen selected node"], ["g t", "workbench tree tab"], ["g p", "cycle doc tabs"], ["g a", "approve (first option)"] ] },
   ];
   const rows = groups.map((g) => el("section", { class: "keymap-group" }, [
@@ -1054,7 +1125,6 @@ function renderKeymap() {
 }
 
 /* ------------------------- key handling ------------------------- */
-const NAV_KEYS = new Set(["ctrl+]", "ctrl+[", "⌘+1", "⌘+2", "⌘+3", "⌘+4", "⌘+5", "⌘+6", "⌘+7", "⌘+8", "⌘+9", "⌘+0"]);
 
 function isLive(nodeId) {
   if (nodeId === "main") return false;
@@ -1136,6 +1206,7 @@ function onGlobalKey(e) {
   if (k === "?") { state.keymapOpen = true; render(); return; }
   if ((e.ctrlKey || e.metaKey) && k === "]") { cycleInspectorDir(1); return; }
   if ((e.ctrlKey || e.metaKey) && k === "[") { cycleInspectorDir(-1); return; }
+  if ((e.ctrlKey || e.metaKey) && k === "l") { e.preventDefault(); focusPrompt(); return; }
   if (k === "g" && !e.metaKey && !e.ctrlKey) {
     state.gPrefix = true;
     setTimeout(() => { state.gPrefix = false; }, 1200);
@@ -1148,7 +1219,20 @@ function onGlobalKey(e) {
     if (p === "r" && state.selectedNode) { state.promptMode = "reopen"; render(); focusPrompt(); return; }
     if (p === "t") { state.workbenchTab = "tree"; render(); return; }
     if (p === "p") { cycleDocTab(); render(); return; }
-    if (p === "a" && (state.snapshot.pending_approvals || []).length) { return; }
+    if (p === "a") {
+      // §13 keymap: `g a` resolves the top pending approval with its first
+      // (primary) option. Was a no-op before — the documented key did
+      // nothing.
+      const a = (state.snapshot.pending_approvals || [])[0];
+      if (a && (a.options || []).length) {
+        const opt = a.options[0];
+        recordCli(a, opt.value);
+        guarded(() => apiPost(`/api/approvals/${encodeURIComponent(a.approval_id)}/resolve`, { action: opt.value }).then(() => showToast("Approval resolved")));
+      } else {
+        showToast("No pending approval to resolve", true);
+      }
+      return;
+    }
     render();
     return;
   }
@@ -1174,18 +1258,19 @@ function onGlobalKey(e) {
     const a = state.snapshot.pending_approvals[0];
     if (k >= "1" && k <= "9") {
       const opt = (a.options || [])[Number(k) - 1];
-      if (opt) { guarded(() => apiPost(`/api/approvals/${encodeURIComponent(a.approval_id)}/resolve`, { action: opt.value }).then(() => showToast("Approval resolved"))); }
+      if (opt) { recordCli("approve"); guarded(() => apiPost(`/api/approvals/${encodeURIComponent(a.approval_id)}/resolve`, { action: opt.value }).then(() => showToast("Approval resolved"))); }
       return;
     }
     if (e.key === "Enter" && (a.options || []).length) {
       const opt = a.options[0];
+      recordCli("approve");
       guarded(() => apiPost(`/api/approvals/${encodeURIComponent(a.approval_id)}/resolve`, { action: opt.value }).then(() => showToast("Approval resolved")));
       return;
     }
   }
 
   // j/k move + Enter open, scoped to the task tree's visible rows.
-  if (!isTyping && state.workbenchTab === "tree" && (k === "j" || k === "k" || e.key === "Enter")) {
+  if (!isTyping && state.workbenchTab === "tree" && (k === "j" || k === "k" || k === "h" || k === "l" || e.key === "Enter")) {
     const list = state.treeCursorList || [];
     if (!list.length) return;
     if (k === "j" || k === "k") {
@@ -1193,6 +1278,14 @@ function onGlobalKey(e) {
       const next = Math.min(list.length - 1, Math.max(0, idx + (k === "j" ? 1 : -1)));
       state.treeCursor = list[next];
       render();
+      return;
+    }
+    if (k === "h" || k === "l") {
+      // §13 keymap: h/l collapse/expand the focused folder row (vim-ish).
+      if (state.treeCursor) {
+        const entry = buildNodeTreeIndex().index[state.treeCursor];
+        if (entry && !entry.node) { state.treeCollapsed[state.treeCursor] = k === "h"; render(); }
+      }
       return;
     }
     if (e.key === "Enter" && state.treeCursor) {
@@ -1248,7 +1341,7 @@ function renderContextMenu() {
   } else if (m.nodeId !== undefined) {
     items.push(el("div", { class: "ctx-item", onclick: () => { state.contextMenu = null; openNode(m.nodeId, "overview"); render(); } }, "node overview"));
     items.push(el("div", { class: "ctx-item", onclick: () => { state.contextMenu = null; openReopen(m.nodeId); render(); } }, "reopen (repair)"));
-    items.push(el("div", { class: "ctx-item", onclick: () => { state.contextMenu = null; render(); guarded(() => apiPost(`/api/node/${encodeURIComponent(m.nodeId)}/redispatch`, {}).then(() => showToast("Redispatch approval queued"))); } }, "redispatch"));
+    items.push(el("div", { class: "ctx-item", onclick: () => { state.contextMenu = null; render(); guarded(() => apiPost(`/api/node/${encodeURIComponent(m.nodeId)}/redispatch`, {}).then(() => { recordCli("redispatch", m.nodeId); showToast("Redispatch approval queued"); })); } }, "redispatch"));
     items.push(el("div", { class: "ctx-item", onclick: () => { state.contextMenu = null; render(); navigator.clipboard && navigator.clipboard.writeText(m.nodeId).then(() => showToast("copied id")); } }, "copy id"));
   }
   return el("div", { class: "overlay ctx-overlay", onclick: () => { state.contextMenu = null; render(); } }, [
@@ -1330,6 +1423,16 @@ function loadNodeDetail(id) {
 
 function renderRightWorkbench() {
   const tab = state.workbenchTab;
+  if (!state.snapshot.attached) {
+    // §10 "No run attached": the inspector is empty — no chrome pretending
+    // to have data.
+    return el("div", { class: "workbench-panel" }, [
+      el("div", { class: "workbench-tabs" }, []),
+      el("div", { class: "workbench-content" }, el("div", { class: "empty-state" }, [
+        el("div", { class: "dim", style: "font-size:12px;" }, "attach a run to inspect it"),
+      ])),
+    ]);
+  }
   const tabs = WORKBENCH_TABS.map((t) =>
     el("button", {
       class: "wb-tab" + (tab === t.id ? " active" : ""),
@@ -1419,8 +1522,11 @@ function renderGatesTab() {
     it.node_ids && it.node_ids.length ? el("span", { class: "node-link dim", onclick: () => it.node_ids.length === 1 ? openNode(it.node_ids[0], "overview") : null }, `→ ${it.node_ids.join(", ")}`) : null,
     el("span", { class: "dim", style: "margin-left:auto; font-size:11px;" }, it.class || ""),
   ].concat(it.defect ? [el("div", { class: "defect", style: "grid-column:1/-1;" }, it.defect)] : []))) : el("div", { class: "dim" }, "(no review items)");
+  // §5.2: a verdict reached over a cut artifact is a weaker verdict — the
+  // truncated flag must be visible here, not only on the Overview tab.
+  const truncatedChip = d.truncated ? el("span", { class: "truncated-chip", title: "the artifact was over the reviewer input cap — a section group was truncated for review" }, "⚠ truncated") : null;
   return el("div", { class: "gates-tab" }, [
-    el("div", { class: "sub-hdr" }, "GATES (machine, cached at dispatch)"),
+    el("div", { class: "sub-hdr" }, ["GATES (machine, cached at dispatch)", truncatedChip]),
     ...gateRows,
     el("div", { class: "sub-hdr", style: "margin-top:14px;" }, "REVIEW ITEMS"),
     ...itemRows,
@@ -1452,6 +1558,14 @@ function renderArtifactsTab() {
   const d = state.nodeDetail;
   if (!d) return el("div", { class: "placeholder" }, "loading…");
   if (!state.artifactsDetail) return el("div", { class: "placeholder" }, "loading artifact…");
+  // §10: an empty artifact is a real, diagnostic state — render it
+  // explicitly, not as an empty <pre> that reads like a rendering failure.
+  if (!state.artifactsDetail.text.trim()) {
+    return el("div", { class: "empty-artifact" }, [
+      el("span", { style: "font-size:22px; opacity:.7;" }, "∅"),
+      el("div", { class: "dim" }, "empty artifact — the episode ended without producing content"),
+    ]);
+  }
   return el("pre", { class: "artifact-pre" }, state.artifactsDetail.text);
 }
 
@@ -1470,9 +1584,20 @@ function renderAgentTab() {
   ];
   const subBadge = sub ? el("span", { class: "badge", "data-status": sub.status }, sub.status) : null;
   const liveBadge = sub && sub.live ? el("span", { class: "badge live-badge" }, "● live") : null;
+  // §5.2 dense label-free header: `node-03.02 · attempt 2 · prose ·
+  // 3.1k/24k tok · ●live` — position matters, words don't.
+  const metaBits = [];
+  if (d) {
+    if (d.attempts) metaBits.push(`attempt ${d.attempts}`);
+    if (d.shape) metaBits.push(SHAPE2[d.shape] || d.shape);
+    const bud = d.budget && d.budget.tokens ? (d.budget.tokens / 1000).toFixed(1) + "K" : "?";
+    metaBits.push(`${(d.artifact_tokens || 0) / 1000}K/${bud} tok`);
+    if (d.parent) metaBits.push(`child of ${d.parent}`);
+  }
+  const metaLine = metaBits.length ? el("span", { class: "dim", style: "font-size:11px; margin-left:8px;" }, metaBits.join(" · ")) : null;
   const hdr = el("div", { class: "agent-panel-hdr" }, [
     el("span", { class: "agent-id" }, id),
-    subBadge, liveBadge,
+    subBadge, liveBadge, metaLine,
     el("span", { style: "margin-left:auto;" }, [
       el("button", { class: "btn-tiny", title: "go back to task tree", onclick: closeNode }, "✕"),
     ]),
@@ -1515,11 +1640,13 @@ function renderPilotEditor() {
   const editedLines = (state.pilotDrafts[draftKey] || "").split("\n");
   const saveBtn = el("button", { class: "primary", disabled: state.busy ? "" : null, onclick: () => guarded(async () => {
     await apiPost(`/api/approvals/${encodeURIComponent(a.approval_id)}/pilot-save`, { text: state.pilotDrafts[draftKey] || "" });
+    recordCli("pilot", a.context && a.context.node_id || d.id);
     showToast("Pilot edit saved & approval resolved");
   }) }, "Save & approve edit");
   const asIsBtn = el("button", { disabled: state.busy ? "" : null, onclick: () => guarded(async () => {
     if (confirm("Approve this pilot as-is (accepts the Writer's output without changes)?")) {
       await apiPost(`/api/approvals/${encodeURIComponent(a.approval_id)}/resolve`, { action: "approve" });
+      recordCli("pilot", a.context && a.context.node_id || d.id);
       showToast("Approved as-is");
     }
   }) }, "Approve as-is");
@@ -1586,6 +1713,14 @@ function treeRowClass(key, n) {
   return cls.join(" ");
 }
 
+// §5.1: a live subagent attached to a node (its own Writer dispatch, or a
+// ~repair/~research child) renders as a clickable ● pill that opens the
+// node's Chat directly on that subagent.
+function liveSubFor(nodeId) {
+  const subs = state.snapshot.subagents || [];
+  return subs.find((s) => s.live && (s.id === nodeId || s.id.startsWith(nodeId + "~"))) || null;
+}
+
 function renderTreeBranch(key, depth, visible) {
   const { index } = buildNodeTreeIndex();
   const entry = index[key];
@@ -1605,12 +1740,26 @@ function renderTreeBranch(key, depth, visible) {
   if (n) rowAttrs.onclick = () => openNode(n.id, "overview");
   else rowAttrs.onclick = () => { state.treeCollapsed[key] = !state.treeCollapsed[key]; render(); };
   if (n) rowAttrs.oncontextmenu = (e) => { e.preventDefault(); state.contextMenu = { x: e.clientX, y: e.clientY, nodeId: n.id }; render(); };
+  const liveSub = n ? liveSubFor(n.id) : null;
+  const attemptsSpan = n && n.attempts ? el("span", {
+    class: "row-attempts" + (n.status === "blocked" || n.status === "failed" ? " warn" : (n.attempts >= 2 ? " warm" : "")),
+    title: `attempts ${n.attempts}/${n.gates ? n.gates : "?"}`,
+  }, `a${n.attempts}`) : null;
+  const artSpan = n && n.artifact_count ? el("span", { class: "dim", style: "font-size:10px;", title: `${n.artifact_count} artifact${n.artifact_count > 1 ? "s" : ""} (current + versions)` }, `📁${n.artifact_count}`) : null;
+  const livePill = liveSub ? el("span", {
+    class: "tree-live",
+    title: `live subagent ${liveSub.id} — open its chat`,
+    onclick: (e) => { e.stopPropagation(); openNode(liveSub.id, "chat"); },
+  }, "●") : null;
   const row = el("div", rowAttrs, [
     el("span", { class: "row-glyph tree-glyph" }, glyph),
     el("span", { class: "row-id" }, key),
     shape ? el("span", { class: "dim", style: "font-size:10px; margin:0 6px;" }, shape) : null,
     el("span", { class: "gate-pips" }, gatePips),
-    el("span", { class: "dim", style: "font-size:10px; margin-left:auto;" }, n ? `${(n.artifact_tokens !== undefined ? `≈${n.artifact_tokens}t` : "")}${n.versions ? " 📁" + n.versions.length : ""}` : ""),
+    attemptsSpan,
+    el("span", { class: "dim", style: "font-size:10px; margin-left:auto;" }, n ? `${(n.artifact_tokens !== undefined ? `≈${n.artifact_tokens}t` : "")}` : ""),
+    artSpan,
+    livePill,
   ]);
   const kids = entry.children.filter((c) => {
     if (state.treeFilter) return c.includes(state.treeFilter);
@@ -1660,10 +1809,14 @@ function renderDocTab() {
   if (state.docTab === "contract") {
     const c = state.contractData || { text: "", tokens: 0, ceiling: 1500 };
     const pct = c.ceiling ? Math.min(100, Math.round((c.tokens / c.ceiling) * 100)) : 0;
+    // §5.3: [ amend ] sits on the contract view, not in a global menu —
+    // amendment is a contract operation and its blast radius is the whole run.
+    const amendBtn = state.snapshot.control_enabled ? el("button", { class: "btn-tiny", title: "append a rule to the contract (whole run)", onclick: () => { state.promptMode = "amend"; render(); focusPrompt(); } }, "✏️ amend…") : null;
     body = el("div", { class: "doc-body" }, [
       el("div", { class: "contract-meter" }, [
         el("span", { class: "dim" }, `${c.tokens}t / ceiling ${c.ceiling}t`),
         el("div", { class: "meter", style: `width:${pct}%;` + (pct > 90 ? "background:var(--accent-red);" : "") }),
+        amendBtn,
       ]),
       el("pre", { class: "doc-pre" }, c.text),
     ]);
@@ -1684,10 +1837,27 @@ function renderAsmTab() {
   if (!a) return el("div", { class: "placeholder" }, "loading assembly…");
   const checksArr = a.checks || {};
   const checks = Array.isArray(checksArr) ? checksArr : (checksArr.checks || []);
-  const rows = checks.length ? checks.map((c) => el("div", { class: "gate-row" }, [
-    el("span", { class: c.passed ? "gate-pass" : "gate-fail" }, (c.passed ? "✓" : "✕") + " " + (c.name || c.id || "")),
-    el("span", { class: "dim" }, c.detail || ""),
-  ])) : el("div", { class: "dim" }, "(no checks recorded)");
+  // §5.4: failed cross-cutting checks carry offending node ids as details
+  // lines ("node-04: currently fails gates [...]") — each must be a
+  // clickable chip straight through to that node, not bare text.
+  const knownIds = new Set((state.snapshot.tree || []).map((n) => n && n.id).filter(Boolean));
+  const rows = checks.length ? checks.map((c) => {
+    const details = Array.isArray(c.details) ? c.details : (c.detail ? [c.detail] : []);
+    const lines = details.map((detail) => {
+      const m = /^([\w.~\-]+):\s*(.*)$/s.exec(detail || "");
+      if (m && knownIds.has(m[1])) {
+        return el("div", { class: "asm-detail" }, [
+          el("span", { class: "node-link", onclick: () => openNode(m[1], "overview") }, m[1] + ":"),
+          el("span", { class: "dim" }, m[2] || ""),
+        ]);
+      }
+      return el("div", { class: "asm-detail" }, el("span", { class: "dim" }, detail));
+    });
+    return el("div", { class: "gate-row asm-check" }, [
+      el("span", { class: c.passed ? "gate-pass" : "gate-fail" }, (c.passed ? "✓" : "✕") + " " + (c.name || c.id || "")),
+      el("div", { class: "asm-details" }, lines),
+    ]);
+  }) : el("div", { class: "dim" }, "(no checks recorded)");
   return el("div", { class: "asm-body" }, [
     el("div", { class: "sub-hdr" }, "CROSS-CUTTING CHECKS"),
     ...rows,
@@ -1698,30 +1868,46 @@ function renderAsmTab() {
   ]);
 }
 
+// §5.5 Terminal: scrolling raw events.jsonl tail, filterable by type, and
+// a copyable CLI equivalent of the last UI action — the escape hatch and
+// teaching device in one. (The old PROGRESS/TREE tables here duplicated the
+// rail and the Tree tab; dropped.)
 function renderTermTab() {
-  const a = state.assembly;
-  const counts = state.snapshot.tree_counts || {};
-  const phaseMap = state.snapshot.phases || {};
-  const progressRows = Object.entries(phaseMap).map(([p, st]) => el("div", { class: "gate-row" }, [
-    el("span", { class: "term-glyph" }, PHASE_GLYPH[st] || "·"),
-    el("span", null, p),
-    el("span", { class: "dim", style: "margin-left:auto;" }, st),
-  ]));
-  const treeTable = el("table", { class: "term-table" }, [
-    el("thead", null, el("tr", null, ["status", "id", "gate", "tokens", "parent"].map((h) => el("th", null, h)))),
-    el("tbody", null, (Array.isArray(state.snapshot.tree) ? state.snapshot.tree : Object.values(state.snapshot.tree || {})).map((n) => el("tr", { class: "term-row" + (n.status === "failed" ? " err" : "") }, [
-      el("td", null, el("span", { class: "term-glyph" }, NODE_GLYPH[n.status] || "·")),
-      el("td", null, el("span", { class: "node-link", onclick: () => openNode(n.id, "overview") }, n.id)),
-      el("td", null, String(n.gates || []).slice(0, 40)),
-      el("td", null, String(n.artifact_tokens !== undefined ? n.artifact_tokens : "-")),
-      el("td", null, n.parent || ""),
-    ]))),
+  const snap = state.snapshot;
+  const events = snap.events || [];
+  const types = Array.from(new Set(events.map((e) => e.type))).sort();
+  const filter = state.terminalFilter || "all";
+  const select = el("select", { class: "term-filter", onchange: (e) => { state.terminalFilter = e.target.value; render(); } }, [
+    el("option", { value: "all", selected: filter === "all" ? "selected" : null }, `all (${events.length})`),
+    ...types.map((t) => el("option", { value: t, selected: filter === t ? "selected" : null }, `${t} (${events.filter((e) => e.type === t).length})`)),
   ]);
+  const rows = events.filter((e) => filter === "all" || e.type === filter).slice(-200).reverse().map((ev) => {
+    const textParts = [ev.type];
+    if (ev.phase) textParts.push(`[${ev.phase}]`);
+    if (ev.status) textParts.push(`- ${ev.status}`);
+    if (ev.error) textParts.push(`ERR "${ev.error}"`);
+    return el("div", { class: "gate-row term-event" }, [
+      el("span", { class: "term-glyph", title: ev.type }, _EVENT_LABEL[ev.type] ? _EVENT_LABEL[ev.type].split(" ")[0] : "·"),
+      el("span", { class: "dim", style: "min-width:76px;" }, fmtTime(ev.ts)),
+      ev.node_id && ev.node_id !== "-" ? el("span", { class: "node-link", onclick: () => openNode(ev.node_id, "overview") }, ev.node_id) : null,
+      el("span", { class: "dim", style: "margin-left:auto; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;" }, textParts.join(" ")),
+    ]);
+  });
+  const cliLine = state.lastCliCommand
+    ? el("div", { class: "term-cli" }, [
+        el("span", { class: "dim" }, "CLI equivalent of your last action:"),
+        el("code", { style: "flex:1; min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;" }, state.lastCliCommand),
+        el("button", { class: "btn-tiny", onclick: () => { navigator.clipboard && navigator.clipboard.writeText(state.lastCliCommand).then(() => showToast("command copied")); } }, "copy"),
+      ])
+    : el("div", { class: "dim", style: "font-size:11px; margin-top:8px;" }, "(no UI actions yet — approve/amend/reopen/redispatch/escalate/halt record their CLI form here)");
   return el("div", { class: "term-body" }, [
-    el("div", { class: "sub-hdr" }, "PROGRESS"),
-    ...progressRows,
-    el("div", { class: "sub-hdr", style: "margin-top:14px;" }, `TREE (${counts.passed || 0} passed / ${counts.pending || 0} pending / ${counts.failed || 0} failed / ${counts.split || 0} split)`),
-    treeTable,
+    el("div", { class: "sub-hdr" }, [
+      el("span", null, `TERMINAL — events.jsonl tail (${events.length} total)`),
+      select,
+    ]),
+    el("div", { class: "term-events" }, rows.length ? rows : el("div", { class: "dim" }, "(no matching events)")),
+    el("div", { class: "sub-hdr", style: "margin-top:14px;" }, "LAST UI ACTION → CLI"),
+    cliLine,
   ]);
 }
 

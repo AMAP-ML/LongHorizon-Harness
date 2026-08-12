@@ -19,6 +19,7 @@ from kusudaemon.v1.provider import (  # noqa: E402
     OpenAICompatibleProvider,
     ProviderError,
     ProviderHTTPError,
+    RATE_LIMIT_BACKOFFS,
 )
 from kusudaemon.v1.reviewer import cap_artifact_text, review_node  # noqa: E402
 from kusudaemon.v1.tree import TaskNode, TaskTree, TreeValidationError  # noqa: E402
@@ -636,31 +637,121 @@ class ProviderStructuredOutputTest(unittest.TestCase):
             provider.complete_json([{"role": "user", "content": "hi"}], self.SCHEMA)
         self.assertEqual(ctx.exception.status, 500)
 
-    # §11.10.3: 429 / 5xx retry with backoff honoring Retry-After; other
-    # statuses and exhaustion surface immediately.
+    # §11.10.3 / §D11: 429 takes the operator-specified ladder (1m → 5m →
+    # 30m → 1h → 3h → 5h, then raise); 5xx keeps the short exponential
+    # loop. Retry-After can only extend a rung, never shrink it; other
+    # statuses and ladder exhaustion surface immediately (the task stops).
 
-    def test_429_retries_with_retry_after_then_succeeds(self) -> None:
+    def test_429_uses_the_ladder_and_retries_until_success(self) -> None:
+        # Two 429s then a success: the ladder fires twice (rungs 0 and 1),
+        # the third HTTP call succeeds. Sleeps match the first two rungs of
+        # RATE_LIMIT_BACKOFFS with ±20% jitter.
         calls: list[float] = []
 
         def transport(url, payload, headers):
-            if len(calls) < 2:
-                calls.append(0.0)
-                raise ProviderHTTPError(429, "HTTP 429 from provider: rate limit", retry_after=0.1)
             calls.append(0.0)
+            if len(calls) < 3:
+                raise ProviderHTTPError(429, "HTTP 429 from provider: rate limit")
             return {"choices": [{"message": {"content": '{"action": "stop"}'}}]}
 
         sleeps: list[float] = []
-        provider = OpenAICompatibleProvider(
-            transport=transport, api_key="unused", base_retry_delay=100.0,
-            sleep=sleeps.append,
-        )
+        provider = OpenAICompatibleProvider(transport=transport, api_key="unused", sleep=sleeps.append)
         result = provider.complete_json([{"role": "user", "content": "hi"}], self.SCHEMA)
         self.assertEqual(result, {"action": "stop"})
         self.assertEqual(len(calls), 3)
-        # Retry-After wins over the base delay: ~0.1s with jitter, not ~100.
-        for delay in sleeps:
-            self.assertGreaterEqual(delay, 0.04)
-            self.assertLessEqual(delay, 0.16)
+        self.assertEqual(len(sleeps), 2)
+        for observed, rung in zip(sleeps, RATE_LIMIT_BACKOFFS[:2]):
+            self.assertGreaterEqual(observed, rung * 0.8)
+            self.assertLessEqual(observed, rung * 1.2)
+
+    def test_429_retry_after_can_only_extend_a_rung_never_shrink_it(self) -> None:
+        # §D11: an endpoint ``Retry-After`` of 0.1s is below the first rung
+        # (60s), so the ladder still waits the rung — the schedule is a
+        # floor, not a hint. A ``Retry-After`` larger than the current rung
+        # extends it (the endpoint knows its reset); capped at the ladder
+        # ceiling.
+        def transport(url, payload, headers):
+            raise ProviderHTTPError(429, "rate limit", retry_after=0.1)
+
+        sleeps: list[float] = []
+        provider = OpenAICompatibleProvider(transport=transport, api_key="unused", sleep=sleeps.append)
+        with self.assertRaises(ProviderHTTPError) as ctx:
+            provider.complete_json([{"role": "user", "content": "hi"}], self.SCHEMA)
+        self.assertEqual(ctx.exception.status, 429)
+        # Six rungs fired (seven HTTP attempts total: the 7th's 429 re-raises).
+        self.assertEqual(len(sleeps), len(RATE_LIMIT_BACKOFFS))
+        for observed, rung in zip(sleeps, RATE_LIMIT_BACKOFFS):
+            self.assertGreaterEqual(observed, rung * 0.8)
+            self.assertLessEqual(observed, rung * 1.2)
+
+    def test_429_retry_after_above_a_rung_extends_it_up_to_the_ceiling(self) -> None:
+        # On rung 1 (300s) an endpoint ``Retry-After`` of 1200s extends the
+        # wait to 1200s (it knows its own cooldown); an absurd ``Retry-After``
+        # is capped at the ladder's 5h ceiling.
+        calls: list[float] = []
+
+        def transport(url, payload, headers):
+            calls.append(0.0)
+            if len(calls) == 1:
+                raise ProviderHTTPError(429, "rate limit")  # rung 0: 60s, no header
+            if len(calls) == 2:
+                raise ProviderHTTPError(429, "rate limit", retry_after=1200.0)  # extends rung 1
+            if len(calls) == 3:
+                raise ProviderHTTPError(429, "rate limit", retry_after=99_999.0)  # capped at 5h
+            return {"choices": [{"message": {"content": '{"action": "stop"}'}}]}
+
+        sleeps: list[float] = []
+        provider = OpenAICompatibleProvider(transport=transport, api_key="unused", sleep=sleeps.append)
+        result = provider.complete_json([{"role": "user", "content": "hi"}], self.SCHEMA)
+        self.assertEqual(result, {"action": "stop"})
+        self.assertEqual(len(sleeps), 3)
+        self.assertGreaterEqual(sleeps[0], RATE_LIMIT_BACKOFFS[0] * 0.8)
+        self.assertLessEqual(sleeps[0], RATE_LIMIT_BACKOFFS[0] * 1.2)
+        # rung 1 extended by Retry-After 1200s (no jitter floor violation:
+        # the extension replaces the rung value before jitter).
+        self.assertGreaterEqual(sleeps[1], 1200.0 * 0.8)
+        self.assertLessEqual(sleeps[1], 1200.0 * 1.2)
+        # rung 2 capped at the ladder ceiling (18000s), not 99999s.
+        self.assertGreaterEqual(sleeps[2], RATE_LIMIT_BACKOFFS[-1] * 0.8)
+        self.assertLessEqual(sleeps[2], RATE_LIMIT_BACKOFFS[-1] * 1.2)
+
+    def test_429_exhaustion_raises_and_stops_the_task(self) -> None:
+        # Seven 429s in a row -> the 7th re-raises (attempt == 6 == len).
+        calls: list[float] = []
+
+        def transport(url, payload, headers):
+            calls.append(0.0)
+            raise ProviderHTTPError(429, "rate limit")
+
+        provider = OpenAICompatibleProvider(transport=transport, api_key="unused", sleep=lambda _: None)
+        with self.assertRaises(ProviderHTTPError) as ctx:
+            provider.complete_json([{"role": "user", "content": "hi"}], self.SCHEMA)
+        self.assertEqual(ctx.exception.status, 429)
+        # 1 initial + 6 rung retries = 7 total HTTP attempts.
+        self.assertEqual(len(calls), len(RATE_LIMIT_BACKOFFS) + 1)
+
+    def test_on_backoff_fires_before_each_rung_with_attempt_and_delay(self) -> None:
+        calls: list[float] = []
+        events: list[tuple[int, float]] = []
+
+        def transport(url, payload, headers):
+            calls.append(0.0)
+            if len(calls) < 3:
+                raise ProviderHTTPError(429, "rate limit")
+            return {"choices": [{"message": {"content": '{"action": "stop"}'}}]}
+
+        provider = OpenAICompatibleProvider(
+            transport=transport,
+            api_key="unused",
+            sleep=lambda _: None,
+            on_backoff=lambda attempt, delay: events.append((attempt, delay)),
+        )
+        provider.complete_json([{"role": "user", "content": "hi"}], self.SCHEMA)
+        # Two backoffs (rungs 0 and 1), 1-based attempt numbers.
+        self.assertEqual([ev[0] for ev in events], [1, 2])
+        for (attempt, delay), rung in zip(events, RATE_LIMIT_BACKOFFS[:2]):
+            self.assertGreaterEqual(delay, rung)
+            self.assertLessEqual(delay, RATE_LIMIT_BACKOFFS[-1])
 
     def test_529_exhaustion_raises_the_original_status(self) -> None:
         def transport(url, payload, headers):
