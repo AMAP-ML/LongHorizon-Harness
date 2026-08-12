@@ -2,11 +2,11 @@
 
 # LongHorizon-Harness
 
-### Advancing Long-Horizon Agents for Real-World Tasks
+### Loop Engineering for Computer-Use Agents
 
-**Operate the whole computer like a human. Work across desktop apps and the command line for dozens of hours.**
+**Give Claude Code or Codex a goal once. Keep it working across desktop apps and the terminal for dozens of hours.**
 
-**No state drift. Verifiable progress. Complex tasks carried through to completion.**
+**Plan → act → verify → checkpoint or recover → repeat — until the work is actually done.**
 
 <p align="center">
 <a href="https://lh-harness.pages.dev"><img src="https://img.shields.io/badge/🌐-Website-1f6feb.svg?style=flat-square" alt="Website" /></a>
@@ -21,18 +21,18 @@
 [![Agents](https://img.shields.io/badge/backends-Claude%20Code%20|%20Codex-8A2BE2)](#any-model-any-agent-backend)
 [![Benchmarks](https://img.shields.io/badge/benchmarks-WeaveBench%20|%20OSWorld%202.0%20|%20Terminal--Bench%202.1-orange)](#hundreds-of-real-tasks-measured-gains)
 
-[Usage](#one-command-full-visibility) · [What You Get](#desktop-apps-and-cli-one-continuous-task) · [How It Works](#three-roles-one-trusted-state) · [Results](#hundreds-of-real-tasks-measured-gains) · [Project Website](https://lh-harness.pages.dev) · [简体中文](README.zh-CN.md)
+[Usage](#one-command-full-visibility) · [The Loop](#loop-engineering-for-real-computer-environments) · [Computer Use](#desktop-apps-and-cli-one-continuous-task) · [Results](#hundreds-of-real-tasks-measured-gains) · [Project Website](https://lh-harness.pages.dev) · [简体中文](README.zh-CN.md)
 
 <br>
 <img src="assets/quickstart.gif" alt="Install and run LongHorizon-Harness from the command line" width="720">
 
 </div>
 
-> **The model determines what an agent can do in one round. LongHorizon-Harness determines whether that work can be verified, preserved, and continued until the task is actually complete.**
+> **The model determines what an agent can do in one round. LongHorizon-Harness engineers the loop around it: what to do next, how to verify the result in the real computer, what progress to preserve, and how to continue after failure or context refresh.**
 
-**Works with Claude Code and Codex. One-command install, ready to run.**
+**A Loop Engineering system for Claude Code and Codex. One-command install, ready to run.**
 
-LongHorizon-Harness is an execution, state-management, and result-verification system for long-horizon tasks. It does not train a new model or replace an existing agent. It runs on top of systems such as Codex and Claude Code, helping agents operate autonomously in real computer environments for extended periods and continuously move complex tasks forward.
+LongHorizon-Harness turns existing agents into long-running computer-use systems. Across desktop apps and the terminal CLI, it continuously recovers the goal and verified state, selects the next bounded step, executes it with a fresh context, checks the actual result, and then checkpoints accepted progress or feeds failure evidence into the next round. It does not train a new model or replace an existing agent; it provides the durable execution loop around one.
 
 ## ✨ News
 
@@ -57,17 +57,36 @@ https://github.com/user-attachments/assets/ca8b77ce-9220-4d85-a272-b346009b2454
 
 <p align="center"><a href="assets/promotional_video_1440p.mp4"><strong>Open the promotional video (1440p MP4)</strong></a></p>
 
-## Three roles. One trusted state.
+## Loop Engineering for real computer environments.
 
-LongHorizon-Harness separates planning, execution, and verification so that one growing context is not responsible for everything.
+Give LongHorizon-Harness an outcome. It repeatedly turns the remaining work into a bounded step, performs that step on the right computer surface, checks what actually happened, and carries the verified result into the next round.
 
-| | Role | One responsibility |
+```mermaid
+flowchart LR
+    S["Original goal +<br/>verified state"] --> P["Plan the next<br/>bounded step"]
+    P --> A["Act in a desktop app or CLI<br/>with fresh context"]
+    A --> V["Verify files, UI, logs, and tests<br/>in the real environment"]
+    V -->|Pass| C["Checkpoint<br/>verified progress"]
+    V -->|Fail| R["Record evidence<br/>and recover"]
+    C --> D{"Task complete?"}
+    R --> S
+    D -->|No| S
+    D -->|Yes| F["Verified result"]
+```
+
+This is **Loop Engineering**: designing the execution, verification, correction, and recovery loop around the agent — not just the prompt for a single turn.
+
+### One loop. Three focused responsibilities.
+
+The roles are implementation boundaries inside the loop, not three agents independently growing their own versions of the task.
+
+| Loop responsibility | Role | What it owns |
 |---|---|---|
-| 🧭 | **Manager** | Maintains the original goal, verified progress, and next step |
-| ⚡ | **Executor** | Starts each round with a fresh context and focuses on one clearly defined task |
-| 🔍 | **Auditor** | Independently inspects files, interfaces, logs, and tests in the real environment |
+| 🧭 **State and next step** | **Manager** | Rebuilds each round from the original goal, verified progress, failure evidence, and remaining work |
+| ⚡ **Action** | **Executor** | Starts with a fresh context and completes one clearly defined step in a desktop app or the CLI |
+| 🔍 **Ground truth** | **Auditor** | Independently inspects the actual files, interfaces, logs, and tests instead of trusting the Executor's claim |
 
-Only results that pass independent verification enter persistent task state. Even when the context is refreshed, an action fails, or a deliverable does not pass inspection, the system retains previously verified progress and continues from what remains.
+Only results that pass independent verification become trusted task state. A rejected result remains evidence, not progress. When a context is refreshed, an action fails, or a deliverable does not pass inspection, the next round starts from the original goal and the last verified checkpoint, then continues from what remains.
 
 ## Desktop apps and CLI. One continuous task.
 
