@@ -87,25 +87,18 @@ const state = {
   authDraft: "",
   runSwitcherOpen: false,
   navCollapsed: {},
-  navFocus: "runs",        // keyboard-targeted nav section
   treeFilter: "",
-  treeFilterActive: false,
-  treeCursor: null,        // focused visible row id (j/k)
   treeCollapsed: {},       // folder segment -> collapsed
   contextMenu: null,       // {x, y, nodeId|runId}
   approvalTakeover: false,
   takeoverFor: "",         // approval id the takeover is (or was) for
   triageOpen: {},          // approvalId -> 'clean'|'patchable'|'regenerate' (expanded chip)
-  paletteOpen: false,
-  paletteQuery: "",
-  paletteCursor: 0,
-  keymapOpen: false,
+  helpOpen: false,
   inspectorWidth: 480,
   docTab: "contract",      // 'spec' | 'contract' | 'spine' | 'manifest'
   terminalFilter: "all",
   lastCliCommand: "",      // §5.5 copyable CLI equivalent of the last UI action
   escalationFlash: false,
-  gPrefix: false,          // 'g' pressed, awaiting r/t/a/p
 };
 
 const root = document.getElementById("app");
@@ -221,7 +214,7 @@ function loadMainAgentThinking() {
       const next = { id: targetId, label: sub ? `${targetId} (${sub.role || sub.kind})` : targetId, entries: d.entries || [], live: sub ? sub.live : false };
       if (JSON.stringify(next) !== JSON.stringify(state.mainAgentThinking)) {
         state.mainAgentThinking = next;
-        render();
+        schedulePatch(patchCenter);  // the thinking stream lives in the center pane — patch only that
       }
     })
     .catch(() => {});
@@ -261,7 +254,21 @@ function applySnapshot(snap) {
   if (state.selectedNode && isLive(state.selectedNode)) {
     loadThinkingIfNeeded(true);
   }
-  if (!unchanged) render();
+  if (!unchanged) {
+    // §Responsive: never rebuild the command bar (and so drop the operator's
+    // caret / typed text) when they're actively typing in it. The cmdbar
+    // still reflects promptText/promptMode from state, so the next mutation
+    // outside typing rebuilds it correctly.
+    const typingInCmdbar = (() => {
+      const a = document.activeElement;
+      return !!(a && (a.tagName === "TEXTAREA" || a.tagName === "INPUT") && els.cmdbar && els.cmdbar.contains(a));
+    })();
+    if (typingInCmdbar) {
+      schedulePatch(patchRail, patchHeader, patchNav, patchCenter, patchInspector, patchJobs, patchOverlays, patchToast);
+    } else {
+      scheduleAll();
+    }
+  }
 }
 
 function updateChrome(hasPending) {
@@ -708,8 +715,8 @@ function renderRunSwitcher() {
 
 function renderNavSection(key, title, rows) {
   const collapsed = state.navCollapsed[key];
-  return el("section", { class: "nav-section" + (state.navFocus === key ? " focused" : ""), "data-section": key }, [
-    el("div", { class: "nav-head", onclick: () => { state.navCollapsed[key] = !collapsed; render(); } }, [
+  return el("section", { class: "nav-section", "data-section": key }, [
+    el("div", { class: "nav-head", onclick: () => { state.navCollapsed[key] = !collapsed; patchNav(); } }, [
       el("span", { class: "nav-caret" }, collapsed ? "▸" : "▾"),
       el("span", { class: "nav-title" }, title),
       el("span", { class: "nav-count" }, rows.length),
@@ -816,7 +823,12 @@ function renderCenterStream() {
 // §7.2 command bar. `>` → command mode with live suggestions (Ctrl/Cmd-K also
 // opens the same list as a palette). Modes: msg_agent (default)/command/
 // amend/reopen. Drawn once per render, re-rendered on input via full-teardown
-// render(); focus + caret restored from state.
+// §RESPONSIVE: the command bar is rebuilt only by explicit patches
+// (mode-chip click, a slash-command suggestion click, a snapshot poll). On
+// plain typing the textarea itself is the source of truth — its `input`
+// event updates `state.promptText`/`promptMode` and refreshes only the
+// rendered command suggestions in place; the cmdbar DOM is NOT rebuilt,
+// so typing never loses focus or triggers a synchronous region rebuild.
 function renderCommandBar() {
   const isCommand = state.promptText.trim().startsWith(">");
   const nodeId = state.selectedNode;
@@ -829,43 +841,36 @@ function renderCommandBar() {
         : (nodeId ? `message ${nodeId} …` : "message main agent (e.g. much more important to prioritize examples like the Friday fleet)");
   const modeChip = (mode, label, glyph, title) => el("button", {
     class: "mode-chip " + (state.promptMode === mode ? "active" : ""),
-    title, onclick: () => { state.promptMode = mode; render(); },
+    title, onclick: () => { state.promptMode = mode; patchCmdbar(); focusCmdbar(); },
   }, glyph + label);
-  const suggestionList = isCommand ? commandSuggestions() : null;
-  const textEl = el("textarea", { class: "cmd-input" + (state.promptMode !== "msg_agent" && state.promptMode !== "command" ? " mode-" + state.promptMode : ""), rows: "2", placeholder, "data-key": "promptText" });
+  const textEl = el("textarea", { class: "cmd-input" + (state.promptMode !== "msg_agent" && state.promptMode !== "command" ? " mode-" + state.promptMode : ""), rows: "2", placeholder });
   textEl.value = state.promptText;
+  const suggestionsHost = el("div", { class: "cmd-suggestions" });
+  const renderSuggestionsInto = (host) => {
+    host.replaceChildren(...(isCommand ? commandSuggestions() : []));
+  };
+  let sugTimer = null;
   textEl.addEventListener("input", () => {
     state.promptText = textEl.value;
-    if (textEl.value.startsWith(">")) state.promptMode = "command";
-    else if (state.promptMode === "command" && !textEl.value.startsWith(">")) state.promptMode = "msg_agent";
-    render();
+    const nowCmd = textEl.value.trim().startsWith(">");
+    if (nowCmd && state.promptMode !== "command") state.promptMode = "command";
+    else if (!nowCmd && state.promptMode === "command") state.promptMode = "msg_agent";
+    // §Responsive: refresh only the suggestions list, debounced, never the
+    // cmdbar — typing stays live.
+    if (sugTimer) clearTimeout(sugTimer);
+    sugTimer = setTimeout(() => renderSuggestionsInto(suggestionsHost), 80);
   });
   textEl.addEventListener("keydown", (e) => {
     if (e.key === "Enter" && !e.shiftKey) {
       e.preventDefault();
       handlePromptSubmit(e);
-    } else if (e.key === "ArrowUp" && isCommand && suggestionList && suggestionList.length && document.activeElement === textEl && (e.target.selectionStart === 0 || state.promptText.startsWith(">"))) {
-      e.preventDefault();
-      state.paletteCursor = (state.paletteCursor + suggestionList.length - 1) % suggestionList.length;
-      render();
-      focusPrompt();
-    } else if (e.key === "ArrowDown" && isCommand && suggestionList && suggestionList.length) {
-      e.preventDefault();
-      state.paletteCursor = (state.paletteCursor + 1) % suggestionList.length;
-      render();
-      focusPrompt();
-    } else if (e.key === "Tab" && isCommand && suggestionList && suggestionList.length) {
-      e.preventDefault();
-      const sel = suggestionList[state.paletteCursor % suggestionList.length];
-      state.promptText = sel.usage.replace(/^>/, "").trim();
-      render();
-      focusPrompt();
     }
   });
+  renderSuggestionsInto(suggestionsHost);
 
   const subs = state.snapshot.subagents || [];
   const anyLive = subs.some((s) => s.live);
-  const targetSelect = el("select", { class: "target-select", title: "message target — auto-follows the live agent unless you pick one", onchange: (e) => { state.targetAgentId = e.target.value; state.targetAgentManual = true; render(); } }, [
+  const targetSelect = el("select", { class: "target-select", title: "message target — auto-follows the live agent unless you pick one", onchange: (e) => { state.targetAgentId = e.target.value; state.targetAgentManual = true; } }, [
     el("option", { value: "main", selected: ((!state.targetAgentManual && anyLive) || state.targetAgentId === "main") ? "selected" : null }, anyLive ? "🤖 main (live)" : "🤖 main"),
     ...subs.map((s) => el("option", { value: s.id, selected: (state.targetAgentManual && state.targetAgentId === s.id) ? "selected" : null }, `${s.live ? "● " : ""}${s.id}`)),
   ]);
@@ -880,7 +885,7 @@ function renderCommandBar() {
   return el("div", { class: "cmdbar" }, [
     row,
     el("div", { class: "cmd-row" }, [textEl]),
-    suggestionList ? el("div", { class: "cmd-suggestions" }, suggestionList) : null,
+    suggestionsHost,
   ]);
 }
 
@@ -893,14 +898,13 @@ async function handlePromptSubmit(e) {
     const q = text.slice(1).trim();
     const suggestions = commandSuggestions();
     const exact = suggestions.find((s) => s.key === q || s.trigger === q);
-    if (exact) { state.promptMode = "msg_agent"; state.promptText = ""; render(); await guarded(exact.run); return; }
+    state.promptMode = "msg_agent"; state.promptText = ""; patchCmdbar();
+    if (exact) { await guarded(exact.run); return; }
     const match = suggestions.find((s) => s.pattern.test(q));
     if (match && match.fromQuery) {
-      state.promptMode = "msg_agent"; state.promptText = ""; render();
       await guarded(() => match.fromQuery(q));
       return;
     }
-    state.promptMode = "msg_agent"; state.promptText = ""; render();
     await guarded(cmdHelp);
     return;
   }
@@ -909,7 +913,7 @@ async function handlePromptSubmit(e) {
     const c = findCommand("amend");
     state.promptMode = "msg_agent";
     state.promptText = "";
-    render();
+    patchCmdbar();
     await guarded(() => c.run(text, target));
     return;
   }
@@ -918,7 +922,7 @@ async function handlePromptSubmit(e) {
     const c = findCommand("reopen");
     state.promptMode = "msg_agent";
     state.promptText = "";
-    render();
+    patchCmdbar();
     await guarded(() => c.run(text, state.selectedNode));
     return;
   }
@@ -927,6 +931,7 @@ async function handlePromptSubmit(e) {
   state.targetAgentId = target;
   if (!target) { showToast("No live agent to message", true); return; }
   state.promptText = "";
+  patchCmdbar();
   await guarded(async () => {
     await apiPost(`/api/node/${encodeURIComponent(target)}/interject`, { content: text });
     showToast(`message sent to ${target}`);
@@ -958,8 +963,8 @@ async function cmdResume() {
   await resumeRun();
 }
 async function cmdHelp() {
-  state.keymapOpen = true;
-  render();
+  state.helpOpen = true;
+  patchOverlays();
 }
 async function cmdNewRun() {
   state.newRunOpen = true;
@@ -1076,225 +1081,17 @@ function commandSuggestions() {
 }
 
 function suggestionRow(c) {
-  return el("div", { class: "cmd-suggestion", onclick: () => { state.promptMode = "msg_agent"; state.promptText = c.usage.replace(/^>/, "").trim(); render(); focusPrompt(); } }, [
+  return el("div", { class: "cmd-suggestion", onclick: () => { state.promptMode = "msg_agent"; state.promptText = c.usage.replace(/^>/, "").trim(); patchCmdbar(); focusCmdbar(); } }, [
     el("span", { class: "sug-usage" }, c.usage),
     el("span", { class: "sug-timeout" }, `timeout ${c.timeout}s`),
   ]);
 }
 
-function renderPalette() {
-  if (!state.paletteOpen) return null;
-  const cmds = _memo(buildCommands);
-  const q = state.paletteQuery.replace(/^\s*>/, "").trim();
-  const list = Object.values(cmds);
-  const matches = q ? list.filter((c) => c.usage.includes(q)) : list;
-  const rows = matches.slice(0, 12).map((c, i) => el("div", { class: "pal-row" + (i === state.paletteCursor ? " active" : ""), onclick: () => { state.paletteOpen = false; state.paletteQuery = ""; render(); runCommand(c); } }, [
-    el("span", { class: "pal-usage" }, c.usage),
-    el("span", { class: "pal-timeout" }, `${c.timeout}s`),
-  ]));
-  const input = el("input", { "data-key": "paletteQuery", placeholder: "filter commands…", style: "width:100%" });
-  input.value = state.paletteQuery;
-  input.addEventListener("input", () => { state.paletteQuery = input.value; render(); });
-  return el("div", { class: "overlay", onclick: (e) => { if (e.target === e.currentTarget) closePalette(); } }, [
-    el("div", { class: "panel palette-panel" }, [
-      el("div", { class: "panel-hdr" }, "Commands"),
-      el("div", { class: "panel-body" }, [input, el("div", { class: "pal-list" }, rows)]),
-      el("div", { class: "panel-foot dim" }, "↑/↓ move · ↵ run · esc close"),
-    ]),
-  ]);
+function focusCmdbar() {
+  const ta = els.cmdbar && els.cmdbar.querySelector("textarea");
+  if (ta) { ta.focus(); try { ta.setSelectionRange(ta.value.length, ta.value.length); } catch (e) {} }
 }
 
-function renderKeymap() {
-  if (!state.keymapOpen) return null;
-  const groups = [
-    { title: "Global", keys: [["ctrl/cmd+K", "command palette"], ["g then r / p / t / a", "reopen / doc tabs / tree / approve (g-key prefixes)"], ["esc", "close palette/menu/takeover/prompt-mode"], ["?  or  >help", "this"] ] },
-    { title: "Focus move", keys: [["⌘+L", "command bar"], ["ctrl+]  /  [", "cycle workbench tabs"], ["j / k", "move in task tree"], ["h / l", "tree row: collapse/expand"], ["Enter", "open focused tree row"]] },
-    { title: "Run", keys: [["g r", "reopen selected node"], ["g t", "workbench tree tab"], ["g p", "cycle doc tabs"], ["g a", "approve (first option)"] ] },
-  ];
-  const rows = groups.map((g) => el("section", { class: "keymap-group" }, [
-    el("div", { class: "nav-title", style: "padding:6px 10px; color:var(--text-muted); font-weight:700; font-size:11px;" }, g.title.toUpperCase()),
-    g.keys.map(([k, v]) => el("div", { class: "key-row" }, [el("span", { class: "keycap" }, k), el("span", { class: "key-desc" }, v)])),
-  ]));
-  return el("div", { class: "overlay", onclick: (e) => { if (e.target === e.currentTarget) { state.keymapOpen = false; render(); } } }, [
-    el("div", { class: "panel keymap-panel" }, [
-      el("div", { class: "panel-hdr" }, "Keyboard shortcuts"),
-      el("div", { class: "panel-body" }, rows),
-      el("div", { class: "panel-foot" }, el("button", { onclick: () => { state.keymapOpen = false; render(); } }, "Close")),
-    ]),
-  ]);
-}
-
-/* ------------------------- key handling ------------------------- */
-
-function isLive(nodeId) {
-  if (nodeId === "main") return false;
-  const s = state.snapshot.subagents || [];
-  const match = s.find((x) => x.id === nodeId);
-  return match ? !!(match.live) : false;
-}
-
-function loadThinkingIfNeeded(force) {
-  if (!state.nodeDetail) return;
-  const nodeId = state.selectedNode;
-  if (!nodeId) return;
-  if (state.nodeThinking && !force) return;
-  apiGet(`/api/node/${encodeURIComponent(nodeId)}/thinking`)
-    .then((d) => { state.nodeThinking = d; render(); })
-    .catch(() => { state.nodeThinking = { entries: [] }; render(); });
-}
-
-function currentDocTab() {
-  return state.docTab || "contract";
-}
-
-function cycleInspectorDir(dir) {
-  const tabs = ["tree", "doc", "asm", "term", "node"];
-  const idx = tabs.indexOf(state.workbenchTab);
-  state.workbenchTab = tabs[(idx + dir + tabs.length) % tabs.length];
-  if (state.workbenchTab === "doc") state.docTab = "contract";
-  if (state.workbenchTab === "asm" || state.workbenchTab === "term") fetchWorkbenchData("asm");
-  render();
-}
-
-function focusPrompt() {
-  const el2 = document.querySelector("[data-key=promptText]");
-  if (el2) {
-    el2.focus();
-    try { el2.setSelectionRange(el2.value.length, el2.value.length); } catch (e) {}
-  }
-}
-
-function closePalette() {
-  state.paletteOpen = false;
-  state.paletteQuery = "";
-  render();
-}
-
-function onGlobalKey(e) {
-  if (!state.snapshot.attached) {
-    if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === "k") { e.preventDefault(); state.paletteOpen = true; state.paletteCursor = 0; render(); }
-    return;
-  }
-  const k = e.key.toLowerCase();
-  const isTyping = ["INPUT", "TEXTAREA"].includes((document.activeElement || {}).tagName);
-
-  if ((e.metaKey || e.ctrlKey) && k === "k") {
-    e.preventDefault();
-    state.paletteOpen = true;
-    state.paletteCursor = 0;
-    state.paletteQuery = "";
-    render();
-    return;
-  }
-  if (isTyping) return;
-
-  if (e.key === "Escape") {
-    if (state.contextMenu) { state.contextMenu = null; render(); return; }
-    if (state.runSwitcherOpen) { state.runSwitcherOpen = false; render(); return; }
-    if (state.paletteOpen) { closePalette(); return; }
-    if (state.keymapOpen) { state.keymapOpen = false; render(); return; }
-    if (state.approvalTakeover) {
-      const a = (state.snapshot.pending_approvals || [])[0];
-      if (a) dismissTakeover(a);
-      return;
-    }
-    if (state.promptMode !== "msg_agent") { state.promptMode = "msg_agent"; render(); return; }
-    if (state.newRunOpen) { state.newRunOpen = false; render(); return; }
-    if (state.workbenchTab !== "tree") { state.workbenchTab = "tree"; render(); }
-    return;
-  }
-  if (k === "?") { state.keymapOpen = true; render(); return; }
-  if ((e.ctrlKey || e.metaKey) && k === "]") { cycleInspectorDir(1); return; }
-  if ((e.ctrlKey || e.metaKey) && k === "[") { cycleInspectorDir(-1); return; }
-  if ((e.ctrlKey || e.metaKey) && k === "l") { e.preventDefault(); focusPrompt(); return; }
-  if (k === "g" && !e.metaKey && !e.ctrlKey) {
-    state.gPrefix = true;
-    setTimeout(() => { state.gPrefix = false; }, 1200);
-    render();
-    return;
-  }
-  if (state.gPrefix) {
-    const p = k;
-    state.gPrefix = false;
-    if (p === "r" && state.selectedNode) { state.promptMode = "reopen"; render(); focusPrompt(); return; }
-    if (p === "t") { state.workbenchTab = "tree"; render(); return; }
-    if (p === "p") { cycleDocTab(); render(); return; }
-    if (p === "a") {
-      // §13 keymap: `g a` resolves the top pending approval with its first
-      // (primary) option. Was a no-op before — the documented key did
-      // nothing.
-      const a = (state.snapshot.pending_approvals || [])[0];
-      if (a && (a.options || []).length) {
-        const opt = a.options[0];
-        recordCli(a, opt.value);
-        guarded(() => apiPost(`/api/approvals/${encodeURIComponent(a.approval_id)}/resolve`, { action: opt.value }).then(() => showToast("Approval resolved")));
-      } else {
-        showToast("No pending approval to resolve", true);
-      }
-      return;
-    }
-    render();
-    return;
-  }
-  if (state.paletteOpen) {
-    if (k === "arrowdown") { state.paletteCursor = (state.paletteCursor + 1) % 12; render(); return; }
-    if (k === "arrowup") { state.paletteCursor = (state.paletteCursor + 11) % 12; render(); return; }
-    if (e.key === "Enter") {
-      const cmds = _memo(buildCommands);
-      let i = 0;
-      const list = Object.values(cmds).filter((c) => state.paletteQuery ? c.usage.includes(state.paletteQuery) : true);
-      const c = list[state.paletteCursor] || list[0];
-      if (c) { closePalette(); runCommand(c); }
-      return;
-    }
-  }
-  if (state.contextMenu) {
-    if (k === "arrowdown") { state.contextMenu.y += 20; render(); return; }
-    if (k === "arrowup") { state.contextMenu.y -= 20; render(); return; }
-    return;
-  }
-
-  if (state.approvalTakeover && (state.snapshot.pending_approvals || []).length) {
-    const a = state.snapshot.pending_approvals[0];
-    if (k >= "1" && k <= "9") {
-      const opt = (a.options || [])[Number(k) - 1];
-      if (opt) { recordCli("approve"); guarded(() => apiPost(`/api/approvals/${encodeURIComponent(a.approval_id)}/resolve`, { action: opt.value }).then(() => showToast("Approval resolved"))); }
-      return;
-    }
-    if (e.key === "Enter" && (a.options || []).length) {
-      const opt = a.options[0];
-      recordCli("approve");
-      guarded(() => apiPost(`/api/approvals/${encodeURIComponent(a.approval_id)}/resolve`, { action: opt.value }).then(() => showToast("Approval resolved")));
-      return;
-    }
-  }
-
-  // j/k move + Enter open, scoped to the task tree's visible rows.
-  if (!isTyping && state.workbenchTab === "tree" && (k === "j" || k === "k" || k === "h" || k === "l" || e.key === "Enter")) {
-    const list = state.treeCursorList || [];
-    if (!list.length) return;
-    if (k === "j" || k === "k") {
-      const idx = list.indexOf(state.treeCursor);
-      const next = Math.min(list.length - 1, Math.max(0, idx + (k === "j" ? 1 : -1)));
-      state.treeCursor = list[next];
-      render();
-      return;
-    }
-    if (k === "h" || k === "l") {
-      // §13 keymap: h/l collapse/expand the focused folder row (vim-ish).
-      if (state.treeCursor) {
-        const entry = buildNodeTreeIndex().index[state.treeCursor];
-        if (entry && !entry.node) { state.treeCollapsed[state.treeCursor] = k === "h"; render(); }
-      }
-      return;
-    }
-    if (e.key === "Enter" && state.treeCursor) {
-      const entry = buildNodeTreeIndex().index[state.treeCursor];
-      if (entry && entry.node) { openNode(state.treeCursor, "overview"); return; }
-      if (entry) { state.treeCollapsed[state.treeCursor] = !state.treeCollapsed[state.treeCursor]; render(); return; }
-    }
-  }
-}
 /* ========================= PART D ========================= */
 
 const WORKBENCH_TABS = [
@@ -1313,7 +1110,6 @@ function attachRun(runId) {
       state.approvalTakeover = true;
       state.takeoverFor = "";
       state.treeFilter = "";
-      state.treeCursor = null;
       apiGet("/api/snapshot").then(applySnapshot).catch(() => {});
     })
     .catch((err) => showToast(String(err.message || err), true));
@@ -1347,13 +1143,6 @@ function renderContextMenu() {
   return el("div", { class: "overlay ctx-overlay", onclick: () => { state.contextMenu = null; render(); } }, [
     el("div", { class: "ctx-menu", style: `left:${m.x}px; top:${m.y}px;` }, items),
   ]);
-}
-
-function cycleDocTab() {
-  const order = ["contract", "spec", "spine", "manifest"];
-  const i = order.indexOf(state.docTab || "contract");
-  state.docTab = order[(i + 1) % order.length];
-  fetchWorkbenchData(state.docTab);
 }
 
 function isPreviewTab(t) {
@@ -1441,8 +1230,8 @@ function renderRightWorkbench() {
         state.workbenchTab = t.id;
         if (t.id === "doc") fetchWorkbenchData(state.docTab || "contract");
         if (t.id === "asm" || t.id === "term") fetchWorkbenchData("asm");
-        if (t.id === "tree") { state.treeFilter = ""; state.treeCursor = null; }
-        render();
+        if (t.id === "tree") state.treeFilter = "";
+        patchInspector();
       },
     }, [el("span", { class: "wb-glyph" }, t.glyph), el("span", { class: "wb-label" }, t.label)])
   );
@@ -1618,7 +1407,7 @@ function renderAgentTab() {
   }
   else if (state.agentTab === "chat") {
     const entries = (state.nodeThinking && state.nodeThinking.entries) ? state.nodeThinking.entries : [];
-    body = el("div", { class: "chat-feed node-chat", "data-scroll-key": `node-chat-${id}` }, entries.map(renderAgentChatEntry));
+    body = el("div", { class: "chat-feed node-chat" }, entries.map(renderAgentChatEntry));
   } else if (state.agentTab === "gates") body = renderGatesTab();
   else if (state.agentTab === "artifact") body = renderArtifactsTab();
   else if (state.agentTab === "versions") body = renderVersionsTab();
@@ -1708,7 +1497,6 @@ function buildNodeTreeIndex() {
 
 function treeRowClass(key, n) {
   const cls = ["tree-row"];
-  if (state.treeCursor === key) cls.push("cursor");
   if (!n) cls.push("tree-row-folder");
   return cls.join(" ");
 }
@@ -1778,22 +1566,28 @@ function visibleTreeRows() {
 function renderTaskTreeTab() {
   const { tops } = buildNodeTreeIndex();
   const counts = state.snapshot.tree_counts || {};
-  const filterInput = el("input", { "data-key": "tree-filter", type: "text", placeholder: "filter node ids…", style: "width:100%;" });
+  const filterInput = el("input", { type: "text", placeholder: "filter node ids…", style: "width:100%;" });
   filterInput.value = state.treeFilter;
-  filterInput.addEventListener("input", () => { state.treeFilter = filterInput.value; state.treeCursor = null; render(); });
-  filterInput.addEventListener("keydown", (e) => {
-    if (e.key === "Escape") { state.treeFilter = ""; state.treeCursor = null; render(); }
+  const listHost = el("div", { class: "tree-list" });
+  const refreshList = () => {
+    const { tops: t2 } = buildNodeTreeIndex();
+    const vis = [];
+    listHost.replaceChildren(...t2.map((t) => renderTreeBranch(t, 0, vis)));
+  };
+  let filterTimer = null;
+  filterInput.addEventListener("input", () => {
+    state.treeFilter = filterInput.value;
+    if (filterTimer) clearTimeout(filterTimer);
+    filterTimer = setTimeout(refreshList, 60);  // §Responsive: typing filters the list in place; the input keeps focus
   });
-  const visible = [];
-  const rows = tops.map((t) => renderTreeBranch(t, 0, visible));
-  state.treeCursorList = visible;
+  refreshList();
   return el("div", { class: "tree-tab" }, [
     el("div", { class: "tree-hdr" }, [
       el("span", { class: "sub-hdr" }, `TASK TREE — ${counts.passed || 0}/${(counts.passed || 0) + (counts.failed || 0) + (counts.blocked || 0) + (counts.pending || 0) + (counts.ready || 0) + (counts.dispatched || 0) + (counts.awaiting_review || 0) + (counts.stale || 0) + (counts.split || 0)}`),
-      el("button", { class: "btn-tiny", onclick: () => { state.promptMode = "command"; state.promptText = "> redispatch "; render(); focusPrompt(); } }, "redispatch"),
+      el("button", { class: "btn-tiny", onclick: () => { state.promptMode = "command"; state.promptText = "> redispatch "; patchCmdbar(); focusCmdbar(); } }, "redispatch"),
     ]),
     el("div", { class: "tree-filter" }, filterInput),
-    el("div", { class: "tree-list" }, rows),
+    listHost,
   ]);
 }
 
@@ -1811,7 +1605,7 @@ function renderDocTab() {
     const pct = c.ceiling ? Math.min(100, Math.round((c.tokens / c.ceiling) * 100)) : 0;
     // §5.3: [ amend ] sits on the contract view, not in a global menu —
     // amendment is a contract operation and its blast radius is the whole run.
-    const amendBtn = state.snapshot.control_enabled ? el("button", { class: "btn-tiny", title: "append a rule to the contract (whole run)", onclick: () => { state.promptMode = "amend"; render(); focusPrompt(); } }, "✏️ amend…") : null;
+    const amendBtn = state.snapshot.control_enabled ? el("button", { class: "btn-tiny", title: "append a rule to the contract (whole run)", onclick: () => { state.promptMode = "amend"; patchCmdbar(); focusCmdbar(); } }, "✏️ amend…") : null;
     body = el("div", { class: "doc-body" }, [
       el("div", { class: "contract-meter" }, [
         el("span", { class: "dim" }, `${c.tokens}t / ceiling ${c.ceiling}t`),
@@ -1919,9 +1713,9 @@ function renderNewRunModal() {
     el("span", { class: "form-label" }, label),
     fieldCh,
   ]);
-  const set = (k, v) => { state.newRun[k] = v; render(); };
+  const set = (k, v) => { state.newRun[k] = v; };  // §Responsive: typing in the modal never rebuilds — values live in state
   const input = (key, type, ph) => {
-    const el2 = el("input", { type: type || "text", placeholder: ph, "data-key": "newrun-" + key });
+    const el2 = el("input", { type: type || "text", placeholder: ph });
     el2.value = state.newRun[key] || "";
     el2.addEventListener("input", () => set(key, el2.value));
     return el2;
@@ -2021,82 +1815,122 @@ async function submitAuth() {
 }
 
 /* ------------------------- root render ------------------------- */
+// §RESPONSIVE: there is no single ``render()`` doing a full ``#app``
+// teardown any more — that was the lag the operator hit on every keystroke
+// and every button click: a synchronous rebuild of the entire DOM (hundreds
+// of tree rows + every subagent's chat) per input event. Now the chrome is
+// built once, then each region is patched in place by rebuilding only its
+// own container's children. A burst of ``schedulePatch(region)`` calls
+// collapses into one ``requestAnimationFrame`` flush, so a snapshot poll
+// landing mid-typing never rebuilds a region the operator isn't looking at.
+//
+// No keyboard shortcuts: ``onGlobalKey`` and the palette/keymap/g-prefix
+// machinery are gone; commands come from the ``>`` command bar only. The old
+// ``data-key`` focus-restore and ``captureScrollStates``/``restoreScrollStates``
+// dance existed *only* to survive keyboard-driven full teardowns — both gone.
 
-function captureScrollStates() {
-  state._scrolls = {};
-  document.querySelectorAll("[data-scroll-key]").forEach((el2) => {
-    state._scrolls[el2.getAttribute("data-scroll-key")] = el2.scrollTop;
-  });
+const els = {};
+
+function buildChrome() {
+  const appRoot = el("div", { class: "app-root" });
+  els.frame = el("div", { class: "chrome-frame" });
+  els.cmrail = el("div", null, null);   // placeholder; rail rebuilds its own subtree
+  els.header = el("div", null, null);
+  els.workspace = el("div", { class: "kd-workspace" }, [
+    els.nav = el("div", null, null),
+    els.center = el("div", null, null),
+    els.inspector = el("div", null, null),
+  ]);
+  els.cmdbar = el("div", null, null);
+  els.overlays = el("div", null, null);
+  els.jobs = el("div", null, null);
+  els.toast = el("div", null, null);
+  els.frame.replaceChildren(els.cmrail, els.header, els.workspace, els.cmdbar);
+  appRoot.replaceChildren(els.frame, els.jobs, els.overlays, els.toast);
+  root.replaceChildren(appRoot);
 }
 
-function restoreScrollStates() {
-  setTimeout(() => {
-    document.querySelectorAll("[data-scroll-key]").forEach((el2) => {
-      const k = el2.getAttribute("data-scroll-key");
-      if (state._scrolls && state._scrolls[k] !== undefined) el2.scrollTop = state._scrolls[k];
-    });
-    const feed = document.querySelector("#chat-feed");
-    if (feed && !state._chatPinned) {
-      try { feed.scrollTop = feed.scrollHeight; } catch (e) {}
-    }
-  }, 0);
+// Region patchers — each rebuilds only its own container's subtree.
+function patchRail() { if (els.cmrail) els.cmrail.replaceChildren(renderRail()); }
+function patchHeader() { if (els.header) els.header.replaceChildren(renderHeaderRow()); }
+function patchNav() { if (els.nav) els.nav.replaceChildren(renderNav()); }
+function patchCenter() { if (els.center) els.center.replaceChildren(renderCenterStream()); }
+function patchInspector() { if (els.inspector) els.inspector.replaceChildren(renderRightWorkbench()); }
+function patchCmdbar() { if (els.cmdbar) els.cmdbar.replaceChildren(renderCommandBar()); }
+function patchJobs() {
+  if (!els.jobs) return;
+  const running = (state.snapshot.jobs || []).filter((j) => j.status === "running" || j.status === "queued");
+  if (!running.length) { els.jobs.replaceChildren(); return; }
+  els.jobs.replaceChildren(el("div", { class: "jobs-strip" }, running.map((j) =>
+    el("div", { class: "job-chip" }, [
+      el("span", null, `${j.kind || "job"} ${j.job_id || ""}`),
+      el("button", { class: "btn-tiny", disabled: !state.snapshot.control_enabled ? "" : null, onclick: () => guarded(() => apiPost(`/api/jobs/${encodeURIComponent(j.job_id || "")}/cancel`, {}).then(() => showToast("job cancel requested"))) }, "✕"),
+    ])
+  )));
 }
-
-// Full-teardown render rule: every input that must keep the operator's
-// typing carries a data-key; after the DOM is rebuilt, refocus the fresh
-// node and restore the caret.
-function restoreFocus() {
-  const active = document.activeElement;
-  if (!active || !active.hasAttribute || !active.hasAttribute("data-key")) return;
-  const key = active.getAttribute("data-key");
-  const fresh = document.querySelector(`[data-key="${CSS.escape(key)}"]`);
-  if (!fresh || fresh === active) return;
-  let selStart = -1, selEnd = -1;
-  try { selStart = active.selectionStart; selEnd = active.selectionEnd; } catch (e) {}
-  fresh.focus();
-  if (selStart >= 0) { try { fresh.setSelectionRange(selStart, selEnd); } catch (e) {} }
-}
-
-function render() {
-  const snap = state.snapshot;
-  if (!snap) return;
-  captureScrollStates();
-  const children = [
-    renderRail(),
-    renderHeaderRow(),
-    el("div", { class: "kd-workspace" }, [
-      renderNav(),
-      renderCenterStream(),
-      renderRightWorkbench(),
-    ]),
-    renderCommandBar(),
+function patchOverlays() {
+  if (!els.overlays) return;
+  els.overlays.replaceChildren(
     renderContextMenu(),
-    renderPalette(),
-    renderKeymap(),
     renderRunSwitcher(),
     renderNewRunModal(),
     renderAuthOverlay(),
-  ];
-  const jobStrip = (state.snapshot.jobs || []).filter((j) => j.status === "running" || j.status === "queued").length
-    ? el("div", { class: "jobs-strip" }, (state.snapshot.jobs || []).filter((j) => j.status === "running" || j.status === "queued").map((j) =>
-        el("div", { class: "job-chip" }, [
-          el("span", null, `${j.kind || "job"} ${j.job_id || ""}`),
-          el("button", { class: "btn-tiny", disabled: !snap.control_enabled ? "" : null, onclick: () => guarded(() => apiPost(`/api/jobs/${encodeURIComponent(j.job_id || "")}/cancel`, {}).then(() => showToast("job cancel requested"))) }, "✕"),
-        ])
-      ))
-    : null;
-  root.replaceChildren(el("div", { class: "app-root" }, [
-    el("div", { class: "chrome-frame" }, children),
-    jobStrip,
-    state.toast ? el("div", { class: "toast" + (state.toast.isError ? " err" : ""), onclick: () => { state.toast = null; render(); } }, state.toast.message) : null,
-  ]));
-  restoreScrollStates();
-  restoreFocus();
+    renderHelpModal(),
+  );
+}
+function patchToast() {
+  if (!els.toast) return;
+  els.toast.replaceChildren(
+    state.toast ? el("div", { class: "toast" + (state.toast.isError ? " err" : ""), onclick: () => { state.toast = null; patchToast(); } }, state.toast.message) : null
+  );
+}
+
+// Coalesce a burst of region patches into one rAF flush. Multiple
+// ``schedulePatch(...)`` calls in the same frame run their fns exactly once,
+// deduped, in registration order.
+let _pending = new Set();
+let _rafQueued = false;
+function schedulePatch(...fns) {
+  for (const f of fns) if (typeof f === "function") _pending.add(f);
+  if (_rafQueued) return;
+  _rafQueued = true;
+  requestAnimationFrame(() => {
+    _rafQueued = false;
+    const run = Array.from(_pending);
+    _pending = new Set();
+    for (const f of run) {
+      try { f(); } catch (e) { console.error(e); }
+    }
+  });
+}
+
+// The snapshot poll re-patches every region. Each region patcher rebuilds
+// only its own container; the operator's text inputs live inside cmdbar
+// (which a snapshot does NOT touch unless typing already scheduled it).
+function scheduleAll() {
+  schedulePatch(patchRail, patchHeader, patchNav, patchCenter, patchInspector, patchCmdbar, patchJobs, patchOverlays, patchToast);
+}
+
+// §RESPONSIVE: every button click updates `state` then schedules the
+// regions that visibly depend on it — never the whole app.
+function render() { scheduleAll(); }
+
+function renderHelpModal() {
+  if (!state.helpOpen) return null;
+  const cmds = _memo(buildCommands);
+  const groups = Object.values(cmds).map((c) =>
+    el("div", { class: "key-row" }, [el("span", { class: "keycap" }, c.usage), el("span", { class: "key-desc" }, c.label)])
+  );
+  return el("div", { class: "overlay", onclick: (e) => { if (e.target === e.currentTarget) { state.helpOpen = false; patchOverlays(); } } }, [
+    el("div", { class: "panel keymap-panel" }, [
+      el("div", { class: "panel-hdr" }, "Slash commands"),
+      el("div", { class: "panel-body" }, groups.length ? groups : el("div", { class: "dim" }, "(none)")),
+      el("div", { class: "panel-foot" }, el("button", { onclick: () => { state.helpOpen = false; patchOverlays(); } }, "Close")),
+    ]),
+  ]);
 }
 
 /* ------------------------- boot ------------------------- */
-
-window.addEventListener("keydown", onGlobalKey);
 
 const DEFAULT_FAVICON = "data:image/svg+xml;utf8," + encodeURIComponent('<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16"><circle cx="8" cy="8" r="6" fill="%236366f1"/></svg>');
 const RED_FAVICON = "data:image/svg+xml;utf8," + encodeURIComponent('<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16"><circle cx="8" cy="8" r="6" fill="%23f43f5e"/></svg>');
@@ -2106,6 +1940,8 @@ document.addEventListener("DOMContentLoaded", () => {
   icon.rel = "icon";
   icon.href = DEFAULT_FAVICON;
   document.head.appendChild(icon);
+  buildChrome();
+  scheduleAll();
   apiGet("/api/runs", { allowAuthPrompt: true })
     .then((d) => {
       state.authRequired = false;
@@ -2120,9 +1956,8 @@ document.addEventListener("DOMContentLoaded", () => {
     })
     .catch((err) => {
       state.authRequired = true;
-      render();
+      scheduleAll();
     });
-  render();
   setInterval(() => {
     const now = new Date();
     const clock = document.querySelector(".rail-a40");
