@@ -8,6 +8,7 @@ import json
 import logging
 import os
 import stat as stat_module
+import sys
 import time
 from dataclasses import asdict, dataclass, field
 import traceback
@@ -25,6 +26,7 @@ from .environment.remote_files import ensure_remote_dir, write_remote_text
 from .runtime_signals import hard_signal_labels
 from .provider_errors import classify_agent_runtime_failure
 from .trajectory_artifacts import persist_trajectory_artifacts
+from .utils import paths as long_paths
 from .role_prompts import (
     MANAGER_NEXT_BLOCKED,
     MANAGER_NEXT_DONE,
@@ -73,6 +75,7 @@ from .auditor_agent import (
     audit_report_from_episode_result,
 )
 
+IS_WINDOWS = sys.platform == "win32"
 ROLE_VARIANT = "lh_harness_role_managed"
 logger = logging.getLogger(__name__)
 _MAX_SAVED_TRAJECTORY_BYTES = 16 * 1024 * 1024
@@ -1540,7 +1543,7 @@ async def _write_final_response(
     # Stored per round, like the other roles, so a discarded reply keeps its own
     # artifacts and the dashboard's round trajectory viewer can reach them.
     round_dir = ctx.role_dir / "rounds" / f"round_{round_index:03d}"
-    round_dir.mkdir(parents=True, exist_ok=True)
+    long_paths.makedirs(round_dir)
     _write_local(round_dir / "final_response_input.txt", prompt)
     _append_event(
         ctx.events_path,
@@ -2485,8 +2488,47 @@ def _budget_to_dict(budget: EpisodeBudget) -> dict[str, int]:
     }
 
 
+def _event_record(path: Path, event: str, payload: dict[str, Any], sequence: int) -> dict[str, Any]:
+    run_id = path.parents[2].name if len(path.parents) > 2 else "local"
+    return {
+        "schema_version": 1,
+        "event_id": f"{run_id}:{sequence:06d}",
+        "ts": time.time(),
+        "event": event,
+        **_json_safe(payload),
+    }
+
+
+def _append_event_windows(path: Path, event: str, payload: dict[str, Any]) -> None:
+    """Append one event on Windows, which has no O_NOFOLLOW/dir_fd/flock.
+
+    Same record shape and same sequence-derived event id as the POSIX path. The
+    difference is the locking: a single process owns this log for the run, so
+    the sequence is read and written under one handle rather than an advisory
+    lock.
+    """
+
+    if path.is_symlink():
+        raise OSError(f"refusing to follow a reparse point: {path}")
+    target = long_paths.os_path(path)
+    with open(target, "a+", encoding="utf-8", newline="") as fh:
+        fh.seek(0)
+        sequence = sum(1 for line in fh if line.strip()) + 1
+        fh.seek(0, 2)
+        fh.write(
+            json.dumps(_event_record(path, event, payload, sequence), ensure_ascii=False, sort_keys=True)
+            + "\n"
+        )
+        fh.flush()
+        with contextlib.suppress(OSError):
+            os.fsync(fh.fileno())
+
+
 def _append_event(path: Path, event: str, payload: dict[str, Any]) -> None:
     _ensure_dir_nofollow(path.parent)
+    if IS_WINDOWS:
+        _append_event_windows(path, event, payload)
+        return
     # Event ids are assigned while holding the file lock, so the same absolute
     # id survives snapshot truncation, REST replay, and a reconnect after an
     # API restart.  The legacy ``event`` field remains for old readers.

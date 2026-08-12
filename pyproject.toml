@@ -28,9 +28,6 @@ test = [
     "httpx2",
 ]
 
-[project.optional-dependencies]
-dev = ["pytest>=8"]
-
 [project.urls]
 Homepage = "https://github.com/AMAP-ML/LongHorizon-Harness"
 Issues = "https://github.com/AMAP-ML/LongHorizon-Harness/issues"

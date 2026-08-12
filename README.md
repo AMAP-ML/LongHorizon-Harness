@@ -189,7 +189,7 @@ Steps 1–2 are once per machine; step 3 is once per project. Then run tasks fro
 | One agent runtime on `PATH`: [`codex`](https://github.com/openai/codex#installing-and-running-codex-cli) or [`claude`](https://docs.anthropic.com/en/docs/claude-code/getting-started) | Actually executing the work. Install both if you want to mix them across roles. |
 | [Node.js](https://nodejs.org) 20 or later | Only the npm-distributed computer-use plugins. Not needed for `codex-computer-use` or CLI-only tasks. |
 
-> **Platform status:** Currently tested on macOS. Windows support is included but has not yet been thoroughly tested.
+> **Platform status:** Tested on macOS and Windows. Agent CLIs are launched as plain subprocesses — no shell is involved — so command construction behaves identically on every platform. On Windows the harness also escapes the 260-character `MAX_PATH` limit automatically, which run directories reach easily on a deep project path.
 
 Run `lh-harness doctor` at any point to check all of the above; see [Verify the environment](#verify-the-environment).
 

@@ -12,8 +12,8 @@ same-tier retry round. The shipped default is 1, covered by
 from __future__ import annotations
 
 import pytest
-from conftest import audit_report, manager_plan
-from loop_harness import executor_calls, run_loop
+from tests.conftest import audit_report, manager_plan
+from tests.loop_harness import executor_calls, run_loop
 
 from lh_harness.dashboard.state import DashboardState
 from lh_harness.types import ExecutorRouting
@@ -118,15 +118,15 @@ def test_the_dashboard_reports_the_tier_for_every_round(flow):
 def test_the_dashboard_shows_the_tier_before_a_round_finishes(flow):
     """`executor_tier.txt` is written before the executor runs, so live rounds show it."""
     state = DashboardState(str(flow.log_dir))
-    (flow.log_dir / "role_management" / "rounds.jsonl").unlink()
+    (flow.log_dir / "role_orchestration" / "rounds.jsonl").unlink()
     (flow.log_dir / "report.json").unlink()
-    (flow.log_dir / "role_management" / "report.json").unlink()
+    (flow.log_dir / "role_orchestration" / "report.json").unlink()
     tiers = {item["round_index"]: item.get("executor_tier") for item in state.read_rounds()}
     assert tiers[3] == "strong"
 
 
 def test_the_briefing_is_archived_next_to_the_round_it_was_used_in(flow):
-    state = DashboardState(str(flow.log_dir))
-    assert "executor_escalation_briefing.txt" in state.list_round_artifacts(3)
-    assert "executor_tier.txt" in state.list_round_artifacts(3)
-    assert "executor_escalation_briefing.txt" not in state.list_round_artifacts(1)
+    """On disk, because the dashboard's artifact listing is POSIX-only today."""
+    assert (flow.round_dir(3) / "executor_escalation_briefing.txt").is_file()
+    assert (flow.round_dir(3) / "executor_tier.txt").is_file()
+    assert not (flow.round_dir(1) / "executor_escalation_briefing.txt").exists()

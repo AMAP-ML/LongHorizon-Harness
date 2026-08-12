@@ -8,8 +8,8 @@ model starts blind and can repeat the same rejected approaches.
 from __future__ import annotations
 
 import pytest
-from conftest import audit_report, manager_plan
-from loop_harness import run_loop
+from tests.conftest import audit_report, manager_plan
+from tests.loop_harness import run_loop
 
 from lh_harness.role_prompts import (
     ESCALATION_BRIEFING_MAX_ROUNDS,

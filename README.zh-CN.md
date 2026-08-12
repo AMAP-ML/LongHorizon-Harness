@@ -190,7 +190,7 @@ LongHorizon-Harness 不只展示了几个精心挑选的成功案例。
 | `PATH` 上有一个 Agent 运行时：[`codex`](https://github.com/openai/codex#installing-and-running-codex-cli) 或 [`claude`](https://docs.anthropic.com/en/docs/claude-code/getting-started) | 真正执行任务。想按角色混用两个后端就都装上。 |
 | [Node.js](https://nodejs.org) 20 或更高版本 | 只有 npm 分发的 computer-use 插件需要。用 `codex-computer-use` 或纯 CLI 任务时不需要。 |
 
-> **平台状态：** 目前只在 macOS 上完成了测试；Windows 已支持，但尚未经过详细测试。
+> **平台状态：** 已在 macOS 和 Windows 上测试。Agent CLI 以普通子进程方式启动，不经过 shell，因此命令构造在所有平台上行为一致。在 Windows 上还会自动绕开 260 字符的 `MAX_PATH` 限制——项目路径较深时，运行目录很容易超过这个长度。
 
 以上都可以用 `lh-harness doctor` 一次性检查，见[检查运行环境](#检查运行环境)。
 

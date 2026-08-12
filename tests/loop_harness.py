@@ -12,7 +12,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from conftest import FakeEnvironment, ScriptedAdapter, audit_report, manager_plan
+from tests.conftest import FakeEnvironment, ScriptedAdapter, audit_report, manager_plan
 
 from lh_harness import manager
 
@@ -34,7 +34,7 @@ class LoopRun:
         return [item["executor_tier"] for item in self.report["rounds"]]
 
     def events(self, name: str | None = None) -> list[dict[str, Any]]:
-        path = self.log_dir / "role_management" / "events.jsonl"
+        path = self.log_dir / "role_orchestration" / "events.jsonl"
         records = [
             json.loads(line)
             for line in path.read_text(encoding="utf-8").splitlines()
@@ -43,7 +43,7 @@ class LoopRun:
         return [item for item in records if name is None or item.get("event") == name]
 
     def rounds_jsonl(self) -> list[dict[str, Any]]:
-        path = self.log_dir / "role_management" / "rounds.jsonl"
+        path = self.log_dir / "role_orchestration" / "rounds.jsonl"
         return [
             json.loads(line)
             for line in path.read_text(encoding="utf-8").splitlines()
@@ -51,7 +51,7 @@ class LoopRun:
         ]
 
     def round_dir(self, round_index: int) -> Path:
-        return self.log_dir / "role_management" / "rounds" / f"round_{round_index:03d}"
+        return self.log_dir / "role_orchestration" / "rounds" / f"round_{round_index:03d}"
 
 
 def run_loop(

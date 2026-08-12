@@ -11,8 +11,8 @@ end-to-end runs escalated on round 1 that way.
 from __future__ import annotations
 
 import pytest
-from conftest import audit_report, manager_plan, progress_report
-from loop_harness import executor_calls, run_loop
+from tests.conftest import audit_report, manager_plan, progress_report
+from tests.loop_harness import executor_calls, run_loop
 
 from lh_harness.manager import (
     _audit_gap_fingerprint,

@@ -1,16 +1,47 @@
+"""Write harness bookkeeping into whatever environment a run uses.
+
+An environment that can touch its own filesystem directly (the local one) does
+so through ``makedirs``/``write_text``. Only a genuinely remote environment
+falls back to shelling out, and that fallback is POSIX because the remote side
+is a Linux VM or container.
+"""
+
 from __future__ import annotations
 
 import os
 import posixpath
 import shlex
-import tempfile
 from pathlib import Path
 
 from .base import Environment
-from ..types import DEFAULT_TMP_DIR
 
 
 async def write_remote_text(env: Environment, remote_path: str, content: str, mode: str = "0644") -> None:
+    native = getattr(env, "write_text", None)
+    if callable(native):
+        await native(remote_path, content)
+        return
+    await _shell_write_text(env, remote_path, content, mode)
+
+
+async def ensure_remote_dir(env: Environment, remote_path: str) -> None:
+    native = getattr(env, "makedirs", None)
+    if callable(native):
+        await native(remote_path)
+        return
+    result = await env.exec(f"mkdir -p {shlex.quote(remote_path)}", timeout=30)
+    if result.exit_code != 0:
+        raise RuntimeError(f"failed creating {remote_path}: {result.stderr or result.stdout}")
+
+
+async def _shell_write_text(
+    env: Environment, remote_path: str, content: str, mode: str
+) -> None:
+    """Stage locally, upload, then fix permissions -- the remote-environment path."""
+    import tempfile
+
+    from ..types import DEFAULT_TMP_DIR
+
     parent = posixpath.dirname(remote_path.rstrip("/"))
     if parent:
         await ensure_remote_dir(env, parent)
@@ -36,9 +67,3 @@ async def write_remote_text(env: Environment, remote_path: str, content: str, mo
     result = await env.exec(f"chmod {shlex.quote(mode)} {shlex.quote(remote_path)}", timeout=30)
     if result.exit_code != 0:
         raise RuntimeError(f"failed chmod {remote_path}: {result.stderr or result.stdout}")
-
-
-async def ensure_remote_dir(env: Environment, remote_path: str) -> None:
-    result = await env.exec(f"mkdir -p {shlex.quote(remote_path)}", timeout=30)
-    if result.exit_code != 0:
-        raise RuntimeError(f"failed creating {remote_path}: {result.stderr or result.stdout}")
