@@ -41,15 +41,9 @@ LongHorizon-Harness 将现有 Agent 变成可长期运行的 computer-use 系统
 - **[v0.1.3 · 2026-08-07]** 每次运行结束都会输出一份自然语言回复，只依据已验证状态回答你的任务；任务默认作用于你启动命令的目录，控制台也会实时打印每一轮进展。
 - **[2026-08-06]** LongHorizon-Harness 登上 [Hugging Face Daily Papers 周榜](https://huggingface.co/papers/week/2026-W32)**第 1 名**。
 - **[v0.1.2 · 2026-08-06]** 新增统一的 computer-use 插件管理，强化 Auditor 只读校验、角色隔离和进程清理，并扩展 `doctor` 环境检查。见[管理 computer-use 插件](#管理-computer-use-插件)。
-- **[2026-08-06]** 微信交流群已开放，扫码加入。
 
 > 🚀 我们正在快速迭代，敬请期待！
 
-<div align="center">
-<img src="assets/wechat_group.JPG" alt="微信交流群二维码" width="240">
-<br>
-<sub>二维码会定期更新，失效请提 issue，我们会补一张新的。</sub>
-</div>
 
 ## 视频演示
 
