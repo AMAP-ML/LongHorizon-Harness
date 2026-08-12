@@ -211,6 +211,17 @@ def _post_halt(handler: "DashboardRequestHandler", match: Any, body: dict) -> tu
     return (200, {"ok": True}) if ok else (409, {"ok": False, "error": "no attached run"})
 
 
+@_route("POST", r"^/api/runs/kill$")
+def _post_kill_run(handler: "DashboardRequestHandler", match: Any, body: dict) -> tuple[int, Any]:
+    """Immediately terminate the driver process for a run (SIGTERM→SIGKILL).
+    Accepts an optional ``run_id``; if omitted, kills the attached run's driver."""
+    handler.require_control()
+    run_id = str(body.get("run_id", "")).strip() or None
+    ok = handler.state.kill_run(run_id)
+    return (200, {"ok": True}) if ok else (409, {"ok": False, "error": "no driver PID found for this run — it may already be stopped"})
+
+
+
 @_route("POST", r"^/api/approvals/([^/]+)/resolve$")
 def _post_resolve(handler: "DashboardRequestHandler", match: Any, body: dict) -> tuple[int, Any]:
     handler.require_control()
@@ -365,7 +376,8 @@ def _post_interject(handler: "DashboardRequestHandler", match: Any, body: dict) 
     subagent's gptme session mid-episode (``RunState.interject``)."""
     handler.require_control()
     node_id = unquote(match.group(1))
-    ok = handler.state.interject(node_id, str(body.get("text", "")))
+    text = str(body.get("text") or body.get("content") or "").strip()
+    ok = handler.state.interject(node_id, text)
     return (200, {"ok": True}) if ok else (409, {"ok": False, "error": "no live session found for this node"})
 
 
@@ -404,16 +416,23 @@ def _get_assembly(handler: "DashboardRequestHandler", match: Any, body: dict) ->
 
 def _read_text_field(raw: Any) -> str:
     """Server-side ``@path`` resolution for the ``goal``/``source`` fields
-    of ``POST /api/runs`` — mirrors ``pipeline/run.py``'s
-    ``_read_text_arg``, which the deleted TUI's New-run form applied
-    client-side (same process, same machine, so "client-side" and
-    "server-side" were the same thing there). A browser can't read
-    arbitrary server files, so this resolution has to happen here instead,
-    against the *server's* filesystem — the one place both the CLI and the
-    web form agree "@path" should be resolved relative to."""
-    from ..pipeline.run import _read_text_arg
-
-    return _read_text_arg(str(raw or ""))
+    of ``POST /api/runs`` — safely resolves file paths without blocking
+    on non-existent paths, UI placeholders, or stdin."""
+    s = str(raw or "").strip()
+    if not s or s == "-":
+        return s if s != "-" else ""
+    if s.startswith("@"):
+        path_str = s[1:].strip()
+        if not path_str or path_str.startswith("/path/to/"):
+            return ""
+        path = Path(path_str)
+        try:
+            if not path.is_file():
+                return ""
+            return path.read_text(encoding="utf-8").strip()
+        except OSError:
+            return ""
+    return s
 
 
 class ControlDisabledError(Exception):
@@ -437,6 +456,11 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
     # _post_runs when the count reaches this. Set on the handler class the
     # same way ``state``/``control_enabled`` are.
     max_concurrent_runs: int = DEFAULT_MAX_CONCURRENT_RUNS
+
+    def address_string(self) -> str:
+        # §PERF: avoid socket.getfqdn reverse DNS lookups on incoming HTTP
+        # requests, which can stall for 30-60s on macOS or local networks.
+        return self.client_address[0]
 
     def log_message(self, fmt: str, *args: Any) -> None:  # noqa: A003
         if self.verbose:

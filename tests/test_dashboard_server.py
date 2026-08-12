@@ -285,6 +285,21 @@ class SubagentsInterjectDiffThinkingTest(_ServerTestCase):
         queued = (logdir / "prompt-queue.jsonl").read_text(encoding="utf-8")
         self.assertIn("cover edge cases too", queued)
 
+    def test_interject_succeeds_with_content_payload(self) -> None:
+        EventLog(events_path(self.run_dir)).append({"node_id": "3", "role": "writer", "round": 0, "type": "node_dispatched"})
+        scratch = node_scratch_dir(self.run_dir, "3")
+        scratch.mkdir(parents=True, exist_ok=True)
+        logdir = self.tmp / "gptme-logdir-3"
+        logdir.mkdir()
+        (scratch / "trace.jsonl").write_text(
+            json.dumps({"type": "logdir", "logdir": str(logdir)}) + "\n", encoding="utf-8"
+        )
+        status, payload = self._post("/api/node/3/interject", {"content": "message via content key"})
+        self.assertEqual(status, 200)
+        self.assertTrue(payload["ok"])
+        queued = (logdir / "prompt-queue.jsonl").read_text(encoding="utf-8")
+        self.assertIn("message via content key", queued)
+
     def test_thinking_parses_trace_into_role_tagged_entries(self) -> None:
         scratch = node_scratch_dir(self.run_dir, "1")
         scratch.mkdir(parents=True, exist_ok=True)

@@ -70,6 +70,7 @@ const state = {
   busy: false,
   toast: null,
   pendingMessages: [],   // chat outbox: queued when no agent is live, flushed via interject when one runs
+  editingPending: {},    // ts -> draft text for inline-edit of a queued message
   flushingPending: false,
   contractData: { text: "", tokens: 0, ceiling: 1500 },
   specText: "",
@@ -562,15 +563,59 @@ const _EVENT_LABEL = {
 
 // Chat outbox card: "📨 queued" (amber) until the flush marks it sent
 // (green), then it stays in the feed as a record of what was delivered.
+// Unsent entries show Edit and Delete buttons; sent entries are read-only.
 function renderPendingEntry(m) {
+  const editing = !m.sent && state.editingPending[m.ts] !== undefined;
+  const deleteFn = () => {
+    state.pendingMessages = state.pendingMessages.filter((x) => x.ts !== m.ts);
+    delete state.editingPending[m.ts];
+    patchCenter(); patchCmdbar();
+  };
+  const actions = m.sent ? null : el("div", { class: "pending-actions" }, [
+    editing
+      ? [
+          el("button", { class: "btn-tiny pending-save", onclick: () => {
+            const draft = state.editingPending[m.ts];
+            if (draft !== undefined) m.text = draft.trim() || m.text;
+            delete state.editingPending[m.ts];
+            patchCenter();
+          }}, "Save"),
+          el("button", { class: "btn-tiny", onclick: () => { delete state.editingPending[m.ts]; patchCenter(); } }, "Cancel"),
+        ]
+      : [
+          el("button", { class: "btn-tiny", onclick: () => { state.editingPending[m.ts] = m.text; patchCenter(); } }, "✏️ Edit"),
+          el("button", { class: "btn-tiny pending-del", onclick: deleteFn }, "🗑 Delete"),
+        ],
+  ]);
+  const body = (editing)
+    ? (() => {
+        const ta = el("textarea", { class: "pending-edit-ta", rows: "3", "aria-label": "edit queued message" });
+        ta.value = state.editingPending[m.ts];
+        ta.oninput = (e) => { state.editingPending[m.ts] = e.target.value; };
+        ta.onkeydown = (e) => {
+          if (e.key === "Enter" && !e.shiftKey) {
+            e.preventDefault();
+            const draft = state.editingPending[m.ts];
+            if (draft !== undefined) m.text = draft.trim() || m.text;
+            delete state.editingPending[m.ts];
+            patchCenter();
+          } else if (e.key === "Escape") {
+            delete state.editingPending[m.ts];
+            patchCenter();
+          }
+        };
+        return ta;
+      })()
+    : el("div", { class: "msg-body", style: "font-size:12px;" }, m.text);
   return el("div", { class: "stream-msg" + (m.sent ? " sent" : ""), "data-key": "pending-" + m.ts }, [
     el("div", { class: "msg-hdr" }, [
       el("span", { class: "author", style: m.sent ? "color:var(--accent-green);" : "color:var(--accent-amber); font-weight:700;" }, m.sent ? "📨 sent" : "📨 queued"),
       el("span", { class: "dim", style: "font-size:11px;" }, m.sent
         ? `to ${m.target} · ${fmtTime(m.sentAt)}`
         : (m.target ? `will send to ${m.target} when it next runs` : "will send when an agent next runs")),
+      actions,
     ]),
-    el("div", { class: "msg-body", style: "font-size:12px;" }, m.text),
+    body,
   ]);
 }
 
@@ -800,8 +845,15 @@ function liveMap() {
 // anywhere, so each push threw ReferenceError and the whole app froze (the
 // same bug class as the `loadThinkingIfNeeded` loss in §PERF round 2).
 function isLive(id) {
+  if (!id) return false;
+  if (id === "main" || id === "root" || id === "harness") {
+    const snap = state.snapshot;
+    if (!snap || !snap.attached) return false;
+    const subs = snap.subagents || [];
+    return subs.some((s) => s.live) || snap.status === "running" || !!snap.phase;
+  }
   const m = liveMap();
-  return !!(id && m[id] && m[id].live);
+  return !!(m[id] && m[id].live);
 }
 /* ========================= PART B ========================= */
 
@@ -919,6 +971,14 @@ function renderRunSwitcher() {
       el("span", { class: "rr-pip" }, r.pending_approvals ? `⏸ ${r.pending_approvals}` : ""),
       el("span", { class: "rr-phase" }, PHASE_GLYPH[r.status] || "·"),
       el("span", { class: "rr-goal" }, r.goal || ""),
+      snap.control_enabled && (r.hosted || r.status === "in_progress") ? el("button", {
+        class: "rr-del", title: `kill driver for ${r.id} (SIGTERM→SIGKILL)`,
+        style: "color:var(--accent-red);",
+        onclick: (e) => {
+          e.stopPropagation();
+          if (confirm(`Kill driver for "${r.id}"? This immediately terminates the process.`)) killRun(r.id);
+        },
+      }, "☠") : null,
       snap.control_enabled ? el("button", {
         class: "rr-del", title: `delete run ${r.id}`,
         onclick: (e) => {
@@ -972,6 +1032,10 @@ function renderNav() {
     el("span", { class: "row-id", title: r.id }, ltrunc(r.id, 18)),
     el("span", { class: "row-pip" }, r.pending_approvals ? `⏸${r.pending_approvals}` : (r.hosted ? "●" : "")),
     el("span", { class: "row-status" }, PHASE_GLYPH[r.status] || "·"),
+    snap.control_enabled && (r.hosted || r.status === "in_progress") ? el("button", {
+      class: "nav-kill-btn", title: `kill driver (SIGTERM→SIGKILL)`,
+      onclick: (e) => { e.stopPropagation(); if (confirm(`Kill driver for "${r.id}"?`)) killRun(r.id); },
+    }, "☠") : null,
   ]));
   const subs = (snap.subagents || []).slice().reverse();
   const subRows = subs.map((s) => el("div", {
@@ -981,6 +1045,10 @@ function renderNav() {
     el("span", { class: "row-glyph" }, SUB_GLYPH[s.status] || "·"),
     el("span", { class: "row-id", title: s.id }, ltrunc(s.id, 18)),
     el("span", { class: "row-pip" }, s.live ? "●" : ""),
+    s.live && snap.control_enabled ? el("button", {
+      class: "nav-kill-btn", title: `kill driver (terminates all agents in this run)`,
+      onclick: (e) => { e.stopPropagation(); if (confirm(`Kill the driver for this run? This stops all running agents.`)) killRun(snap.run_id); },
+    }, "☠") : null,
   ]));
   const phaseRows = Object.entries(snap.phases || {}).map(([p, st]) => el("div", { class: "nav-row" }, [
     el("span", { class: "row-glyph" }, PHASE_GLYPH[st] || "·"),
@@ -1204,7 +1272,7 @@ async function handlePromptSubmit(e) {
   // message (what "nothing happens" used to mean), the outbox queues it
   // and flushes via interject the moment a subagent goes live.
   const live = liveSubId();
-  const target = state.targetAgentManual ? state.targetAgentId : live;
+  const target = state.targetAgentManual ? state.targetAgentId : (live || "main");
   if (!target || !isLive(target)) {
     // No deliverable session right now (no live subagent, or the manual
     // target isn't live): queue the message instead of dropping it (what
@@ -1227,11 +1295,23 @@ async function handlePromptSubmit(e) {
   }
   state.targetAgentId = target;
   await guarded(async () => {
-    await apiPost(`/api/node/${encodeURIComponent(target)}/interject`, { content: text });
-    state.promptText = "";
-    patchCmdbar();
-    showToast(`message sent to ${target}`);
-    loadThinkingIfNeeded(true);
+    try {
+      await apiPost(`/api/node/${encodeURIComponent(target)}/interject`, { text: text, content: text });
+      state.promptText = "";
+      patchCmdbar();
+      showToast(`message sent to ${target}`);
+      loadThinkingIfNeeded(true);
+    } catch (err) {
+      if (String(err.message || err).includes("no live session")) {
+        const pin = (state.snapshot.subagents || []).some((s) => s.id === target) ? target : null;
+        state.pendingMessages.push({ text, ts: Date.now(), target: pin, sent: false });
+        state.promptText = "";
+        patchCmdbar();
+        showToast("📨 queued — sent when an agent next runs");
+      } else {
+        throw err;
+      }
+    }
   });
 }
 
@@ -1257,7 +1337,7 @@ function flushPendingMessages() {
       const target = m.target || liveSubId();
       if (!target || !isLive(target)) break;
       try {
-        await apiPost(`/api/node/${encodeURIComponent(target)}/interject`, { content: m.text });
+        await apiPost(`/api/node/${encodeURIComponent(target)}/interject`, { text: m.text, content: m.text });
         m.sent = true;
         m.target = target;
         m.sentAt = Date.now();
@@ -1370,7 +1450,7 @@ function buildCommands() {
     interject: { key: "interject", trigger: "interject", label: "Message agent", usage: "> interject <text> or just type below", timeout: 20, run: async (text) => {
       const target = state.targetAgentManual ? state.targetAgentId : (liveSubId() || "main");
       if (!target) { showToast("No live agent", true); return; }
-      await apiPost(`/api/node/${encodeURIComponent(target)}/interject`, { content: text });
+      await apiPost(`/api/node/${encodeURIComponent(target)}/interject`, { text: text, content: text });
       recordCli("interject", target);
       showToast("Message sent");
       loadThinkingIfNeeded(true);
@@ -1444,6 +1524,14 @@ function deleteRun(runId) {
     .catch((err) => showToast(String(err.message || err), true));
 }
 
+// Immediately terminate the driver for a run (SIGTERM→SIGKILL). Does NOT
+// delete the run directory — use deleteRun for that.
+function killRun(runId) {
+  apiPost("/api/runs/kill", { run_id: runId })
+    .then(() => { showToast(`☠ driver killed for ${runId}`); apiGet("/api/snapshot").then(applySnapshot).catch(() => {}); })
+    .catch((err) => showToast(String(err.message || err), true));
+}
+
 function openRunMenu(e, runId) {
   e.preventDefault();
   state.contextMenu = { x: e.clientX, y: e.clientY, runId };
@@ -1456,7 +1544,8 @@ function renderContextMenu() {
   const items = [];
   if (m.runId !== undefined) {
     items.push(el("div", { class: "ctx-item", onclick: () => { state.contextMenu = null; attachRun(m.runId); render(); } }, "attach"));
-    items.push(el("div", { class: "ctx-item danger", onclick: () => { state.contextMenu = null; render(); if (confirm(`Delete run ${m.runId}?`)) deleteRun(m.runId); } }, "delete run"));
+    items.push(el("div", { class: "ctx-item danger", onclick: () => { state.contextMenu = null; render(); if (confirm(`Kill driver for run "${m.runId}"? This immediately terminates the process.`)) killRun(m.runId); } }, "☠ kill driver"));
+    items.push(el("div", { class: "ctx-item danger", onclick: () => { state.contextMenu = null; render(); if (confirm(`Delete run "${m.runId}"? This action cannot be undone.`)) deleteRun(m.runId); } }, "delete run"));
   } else if (m.nodeId !== undefined) {
     items.push(el("div", { class: "ctx-item", onclick: () => { state.contextMenu = null; openNode(m.nodeId, "overview"); render(); } }, "node overview"));
     items.push(el("div", { class: "ctx-item", onclick: () => { state.contextMenu = null; openReopen(m.nodeId); render(); } }, "reopen (repair)"));
@@ -2115,6 +2204,7 @@ function renderNewRunModal() {
             compile_command: state.newRun.compile || undefined,
             workspace: state.newRun.workspace || undefined,
             model: state.newRun.model || undefined,
+            tier_override: state.newRun.tier || undefined,
             tier_floor: state.newRun.tier || undefined,
             dispatch_policy: state.newRun.dispatch_policy,
             survey_mode: state.newRun.survey_mode,

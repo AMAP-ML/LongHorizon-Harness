@@ -715,6 +715,37 @@ button.icon-btn {
   animation: slideFadeUp 0.25s var(--ease-spring);
 }
 
+/* Pending message action buttons (edit / delete) */
+.pending-actions {
+  display: flex;
+  gap: 4px;
+  margin-left: auto;
+}
+.pending-save {
+  color: var(--accent-green) !important;
+}
+.pending-del {
+  color: var(--accent-red) !important;
+}
+.pending-edit-ta {
+  width: 100%;
+  background: var(--bg-tertiary);
+  border: 1px solid var(--accent-amber);
+  border-radius: var(--radius-sm);
+  color: var(--text-bright);
+  font-family: var(--font-mono);
+  font-size: 12px;
+  padding: 8px 10px;
+  resize: vertical;
+  box-sizing: border-box;
+}
+.pending-edit-ta:focus {
+  outline: none;
+  border-color: var(--accent-amber);
+  box-shadow: 0 0 0 2px rgba(245, 158, 11, 0.25);
+}
+
+
 @keyframes slideFadeUp {
   from { opacity: 0; transform: translateY(8px); }
   to { opacity: 1; transform: translateY(0); }
@@ -1918,6 +1949,15 @@ input:focus, textarea:focus, select:focus {
   padding: 0 2px; margin-left: 6px;
 }
 .nav-add:hover { color: var(--accent-cyan); }
+.nav-kill-btn {
+  background: none; border: none; cursor: pointer;
+  color: var(--text-muted); font-size: 12px; line-height: 1;
+  padding: 0 2px; opacity: 0;
+  transition: opacity 0.15s ease, color 0.15s ease;
+}
+.nav-row:hover .nav-kill-btn { opacity: 1; }
+.nav-kill-btn:hover { color: var(--accent-red) !important; }
+
 .nav-body { display: flex; flex-direction: column; }
 .nav-row {
   display: flex; align-items: center; gap: 6px;

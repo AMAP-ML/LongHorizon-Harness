@@ -594,7 +594,7 @@ class RunState:
                 from ..v6.work_object import measure_workspace
 
                 work_object = measure_workspace(root)
-        tier_override = str(body.get("tier_override") or "").strip().upper() or None
+        tier_override = str(body.get("tier_override") or body.get("tier_floor") or "").strip().upper() or None
         if tier_override not in (None, "T0", "T1", "T2", "T3"):
             raise ValueError(f"invalid tier_override: {tier_override!r} (want T0-T3 or blank)")
 
@@ -672,6 +672,52 @@ class RunState:
                 flag.unlink()
             except OSError:
                 pass
+        return True
+
+    def kill_run(self, run_id: str | None = None) -> bool:
+        """Immediately terminate the driver process for a run (SIGTERM then
+        SIGKILL). Writes halt.flag first so the driver won't restart itself,
+        then sends the signal to the PID recorded in driver.pid.json. Also
+        removes the run from the hosted-threads registry so the capacity cap
+        is released. Returns True when the PID was found and signalled (or
+        the run was hosted here); False when no driver PID could be located."""
+
+        if self.runs_root is None:
+            return False
+        target_id = run_id or self.attached_run_id
+        if not target_id:
+            return False
+        if "/" in target_id or "\\" in target_id or target_id in {".", ".."}:
+            return False
+        run_dir = (self.runs_root / target_id).resolve()
+        try:
+            run_dir.relative_to(self.runs_root.resolve())
+        except ValueError:
+            return False
+        if not run_dir.is_dir():
+            return False
+
+        # Write halt flag first so the driver won't re-enter the next phase.
+        try:
+            halt_path(run_dir).touch()
+        except OSError:
+            pass
+
+        # Remove from hosted-threads registry so the capacity cap is released.
+        with self._lock:
+            self._hosts.pop(target_id, None)
+
+        # Signal the driver process from driver.pid.json.
+        pid_file = driver_pid_path(run_dir)
+        try:
+            record = json.loads(pid_file.read_text(encoding="utf-8"))
+        except (OSError, ValueError, json.JSONDecodeError):
+            return False
+        if not isinstance(record.get("pid"), int):
+            return False
+        pid: int = record["pid"]
+        from ..utils.process_group import kill_process_group
+        kill_process_group(pid, grace_seconds=2.0)
         return True
 
     # ------------------------------------------------------------------
