@@ -14,7 +14,7 @@ from lh_harness.agent_logs import parse_trajectory
 from lh_harness.dashboard.state import DashboardState
 from lh_harness.supervisor.control_bus import ControlBus
 from lh_harness.webapi.events import EventTailer, normalize_event
-from lh_harness.webapi.server import create_app
+from lh_harness.webapi.server import _STATIC_DIR, create_app
 from lh_harness.webapi.snapshot import build_snapshot
 
 
@@ -250,10 +250,7 @@ def test_legacy_static_dashboard_routes_are_not_registered(tmp_path: Path) -> No
     root, state = _fixture(tmp_path)
     app = create_app(state=state, runs_root=root, run_id="run-1")
     paths = {getattr(route, "path", "") for route in app.routes}
-    page = TestClient(app).get("/")
 
-    assert page.status_code == 200
-    assert '<div id="root"></div>' in page.text
     assert "/api/state" not in paths
     assert "/api/round/{round_index}" not in paths
     assert "/api/round/{round_index}/{name}" not in paths
@@ -280,6 +277,20 @@ def test_dashboard_javascript_asset_has_valid_mime_type_on_bad_platform_mapping(
     assert response.status_code == 200
     assert response.headers["content-type"].split(";", 1)[0] == "application/javascript"
     assert response.headers["x-content-type-options"] == "nosniff"
+
+
+@pytest.mark.skipif(
+    not _STATIC_DIR.is_dir(),
+    reason="web bundle not built; run `npm run build --prefix frontend/web`",
+)
+def test_built_web_bundle_is_served_at_root(tmp_path: Path) -> None:
+    root, state = _fixture(tmp_path)
+    app = create_app(state=state, runs_root=root, run_id="run-1")
+
+    page = TestClient(app).get("/")
+
+    assert page.status_code == 200
+    assert '<div id="root"></div>' in page.text
 
 
 def test_api_snapshot_replay_and_artifact(tmp_path: Path) -> None:
