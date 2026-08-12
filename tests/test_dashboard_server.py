@@ -174,6 +174,27 @@ class DashboardServerTest(_ServerTestCase):
         status, missing = self._get("/api/node/does-not-exist")
         self.assertEqual(status, 404)
 
+    def test_pseudo_agent_node_detail_is_synthetic_200(self) -> None:
+        # 2026-08-11: a dispatched-but-tree-less id (the survey explorer's
+        # "explore-01", or a ~repair/~research derived dispatch) used to 404
+        # — and the inspector re-fetches while nodeDetail is null, so every
+        # render re-fired the request (console spam + a chat tab stuck on
+        # "loading…"). It now serves a minimal detail from the subagent
+        # summary.
+        self._post("/api/attach", {"run_id": "run-a"})
+        EventLog(events_path(self.run_dir)).append(
+            {"node_id": "explore-01", "role": "explorer", "round": 0, "type": "node_dispatched"}
+        )
+        status, detail = self._get("/api/node/explore-01")
+        self.assertEqual(status, 200)
+        self.assertEqual(detail["id"], "explore-01")
+        self.assertEqual(detail["status"], "running")
+        self.assertEqual(detail["gate_results"], [])
+        self.assertEqual(detail["artifact"], "")
+        # a truly unknown id is still a 404
+        status, missing = self._get("/api/node/not-dispatched-anywhere")
+        self.assertEqual(status, 404)
+
     def test_resolve_pending_approval(self) -> None:
         self._post("/api/attach", {"run_id": "run-a"})
         status, snap = self._get("/api/snapshot")
@@ -187,6 +208,22 @@ class DashboardServerTest(_ServerTestCase):
         self.assertEqual(snap["pending_approvals"], [])
         resolved = [a for a in snap["approvals"] if a["approval_id"] == approval_id][0]
         self.assertEqual(resolved["user_input"], "developers")
+
+    def test_resolve_duplicate_is_idempotent_200(self) -> None:
+        # 2026-08-11: a resolve that arrives after the record is already
+        # resolved (double-click inside one UI tick, a second dashboard tab,
+        # or the CLI `approve` racing the browser) is a no-op success, not
+        # the 409 it used to be — the pair of identical 409s the operator
+        # saw on one approval id was this exact double-fire.
+        self._post("/api/attach", {"run_id": "run-a"})
+        status, snap = self._get("/api/snapshot")
+        approval_id = snap["pending_approvals"][0]["approval_id"]
+
+        status, _ = self._post(f"/api/approvals/{approval_id}/resolve", {"action": "answer", "user_input": "developers"})
+        self.assertEqual(status, 200)
+        status, payload = self._post(f"/api/approvals/{approval_id}/resolve", {"action": "answer", "user_input": "developers"})
+        self.assertEqual(status, 200)
+        self.assertTrue(payload["ok"])
 
     def test_halt_toggle(self) -> None:
         self._post("/api/attach", {"run_id": "run-a"})

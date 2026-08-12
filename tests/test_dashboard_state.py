@@ -15,6 +15,8 @@ from __future__ import annotations
 
 import json
 import shutil
+import socket
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -25,7 +27,7 @@ _REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(_REPO_ROOT / "src"))
 
 from kusudaemon.pipeline import approvals as approval_store  # noqa: E402
-from kusudaemon.pipeline.run_dir import run_spec_path, tier_path  # noqa: E402
+from kusudaemon.pipeline.run_dir import driver_pid_path, run_spec_path, tier_path  # noqa: E402
 from kusudaemon.dashboard import gptme_queue  # noqa: E402
 from kusudaemon.dashboard.state import RunState  # noqa: E402
 from kusudaemon.v0.events import EventLog  # noqa: E402
@@ -468,6 +470,66 @@ class HostedCountTest(unittest.TestCase):
         run_id, error = self.state.start_run({"goal": "g"}, driver=_StubDriver())
         self.assertEqual(error, "")
         self.assertEqual(self.state.hosted_count(), 1)
+
+
+class ResumeDoubleDriverGuardTest(unittest.TestCase):
+    """§2026-08-11: ``POST /api/runs`` on an existing run must refuse to
+    double-host when ``driver.pid.json`` shows a driver still alive on this
+    host — otherwise "▶ Resume" on a live CLI-driven run would race two
+    drivers over one run directory. A dead pid (the whole point of
+    re-hosting) must pass through."""
+
+    def setUp(self) -> None:
+        self.tmp = Path(tempfile.mkdtemp())
+        self.runs_root = self.tmp / "runs"
+        self.runs_root.mkdir()
+        self.run_dir = _write_scripted_run(self.runs_root, "run-a")
+        self.state = RunState(self.runs_root)
+
+    def tearDown(self) -> None:
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    @staticmethod
+    def _dead_pid() -> int:
+        proc = subprocess.Popen([sys.executable, "-c", "pass"])
+        proc.wait()
+        return proc.pid
+
+    class _StubDriver:
+        def run(self):  # noqa: ANN201
+            return None
+
+    def test_resume_refused_while_driver_pid_alive(self) -> None:
+        driver_pid_path(self.run_dir).write_text(
+            json.dumps({"pid": subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"]).pid, "started_at": 0, "host": socket.gethostname()}) + "\n",
+            encoding="utf-8",
+        )
+        run_id, error = self.state.start_run({"run_id": "run-a"}, driver=self._StubDriver())
+        self.assertIsNone(run_id)
+        self.assertIn("already running", error)
+
+    def test_resume_allowed_after_driver_dead(self) -> None:
+        driver_pid_path(self.run_dir).write_text(
+            json.dumps({"pid": self._dead_pid(), "started_at": 0, "host": socket.gethostname()}) + "\n",
+            encoding="utf-8",
+        )
+        run_id, error = self.state.start_run({"run_id": "run-a"}, driver=self._StubDriver())
+        self.assertEqual(error, "")
+        self.assertIsNotNone(run_id)
+
+    def test_resume_allowed_without_pid_record(self) -> None:
+        run_id, error = self.state.start_run({"run_id": "run-a"}, driver=self._StubDriver())
+        self.assertEqual(error, "")
+        self.assertIsNotNone(run_id)
+
+    def test_resume_allowed_for_foreign_host_pid(self) -> None:
+        driver_pid_path(self.run_dir).write_text(
+            json.dumps({"pid": self._dead_pid(), "started_at": 0, "host": "some-other-machine"}) + "\n",
+            encoding="utf-8",
+        )
+        run_id, error = self.state.start_run({"run_id": "run-a"}, driver=self._StubDriver())
+        self.assertEqual(error, "")
+        self.assertIsNotNone(run_id)
 
 
 if __name__ == "__main__":

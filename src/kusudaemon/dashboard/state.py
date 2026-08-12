@@ -30,6 +30,7 @@ from __future__ import annotations
 
 import json
 import os
+import socket
 import threading
 import time
 import uuid
@@ -61,6 +62,7 @@ from ..pipeline.driver import (
 from ..pipeline.liveness import run_liveness
 from ..pipeline.run_dir import (
     approvals_path,
+    driver_pid_path,
     halt_path,
     jobs_path,
     phase_path,
@@ -406,8 +408,16 @@ class RunState:
         result: list[dict[str, Any]] = []
         for node_id in order:
             node_events = by_node[node_id]
-            result.append(_summarize_subagent(run_dir, node_id, node_events))
+            result.append(_summarize_subagent(run_dir, node_id, node_events, logdir_for=self._cached_logdir))
         return result
+
+    def _cached_logdir(self, trace_path: Path) -> Path | None:
+        """§PERF: ``_summarize_subagent`` per subagent reads the *whole*
+        trace.jsonl just to find its logdir line — with append-only traces
+        that full read is cacheable the same way ``_cached_events`` is
+        (this is the dominant cost of every snapshot on a run whose
+        episodes have grown large traces)."""
+        return self._cached_read(trace_path, lambda: _last_logdir(trace_path))
 
     def node_gptme_logdir(self, node_id: str) -> Path | None:
         """Scan a node's trace.jsonl for the ``{"type": "logdir", ...}``
@@ -482,6 +492,9 @@ class RunState:
         workspace_root: Path | None = None
         if resuming:
             options = RunOptions.from_spec(_read_json(run_spec_path(run_dir)) or {})
+            other = _other_driver_pid(run_dir)
+            if other is not None:
+                return None, other
         else:
             goal = str(body.get("goal", "")).strip()
             if not goal:
@@ -655,8 +668,16 @@ class RunState:
         if run_dir is None:
             return False
         record = _find_approval(run_dir, approval_id)
-        if record is None or record.status == "resolved":
+        if record is None:
             return False
+        # Retry-safe: an approval that is already resolved is a no-op
+        # success, not an error. The operator's click can legitimately
+        # arrive twice (double-click inside one UI tick, a second browser
+        # tab, or the CLI's `approve` racing the browser) — every surface
+        # resolves the same record, and every surface after the first must
+        # not 409 on a record it never needed to touch.
+        if record.status == "resolved":
+            return True
         # §DASHBOARD-UX §6.3: a batch-form approval (intake rounds, PLAN.md
         # §A5/§B3) is answered per question — the operator's answers ride
         # in ``answers``, keyed by question id, and the driver reads them
@@ -845,7 +866,38 @@ class RunState:
         tree = _load_tree(run_dir)
         node = tree.nodes.get(node_id)
         if node is None:
-            return None
+            # 2026-08-11: a dispatched-but-tree-less id (the survey explorer's
+            # ``explore-01``, or a ``<node>~repair~N`` / ``<node>~research~<slug>``
+            # derived dispatch) owns episodes but no tree node. Serve a minimal
+            # detail from the subagent summary instead of 404'ing — the
+            # inspector re-fetches while ``nodeDetail`` is null, so a 404 made
+            # it retry on every render (one 404 per tick, logged to the
+            # console, while the agent tab sat on "loading…" forever).
+            summary = next((s for s in self.subagents() if s["id"] == node_id), None)
+            if summary is None:
+                return None
+            return {
+                "id": node_id,
+                "brief": "synthetic agent episode — no tree node (explorer / repair / research dispatch)",
+                "status": summary.get("status", "dispatched"),
+                "attempts": summary.get("attempts", 0),
+                "shape": "",
+                "gates": [],
+                "gate_results": [],
+                "judgment": [],
+                "rubric": {},
+                "inputs": [],
+                "budget": {"tokens": 0, "calls": 0},
+                "depends_on": [],
+                "artifact": "",
+                "artifact_tokens": 0,
+                "audit": {},
+                "manifest": None,
+                "versions": [],
+                "promotion": "",
+                "split_proposal": None,
+                "pilot_original": None,
+            }
         artifact = _read_text(node_artifact_path(run_dir, node_id)) or ""
         from ..v1.gates import evaluate_gates, read_gate_cache
 
@@ -1071,6 +1123,30 @@ def _default_backend() -> str:
     import os
 
     return os.getenv("KUSUDAEMON_BACKEND", "gptme")
+
+
+def _other_driver_pid(run_dir: Path) -> str | None:
+    """§2026-08-11: refuse to double-host a run whose driver is demonstrably
+    alive on this host. ``driver.pid.json`` is the same record
+    ``run_liveness`` reads (§D0c) — a dead driver (the whole point of
+    re-hosting) has a dead pid and passes; a live driver (CLI-launched, or
+    hosted by another dashboard instance) refuses with a message the
+    operator can act on instead of racing two drivers over one run
+    directory. Pid reuse is the one false-positive mode, and it only ever
+    produces a visible refusal, never a silent double-run."""
+    try:
+        job = json.loads(driver_pid_path(run_dir).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    if job.get("host") != socket.gethostname() or not isinstance(job.get("pid"), int):
+        return None
+    try:
+        os.kill(job["pid"], 0)
+    except PermissionError:
+        pass
+    except OSError:
+        return None
+    return f"driver already running (pid={job['pid']}) — the run is not dead; un-halt it instead of re-hosting"
 
 
 def _host_driver(run_dir: Path, driver: RecursiveDriver) -> None:
@@ -1380,7 +1456,16 @@ def _kind_of(node_id: str) -> str:
     return "writer"
 
 
-def _summarize_subagent(run_dir: Path, node_id: str, events: list[dict[str, Any]]) -> dict[str, Any]:
+def _summarize_subagent(
+    run_dir: Path,
+    node_id: str,
+    events: list[dict[str, Any]],
+    logdir_for: Callable[[Path], Path | None] | None = None,
+) -> dict[str, Any]:
+    # ``_last_logdir`` is defined below this function, so it can't be a
+    # default-arg here (def-time NameError); resolve at call time instead.
+    if logdir_for is None:
+        logdir_for = _last_logdir
     role = "writer"
     status = "pending"
     duration_ms = 0
@@ -1400,7 +1485,7 @@ def _summarize_subagent(run_dir: Path, node_id: str, events: list[dict[str, Any]
             status = str(event.get("status", "done"))
             duration_ms = int(event.get("duration_ms") or 0)
             error = event.get("error")
-    logdir = _last_logdir(node_trace_path(run_dir, node_id))
+    logdir = logdir_for(node_trace_path(run_dir, node_id))
     live = bool(logdir) and not completed
     return {
         "id": node_id,

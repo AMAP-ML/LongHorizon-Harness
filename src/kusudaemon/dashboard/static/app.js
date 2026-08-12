@@ -36,6 +36,11 @@ const PHASE_GLYPH = {
   pending: "·",
   created: "·",
 };
+// §PERF: the agent Chat tab renders at most this many entries per tick —
+// the DOM work stays bounded even on an episode whose trace has grown to
+// tens of thousands of entries (which is what used to jam the main thread
+// and with it every click: "the POST takes a minute to send").
+const CHAT_RENDER_CAP = 400;
 const SUB_GLYPH = { pending: "·", running: "◐", done: "✓", error: "✕", timeout: "⏱" };
 const SHAPE2 = {
   "prose-dominant": "pr",
@@ -60,10 +65,12 @@ const state = {
   artifactsDetail: null,
   selectedArtifactTag: undefined,
   selectedArtifactText: null,
-  mainAgentThinking: null,
   newRunOpen: false,
+  startingRun: false,
   busy: false,
   toast: null,
+  pendingMessages: [],   // chat outbox: queued when no agent is live, flushed via interject when one runs
+  flushingPending: false,
   contractData: { text: "", tokens: 0, ceiling: 1500 },
   specText: "",
   spineText: "",
@@ -90,8 +97,6 @@ const state = {
   treeFilter: "",
   treeCollapsed: {},       // folder segment -> collapsed
   contextMenu: null,       // {x, y, nodeId|runId}
-  approvalTakeover: false,
-  takeoverFor: "",         // approval id the takeover is (or was) for
   triageOpen: {},          // approvalId -> 'clean'|'patchable'|'regenerate' (expanded chip)
   helpOpen: false,
   inspectorWidth: 480,
@@ -99,6 +104,7 @@ const state = {
   terminalFilter: "all",
   lastCliCommand: "",      // §5.5 copyable CLI equivalent of the last UI action
   escalationFlash: false,
+  chatFeedPinned: true,    // the run stream pins to the newest entry until the operator scrolls up
 };
 
 const root = document.getElementById("app");
@@ -155,6 +161,14 @@ function showToast(msg, isError = false) {
 }
 
 async function guarded(fn) {
+  // Re-entrancy guard: two clicks inside the same UI tick (before the
+  // first render disables the button) must not fire the same POST twice —
+  // that double-fire is what produced a pair of identical 409s on
+  // approval resolve. The second click says so instead of fanning out.
+  if (state.busy) {
+    showToast("Another operation is still in progress — wait a moment", true);
+    return;
+  }
   state.busy = true;
   render();
   try {
@@ -177,6 +191,7 @@ function recordCli(kind, detail) {
     reopen: () => `kusudaemon reopen ${runId} --node ${detail} --defect "…"`,
     redispatch: () => `kusudaemon reopen ${runId} --node ${detail}`,
     escalate: () => `kusudaemon escalate ${runId}`,
+    resume: () => `kusudaemon resume ${runId}`,
     halt: () => `kusudaemon run --run-id ${runId}  (set halt.flag)`,
     pilot: () => `kusudaemon approve ${runId} --file out/.versions/${detail}/pilot-original.md`,
     interject: () => `kusudaemon pipeline interject ${runId} ${detail} "…"`,
@@ -191,10 +206,21 @@ function recordCli(kind, detail) {
 function resumeRun() {
   const id = state.snapshot && state.snapshot.run_id;
   if (!id) { showToast("No run attached", true); return; }
-  recordCli("halt", "");
+  recordCli("resume", "");
   apiPost("/api/runs", { run_id: id })
     .then(() => showToast("Resume requested"))
-    .catch((err) => showToast(String(err.message || err), true));
+    .catch((err) => {
+      const msg = String(err.message || err);
+      if (msg.includes("already running")) {
+        // A driver is genuinely alive on this host (e.g. the CLI process the
+        // run was launched from) — re-hosting would race two drivers. The
+        // right resume there is un-halting: the live driver polls halt.flag
+        // at its next phase boundary and continues on its own.
+        apiPost("/api/halt", { value: false }).then(() => showToast("driver already running — cleared halt flag (it resumes at the next phase boundary)"));
+      } else {
+        showToast(msg, true);
+      }
+    });
 }
 
 /* ------------------- live SSE stream / polling ------------------- */
@@ -207,26 +233,79 @@ function resumeRun() {
 // already driven independently by the boot-time setInterval clock ticker
 // (search "rail-a40" in this file), so dropping it from the fingerprint
 // only affects change-detection, never what's shown.
+// §PERF: the old fingerprint did `JSON.stringify(snap minus two fields)` —
+// a full-snapshot stringify twice per tick on a ~64KB+ snapshot. This one
+// folds only the fields that actually drive a visible render into a compact
+// string, so change-detection costs µs instead of ms. `elapsed` is excluded
+// (it's recomputed fresh every poll and its display runs off the clock
+// ticker — see the §PERF note above); `events` is represented by count +
+// last-event signature, and subagents/approvals/jobs/runs by small
+// per-entry signatures rather than full payloads.
 function snapshotFingerprint(snap) {
-  const { server_time, elapsed, ...rest } = snap || {};
-  return JSON.stringify(rest);
+  if (!snap) return "";
+  const p = (a) => a || [];
+  const sig = (o, keys) => keys.map((k) => `${k}=${o ? o[k] : ""}`).join("&");
+  const lastEv = p(snap.events).slice(-1)[0];
+  const subs = p(snap.subagents).map((s) => `${s.id}|${s.status}|${s.attempts}|${s.live ? "L" : ""}`).join(";");
+  const pend = p(snap.pending_approvals).map((a) => `${a.approval_id}|${a.updated_at || a.created_at || 0}|${a.status}`).join(";");
+  const apps = p(snap.approvals).map((a) => `${a.approval_id}|${a.updated_at || a.created_at || 0}|${a.status}`).join(";");
+  const jobs = p(snap.jobs).map((j) => `${j.job_id || ""}|${j.status || ""}`).join(";");
+  const runs = p(snap.runs).map((r) => `${r.id}|${r.mtime}|${r.phase}|${r.status}|${r.attached ? "A" : ""}|${r.hosted ? "H" : ""}|${r.pending_approvals || 0}`).join(";");
+  return [
+    snap.attached, snap.run_id, snap.goal,
+    snap.phase, snap.phase_status, snap.phase_detail,
+    snap.stalled ? "S" : "", snap.stalled_reason,
+    snap.tier, snap.measured_tier, snap.tier_override,
+    (snap.escalation_history || []).length,
+    sig(snap.tree_counts, ["passed", "failed", "blocked", "pending", "ready", "dispatched", "awaiting_review", "stale", "split"]),
+    snap.events_count, lastEv ? `${lastEv.ts}|${lastEv.type}|${lastEv.node_id || ""}` : "",
+    subs, pend, apps, jobs, runs,
+    snap.halted ? "H" : "", snap.hosted_count,
+    snap.has_spec ? 1 : 0, snap.has_contract ? 1 : 0, snap.has_assembly ? 1 : 0,
+    snap.control_enabled ? 1 : 0, snap.max_concurrent_runs,
+  ].join("‖");
 }
 
-function loadMainAgentThinking() {
-  const snap = state.snapshot;
-  const subagents = (snap && snap.subagents) || [];
-  const liveSub = subagents.find((s) => s.live);
-  const targetId = liveSub ? liveSub.id : (subagents.length ? subagents[subagents.length - 1].id : "main");
-  apiGet(`/api/node/${encodeURIComponent(targetId)}/thinking`)
+// The header pill's target: the live subagent if any, else the most
+// recently dispatched one. Pure snapshot data — no trace fetch at all
+// (the old loadMainAgentThinking() re-parsed a multi-MB trace per tick
+// just to render this one id).
+function mainAgentId() {
+  const subs = (state.snapshot && state.snapshot.subagents) || [];
+  const live = subs.find((s) => s.live);
+  return live ? live.id : (subs.length ? subs[subs.length - 1].id : "");
+}
+
+// Chat tab for the selected node: fetch its parsed trace on demand and
+// keep it current with a quiet re-fetch each tick while that node is live.
+// Plain GETs never touch state.busy, so background refreshes can never
+// disable the operator's action buttons.
+function loadThinkingIfNeeded(force = false) {
+  const id = state.selectedNode;
+  if (!id) return;
+  if (state.nodeThinking !== null && state.nodeThinking !== "loading" && state.nodeThinking.id === id && !force) return;
+  state.nodeThinking = "loading";
+  apiGet(`/api/node/${encodeURIComponent(id)}/thinking`)
     .then((d) => {
-      const sub = subagents.find((s) => s.id === targetId);
-      const next = { id: targetId, label: sub ? `${targetId} (${sub.role || sub.kind})` : targetId, entries: d.entries || [], live: sub ? sub.live : false };
-      if (JSON.stringify(next) !== JSON.stringify(state.mainAgentThinking)) {
-        state.mainAgentThinking = next;
-        schedulePatch(patchCenter);  // the thinking stream lives in the center pane — patch only that
-      }
+      if (state.selectedNode !== id) return;
+      const entries = d.entries || [];
+      const total = d.total || entries.length;
+      const first = entries.length ? entries[0].text : "";
+      const last = entries.length ? entries[entries.length - 1].text : "";
+      const sig = `${entries.length}:${(first || "").length}:${(last || "").length}`;
+      const prev = state.nodeThinking;
+      const changed = prev === null || prev === "loading" || prev.sig !== sig;
+      state.nodeThinking = { id, entries, total, sig };
+      // §PERF: force refreshes fire every tick while a live node is
+      // selected; re-render only when the trace actually moved, or a full
+      // 9-region render pass happens each ~1.5s even when nothing arrived.
+      if (force && changed) render();
     })
-    .catch(() => {});
+    .catch(() => {
+      if (state.selectedNode === id && state.nodeThinking === "loading") {
+        state.nodeThinking = { id, entries: [], total: 0, sig: "" };
+      }
+    });
 }
 
 function applySnapshot(snap) {
@@ -242,15 +321,6 @@ function applySnapshot(snap) {
   const prevPending = (state.snapshot.pending_approvals || []).map((a) => a.approval_id);
   const nextPending = (snap.pending_approvals || []).map((a) => a.approval_id);
   state.snapshot = snap;
-  // §6.1: a fresh pending approval takes the inspector over; once
-  // dismissed for an id, stay dismissed for that id.
-  if (nextPending.length && nextPending[0] !== state.takeoverFor) {
-    state.approvalTakeover = true;
-  }
-  if (!nextPending.length) {
-    state.approvalTakeover = false;
-    state.takeoverFor = "";
-  }
   // §10: escalation fired → rail tier chip flashes once.
   const esc = (snap.escalation_history || []).length;
   if (esc > prevEsc && !state.escalationFlash) {
@@ -259,7 +329,6 @@ function applySnapshot(snap) {
   }
   state.sseLive = true;
   updateChrome(nextPending.length > 0);
-  if (snap && snap.attached) loadMainAgentThinking();
   if (state.selectedNode && isLive(state.selectedNode)) {
     loadThinkingIfNeeded(true);
   }
@@ -278,6 +347,7 @@ function applySnapshot(snap) {
       scheduleAll();
     }
   }
+  flushPendingMessages();
 }
 
 function updateChrome(hasPending) {
@@ -358,7 +428,7 @@ function el(tag, attrs, children) {
 // actually uses (see the `on[a-z]+:` / addEventListener grep this was
 // built from) onto the kept node is what keeps clicks/typing bound to the
 // *current* render's state instead of a stale one.
-const _MORPH_HANDLER_PROPS = ["onclick", "onchange", "oncontextmenu", "oninput", "onkeydown"];
+const _MORPH_HANDLER_PROPS = ["onclick", "onchange", "oncontextmenu", "oninput", "onkeydown", "onscroll"];
 const MORPH_OPTS = {
   getNodeKey(node) {
     return node.dataset && node.dataset.key !== undefined ? node.dataset.key : undefined;
@@ -486,6 +556,20 @@ const _EVENT_LABEL = {
   split_proposal: "⑂ Split proposed",
 };
 
+// Chat outbox card: "📨 queued" (amber) until the flush marks it sent
+// (green), then it stays in the feed as a record of what was delivered.
+function renderPendingEntry(m) {
+  return el("div", { class: "stream-msg" + (m.sent ? " sent" : ""), "data-key": "pending-" + m.ts }, [
+    el("div", { class: "msg-hdr" }, [
+      el("span", { class: "author", style: m.sent ? "color:var(--accent-green);" : "color:var(--accent-amber); font-weight:700;" }, m.sent ? "📨 sent" : "📨 queued"),
+      el("span", { class: "dim", style: "font-size:11px;" }, m.sent
+        ? `to ${m.target} · ${fmtTime(m.sentAt)}`
+        : (m.target ? `will send to ${m.target} when it next runs` : "will send when an agent next runs")),
+    ]),
+    el("div", { class: "msg-body", style: "font-size:12px;" }, m.text),
+  ]);
+}
+
 function renderEventEntry(ev) {
   const isAutoResume = ev.type === "phase_auto_resuming";
   const isFailure = ev.type === "phase_failed" || ev.type === "run_escalated" || (ev.type === "phase_done" && ev.status === "escalated");
@@ -567,10 +651,10 @@ function renderTriageChips(a) {
   return chips.length ? el("div", { class: "triage-chips" }, chips) : null;
 }
 
-// Renders one approval record — chronological feed, pinned pending section,
-// and the §6.1 takeover. Options get [n] number-key bindings; Enter picks
-// the primary one.
-function renderApprovalEntry(a, snap, isTakeover) {
+// Renders one approval record — an entry of the chronological chat history,
+// never its own modal or side block. Options get [n] number-key bindings;
+// Enter picks the primary one.
+function renderApprovalEntry(a, snap) {
   const isPending = a.status === "pending";
   const parts = [
     el("div", { class: "card-title" }, [
@@ -603,9 +687,9 @@ function renderApprovalEntry(a, snap, isTakeover) {
       parts.push(
         el("div", { class: "approval-questions" }, questions.map((q) => {
           const row = el("div", { class: "approval-question" }, [
-            el("label", { style: "font-size:12px; font-weight:600; color:var(--text-bright);" }, q.text || q.id),
+            el("label", { for: `approval-q-${a.approval_id}-${q.id}`, style: "font-size:12px; font-weight:600; color:var(--text-bright);" }, q.text || q.id),
           ]);
-          const inputEl = el("input", { type: "text", "data-key": `approval-q-${a.approval_id}-${q.id}`, placeholder: (q.default_assumption ? `accept default: ${q.default_assumption}` : "answer…"), style: "margin-top:4px;" });
+          const inputEl = el("input", { type: "text", id: `approval-q-${a.approval_id}-${q.id}`, name: `q-${q.id}`, "data-key": `approval-q-${a.approval_id}-${q.id}`, placeholder: (q.default_assumption ? `accept default: ${q.default_assumption}` : "answer…"), style: "margin-top:4px;" });
           const draftKey = `${a.approval_id}::${q.id}`;
           inputEl.value = state.approvalAnswerDrafts[draftKey] || "";
           inputEl.oninput = () => { state.approvalAnswerDrafts[draftKey] = inputEl.value; };
@@ -627,7 +711,7 @@ function renderApprovalEntry(a, snap, isTakeover) {
       );
     }
     if (a.allow_input) {
-      const inputEl = el("input", { type: "text", "data-key": `approval-input-${a.approval_id}`, placeholder: a.input_label || "Provide response details or leave blank for default...", style: "margin-top:8px;" });
+      const inputEl = el("input", { type: "text", name: `approval-input-${a.approval_id}`, "aria-label": a.input_label || "response details (or leave blank for default)", "data-key": `approval-input-${a.approval_id}`, placeholder: a.input_label || "Provide response details or leave blank for default...", style: "margin-top:8px;" });
       inputEl.value = state.approvalDrafts[a.approval_id] || "";
       inputEl.oninput = () => { state.approvalDrafts[a.approval_id] = inputEl.value; };
       parts.push(inputEl);
@@ -650,19 +734,49 @@ function renderApprovalEntry(a, snap, isTakeover) {
       );
     }
     if (a.kind === "pilot" && a.context && a.context.node_id) {
-      actionBtns.push(
-        el("button", { onclick: () => openNode(a.context.node_id, "overview") }, "✏️ Open pilot editor")
-      );
-    }
-    if (isTakeover) {
-      actionBtns.push(
-        el("button", { class: "xs-btn", title: "read the run, come back — any key re-arms the takeover", onclick: () => dismissTakeover(a) }, "⌫ dismiss (keys)")
-      );
+      const pid = a.context.node_id;
+      // §6.2 embedded: the editor renders inline in the feed card once the
+      // node detail (with its frozen pilot_original) is loaded; until then
+      // the card's actions carry the loader button. Only the *first* pending
+      // pilot embeds — renderPilotEditor keys its draft on that record, so
+      // embedding any other pilot's card would save to the wrong approval.
+      const firstPilot = (state.snapshot.pending_approvals || []).find((x) => x.kind === "pilot");
+      const isFirst = firstPilot && firstPilot.approval_id === a.approval_id;
+      if (isFirst && state.nodeDetail && state.nodeDetail.id === pid && state.nodeDetail.pilot_original) {
+        parts.push(el("div", { class: "approval-pilot-embed" }, [renderPilotEditor()]));
+      } else {
+        if (state.nodeDetail && state.nodeDetail.id === pid && !state.nodeDetail.pilot_original) loadNodeDetail(pid);
+        actionBtns.push(
+          el("button", { class: "primary", onclick: () => openNode(pid, "overview") }, "✏️ Open pilot editor")
+        );
+      }
     }
     parts.push(el("div", { class: "approval-actions" }, actionBtns));
   } else if (a.status === "resolved") {
-    const answerDisplay = a.user_input ? `Answer given: "${a.user_input}"` : `Resolved via action: ${a.action || "completed"}`;
-    parts.push(el("div", { style: "font-size:12px; color:var(--text-bright); font-weight:500; margin-top:6px; background:var(--bg-tertiary); padding:6px 10px; border-radius:4px;" }, answerDisplay));
+    // §DASHBOARD-UX: a resolved batch-form approval (intake rounds) must
+    // show what the operator actually answered per question — an
+    // "Answers given" block, not the action name.
+    const qs = a.questions || [];
+    const hasAnswers = a.answers && Object.keys(a.answers).length > 0;
+    const lines = [];
+    if (hasAnswers) {
+      lines.push("Answers given:");
+      if (qs.length) {
+        qs.forEach((q) => {
+          const v = (a.answers[q.id] || "").trim();
+          lines.push(`· ${q.text || q.id}: ${v || "(blank — accepted default)"}`);
+        });
+      } else {
+        for (const [k, v] of Object.entries(a.answers)) {
+          lines.push(`· ${k}: ${(v || "").trim() || "(blank — accepted default)"}`);
+        }
+      }
+    } else if (a.user_input) {
+      lines.push(`Answer given: "${a.user_input}"`);
+    } else {
+      lines.push(`Resolved via action: ${a.action || "completed"}`);
+    }
+    parts.push(el("div", { style: "font-size:12px; color:var(--text-bright); font-weight:500; margin-top:6px; background:var(--bg-tertiary); padding:6px 10px; border-radius:4px;" }, lines.map((l) => el("div", null, l))));
   }
 
   const cardStyle = isPending
@@ -671,16 +785,19 @@ function renderApprovalEntry(a, snap, isTakeover) {
   return el("div", { class: "stream-card approval" + (isPending ? " pending" : ""), style: cardStyle }, parts);
 }
 
-function dismissTakeover(a) {
-  state.approvalTakeover = false;
-  state.takeoverFor = a.approval_id;
-  render();
-}
-
 function liveMap() {
   const m = {};
   for (const s of state.snapshot.subagents || []) m[s.id] = s;
   return m;
+}
+
+// 2026-08-11: defined here as a hoisted function declaration — applySnapshot
+// called `isLive(state.selectedNode)` on every SSE push with no definition
+// anywhere, so each push threw ReferenceError and the whole app froze (the
+// same bug class as the `loadThinkingIfNeeded` loss in §PERF round 2).
+function isLive(id) {
+  const m = liveMap();
+  return !!(id && m[id] && m[id].live);
 }
 /* ========================= PART B ========================= */
 
@@ -758,7 +875,20 @@ function renderHeaderRow() {
       snap.control_enabled && tier !== "T3" ? el("button", { class: "btn-tiny", onclick: () => { if (confirm("Escalate tier (+1, T3 max)?") ) guarded(() => apiPost("/api/escalate", {}).then(() => { recordCli("escalate"); showToast("Tier escalated"); })); } }, "⇡ escalate") : null,
       snap.stalled ? el("button", { class: "btn-tiny", style: "color:var(--accent-red);", onclick: () => guarded(resumeRun) }, "☠ Resume") : null,
       snap.control_enabled && !snap.stalled && (snap.phase_status === "error" || snap.halted || snap.phase_status === "failed" || snap.phase_status === "escalated" || snap.phase_status === "blocked" || snap.phase_status === "paused")
-        ? el("button", { class: "btn-tiny", onclick: () => guarded(() => apiPost("/api/halt", { value: false }).then(() => showToast("Resume requested"))) }, "▶ Resume")
+        ? el("button", { class: "btn-tiny", onclick: () => guarded(() => {
+            if (snap.hosted) {
+              // Our own driver thread is alive in this server process: it
+              // just needs halt.flag cleared to continue at the phase
+              // boundary it is parked on.
+              return apiPost("/api/halt", { value: false }).then(() => showToast("Resume requested"));
+            }
+            // Not hosted here — a CLI-launched or dead driver. Un-halting
+            // would write a flag nobody is polling, i.e. "does nothing":
+            // re-host the run (POST /api/runs; run.spec.json on disk is
+            // authoritative). The server refuses if a driver is genuinely
+            // still alive on this host.
+            resumeRun();
+          }) }, "▶ Resume")
         : null,
       snap.control_enabled ? el("button", { class: "btn-tiny", onclick: () => guarded(() => apiPost("/api/halt", { value: snap.halted ? false : true }).then(() => { recordCli("halt"); showToast(snap.halted ? "Resume requested" : "Halting after current phase"); })) }, snap.halted ? "▶" : "⏸") : null,
     ]),
@@ -776,6 +906,18 @@ function renderRunSwitcher() {
       el("span", { class: "rr-pip" }, r.pending_approvals ? `⏸ ${r.pending_approvals}` : ""),
       el("span", { class: "rr-phase" }, PHASE_GLYPH[r.status] || "·"),
       el("span", { class: "rr-goal" }, r.goal || ""),
+      snap.control_enabled ? el("button", {
+        class: "rr-del", title: `delete run ${r.id}`,
+        onclick: (e) => {
+          e.stopPropagation();
+          guarded(async () => {
+            if (confirm(`Delete run "${r.id}"? This action cannot be undone.`)) {
+              await deleteRun(r.id);
+              showToast(`Deleted run ${r.id}`);
+            }
+          });
+        },
+      }, "🗑") : null,
     ])
   );
   return el("div", { class: "overlay", onclick: (e) => { if (e.target === e.currentTarget) { state.runSwitcherOpen = false; render(); } } }, [
@@ -790,13 +932,14 @@ function renderRunSwitcher() {
   ]);
 }
 
-function renderNavSection(key, title, rows) {
+function renderNavSection(key, title, rows, headExtra) {
   const collapsed = state.navCollapsed[key];
   return el("section", { class: "nav-section", "data-section": key }, [
     el("div", { class: "nav-head", onclick: () => { state.navCollapsed[key] = !collapsed; patchNav(); } }, [
       el("span", { class: "nav-caret" }, collapsed ? "▸" : "▾"),
       el("span", { class: "nav-title" }, title),
       el("span", { class: "nav-count" }, rows.length),
+      headExtra || null,
     ]),
     collapsed ? null : el("div", { class: "nav-body" }, rows),
   ]);
@@ -831,7 +974,8 @@ function renderNav() {
     el("span", { class: "row-id" }, p),
     el("span", { class: "row-status" }, st),
   ]));
-  const sections = [renderNavSection("runs", "RUNS", runRows)];
+  const sections = [renderNavSection("runs", "RUNS", runRows,
+    el("button", { class: "nav-add", title: "start a new run", onclick: (e) => { e.stopPropagation(); state.newRunOpen = true; patchOverlays(); } }, "＋"))];
   if (snap.attached) {
     sections.push(renderNavSection("subagents", "SUBAGENTS", subRows));
     sections.push(renderNavSection("phases", "PHASES", phaseRows));
@@ -860,19 +1004,25 @@ function renderCenterStream() {
   const evList = snap.events || [];
   const lastEvents = evList.slice(-20).map((ev, i) => ({ sort: ev.ts || 0, node: renderEventEntry(ev) }));
   feedEntries.push(...lastEvents);
-  const resolvedApprovals = (snap.approvals || []).filter((a) => a.status !== "pending").map((a) => ({ sort: a.updated_at || a.created_at || 0, node: renderApprovalEntry(a, snap, false) })).sort((a, b) => a.sort - b.sort);
-  feedEntries.push(...resolvedApprovals);
+  // Approvals — pending and resolved alike — are entries of the chat history
+  // itself, sorted into chronological position with everything else. No
+  // separate block below the feed, no modal: the same card that asks the
+  // question resolves into the same history line once answered. Pending
+  // cards keep their red styling + the ⏸ title/favicon cue (updateChrome).
+  const allApprovals = (snap.approvals || []).filter((a) => a.status !== "pending").concat(snap.pending_approvals || [])
+    .map((a) => ({ sort: a.created_at || a.updated_at || 0, node: renderApprovalEntry(a, snap) }));
+  feedEntries.push(...allApprovals);
+  const pendingMsgs = (state.pendingMessages || []).map((m) => ({ sort: m.ts || 0, node: renderPendingEntry(m) }));
+  feedEntries.push(...pendingMsgs);
   feedEntries.sort((a, b) => a.sort - b.sort);
 
   const pinnedHeader = el("div", { class: "pinned-hdr" }, [
     snap.has_contract ? el("span", { class: "hdr-pill" }, "📜 contract ✓") : null,
     snap.has_spec ? el("span", { class: "hdr-pill" }, "spec ✓") : null,
     snap.has_assembly ? el("span", { class: "hdr-pill" }, "assembly ✓") : null,
-    snap.phase_status === "in_progress" && state.mainAgentThinking ? el("span", { class: "hdr-pill", style: "color:var(--accent-purple);" }, `🤖 ${state.mainAgentThinking.id}…`) : null,
+    snap.phase_status === "in_progress" && mainAgentId() ? el("span", { class: "hdr-pill", style: "color:var(--accent-purple);" }, `🤖 ${mainAgentId()}…`) : null,
     el("span", { class: "hdr-pill dim" }, `${snap.events_count || 0} events`),
   ]);
-
-  const approvalFeed = (snap.pending_approvals || []).map((a) => renderApprovalEntry(a, snap, false));
 
   // §10 Stalled: never a bare "running" badge next to a dead driver — a
   // red banner with the reason and a Resume button, pinned above the feed.
@@ -882,18 +1032,22 @@ function renderCenterStream() {
     snap.control_enabled ? el("button", { class: "btn-tiny", onclick: () => guarded(resumeRun) }, "▶ Resume") : null,
   ]) : null;
 
+  const feed = el("div", { class: "chat-feed", id: "chat-feed" }, feedEntries.map((e) => e.node));
+  // §scroll: the feed pins to the newest entry until the operator scrolls
+  // up; morphing preserves the element (and scrollTop) across ticks, so the
+  // pin only re-applies while the operator is at the bottom.
+  feed.onscroll = () => {
+    state.chatFeedPinned = feed.scrollHeight - feed.scrollTop - feed.clientHeight < 60;
+  };
+
   return el("main", { class: "chat-stream-panel" }, [
     el("div", { class: "chat-header" }, [
       el("div", { class: "title" }, ["💬 Run Stream", snap.halted ? badge("halted") : null]),
-      el("button", { class: "btn-tiny", onclick: () => { loadMainAgentThinking(); render(); } }, "refresh"),
+      el("button", { class: "btn-tiny", onclick: () => apiGet("/api/snapshot").then(applySnapshot).catch(() => {}) }, "refresh"),
     ]),
     stalledBanner,
     pinnedHeader,
-    el("div", { class: "chat-feed", id: "chat-feed" }, feedEntries.map((e) => e.node)),
-    approvalFeed.length ? el("div", { class: "pending-approvals-block" }, [
-      el("div", { class: "pending-hdr" }, `⏸ PENDING APPROVALS (${approvalFeed.length})`),
-      ...approvalFeed,
-    ]) : null,
+    feed,
   ]);
 }/* ========================= PART C ========================= */
 
@@ -920,7 +1074,7 @@ function renderCommandBar() {
     class: "mode-chip " + (state.promptMode === mode ? "active" : ""),
     title, onclick: () => { state.promptMode = mode; patchCmdbar(); focusCmdbar(); },
   }, glyph + label);
-  const textEl = el("textarea", { class: "cmd-input" + (state.promptMode !== "msg_agent" && state.promptMode !== "command" ? " mode-" + state.promptMode : ""), rows: "2", placeholder });
+  const textEl = el("textarea", { class: "cmd-input" + (state.promptMode !== "msg_agent" && state.promptMode !== "command" ? " mode-" + state.promptMode : ""), name: "cmdbar-message", "aria-label": "message to the agent — type > for commands", rows: "2", placeholder });
   textEl.value = state.promptText;
   const suggestionsHost = el("div", { class: "cmd-suggestions" });
   const renderSuggestionsInto = (host) => {
@@ -947,12 +1101,16 @@ function renderCommandBar() {
 
   const subs = state.snapshot.subagents || [];
   const anyLive = subs.some((s) => s.live);
-  const targetSelect = el("select", { class: "target-select", title: "message target — auto-follows the live agent unless you pick one", onchange: (e) => { state.targetAgentId = e.target.value; state.targetAgentManual = true; } }, [
+  const targetSelect = el("select", { class: "target-select", "aria-label": "message target — auto-follows the live agent unless you pick one", title: "message target — auto-follows the live agent unless you pick one", onchange: (e) => { state.targetAgentId = e.target.value; state.targetAgentManual = true; } }, [
     el("option", { value: "main", selected: ((!state.targetAgentManual && anyLive) || state.targetAgentId === "main") ? "selected" : null }, anyLive ? "🤖 main (live)" : "🤖 main"),
     ...subs.map((s) => el("option", { value: s.id, selected: (state.targetAgentManual && state.targetAgentId === s.id) ? "selected" : null }, `${s.live ? "● " : ""}${s.id}`)),
   ]);
   const row = el("div", { class: "cmd-buttons" }, [
     targetSelect,
+    (state.pendingMessages || []).some((m) => !m.sent)
+      ? el("span", { class: "mode-chip", style: "color:var(--accent-amber); cursor:default;", title: "queued messages are sent when an agent next runs" },
+          `📨 ${(state.pendingMessages || []).filter((m) => !m.sent).length} queued`)
+      : null,
     modeChip("msg_agent", "A", "💬 ", "message agent"),
     modeChip("command", "⌥", ">", "command mode"),
     modeChip("amend", "m", "✏️ ", "amend contract (whole run)"),
@@ -989,28 +1147,59 @@ async function handlePromptSubmit(e) {
     const target = state.targetAgentManual ? state.targetAgentId : "main";
     const c = findCommand("amend");
     state.promptMode = "msg_agent";
-    state.promptText = "";
     patchCmdbar();
-    await guarded(() => c.run(text, target));
+    await guarded(async () => {
+      await c.run(text, target);
+      state.promptText = "";
+      patchCmdbar();
+    });
     return;
   }
   if (mode === "reopen") {
     if (!state.selectedNode) { showToast("Open a node first (click one in the tree to reopen it)", true); return; }
     const c = findCommand("reopen");
     state.promptMode = "msg_agent";
-    state.promptText = "";
     patchCmdbar();
-    await guarded(() => c.run(text, state.selectedNode));
+    await guarded(async () => {
+      await c.run(text, state.selectedNode);
+      state.promptText = "";
+      patchCmdbar();
+    });
     return;
   }
-  // default: message a live agent
-  const target = state.targetAgentManual ? state.targetAgentId : (liveSubId() || "main");
+  // default: message a live agent. Never fire a doomed POST: with no live
+  // subagent there is no session anywhere (the "main" fallback only ever
+  // resolves through a live subagent's logdir), so the server could only
+  // 409 "no live session found for this node". Instead of dropping the
+  // message (what "nothing happens" used to mean), the outbox queues it
+  // and flushes via interject the moment a subagent goes live.
+  const live = liveSubId();
+  const target = state.targetAgentManual ? state.targetAgentId : live;
+  if (!target || !isLive(target)) {
+    // No deliverable session right now (no live subagent, or the manual
+    // target isn't live): queue the message instead of dropping it (what
+    // "Enter does nothing" used to mean) or firing a doomed 409 POST.
+    // Pin the queue entry to the manual target only when it is a real
+    // subagent id — "main" and unknown ids auto-flush to whatever is
+    // live next instead of sitting pinned forever.
+    const pin = (state.snapshot.subagents || []).some((s) => s.id === target) ? target : null;
+    state.pendingMessages.push({
+      text,
+      ts: Date.now(),
+      target: pin,
+      sent: false,
+    });
+    state.promptText = "";
+    patchCmdbar();
+    patchCenter();
+    showToast("📨 queued — sent when an agent next runs");
+    return;
+  }
   state.targetAgentId = target;
-  if (!target) { showToast("No live agent to message", true); return; }
-  state.promptText = "";
-  patchCmdbar();
   await guarded(async () => {
     await apiPost(`/api/node/${encodeURIComponent(target)}/interject`, { content: text });
+    state.promptText = "";
+    patchCmdbar();
     showToast(`message sent to ${target}`);
     loadThinkingIfNeeded(true);
   });
@@ -1020,6 +1209,34 @@ function liveSubId() {
   const subs = state.snapshot.subagents || [];
   const live = subs.find((s) => s.live);
   return live ? live.id : null;
+}
+
+// Chat outbox delivery: run once per snapshot tick, so a message queued
+// while no agent was live is sent within one poll interval of a subagent
+// going live. Entries pinned to a manual target only flush when that
+// agent itself is live; unpinned entries flush to whatever is live now.
+// A failed interject leaves the entry queued (visible in the feed) and
+// retries the next tick — never silently dropped, never spammed.
+function flushPendingMessages() {
+  if (state.flushingPending) return;
+  const pending = state.pendingMessages.filter((m) => !m.sent);
+  if (!pending.length) return;
+  state.flushingPending = true;
+  (async () => {
+    for (const m of pending) {
+      const target = m.target || liveSubId();
+      if (!target || !isLive(target)) break;
+      try {
+        await apiPost(`/api/node/${encodeURIComponent(target)}/interject`, { content: m.text });
+        m.sent = true;
+        m.target = target;
+        m.sentAt = Date.now();
+        patchCenter();
+      } catch {
+        break; // still queued; next tick retries
+      }
+    }
+  })().finally(() => { state.flushingPending = false; });
 }
 
 /* ------------------------- commands / palette ------------------------- */
@@ -1184,9 +1401,8 @@ function attachRun(runId) {
     .then(() => {
       state.selectedNode = null;
       state.workbenchTab = "tree";
-      state.approvalTakeover = true;
-      state.takeoverFor = "";
       state.treeFilter = "";
+      state.chatFeedPinned = true;
       apiGet("/api/snapshot").then(applySnapshot).catch(() => {});
     })
     .catch((err) => showToast(String(err.message || err), true));
@@ -1255,6 +1471,7 @@ function openReopen(nodeId) {
 function openNode(id, subTab) {
   state.selectedNode = id;
   state.workbenchTab = "node";
+  state.nodeDetailFailed = false;
   if (subTab) state.agentTab = subTab;
   loadNodeDetail(id);
   if (subTab === "chat" || state.agentTab === "chat") loadThinkingIfNeeded(true);
@@ -1264,6 +1481,7 @@ function openNode(id, subTab) {
 function closeNode() {
   state.selectedNode = null;
   state.nodeDetail = null;
+  state.nodeDetailFailed = false;
   state.agentTab = "overview";
   state.workbenchTab = "tree";
   render();
@@ -1277,11 +1495,13 @@ function loadNodeDetail(id) {
     .then((d) => {
       state.nodeDetail = d;
       state.nodeDetailLoading = false;
+      state.nodeDetailFailed = false;
       if (state.agentTab === "artifact" || state.agentTab === "versions") loadArtifactsIfNeeded();
       render();
     })
     .catch((err) => {
       state.nodeDetailLoading = false;
+      state.nodeDetailFailed = true;
       showToast(String(err.message || err), true);
       render();
     });
@@ -1313,11 +1533,7 @@ function renderRightWorkbench() {
     }, [el("span", { class: "wb-glyph" }, t.glyph), el("span", { class: "wb-label" }, t.label)])
   );
   let body;
-  const pendingPilot = (state.snapshot.pending_approvals || []).find((x) => x.kind === "pilot");
-  if (state.approvalTakeover && pendingPilot && state.snapshot.control_enabled) {
-    const pid = pendingPilot.context && pendingPilot.context.node_id;
-    body = pid ? renderTakeoverPilot(pid) : renderApprovalEntry(pendingPilot, state.snapshot, true);
-  } else if (tab === "tree") body = renderTaskTreeTab();
+  if (tab === "tree") body = renderTaskTreeTab();
   else if (tab === "node") body = state.selectedNode ? renderAgentTab() : el("div", { class: "placeholder" }, "◆ select a node — tasks on the left, artifacts for repairs behind ◆ click through or press ↑/↓ + enter");
   else if (tab === "doc") body = renderDocTab();
   else if (tab === "asm") body = renderAsmTab();
@@ -1381,13 +1597,13 @@ function renderGatesTab() {
   const gateRows = gates.length ? gates.map((g, i) => el("div", { class: "gate-row" }, [
     el("span", { class: g.passed ? "gate-pass" : "gate-fail" }, (g.passed ? "✓" : "✕") + " " + g.gate),
     el("span", { class: "dim", style: "margin-left:auto;" }, g.detail || ""),
-  ])) : el("div", { class: "dim" }, "(no cached gate results)");
+  ])) : [el("div", { class: "dim" }, "(no cached gate results)")];
   const itemRows = items.length ? items.map((it) => el("div", { class: "gate-row" + (it.pass ? "" : " fail-row") }, [
     el("span", { class: it.pass ? "gate-pass" : "gate-fail" }, it.pass ? "✓" : "✕"),
     el("span", { class: "item-id" }, it.id),
     it.node_ids && it.node_ids.length ? el("span", { class: "node-link dim", onclick: () => it.node_ids.length === 1 ? openNode(it.node_ids[0], "overview") : null }, `→ ${it.node_ids.join(", ")}`) : null,
     el("span", { class: "dim", style: "margin-left:auto; font-size:11px;" }, it.class || ""),
-  ].concat(it.defect ? [el("div", { class: "defect", style: "grid-column:1/-1;" }, it.defect)] : []))) : el("div", { class: "dim" }, "(no review items)");
+  ].concat(it.defect ? [el("div", { class: "defect", style: "grid-column:1/-1;" }, it.defect)] : []))) : [el("div", { class: "dim" }, "(no review items)")];
   // §5.2: a verdict reached over a cut artifact is a weaker verdict — the
   // truncated flag must be visible here, not only on the Overview tab.
   const truncatedChip = d.truncated ? el("span", { class: "truncated-chip", title: "the artifact was over the reviewer input cap — a section group was truncated for review" }, "⚠ truncated") : null;
@@ -1439,7 +1655,7 @@ function renderAgentTab() {
   const id = state.selectedNode;
   const d = state.nodeDetail;
   const sub = (state.snapshot.subagents || []).find((s) => s.id === id);
-  if (!d && !state.nodeDetailLoading) { loadNodeDetail(id); return el("div", { class: "placeholder" }, "loading…"); }
+  if (!d && !state.nodeDetailLoading && !state.nodeDetailFailed) { loadNodeDetail(id); return el("div", { class: "placeholder" }, "loading…"); }
   const tabs = [
     ["overview", "Overview"],
     ["chat", "Chat"],
@@ -1483,8 +1699,20 @@ function renderAgentTab() {
     body = (pilotA && d && d.pilot_original) ? renderPilotEditor() : renderOverview();
   }
   else if (state.agentTab === "chat") {
-    const entries = (state.nodeThinking && state.nodeThinking.entries) ? state.nodeThinking.entries : [];
-    body = el("div", { class: "chat-feed node-chat" }, entries.map(renderAgentChatEntry));
+    const nt = state.nodeThinking;
+    const all = (nt && nt.entries) || [];
+    // §PERF: the DOM render is bounded at the last 400 entries regardless
+    // of how long the episode's trace has grown — morphing every entry on
+    // every tick is what used to jam the main thread (and with it, every
+    // click — "the POST takes a minute to send") on long live episodes.
+    const shown = all.length > CHAT_RENDER_CAP ? all.slice(all.length - CHAT_RENDER_CAP) : all;
+    const total = (nt && nt.total) || all.length;
+    body = nt === "loading"
+      ? el("div", { class: "placeholder" }, "loading chat…")
+      : el("div", { class: "chat-feed node-chat" }, [
+        total > shown.length ? el("div", { class: "dim", style: "font-size:11px; padding:4px 10px; border-bottom:1px solid var(--border);" }, `showing last ${shown.length} of ${total} entries — the trace grows while the agent runs`) : null,
+        ...shown.map(renderAgentChatEntry),
+      ]);
   } else if (state.agentTab === "gates") body = renderGatesTab();
   else if (state.agentTab === "artifact") body = renderArtifactsTab();
   else if (state.agentTab === "versions") body = renderVersionsTab();
@@ -1516,7 +1744,7 @@ function renderPilotEditor() {
       showToast("Approved as-is");
     }
   }) }, "Approve as-is");
-  const editor = el("textarea", { class: "pilot-editor", "data-key": `pilot-${draftKey}`, rows: "10" });
+  const editor = el("textarea", { class: "pilot-editor", "data-key": `pilot-${draftKey}`, name: `pilot-edit-${draftKey}`, "aria-label": "edited pilot artifact — the frozen original is shown for comparison", rows: "10" });
   editor.value = state.pilotDrafts[draftKey] || "";
   editor.oninput = () => { state.pilotDrafts[draftKey] = editor.value; };
   return el("div", null, [
@@ -1531,22 +1759,6 @@ function renderPilotEditor() {
 }
 
 function renderPendingPilotNote() { return null; }
-
-function renderTakeoverPilot(nodeId) {
-  const a = (state.snapshot.pending_approvals || []).find((x) => x.kind === "pilot");
-  if (!a) return el("div", { class: "placeholder" }, "no pilot pending");
-  const d = state.nodeDetail;
-  if (!d || d.id !== nodeId) {
-    loadNodeDetail(nodeId);
-    return el("div", { class: "placeholder" }, "loading pilot node…");
-  }
-  const dismissBtn = el("button", { class: "btn-tiny", onclick: () => dismissTakeover(a) }, "⌫ dismiss (any key re-arms)");
-  return el("div", { class: "takeover-pilot" }, [
-    el("div", { class: "sub-hdr" }, `⏸ PILOT · ${a.context && a.context.node_id ? a.context.node_id : nodeId} · awaiting your edit`),
-    renderPilotEditor(),
-    el("div", { style: "margin-top:10px;" }, dismissBtn),
-  ]);
-}
 
 /* ------------------------- task tree tab ------------------------- */
 
@@ -1586,8 +1798,10 @@ function liveSubFor(nodeId) {
   return subs.find((s) => s.live && (s.id === nodeId || s.id.startsWith(nodeId + "~"))) || null;
 }
 
-function renderTreeBranch(key, depth, visible) {
-  const { index } = buildNodeTreeIndex();
+// §PERF: `index` is built once per render pass and threaded down the
+// recursion — the old per-row `buildNodeTreeIndex()` made rendering the
+// whole tree O(n²) on every snapshot tick.
+function renderTreeBranch(key, depth, visible, index) {
   const entry = index[key];
   if (!entry) return null;
   const n = entry.node;
@@ -1638,26 +1852,26 @@ function renderTreeBranch(key, depth, visible) {
 }
 
 function visibleTreeRows() {
-  const { tops } = buildNodeTreeIndex();
+  const { tops, index } = buildNodeTreeIndex();
   const visible = [];
-  for (const t of tops) renderTreeBranch(t, 0, visible);
+  for (const t of tops) renderTreeBranch(t, 0, visible, index);
   return visible;
 }
 
 function renderTaskTreeTab() {
   const { tops } = buildNodeTreeIndex();
   const counts = state.snapshot.tree_counts || {};
-  const filterInput = el("input", { type: "text", placeholder: "filter node ids…", style: "width:100%;" });
+  const filterInput = el("input", { type: "text", name: "tree-filter", "aria-label": "filter node ids", placeholder: "filter node ids…", style: "width:100%;" });
   filterInput.value = state.treeFilter;
   const listHost = el("div", { class: "tree-list" });
   const refreshList = () => {
-    const { tops: t2 } = buildNodeTreeIndex();
+    const { tops: t2, index } = buildNodeTreeIndex();
     const vis = [];
     // §PERF: renderTreeBranch nests a node's return value with its own
     // children rather than returning flat siblings (see its own comment) --
     // flatten before reconciling, then keyed-diff in place instead of
     // tearing the whole list down on every filter keystroke / snapshot tick.
-    const rows = t2.map((t) => renderTreeBranch(t, 0, vis)).flat(Infinity);
+    const rows = t2.map((t) => renderTreeBranch(t, 0, vis, index)).flat(Infinity);
     morphChildrenInto(listHost, rows);
   };
   let filterTimer = null;
@@ -1757,7 +1971,7 @@ function renderTermTab() {
   const events = snap.events || [];
   const types = Array.from(new Set(events.map((e) => e.type))).sort();
   const filter = state.terminalFilter || "all";
-  const select = el("select", { class: "term-filter", onchange: (e) => { state.terminalFilter = e.target.value; render(); } }, [
+  const select = el("select", { class: "term-filter", name: "term-filter", "aria-label": "filter terminal events by phase status", onchange: (e) => { state.terminalFilter = e.target.value; render(); } }, [
     el("option", { value: "all", selected: filter === "all" ? "selected" : null }, `all (${events.length})`),
     ...types.map((t) => el("option", { value: t, selected: filter === t ? "selected" : null }, `${t} (${events.filter((e) => e.type === t).length})`)),
   ]);
@@ -1795,10 +2009,16 @@ function renderTermTab() {
 
 function renderNewRunModal() {
   if (!state.newRunOpen) return null;
-  const f = (key, label, type, fieldCh) => el("label", { class: "form-field" }, [
-    el("span", { class: "form-label" }, label),
-    fieldCh,
-  ]);
+  const f = (key, label, fieldEl) => {
+    // §A11Y: every field gets an id + name, and the wrapping label a `for`,
+    // so the form is machine-readable instead of "inputs with no label".
+    fieldEl.setAttribute("id", `newrun-${key}`);
+    fieldEl.setAttribute("name", `newrun-${key}`);
+    return el("label", { class: "form-field", for: `newrun-${key}` }, [
+      el("span", { class: "form-label" }, label),
+      fieldEl,
+    ]);
+  };
   const set = (k, v) => { state.newRun[k] = v; };  // §Responsive: typing in the modal never rebuilds — values live in state
   const input = (key, type, ph) => {
     const el2 = el("input", { type: type || "text", placeholder: ph });
@@ -1806,9 +2026,15 @@ function renderNewRunModal() {
     el2.oninput = () => set(key, el2.value);
     return el2;
   };
+  const area = (key, rows, ph) => {
+    const el2 = el("textarea", { rows: String(rows || 6), placeholder: ph });
+    el2.value = state.newRun[key] || "";
+    el2.oninput = () => set(key, el2.value);
+    return el2;
+  };
   const form = el("div", { class: "form-grid" }, [
+    f("goal", "Goal", area("goal", 6, "one or more sentences — the more specific the better (audience, what counts, what to exclude)")),
     f("run_id", "Run id", input("runId", "text", "e.g. monads-01")),
-    f("goal", "Goal", input("goal", "text", "the one-sentence goal")),
     f("source", "source.txt path or @path", input("source", "text", "@/path/to/corpus.txt or leave empty (workspace)")),
     f("workspace", "workspace root (optional, overrides source)", input("workspace", "text", "@/path/to/repo")),
     f("model", "model", input("model", "text", "provider model id")),
@@ -1824,7 +2050,7 @@ function renderNewRunModal() {
     f("max_attempts", "max attempts", input("max_attempts", "number", "3")),
   ]);
   const flag = (key, label) => el("label", { class: "form-flag" }, [
-    el("input", { type: "checkbox", checked: state.newRun[key] ? "checked" : null, onchange: (e) => set(key, e.target.checked) }),
+    el("input", { type: "checkbox", name: `flag-${key}`, checked: state.newRun[key] ? "checked" : null, onchange: (e) => set(key, e.target.checked) }),
     el("span", null, label),
   ]);
   return el("div", { class: "overlay", onclick: (e) => { if (e.target === e.currentTarget) { state.newRunOpen = false; render(); } } }, [
@@ -1836,7 +2062,10 @@ function renderNewRunModal() {
       ]),
       el("div", { class: "panel-foot" }, [
         el("button", { class: "primary", disabled: state.busy ? "" : null, onclick: () => guarded(async () => {
-          const r = await apiPost("/api/runs", {
+          state.startingRun = true;
+          render();
+          try {
+            const r = await apiPost("/api/runs", {
             run_id: state.newRun.runId || undefined,
             goal: state.newRun.goal,
             source: state.newRun.source || undefined,
@@ -1855,7 +2084,11 @@ function renderNewRunModal() {
           state.newRunOpen = false;
           if (r && r.run_id) await attachRun(r.run_id);
           else apiGet("/api/snapshot").then(applySnapshot).catch(() => {});
-        }) }, "Start run…"),
+          } finally {
+            state.startingRun = false;
+            render();
+          }
+        }) }, state.startingRun ? "⏳ starting…" : "Start run…"),
         el("button", { onclick: () => { state.newRunOpen = false; render(); } }, "Close"),
       ]),
     ]),
@@ -1866,7 +2099,7 @@ function renderNewRunModal() {
 
 function renderAuthOverlay() {
   if (!state.authRequired) return null;
-  const input = el("input", { type: "password", "data-key": "authDraft", placeholder: "dashboard auth token", style: "width:100%;" });
+  const input = el("input", { type: "password", name: "auth-token", "aria-label": "dashboard auth token", "data-key": "authDraft", placeholder: "dashboard auth token", style: "width:100%;" });
   input.value = state.authDraft || "";
   input.oninput = () => { state.authDraft = input.value; };
   input.onkeydown = (e) => { if (e.key === "Enter") { e.preventDefault(); submitAuth(); } };
@@ -1940,7 +2173,12 @@ function buildChrome() {
 function patchRail() { if (els.cmrail) morphInto(els.cmrail, renderRail()); }
 function patchHeader() { if (els.header) morphInto(els.header, renderHeaderRow()); }
 function patchNav() { if (els.nav) morphInto(els.nav, renderNav()); }
-function patchCenter() { if (els.center) morphInto(els.center, renderCenterStream()); }
+function patchCenter() {
+  if (!els.center) return;
+  morphInto(els.center, renderCenterStream());
+  const feed = els.center.querySelector("#chat-feed");
+  if (feed && state.chatFeedPinned) feed.scrollTop = feed.scrollHeight;
+}
 function patchInspector() { if (els.inspector) morphInto(els.inspector, renderRightWorkbench()); }
 function patchCmdbar() { if (els.cmdbar) morphInto(els.cmdbar, renderCommandBar()); }
 function patchJobs() {
@@ -2050,6 +2288,5 @@ document.addEventListener("DOMContentLoaded", () => {
     if (clock && Math.abs(state.snapshot.elapsed || 0) > 0) {
       clock.textContent = fmtDur((state.snapshot.elapsed || 0) + 0.5);
     }
-    if (!state.sseLive || now.getSeconds() % 10 === 0) loadMainAgentThinking();
   }, 5000);
 });

@@ -1526,6 +1526,230 @@ new dispatch pattern — structural exploration, scheduled pre-plan at T2+.**
    `Element`/`Node` behavior rather than reasoned about blind. The Python
    suite (689 tests) and `node --check` both stay green throughout.
 
+   **§PERF round 2 / §DASHBOARD-UX follow-up (2026-08-11, same day).** The
+   "Start run" button appeared to hang for ~a minute (sometimes never
+   firing) on a real machine while every synthetic measurement said the
+   server path was 1-2ms; the client-side hot path, examined per tick,
+   turned out to be the culprit — plus one real correctness bug. Measured
+   before: per-tick `snapshot()` 137ms on a heavy run, thinking endpoint
+   30ms/7.5MB, SSE interval 1.65s. Fixed, in one pass:
+   - **`loadThinkingIfNeeded` was missing.** Called from 5 sites (per-tick
+     `applySnapshot` while a live node is selected, the chat tab, interject
+     handlers, `openNode`) but *defined* nowhere — it existed in commit
+     `3eb0990` (line 893) and was lost in the §13 rewrite (`d376ccf`).
+     `applySnapshot`'s per-tick call threw `ReferenceError` every tick a
+     live node was selected → `scheduleAll()` never ran → **all UI updates
+     froze, and the Chat tab stayed permanently blank** (and, with the
+     feed frozen, an operator's "click Start run" appeared to do nothing
+     for a long time before a background network settle — the correct
+     explanation for the observed symptom). Restored against the current
+     `{id, entries}` data shape, with a `"loading"` placeholder state in
+     the Chat tab, a stale-selection guard, and quiet GETs (plain
+     `apiGet` never touches `state.busy`, so background refreshes can't
+     disable action buttons).
+   - **`loadMainAgentThinking` deleted.** It re-fetched a full parsed trace
+     (7.5MB+ at heavy scale, growing with episode length) and did two
+     whole-object `JSON.stringify` comparisons per tick — all to render
+     one header pill showing an agent id. Replaced by `mainAgentId()`,
+     which reads live/status straight off the already-in-snapshot
+     `subagents` summaries: zero fetches, zero parses. Also removed from
+     the boot-time `setInterval` (which had been polling it every 10s
+     even with no SSE active); the header "refresh" button now does a
+     quiet `/api/snapshot` poll instead.
+   - **`snapshotFingerprint` rewritten** from
+     `JSON.stringify(snap minus server_time/elapsed)` (two full-snapshot
+     stringifies per tick, ~64KB each) to a compact string folded from
+     the fields that actually drive renders: phase/status/detail, stalled,
+     tier + escalation count, tree_counts signature, events count +
+     last-event signature, per-subagent/per-approval/per-job/per-run
+     signature lines. Change-detection cost: µs.
+   - **`buildNodeTreeIndex` hoisted out of `renderTreeBranch`** — the
+     recursion rebuilt the whole index per row, O(n²) per tick on any
+     tree with real depth; the index is now built once per render pass
+     and threaded down (`visibleTreeRows` + the tree tab's `refreshList`
+     both pass it).
+   - **Server: `_last_logdir` cached per trace path.** `subagents()`
+     called it once per node via a full `read_text` of each node's
+     `trace.jsonl` (30MB of traces in the heavy run) on every snapshot —
+     the 137ms figure. Now `RunState._cached_logdir` routes the same
+     read through `_cached_read` (append-only traces, same stamp-cache
+     contract as `_cached_events`); `_summarize_subagent` gained an
+     injectable `logdir_for` (default `None` → module `_last_logdir`,
+     resolved at call time, not def-time, because `_last_logdir` is
+     defined later in the file). Steady-state snapshot(): 137ms → ~8.6ms.
+     `node_gptme_logdir` keeps the uncached read (on-demand path, not
+     per-tick).
+   - **New-run modal: the Goal field is now a full-width textarea**
+     (`.form-field.span-2`, `grid-column: 1 / -1`, min-height 120px,
+     value living in `state.newRun.goal` per the full-teardown rule).
+   - **Approval takeover removed.** §6.1's inspector takeover
+     (`approvalTakeover`/`takeoverFor`, `dismissTakeover`,
+     `renderTakeoverPilot`, the `renderRightWorkbench` branch) is gone:
+     a pending pilot's approval card in the center feed now embeds the
+     real `renderPilotEditor` inline (two-pane frozen-original/editable
+     textarea + Save & approve edit / Approve as-is) once the node
+     detail's `pilot_original` is loaded, and falls back to a
+     "✏️ Open pilot editor" loader button until then — the editor is
+     also still reachable from the node's Overview tab as before. Only
+     the *first* pending pilot embeds (that's what `renderPilotEditor`
+     keys its draft on); the `isTakeover` parameter and dismiss branch
+     are deleted. **The same pass removed the separate
+     ``⏸ PENDING APPROVALS`` block that used to sit below the feed**
+     (`.pending-approvals-block`/`.pending-hdr`, deleted): pending and
+     resolved approvals alike are now plain entries of the chronological
+     chat-history feed (`renderCenterStream` concatenates
+     `approvals.filter(status != pending)` with `pending_approvals` and
+     sorts both by timestamp alongside the events — the old
+     "resolved-only in history, pending pinned separately" split is
+     gone). They are never their own modal, overlay, or side section.
+     The ⏸ title/favicon cue (`updateChrome`) still flags an unanswered
+     approval.
+   Verified: 689 Python tests green, `node --check` clean, repro numbers
+   above. Browser end-to-end remains the operator's own step per
+   top-of-file instructions.
+
+   **2026-08-11, operator bug reports — the control-surface rough edges,
+   in one pass (JS + two Python lines; 690 tests green).** Four reports:
+   "keep bumping into 409 `not pending or no attached run` on approval
+   resolve", "Enter in the command bar does nothing", "the answers I gave
+   aren't displayed", "form fields have no labels". Root causes and fixes:
+   - **The 409 double-fire.** `guarded` had no re-entrancy check, so two
+     clicks inside one UI tick (before the first render disabled the
+     button) fired the same resolve POST twice; the second arrived after
+     the record was already resolved and 409'd with the unhelpful message
+     (a pair of identical 409s for the same id is exactly what the
+     operator saw). Two layers now cover it: `guarded` returns early with
+     "Another operation is still in progress" when `state.busy` is already
+     set (app.js), and `state.py`'s `resolve_approval` is **idempotent** —
+     a record already `resolved` returns `True` (no-op success) instead of
+     `False`, so a duplicate resolve from any source (double-click, second
+     tab, CLI `approve` racing the browser) is harmless. The remaining
+     `False` cases (no attached run / id not in the attached run) still
+     409, now with the honest message "no run attached, or no such pending
+     approval in the attached run". Regression test:
+     `test_resolve_duplicate_is_idempotent_200`.
+   - **Enter "did nothing" — a doomed POST with the text eaten first.**
+     `handlePromptSubmit`'s default message branch always targeted
+     `liveSubId() || "main"`, so with no live subagent it fired interject
+     at `"main"` — which `node_gptme_logdir("main")` can only resolve
+     *through a live subagent*, i.e. the server could only 409 "no live
+     session found for this node" — and it cleared `state.promptText`
+     *before* the POST, so the failure read as "nothing happened and my
+     text vanished". Now: with no live agent the branch short-circuits to
+     an honest toast ("no agent is running right now — nothing to
+     message") and **keeps the text**; all three chip branches (amend/
+     reopen/message) clear the text only after the POST succeeds, never
+     before.
+   - **Resolved answers weren't displayed.** The resolved-approval card
+     only knew `user_input` vs `action`; an intake round's per-question
+     `answers` map fell through to "Resolved via action: answer". The
+     card now renders an "Answers given:" block, one line per question
+     (`· <text>: <answer>` / "(blank — accepted default)" when the
+     operator submitted a blank), falling back to the old single line for
+     approvals without answers.
+   - **Accessibility.** Every form control now has a machine-readable
+     name: new-run modal fields get `id`+`name` (`newrun-<key>`) with the
+     wrapping label's `for` pointing at the child (`f()` helper), approval
+     question inputs get `id`/`name`/label-`for`, the pilot editor, tree
+     filter, terminal filter, auth input, target select, and cmdbar
+     textarea get `name`+`aria-label`, and the new-run checkboxes get
+     `name="flag-<key>"`.
+
+   **2026-08-11, second operator report the same way — "the POST takes
+   about a minute to send" (JS + two Python modules + one test; 691
+   green).** The real root cause surfaced as a console error the operator
+   pasted: `applySnapshot isLive is not defined` on every SSE push.
+   `applySnapshot` has called `isLive(state.selectedNode)` since §PERF
+   round 2's `loadThinkingIfNeeded` restoration, but **no `isLive`
+   definition existed anywhere in app.js** — the same lost-function bug
+   class as round 2, this time in the *gate* itself. Every push threw
+   ReferenceError inside `applySnapshot`, so `scheduleAll()` never ran,
+   the `attachRun` chain died mid-`.then`, and no region ever re-rendered
+   from the stream: the run the operator just started never appeared
+   anywhere (rail, feed, phase) — "it doesn't show up for about a
+   minute", i.e. forever until the page reloaded. Fixes, one pass:
+   - **`isLive` defined** as a hoisted function declaration next to
+     `liveMap()` (function-declaration hoisting is what makes the
+     line-302 call site work at all). A systematic called-vs-defined scan
+     of app.js found no other missing function.
+   - **The unbounded per-tick Chat-tab cost, fixed while in here** so the
+     jam can't return at scale once the UI is alive again: (a) the
+     `/api/node/<id>/thinking` route now caps its payload at the last
+     `MAX_THINKING_ENTRIES` (1500) entries and reports `total`/
+     `truncated` — an episode's unbounded trace used to be serialized in
+     full every ~1.5s (measured multi-MB); (b) the Chat tab renders at
+     most the last `CHAT_RENDER_CAP` (400) entries with a "showing last
+     400 of N" note — morphing every entry of a tens-of-thousands-entry
+     trace per tick is what jammed the main thread and with it every
+     click; (c) `loadThinkingIfNeeded` is now change-gated on an
+     entry-count + head/tail-length signature, so a per-tick force
+     refresh that found nothing new no longer triggers a full 9-region
+     render.
+   - **The `explore-01` 404 spam** (the console was full of
+     `GET /api/node/explore-01 404`). A dispatched-but-tree-less id — the
+     survey explorer's pseudo-agent, or a `~repair`/`~research` derived
+     dispatch — owns episodes but no `tree.json` node, so `node_detail`
+     404'd, and the inspector re-fetches while `nodeDetail` is null:
+     one 404 per render, forever, while the agent tab sat on
+     "loading…". `node_detail` now serves a synthetic minimal detail
+     (status/attempts from the subagent summary, empty gates/inputs/
+     artifact) for exactly those ids, so the agent's Overview and Chat
+     open normally; the client additionally got a `nodeDetailFailed`
+     marker so a genuinely unknown id can never re-fire per render.
+     Regression test: `test_pseudo_agent_node_detail_is_synthetic_200`.
+   - **Instant "start run" feedback**: the Start button now flips to
+     "⏳ starting…" the moment it's clicked (`state.startingRun`),
+     cleared in a `finally` after attach — the modal no longer sits
+     frozen-looking while the run boots.
+
+   **2026-08-11, third report — "resume does nothing (it just sends a halt
+   request)" + "typing in the chat bar sends no network request at all" (JS
+   + two Python modules + four tests; 695 green).** Two real bugs plus one
+   latent crash surfaced by the synthetic-detail fix:
+   - **"▶ Resume" only ever un-halted.** The header Resume button POSTed
+     `/api/halt {value:false}` unconditionally — writing a flag that
+     nothing was polling. For a CLI-launched or dead driver that is
+     exactly "does nothing", and the endpoint's name made the network
+     panel read as "it sent a halt request". Now `app.js` branches on
+     `snap.hosted`: hosted (our own driver thread, alive in this server
+     process) → un-halt as before; not hosted → `resumeRun()` (POST
+     `/api/runs`, the re-host path run.spec.json-on-disk is authoritative
+     for). The stalled-banner button already did the latter.
+   - **`state.start_run` refuses to double-host** (`_other_driver_pid`):
+     when the resume is for a run whose `driver.pid.json` records a live
+     pid on this host, it returns a 400 naming the pid ("driver already
+     running — the run is not dead; un-halt it instead of re-hosting")
+     instead of racing a second driver over one run directory. Same
+     record `run_liveness` reads; a dead pid (the whole point of
+     re-hosting) passes, foreign-host/unreadable records pass. The client
+     handles that 400 gracefully: `resumeRun` falls back to un-halting
+     with a toast explaining the live driver will resume at its next
+     phase boundary. Regression: `tests/test_dashboard_state.py`'s new
+     `ResumeDoubleDriverGuardTest` (4 tests: alive pid refuses, dead pid
+     allows, no record allows, foreign-host record allows).
+   - **Chat outbox — Enter always does something visible now.** The old
+     no-live-agent branch toasted "nothing to message" and kept the text;
+     the manual-but-dead-target branch fired a doomed 409 POST. Both are
+     replaced by a pending outbox: `state.pendingMessages` entries
+     `{text, ts, target?, sent}` render as 📨 cards in the chronological
+     feed (amber "queued" → green "sent to <id>"), the cmdbar shows a
+     "📨 N queued" chip, and `flushPendingMessages()` — called at the
+     end of every `applySnapshot`, re-entrancy-guarded — POSTs the queue
+     via interject within one poll interval of a subagent going live
+     (entries pinned to a real subagent id wait for that id; "main" and
+     unknown ids auto-flush to whatever is live next). A failed POST
+     stays queued and retries next tick; nothing is silently dropped.
+     `resumeRun` also stopped recording `recordCli("halt")` — it has a
+     real `resume` form now.
+   - **The synthetic-detail crash the console caught:** `renderGatesTab`
+     spread a *fallback DOM element* with `...gateRows`/`...itemRows`
+     (the ternary's `el()` placeholder branch), which is not iterable —
+     latent for every node with no cached gate results, made reachable by
+     the pseudo-agent synthetic detail (empty `gate_results`/`audit`).
+     The fallbacks are arrays now. This is the "Failed to load resource:
+     400" class of console noise eliminated along with the resume 400
+     handling above.
+
 ## v6 — the work object (v6/)
 
 PLAN.md §A3/§B1: the single input abstraction that replaces
@@ -2211,7 +2435,7 @@ Stdlib `unittest`. No pytest, no network, no agent binary, no API key.
 python3 -m unittest discover -s tests -p "test_*.py" -v
 ```
 
-**683 tests, ~35s, all passing.** History: 387 after 2026-08-10's
+**695 tests, ~38s, all passing.** History: 387 after 2026-08-10's
 §D0b/§D0/§D1/§D2/§D4/§D5/§D6/§D7/§D10/§D0c defect-fix session → 410 after
 §B1 (the v6 work object: new `test_v6_work_object.py` (23), plus additions
 to `test_pipeline_backends.py`/`test_driver_phases.py`) → 461 after §B2
@@ -2234,7 +2458,15 @@ hardening: `test_dashboard_server.py` +15, `test_dashboard_state.py` +5)
 +12 — `OperatorActionRoutesTest`'s 8 route tests plus 4 read-only 403s) →
 **683 (the §13 frontend rewrite, same day — JS/CSS only, zero new tests;
 the +2 over 681 is drift in the earlier sessions' recorded counts, not new
-coverage).**
+coverage) → 690 after the 2026-08-11 rough-edges pass: +1
+(`test_resolve_duplicate_is_idempotent_200`; the 689 recorded in that
+pass's own Verified line already included the round-2 count drift from
+the pre-690 session — the §PERF round 2 entry's "Verified: 689" predates
+this entry's test) → **691 after the 2026-08-11 freeze fix (same day):
++1 — `test_pseudo_agent_node_detail_is_synthetic_200`. → **695 after the
+2026-08-11 resume-and-outbox fix (same day): +4 —
+`ResumeDoubleDriverGuardTest` (resume refuses to double-host a live
+driver; dead-pid/no-record/foreign-host resumes pass).**
 
 **Every test file starts with `sys.path.insert(0, str(_REPO_ROOT / "src"))`.
 This is load-bearing, not boilerplate.** Stale `_editable_impl_*.pth` files
@@ -2261,7 +2493,7 @@ guard into any new test file.
 | `test_v4_probes.py` | 21 | §B4: `workspace` probe gets no write/shell tool, `max_explorers_for` enforced (more units than the cap still dispatches ≤ the cap), 300-token finding cap regardless of input, cached-finding idempotency (no re-dispatch), `plan_level`'s prompt includes explorer summaries and no source content |
 | `test_v4_probe_planner.py` | 14 | §C3: `needs_probe` filter boundaries (8-word brief floor, shape markers, URL/doc lookup markers), windowed one-call-per-60-candidates (call count flat in candidate count), out-of-window ids dropped + logged, per-window cap, per-node dedup + slug disambiguation, driver integration (auto plan from candidates, no explicit research_plan needed) |
 | `test_workspace_read_tool.py` | 9 | §B4: `list_dir`/`grep` confined to a root, `../..` escape attempts rejected in code (`_resolve_within_root`), importable outside a real gptme process |
-| `test_dashboard_state.py` / `_server.py` | 25/34 | `RunState` directly (no port), then HTTP over a real loopback `ThreadingHTTPServer` incl. traversal rejection and `--no-control` 403s; §11.10.14 read-only poll leaves runs unmutated; §11.10.15 bounded cache + 8-thread hammer. §C4: tier/escalation snapshot fields, hosted-count cap; auth via Bearer/cookie over loopback (anonymous 401, wrong token 401, cookie 403 for SSE without it), non-loopback refusal without token, 429 at `--max-concurrent-runs`. §DASHBOARD-UX: `OperatorActionRoutesTest` — escalate route (raises tier, 409 without tier.json), pilot-save (writes artifact, resolves with the edit, rejects wrong-node/non-pilot), intake answers resolve as one approval, redispatch (route → approval → apply resets node to pending), job cancel, split-proposal endpoint, snapshot hosted/cap fields, and the four new read-only 403s |
+| `test_dashboard_state.py` / `_server.py` | 25/40 | `RunState` directly (no port), then HTTP over a real loopback `ThreadingHTTPServer` incl. traversal rejection and `--no-control` 403s; §11.10.14 read-only poll leaves runs unmutated; §11.10.15 bounded cache + 8-thread hammer. §C4: tier/escalation snapshot fields, hosted-count cap; auth via Bearer/cookie over loopback (anonymous 401, wrong token 401, cookie 403 for SSE without it), non-loopback refusal without token, 429 at `--max-concurrent-runs`. §DASHBOARD-UX: `OperatorActionRoutesTest` — escalate route (raises tier, 409 without tier.json), pilot-save (writes artifact, resolves with the edit, rejects wrong-node/non-pilot), intake answers resolve as one approval, redispatch (route → approval → apply resets node to pending), job cancel, split-proposal endpoint, snapshot hosted/cap fields, and the four new read-only 403s. 2026-08-11 rough-edges pass: `test_resolve_duplicate_is_idempotent_200` (a duplicate resolve of an already-resolved approval is a 200 no-op, not a 409). 2026-08-11 freeze-fix pass: `test_pseudo_agent_node_detail_is_synthetic_200` (a dispatched-but-tree-less id — `explore-01`, `~repair`/`~research` — gets a synthetic 200 detail from the subagent summary instead of a 404; genuinely unknown ids still 404). 2026-08-11 resume-and-outbox pass: `ResumeDoubleDriverGuardTest` (4 tests — `start_run` refuses to re-host a run whose `driver.pid.json` records a live same-host pid, and lets dead-pid/no-record/foreign-host resumes through) |
 | `test_dashboard_rendering.py` | 14 | `parse_trace`: `<think>`/`<thinking>` tag extraction incl. the Anthropic think-sig comment, `save`/`append`/`patch` code-fence → `tool_call` + `diff` entries, per-path diff continuity across turns (not "whole file added" every time), `error` vs routine `system` classification | 
 | `test_pipeline_prompts.py` / `_backends.py` / `test_driver_phases.py` | 18/11/34 | byte-identical default prompt (now including §D0's absolute artifact-path line and §D1's goal block), §D2's out/scratch carve-out (hidden but excepted, not dropped), adapter wiring incl. §B1's workspace-mode `run_dir` branches and §B4's probe-kind allowlists, phase detail preservation, §D4's corpus-less-raises, §11.10.15 contract-cache bound, §B1's default-writer-factory and `--workspace` CLI wiring, §B2's `_phase_done("classify"/"explore")`, `tier_override` spec round-trip, `escalate_run`, `--tier`/`escalate` CLI wiring, §B3's adaptive-intake driver integration, §B4's T2/T3 structural-exploration dispatch, §B5's `split_accepted` escalation end-to-end, §B6's T2-unconditional/T3-still-flag-gated document review split | 
 | `test_v6_work_object.py` | 15 | §B1: measurement excludes binaries/`.git`/`node_modules`/lockfiles/oversized files, gitignore respected, `top_dirs` grouping; `kind="text"`/`kind="none"` constructors; `survey_workspace`'s members resolve to real files and respect a token ceiling; the run dir is hidden as one subtree when nested inside `work.root`; ship gate via a real subprocess fixture (not gptme) proving cwd=work.root and the artifact still lands under run_dir |

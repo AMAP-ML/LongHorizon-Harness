@@ -88,6 +88,12 @@ from .state import RunState
 _STATIC_DIR = Path(__file__).parent / "static"
 _STREAM_INTERVAL = 1.5
 
+# §PERF: the /api/node/<id>/thinking payload cap (see the route). The chat
+# tab is polled every _STREAM_INTERVAL while an episode runs; a long
+# episode's full trace is megabytes and grows every turn, so the server
+# returns only the tail and reports the real total.
+MAX_THINKING_ENTRIES = 1500
+
 # §C4: the maximum number of concurrently-hosted runs the dashboard will
 # accept. Each hosted run owns a driver thread with a process and a provider
 # connection; more than a small number is almost always a misconfiguration
@@ -217,7 +223,7 @@ def _post_resolve(handler: "DashboardRequestHandler", match: Any, body: dict) ->
         # per question, keyed by question id.
         answers=body.get("answers"),
     )
-    return (200, {"ok": True}) if ok else (409, {"ok": False, "error": "not pending or no attached run"})
+    return (200, {"ok": True}) if ok else (409, {"ok": False, "error": "no run attached, or no such pending approval in the attached run"})
 
 
 @_route("POST", r"^/api/approvals/([^/]+)/pilot-save$")
@@ -317,7 +323,15 @@ def _get_node_thinking(handler: "DashboardRequestHandler", match: Any, body: dic
     long as an episode runs, so re-parsing the whole trace from scratch on
     every call got slower every tick as the trace grew."""
     entries = handler.state.trace_entries(unquote(match.group(1))) or []
-    return 200, {"entries": [{"role": e.role, "text": e.text} for e in entries]}
+    serialized = [{"role": e.role, "text": e.text} for e in entries]
+    # §PERF: this route is polled every ~1.5s for as long as an episode
+    # runs; an unbounded payload grows with the episode and the client then
+    # JSON.parses megabytes per tick. Cap at the tail — live episodes only
+    # need the recent turns (the client bounds its own DOM render at
+    # CHAT_RENDER_CAP) — and report ``total`` so the UI can say how much
+    # history was omitted.
+    trimmed = serialized[-MAX_THINKING_ENTRIES:] if len(serialized) > MAX_THINKING_ENTRIES else serialized
+    return 200, {"entries": trimmed, "total": len(serialized), "truncated": len(trimmed) < len(serialized)}
 
 
 @_route("GET", r"^/api/node/([^/]+)/version/([^/]+)$")
