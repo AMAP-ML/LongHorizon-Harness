@@ -8,9 +8,12 @@ build synthetic run directories.
 The headline assertion is the §C5 cost claim itself: five fixed tasks
 across the tier spectrum classify into the expected tiers, a first run
 spends exactly the budget the phase machinery implies (T0=1, T1=1, T2=5,
-T3=2 provider calls), a resume spends only T2's re-run review (3 calls)
-and never re-dispatches a writer, and escalation precision is 1.0 across
-a suite where nothing should have escalated.
+T3=2 provider calls), a resume spends zero further calls — including at
+T2, whose document-review pass is cached by a digest of its own inputs
+(PLAN-AUDIT.md §E17) and a resume changes none of them, so the pass is
+skipped rather than re-run — and never re-dispatches a writer, and
+escalation precision is 1.0 across a suite where nothing should have
+escalated.
 """
 
 from __future__ import annotations
@@ -225,11 +228,13 @@ class EvalSuiteShipGateTest(unittest.TestCase):
                 by_tier[tier]["mean_calls"], float(expected), f"{tier} first-run+resume call cost"
             )
 
-        # First run is budget minus the resume's T2 re-review (3 calls).
+        # PLAN-AUDIT.md §E17: T2's document-review pass is now cached by a
+        # digest of its own inputs, so a resume that changes nothing spends
+        # zero further calls at every tier, not just T0/T1/T3.
         for m in report.measurements:
             self.assertEqual(m.tier_measured, m.tier_final)
             self.assertEqual(m.tier_final, m.tier_override or m.tier_final)
-        for tier, first_run, resume in (("T0", 1, 0), ("T1", 1, 0), ("T2", 5, 3), ("T3", 2, 0)):
+        for tier, first_run, resume in (("T0", 1, 0), ("T1", 1, 0), ("T2", 5, 0), ("T3", 2, 0)):
             runs = [m for m in report.measurements if m.tier_measured == tier]
             for m in runs:
                 self.assertEqual(m.first_run_calls, first_run, m.task_id)

@@ -32,6 +32,7 @@ from kusudaemon.v0.events import EventLog  # noqa: E402
 from kusudaemon.v0.run_dir import create_run_dir, events_path, manifest_path, node_artifact_path, spec_path  # noqa: E402
 from kusudaemon.v1.manifest import append_manifest_line  # noqa: E402
 from kusudaemon.v1.tree import TaskNode, TaskTree  # noqa: E402
+from kusudaemon.v4.research import ResearchQuery  # noqa: E402
 from kusudaemon.v6.work_object import measure_workspace  # noqa: E402
 
 _PROVIDER_ENV_KEYS = (
@@ -1744,6 +1745,157 @@ class RateLimitBackoffEventWiringTest(unittest.TestCase):
             create_run_dir(run_dir.parent, run_dir.name)
             _log_rate_limit_backoff_for(run_dir)
             self.assertEqual(EventLog(events_path(run_dir)).read_all(), [])
+
+
+class PhaseExploreResearchDelegationTest(unittest.TestCase):
+    """PLAN-AUDIT.md §E14: ``_phase_explore`` delegates into
+    ``_phase_research`` as a sub-step while ``phase.json`` still says
+    "explore" (it never becomes its own top-level phase dispatch in this
+    path). The capability-refusal branch inside ``_phase_research`` must
+    stamp ``phase.json`` with the caller's phase name -- "explore" -- not a
+    hardcoded "research", or a dashboard poll mid-explore would see
+    research/done instead of explore/done."""
+
+    def test_capability_refusal_stamps_explore_not_research(self) -> None:
+        import asyncio
+
+        async def scenario() -> None:
+            with tempfile.TemporaryDirectory() as root_str:
+                run_dir = Path(root_str) / "run"
+                _ScriptedDriver(run_dir)
+                _write_tier(run_dir, "T2")
+                # needs_explore must be True to reach the research-plan
+                # delegation at all -- _write_tier defaults it False.
+                record = json.loads(tier_path(run_dir).read_text(encoding="utf-8"))
+                record["needs_explore"] = True
+                tier_path(run_dir).write_text(json.dumps(record), encoding="utf-8")
+                # An empty spine (no top-level units) makes structural
+                # exploration a no-op, isolating this test to the
+                # research-plan delegation path alone.
+                (run_dir / "spine.json").write_text("[]", encoding="utf-8")
+                TaskTree(nodes={"a": _passed_node("a")}).save(tree_path(run_dir))
+
+                provider = FakeProvider([])
+                options = RunOptions(
+                    goal="g",
+                    research_plan={
+                        "a": [ResearchQuery(slug="x", kind="doc_retrieval", question="q?")]
+                    },
+                )
+                driver = RecursiveDriver(
+                    run_dir,
+                    provider=provider,  # type: ignore[arg-type]
+                    options=options,
+                    writer_adapter_factory=lambda node: (_ for _ in ()).throw(
+                        AssertionError("no writer dispatch expected")
+                    ),
+                    # doc_retrieval is a deliberately unwired research kind
+                    # (v4/mcp_research.py raises for it) -- building its
+                    # adapter with a ValueError is exactly the "capability
+                    # refusal" _phase_research's except branch exists for.
+                    research_adapter_factory=lambda node, query: (_ for _ in ()).throw(
+                        ValueError("doc_retrieval has no gptme equivalent")
+                    ),
+                    poll_interval=0.02,
+                )
+
+                await driver._phase_explore()
+
+                payload = json.loads((run_dir / "phase.json").read_text(encoding="utf-8"))
+                self.assertEqual(payload["phase"], "explore")
+                self.assertIn("skipped:", payload["detail"])
+
+        asyncio.run(scenario())
+
+
+class PhaseReviewT2DocumentReviewCacheTest(unittest.TestCase):
+    """PLAN-AUDIT.md §E17: a second, identical document-review pass -- same
+    promotions/briefs, same (empty) contract, same ``keep_depth_pass`` --
+    must spend zero provider calls, because a resume that reruns
+    ``_phase_review`` (tracked as always-rerun, per ``_ran_key``) can't
+    produce a different verdict when nothing about the artifacts changed.
+    This is the resume case §E17 exists to fix, exercised directly rather
+    than through a full driver run."""
+
+    def test_second_identical_pass_spends_zero_calls(self) -> None:
+        import asyncio
+
+        async def scenario() -> None:
+            with tempfile.TemporaryDirectory() as root_str:
+                run_dir = Path(root_str) / "run"
+                _ScriptedDriver(run_dir)
+                _write_tier(run_dir, "T2")
+                _populate_two_leaf_tree(run_dir)
+
+                first_provider = FakeProvider(
+                    [
+                        {"items": [], "verdict": "pass"},  # coverage
+                        {"items": [], "verdict": "pass"},  # duplication
+                        {"items": [], "verdict": "pass"},  # contract_compliance
+                    ]
+                )
+                driver = _driver_with_provider(run_dir, first_provider)
+                outcome = await driver._phase_review()
+                self.assertIsNone(outcome)
+                self.assertEqual(len(first_provider.calls), 3)
+
+                cache_path = run_dir / "audit" / "document_review.json"
+                self.assertTrue(cache_path.exists())
+                cached = json.loads(cache_path.read_text(encoding="utf-8"))
+                self.assertTrue(cached["clean"])
+
+                # A resumed process rebuilds the driver fresh, same as
+                # RecursiveDriver.run() does on every re-invocation --
+                # nothing about the tree/manifest/contract changed.
+                second_provider = FakeProvider([])
+                driver2 = _driver_with_provider(run_dir, second_provider)
+                outcome2 = await driver2._phase_review()
+                self.assertIsNone(outcome2)
+                self.assertEqual(len(second_provider.calls), 0, "the cached pass must not re-run")
+
+                events = EventLog(events_path(run_dir)).read_all()
+                cached_events = [e for e in events if e.get("type") == "document_review_cached"]
+                self.assertEqual(len(cached_events), 1)
+
+        asyncio.run(scenario())
+
+    def test_changed_promotion_invalidates_the_cache(self) -> None:
+        """A repaired node's promotion changing the digest is what makes a
+        genuinely different document re-reviewed instead of skipped."""
+        import asyncio
+
+        async def scenario() -> None:
+            with tempfile.TemporaryDirectory() as root_str:
+                run_dir = Path(root_str) / "run"
+                _ScriptedDriver(run_dir)
+                _write_tier(run_dir, "T2")
+                _populate_two_leaf_tree(run_dir)
+
+                first_provider = FakeProvider([{"items": [], "verdict": "pass"} for _ in range(3)])
+                driver = _driver_with_provider(run_dir, first_provider)
+                await driver._phase_review()
+                self.assertEqual(len(first_provider.calls), 3)
+
+                # Simulate a repair: a new manifest line for "alpha" with a
+                # different promotion changes what build_document_index
+                # reads, so the digest must no longer match.
+                append_manifest_line(
+                    manifest_path(run_dir),
+                    node_id="alpha",
+                    artifact_path=str(node_artifact_path(run_dir, "alpha")),
+                    artifact_text="word " * 10,
+                    gate_results=[],
+                    promotion="The alpha section now covers new ground.",
+                )
+
+                second_provider = FakeProvider([{"items": [], "verdict": "pass"} for _ in range(3)])
+                driver2 = _driver_with_provider(run_dir, second_provider)
+                await driver2._phase_review()
+                self.assertEqual(
+                    len(second_provider.calls), 3, "a changed promotion must re-run the pass"
+                )
+
+        asyncio.run(scenario())
 
 
 if __name__ == "__main__":

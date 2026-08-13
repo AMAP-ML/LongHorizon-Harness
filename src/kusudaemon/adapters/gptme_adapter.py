@@ -102,6 +102,12 @@ class GptmeAdapter(CommandAgentAdapter):
         env_parts = [
             f"OPENAI_BASE_URL={shlex.quote(resolved.base_url)}",
             f"OPENAI_API_KEY={shlex.quote(resolved.api_key)}",
+            # PLAN-AUDIT.md §F3: gptme's own print_msg flushes, and this
+            # worker's own prints pass flush=True, but a library `print` or
+            # an uncaught traceback from a crashing episode can otherwise
+            # sit in the block buffer until process exit -- bad for live
+            # debugging, where the last few lines before a crash matter most.
+            "PYTHONUNBUFFERED=1",
         ]
         if context_length:
             env_parts.append(f"GPTME_CONTEXT_LENGTH={int(context_length)}")

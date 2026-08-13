@@ -567,6 +567,71 @@ class EventLogReadsOncePerDispatchTest(unittest.TestCase):
             self.assertEqual(calls["n"], 1, "run_node must parse events.jsonl exactly once")
 
 
+class WatcherSkippedForNonResumableAdapterTest(unittest.TestCase):
+    """PLAN-AUDIT.md §E13: `_watch_for_session_id` used to poll the growing
+    trace file every ~50ms for the entire episode, for every adapter,
+    finding a `session_id` key that gptme (the only real Writer backend,
+    supports_session_resume=False) never emits. run_node must not even
+    start the watcher task for such an adapter -- there is nothing it could
+    ever find, and nothing downstream reads a gptme session_captured event
+    (the dashboard re-derives logdir straight off the trace file itself)."""
+
+    def test_watcher_task_never_started_when_adapter_does_not_support_resume(self) -> None:
+        with tempfile.TemporaryDirectory() as root_str:
+            root = Path(root_str)
+            run_dir = create_run_dir(root, "run_no_watch")
+            node_id = "writer_no_watch"
+            result = EpisodeResult(status="done", actions_log="ok", metadata={})
+            adapter = _CannedAdapter(result)  # supports_session_resume defaults False (no attr)
+            env = LocalEnvironment(tmp_dir=str(root / "tmp"))
+            budget = EpisodeBudget(max_duration_seconds=30)
+
+            with mock.patch(
+                "kusudaemon.v0.runner._watch_for_session_id"
+            ) as watcher_mock:
+                result_out = asyncio.run(
+                    run_node(run_dir, node_id, "do the task", adapter, env, budget)
+                )
+
+            self.assertEqual(result_out.status, "done")
+            watcher_mock.assert_not_called()
+
+    def test_watcher_task_started_when_adapter_supports_resume(self) -> None:
+        with tempfile.TemporaryDirectory() as root_str:
+            root = Path(root_str)
+            run_dir = create_run_dir(root, "run_watch")
+            node_id = "writer_watch"
+            prompt_dir = root / "prompts"
+            prompt_dir.mkdir(parents=True, exist_ok=True)
+
+            adapter = FakeStreamAgentAdapter(
+                script_path=str(FAKE_CLI),
+                pidfile=str(root / "writer_watch.pid"),
+                prompt_dir=str(prompt_dir),
+                workspace_path=str(run_dir),
+            )
+            env = LocalEnvironment(tmp_dir=str(prompt_dir))
+            budget = EpisodeBudget(max_duration_seconds=30)
+            self.assertTrue(adapter.supports_session_resume)
+
+            real_watch = _watch_for_session_id
+            calls = {"n": 0}
+
+            async def counting_watch(*args, **kwargs):
+                calls["n"] += 1
+                return await real_watch(*args, **kwargs)
+
+            with mock.patch(
+                "kusudaemon.v0.runner._watch_for_session_id", side_effect=counting_watch
+            ):
+                result_out = asyncio.run(
+                    run_node(run_dir, node_id, "do the task", adapter, env, budget)
+                )
+
+            self.assertEqual(result_out.status, "done")
+            self.assertEqual(calls["n"], 1)
+
+
 class SessionIdWatcherTest(unittest.TestCase):
     """§11.9: a session_id that lands on a torn line (no trailing newline
     yet) must be re-read once the line completes. The old text-mode reader
@@ -601,6 +666,32 @@ class SessionIdWatcherTest(unittest.TestCase):
                 stop.set()
                 await watcher
                 self.assertEqual(self._session_ids(log), ["s1"])
+
+            asyncio.run(scenario())
+
+    def test_logdir_line_captures_session_when_no_session_id_present(self) -> None:
+        # PLAN-AUDIT.md §E13: the watcher must key off the adapter's actual
+        # event shape, not hardcode session_id -- a `{"type": "logdir", ...}`
+        # line (the shape _gptme_worker.py actually emits) is captured the
+        # same way, so a resume-capable adapter whose continuity token is a
+        # logdir rather than a session id doesn't need a second watcher.
+        with tempfile.TemporaryDirectory() as root_str:
+            root = Path(root_str)
+            run_dir = create_run_dir(root, "run3")
+            log = EventLog(events_path(run_dir))
+            trace = root / "trace.jsonl"
+            trace.write_bytes(b'{"type":"logdir","logdir":"/tmp/kusudaemon-gptme-xyz"}\n')
+
+            async def scenario() -> None:
+                stop = asyncio.Event()
+                watcher = asyncio.create_task(_watch_for_session_id(trace, log, "n", stop))
+                await asyncio.sleep(0.15)
+                stop.set()
+                await watcher
+                captured = [e for e in log.read_all() if e.get("type") == "session_captured"]
+                self.assertEqual(len(captured), 1)
+                self.assertEqual(captured[0].get("logdir"), "/tmp/kusudaemon-gptme-xyz")
+                self.assertNotIn("session_id", captured[0])
 
             asyncio.run(scenario())
 

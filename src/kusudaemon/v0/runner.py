@@ -117,10 +117,23 @@ async def run_node(
     # the subprocess runs — so this tail can see session_id the instant the
     # agent CLI emits it, without waiting for run_episode() to return. A
     # kill -9 can land any time after that line hits disk.
+    #
+    # PLAN-AUDIT.md §E13: this watcher exists to power session-resume
+    # bookkeeping, and only an adapter with supports_session_resume=True can
+    # ever act on the session it captures (see the resume_session_id branch
+    # above). The only real Writer backend, gptme, has this False — so for
+    # it the poll loop below used to run for the entire episode duration,
+    # every ~50ms, finding nothing, for no functional benefit: no code path
+    # reads a gptme session_captured event, and the dashboard's own
+    # `_last_logdir` re-derives the logdir straight off the trace file
+    # itself rather than depending on this event. Skip starting the task
+    # entirely rather than starting it and having it find nothing.
     stop_watching = asyncio.Event()
-    watcher = asyncio.create_task(
-        _watch_for_session_id(trace_path, log, node_id, stop_watching)
-    )
+    watcher: asyncio.Task[None] | None = None
+    if supports_resume:
+        watcher = asyncio.create_task(
+            _watch_for_session_id(trace_path, log, node_id, stop_watching)
+        )
     try:
         episode_kwargs: dict[str, Any] = {"live_trajectory_path": str(trace_path)}
         if resume_session_id is not None:
@@ -128,9 +141,10 @@ async def run_node(
         result = await adapter.run_episode(prompt, env, budget, **episode_kwargs)
     finally:
         stop_watching.set()
-        watcher.cancel()
-        with contextlib.suppress(asyncio.CancelledError):
-            await watcher
+        if watcher is not None:
+            watcher.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await watcher
 
     artifact_path = node_artifact_path(run_dir, node_id)
     # gptme writes the real artifact itself, mid-episode, via its own
@@ -258,6 +272,24 @@ async def _watch_for_session_id(
                         "round": 0,
                         "type": "session_captured",
                         "session_id": session_id,
+                    }
+                )
+                return
+            # PLAN-AUDIT.md §E13: don't hardcode session_id as the only
+            # event shape a resume-capable adapter can emit. A
+            # `{"type": "logdir", ...}` line (the shape _gptme_worker.py
+            # actually emits, though gptme itself has no session-resume
+            # support today) is captured the same way so a future
+            # resume-capable adapter whose continuity token is a logdir
+            # rather than a session id doesn't need a second watcher.
+            if record.get("type") == "logdir":
+                log.append(
+                    {
+                        "node_id": node_id,
+                        "role": "writer",
+                        "round": 0,
+                        "type": "session_captured",
+                        "logdir": record.get("logdir"),
                     }
                 )
                 return

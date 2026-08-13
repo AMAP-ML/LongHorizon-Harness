@@ -232,10 +232,19 @@ def _emit_assistant_content(entries: list[TraceEntry], content: str, file_state:
     diffs against the prior turn's content rather than showing the whole
     file as newly added every time."""
     content, thoughts = _extract_thinking(content)
-    has_live_thinking = any(e.role == "thinking" for e in entries[-50:])
-    if not has_live_thinking:
-        for thought in thoughts:
-            entries.append(TraceEntry("thinking", thought))
+    # PLAN-AUDIT.md §E20j: this used to gate on `any(role=="thinking" for e
+    # in entries[-50:])` to avoid double-counting live-streamed thinking
+    # already emitted by _gptme_worker.py's stream wrapper -- a lookback
+    # window that dropped a message's own thinking whenever live thinking
+    # existed anywhere in the last 50 entries, and duplicated it once >50
+    # entries intervened. §E20l fixed the actual source of the duplication
+    # (the worker now strips `<think>` tags from what it yields onward, so
+    # they never land in stored message content in the first place), which
+    # makes this heuristic unnecessary: `thoughts` here only ever contains
+    # tags a live wrapper never saw (a degraded/non-gptme trace), so it's
+    # always correct to emit them straight through.
+    for thought in thoughts:
+        entries.append(TraceEntry("thinking", thought))
 
     pos = 0
     for match in _CODEBLOCK_RE.finditer(content):
@@ -321,6 +330,14 @@ def parse_trace_lines(raw: str, entries: list[TraceEntry], file_state: dict[str,
             entries.append(TraceEntry("raw", line))
             continue
         rtype = record.get("type")
+        if rtype == "heartbeat":
+            # PLAN-AUDIT.md §F3: a pure liveness signal from the worker
+            # (see _gptme_worker.py) -- meaningful to "is this wedged?"
+            # tooling, not to the operator reading the chat history, so it
+            # never becomes its own entry. (Falling through to the generic
+            # "raw" bucket would render it dim, which is also fine, but an
+            # explicit skip keeps it out of the feed entirely.)
+            continue
         if rtype == "logdir":
             entries.append(TraceEntry("logdir", f"session started (logdir={record.get('logdir', '')})"))
             continue

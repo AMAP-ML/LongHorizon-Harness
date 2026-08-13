@@ -638,5 +638,232 @@ class ResumeDoubleDriverGuardTest(unittest.TestCase):
         self.assertIsNotNone(run_id)
 
 
+class JobCancelEventCleanupTest(unittest.TestCase):
+    """§E20d (2026-08-12 audit): before this fix, nothing ever popped a
+    finished job's entry out of ``RunState._job_cancel_events`` -- the same
+    "grows forever in a long-lived serve process" bug class as §E9's
+    hosted-run registry leak, fixed the same way: a ``finally``-block
+    ``on_done`` callback threaded through ``_job_thread``."""
+
+    def setUp(self) -> None:
+        self.tmp = Path(tempfile.mkdtemp())
+        self.runs_root = self.tmp / "runs"
+        self.runs_root.mkdir()
+        self.run_dir = _write_scripted_run(self.runs_root, "run-a")
+        self.state = RunState(self.runs_root)
+        self.state.attach("run-a")
+
+    def tearDown(self) -> None:
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _wait_until_removed(self, job_id: str, *, timeout: float = 5.0) -> None:
+        deadline = 0.0
+        import time
+
+        while deadline < timeout:
+            with self.state._lock:
+                if job_id not in self.state._job_cancel_events:
+                    return
+            time.sleep(0.05)
+            deadline += 0.05
+        self.fail(f"{job_id!r} was never removed from _job_cancel_events")
+
+    def test_cancel_event_removed_after_job_succeeds(self) -> None:
+        # The job may complete near-instantly (a trivial noop target on a
+        # thread that starts immediately), so this only asserts the
+        # eventual-cleanup postcondition -- asserting it's still present the
+        # instant _spawn_job returns would race against the thread.
+        def _noop_target(run_dir, approval_id=""):  # noqa: ANN001
+            return None
+
+        self.state._spawn_job(self.run_dir, "amend", _noop_target, "job-ok", approval_id="job-ok")
+        self._wait_until_removed("job-ok")
+
+    def test_cancel_event_removed_after_job_raises(self) -> None:
+        def _boom_target(run_dir, approval_id=""):  # noqa: ANN001
+            raise RuntimeError("boom")
+
+        self.state._spawn_job(self.run_dir, "amend", _boom_target, "job-fail", approval_id="job-fail")
+        self._wait_until_removed("job-fail")
+
+    def test_cancel_event_removed_after_cancel_before_start(self) -> None:
+        # A job cancelled before its thread even reaches the target must
+        # still clean up -- the "cancelled before start" branch in
+        # _job_thread is a separate early-return from the normal path.
+        def _slow_target(run_dir, approval_id=""):  # noqa: ANN001
+            return None
+
+        cancel_event = threading.Event()
+        cancel_event.set()
+        with self.state._lock:
+            self.state._job_cancel_events["job-cancelled"] = cancel_event
+        from kusudaemon.dashboard.state import _job_thread
+
+        _job_thread(
+            self.run_dir, "amend", "job-cancelled", _slow_target,
+            cancel_event=cancel_event,
+            on_done=lambda: self.state._remove_job_cancel_event("job-cancelled"),
+            approval_id="job-cancelled",
+        )
+        with self.state._lock:
+            self.assertNotIn("job-cancelled", self.state._job_cancel_events)
+
+    def test_many_jobs_do_not_leak_across_a_run(self) -> None:
+        """The direct regression for the leak itself: spawning several jobs
+        in sequence must leave the registry empty once they've all
+        finished, not growing one entry per job forever."""
+
+        def _noop_target(run_dir, approval_id=""):  # noqa: ANN001
+            return None
+
+        for i in range(5):
+            self.state._spawn_job(self.run_dir, "amend", _noop_target, f"job-{i}", approval_id=f"job-{i}")
+        for i in range(5):
+            self._wait_until_removed(f"job-{i}")
+        with self.state._lock:
+            self.assertEqual(self.state._job_cancel_events, {})
+
+
+class ProviderConfigAndRunsRootCacheTest(unittest.TestCase):
+    """§E20e (2026-08-12 audit): ``snapshot()`` used to re-read and
+    re-JSON-parse ``provider.json`` (via ``list_available_models()``/
+    ``resolve()``) and re-walk every run directory under ``runs_root``
+    (``_dir_mtime``'s full ``rglob``) fresh on *every* call -- called once
+    per connected SSE client every ``_STREAM_INTERVAL`` (~1.5s), forever.
+    Both are now cached the same stat-stamp way ``_cached_read`` already
+    caches events.jsonl/tree.json/approvals.jsonl."""
+
+    def setUp(self) -> None:
+        self.tmp = Path(tempfile.mkdtemp())
+        self.runs_root = self.tmp / "runs"
+        self.runs_root.mkdir()
+        self.run_dir = _write_scripted_run(self.runs_root, "run-a")
+        self.state = RunState(self.runs_root)
+        self.state.attach("run-a")
+
+    def tearDown(self) -> None:
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_provider_lookup_cached_across_snapshots(self) -> None:
+        import kusudaemon.dashboard.state as state_mod
+
+        calls = {"n": 0}
+        real = state_mod._available_models_and_default
+
+        def counting(*a, **kw):  # noqa: ANN001, ANN002, ANN003
+            calls["n"] += 1
+            return real(*a, **kw)
+
+        with mock.patch.object(state_mod, "_available_models_and_default", counting):
+            self.state.snapshot()
+            self.state.snapshot()
+            self.state.snapshot()
+        self.assertEqual(calls["n"], 1, "an unchanged provider.json must not be re-parsed every snapshot")
+
+    def test_dir_mtime_cached_across_list_runs_calls(self) -> None:
+        import kusudaemon.dashboard.state as state_mod
+
+        calls = {"n": 0}
+        real = state_mod._dir_mtime
+
+        def counting(path):  # noqa: ANN001
+            calls["n"] += 1
+            return real(path)
+
+        with mock.patch.object(state_mod, "_dir_mtime", counting):
+            self.state.list_runs()
+            self.state.list_runs()
+            self.state.list_runs()
+        self.assertEqual(calls["n"], 1, "an unchanged run directory must not be re-walked every list_runs() call")
+
+    def test_dir_mtime_recomputed_after_new_top_level_entry(self) -> None:
+        import kusudaemon.dashboard.state as state_mod
+
+        calls = {"n": 0}
+        real = state_mod._dir_mtime
+
+        def counting(path):  # noqa: ANN001
+            calls["n"] += 1
+            return real(path)
+
+        with mock.patch.object(state_mod, "_dir_mtime", counting):
+            self.state.list_runs()
+            (self.run_dir / "contract.md").write_text("x", encoding="utf-8")
+            self.state.list_runs()
+        self.assertEqual(calls["n"], 2, "a new file directly inside the run dir must invalidate the cached mtime")
+
+
+class ResolveTracePathNoFullSnapshotTest(unittest.TestCase):
+    """§E20g (2026-08-12 audit): resolving the "main" pseudo-agent's trace
+    path used to call ``self.snapshot()`` -- a full snapshot build (tree
+    summary, tier/escalation history, models lookup, the whole run list)
+    just to read back ``phase`` and ``subagents``. It must now resolve
+    without building a full snapshot."""
+
+    def setUp(self) -> None:
+        self.tmp = Path(tempfile.mkdtemp())
+        self.runs_root = self.tmp / "runs"
+        self.runs_root.mkdir()
+        self.run_dir = _write_scripted_run(self.runs_root, "run-a")
+        self.state = RunState(self.runs_root)
+        self.state.attach("run-a")
+
+    def tearDown(self) -> None:
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_resolve_trace_path_main_does_not_call_snapshot(self) -> None:
+        from kusudaemon.v0.run_dir import node_trace_path
+
+        # §D0b: RunState resolves runs_root (symlinks and all -- /var is a
+        # /private/var symlink on macOS), so the expected path must be built
+        # from the *same* resolved run_dir the state itself uses, not the
+        # test's own unresolved self.run_dir, or this compares two paths
+        # that point at the same file but aren't string-equal.
+        run_dir = self.state._attached_dir()
+        EventLog(events_path(run_dir)).append(
+            {"node_id": "2", "role": "writer", "round": 0, "type": "node_dispatched"}
+        )
+        scratch = node_scratch_dir(run_dir, "2")
+        scratch.mkdir(parents=True, exist_ok=True)
+        logdir = self.tmp / "gptme-logdir"
+        logdir.mkdir()
+        node_trace_path(run_dir, "2").write_text(
+            json.dumps({"type": "logdir", "logdir": str(logdir)}) + "\n"
+            + json.dumps({"type": "message", "role": "assistant", "content": "hi"}) + "\n",
+            encoding="utf-8",
+        )
+        with mock.patch.object(RunState, "snapshot", side_effect=AssertionError("must not build a full snapshot")):
+            path = self.state._resolve_trace_path("main")
+        self.assertEqual(path, node_trace_path(run_dir, "2"))
+
+    def test_resolve_trace_path_main_falls_back_without_snapshot_when_nothing_live(self) -> None:
+        with mock.patch.object(RunState, "snapshot", side_effect=AssertionError("must not build a full snapshot")):
+            path = self.state._resolve_trace_path("main")
+        # No live subagent and no phase trace -- falls back to "main"'s own
+        # (nonexistent) trace path, same as before this fix.
+        from kusudaemon.v0.run_dir import node_trace_path
+
+        self.assertEqual(path, node_trace_path(self.state._attached_dir(), "main"))
+
+    def test_node_gptme_logdir_main_does_not_call_snapshot(self) -> None:
+        """The same fix applies to ``node_gptme_logdir``, which had an
+        identical ``self.snapshot()`` call for the same "main" fallback."""
+        from kusudaemon.v0.run_dir import node_trace_path
+
+        EventLog(events_path(self.run_dir)).append(
+            {"node_id": "2", "role": "writer", "round": 0, "type": "node_dispatched"}
+        )
+        scratch = node_scratch_dir(self.run_dir, "2")
+        scratch.mkdir(parents=True, exist_ok=True)
+        logdir = self.tmp / "gptme-logdir"
+        logdir.mkdir()
+        node_trace_path(self.run_dir, "2").write_text(
+            json.dumps({"type": "logdir", "logdir": str(logdir)}) + "\n", encoding="utf-8"
+        )
+        with mock.patch.object(RunState, "snapshot", side_effect=AssertionError("must not build a full snapshot")):
+            found = self.state.node_gptme_logdir("main")
+        self.assertEqual(found, logdir)
+
+
 if __name__ == "__main__":
     unittest.main()

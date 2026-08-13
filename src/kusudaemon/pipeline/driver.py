@@ -31,6 +31,7 @@ come from ``backends.py`` driven by ``RunOptions.backend``.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import random
 import time
@@ -68,6 +69,7 @@ from ..v0.run_dir import create_run_dir, ensure_node_trace_path, events_path, gl
 from ..v1.provider import OpenAICompatibleProvider, ProviderHTTPError
 from ..v1.reviewer import ReviewVerdict
 from ..v1.round_loop import run_round_loop
+from ..v1.run_dir import ensure_audit_dir
 from ..v1.tree import TaskNode, TaskTree
 from ..v2.contract import ContractRule, freeze_contract, render_spec_rubric_to_contract
 from ..v2.intake import GlobalRubric, IntakeObjection, IntakeQuestion, render_spec_md, run_intake
@@ -92,7 +94,12 @@ from ..v2.survey import (
     unit_input_path,
 )
 from ..v3.assembly_loop import run_assembly_loop
-from ..v3.document_review import DocumentReviewResult, run_document_review, serialize_triage
+from ..v3.document_review import (
+    DocumentReviewResult,
+    build_document_index,
+    run_document_review,
+    serialize_triage,
+)
 from ..v3.revalidate import Triage, apply_revalidation_triage, run_revalidation_pass, summarize_triage
 from ..v4.probe_planner import plan_probes
 from ..v4.research import ResearchQuery, run_research_query
@@ -901,7 +908,15 @@ class RecursiveDriver:
         if tier in ("T2", "T3"):
             await self._run_structural_exploration(tier)
         if self.options.research_plan:
-            await self._phase_research()
+            # PLAN-AUDIT.md §E14: this delegates into _phase_research as a
+            # sub-step of the still-running "explore" phase, never as its
+            # own top-level phase dispatch — pass "explore" as the phase
+            # name to stamp so a capability-refusal skip inside
+            # _phase_research (below) writes phase.json's "phase" field as
+            # "explore", not a hardcoded "research" that would momentarily
+            # disagree with what _run_phase itself started and is about to
+            # tail-write once this method returns.
+            await self._phase_research(phase="explore")
 
     async def _run_structural_exploration(self, tier: Tier) -> None:
         """PLAN.md §A6 first bullet/§B4: "one probe per top-level unit of
@@ -1087,7 +1102,7 @@ class RecursiveDriver:
             rules.extend(ContractRule(source=node.id, shape=node.shape, text=text) for text in rule_texts)
         freeze_contract(self.run_dir, rules)
 
-    async def _phase_research(self) -> None:
+    async def _phase_research(self, *, phase: str = "research") -> None:
         """Dispatch targeted exploration (PLAN.md §A6 second bullet/§C3).
 
         Two paths, in priority order:
@@ -1106,6 +1121,20 @@ class RecursiveDriver:
         Both paths feed the same ``run_research_loop`` (the existing
         targeted-loop machinery), so findings attach to ``node.inputs``
         exactly the way operator-supplied findings already do.
+
+        PLAN-AUDIT.md §E14: ``phase`` names which ``phase.json`` entry the
+        capability-refusal branch below stamps. This method is called two
+        ways — as its own top-level phase (``_run_phase("research", ...)``,
+        the T3 phase-list entry, where the default ``"research"`` is
+        correct and matches what ``_run_phase``'s own tail is about to
+        write) and as a sub-step of ``_phase_explore`` while the run is
+        still, structurally, in the "explore" phase. The old hardcoded
+        ``self._set_phase("research", ...)`` was correct for the first
+        caller and a bug for the second: it clobbered ``phase.json``'s
+        ``phase`` field with "research" while ``_phase_explore`` (and the
+        ``_run_phase("explore", ...)`` frame that invoked it) was still
+        running, so a dashboard poll in that window saw ``research/done``
+        mid-explore. ``_phase_explore`` now passes ``phase="explore"``.
         """
         plan = self.options.research_plan
         if not plan and self.options.auto_probe_plan:
@@ -1122,7 +1151,7 @@ class RecursiveDriver:
                 EpisodeBudget(),
             )
         except ValueError as exc:  # only capability refusal is a soft miss
-            self._set_phase("research", "done", detail=f"skipped: {exc}")
+            self._set_phase(phase, "done", detail=f"skipped: {exc}")
 
     def _build_auto_probe_plan(self) -> dict[str, list[ResearchQuery]]:
         """PLAN.md §C3: windowed probe planner over the current tree. The
@@ -1229,6 +1258,13 @@ class RecursiveDriver:
             max_parallel=self.options.max_parallel,
             split_handler=handle_split_proposal if enable_split else None,
             on_node_passed=maybe_derive_split_parent if enable_split else None,
+            # PLAN-AUDIT.md §E15: the exact same halt.flag check
+            # ``_run_phase``'s own phase-boundary halt already reads
+            # (``self._halted``) — not a second mechanism — so a halt
+            # requested mid-execute stops the round loop from starting new
+            # work instead of only taking effect at the next phase
+            # boundary.
+            should_halt=self._halted,
         )
         tree = self._load_tree()
         if tier == "T1" and tree.is_blocked():
@@ -1374,20 +1410,109 @@ class RecursiveDriver:
         ``assembly_loop.py`` — the operator's `reopen_node` intervention is
         the recovery path, not something this phase can resolve on its
         own.
+
+        PLAN-AUDIT.md §E17: ``_phase_done`` treats "review" as always
+        re-run (it's tier-scoped, per the class docstring's ``_ran_key``),
+        so a process-level resume calls this method again even though
+        nothing about the artifacts changed since the last time it ran.
+        Wrapped in ``_document_review_cached_pass`` below, which skips the
+        real call entirely when a digest of exactly this pass's inputs
+        (every reviewed node's promotion+brief, the frozen contract text,
+        and ``keep_depth_pass``) matches what's on disk from the last time
+        it ran clean.
         """
         tree = self._load_tree()
         if tree.is_blocked():
             return False
         if self._current_tier() == "T2":
-            review = run_document_review(
-                self.run_dir, tree, self.provider, keep_depth_pass=False, log=self.log
-            )
+            review = self._document_review_cached_pass(tree, keep_depth_pass=False)
             if review.escalated:
                 return False
             await self._handle_document_review_triage(
                 review, approval_context="review", require_approval=False
             )
         return None
+
+    def _document_review_digest(self, tree: TaskTree, *, keep_depth_pass: bool) -> str:
+        """PLAN-AUDIT.md §E17: a pure function of exactly what the pass
+        actually reads — ``build_document_index`` already restricts to
+        *passed* nodes, so a still-pending sibling changing status doesn't
+        perturb this; only a reviewed node's own ``(promotion, brief)``
+        changing (a repair re-dispatched it), the frozen contract being
+        amended, or the caller switching ``keep_depth_pass`` (T2 vs T3's
+        different scope) can change the digest."""
+        entries = build_document_index(self.run_dir, tree)
+        contract_text = ""
+        try:
+            contract_text = contract_path(self.run_dir).read_text(encoding="utf-8")
+        except OSError:
+            pass
+        payload = {
+            "entries": [[e.node_id, e.promotion, e.brief] for e in entries],
+            "contract": contract_text,
+            "keep_depth_pass": keep_depth_pass,
+        }
+        blob = json.dumps(payload, ensure_ascii=False, sort_keys=True).encode("utf-8")
+        return hashlib.sha256(blob).hexdigest()
+
+    def _document_review_cache_path(self) -> Path:
+        return ensure_audit_dir(self.run_dir) / "document_review.json"
+
+    def _read_document_review_cache(self) -> dict[str, Any]:
+        try:
+            payload = json.loads(self._document_review_cache_path().read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return {}
+        return payload if isinstance(payload, dict) else {}
+
+    def _write_document_review_cache(self, digest: str, review: DocumentReviewResult) -> None:
+        payload = {
+            "digest": digest,
+            # "Clean" mirrors what a resuming caller actually needs to
+            # know: a digest match over a pass that found real triage (or
+            # escalated) must still re-run, since the caller's own repair
+            # dispatch didn't happen from a cached result — only a pass
+            # that found nothing to do is safe to skip verbatim next time.
+            "clean": not review.triage and not review.escalated,
+            "ts": time.time(),
+        }
+        write_text_atomic(
+            self._document_review_cache_path(),
+            json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+        )
+
+    def _document_review_cache_hit(self, digest: str) -> bool:
+        cached = self._read_document_review_cache()
+        return cached.get("digest") == digest and cached.get("clean") is True
+
+    def _document_review_cached_pass(
+        self, tree: TaskTree, *, keep_depth_pass: bool
+    ) -> DocumentReviewResult:
+        """PLAN-AUDIT.md §E17: the caching wrapper around
+        ``run_document_review`` itself — used by ``_phase_review`` (T2,
+        unconditional). ``_phase_assemble``'s T3 flag-gated pass runs
+        through ``run_assembly_loop`` instead (it dispatches the call
+        internally), so it does its own pre-check + cache-write around
+        that call rather than through this helper; both write the same
+        ``audit/document_review.json`` record via
+        ``_write_document_review_cache``."""
+        digest = self._document_review_digest(tree, keep_depth_pass=keep_depth_pass)
+        if self._document_review_cache_hit(digest):
+            self._log(
+                {
+                    "node_id": "-",
+                    "role": "harness",
+                    "round": 0,
+                    "type": "document_review_cached",
+                    "digest": digest,
+                }
+            )
+            return DocumentReviewResult()
+        review = run_document_review(
+            self.run_dir, tree, self.provider, keep_depth_pass=keep_depth_pass, log=self.log
+        )
+        self._write_document_review_cache(digest, review)
+        return review
 
     async def _handle_document_review_triage(
         self, review: DocumentReviewResult, *, approval_context: str, require_approval: bool
@@ -1474,10 +1599,34 @@ class RecursiveDriver:
         T3. Only T3 ever asks ``document_review`` to run from this phase,
         and only when the operator opted in via
         ``RunOptions.document_review`` — byte-identical to pre-§B6
-        behavior for T3."""
+        behavior for T3.
+
+        PLAN-AUDIT.md §E17: unlike ``_phase_review``, this pass runs
+        *inside* ``run_assembly_loop`` (it dispatches ``run_document_review``
+        itself when ``document_review=True``), so caching happens around
+        that call rather than through ``_document_review_cached_pass``: a
+        digest match against a clean prior result flips
+        ``run_full_document_review`` back to ``False`` before the call
+        (skipping it entirely, logging ``document_review_cached``), and a
+        real run's result is cached afterward via the same
+        ``audit/document_review.json`` record ``_phase_review`` writes."""
         run_full_document_review = (
             self.options.document_review and self._current_tier() == "T3"
         )
+        review_digest: str | None = None
+        if run_full_document_review:
+            review_digest = self._document_review_digest(self._load_tree(), keep_depth_pass=True)
+            if self._document_review_cache_hit(review_digest):
+                self._log(
+                    {
+                        "node_id": "-",
+                        "role": "harness",
+                        "round": 0,
+                        "type": "document_review_cached",
+                        "digest": review_digest,
+                    }
+                )
+                run_full_document_review = False
         result = await run_assembly_loop(
             self.run_dir,
             tree_path(self.run_dir),
@@ -1494,6 +1643,8 @@ class RecursiveDriver:
         if result.escalated:
             return False
         if result.review is not None:
+            assert review_digest is not None  # only set when the pass could run
+            self._write_document_review_cache(review_digest, result.review)
             # PLAN.md §A4.4's majority-regenerate trigger (checked inside
             # ``_handle_document_review_triage``) never fires from here in
             # practice — ``run_full_document_review`` above is only ever

@@ -94,6 +94,21 @@ def _available_models_and_default() -> tuple[list[str], str]:
         return [], ""
 
 
+def _provider_config_stat_path() -> Path | None:
+    """§E20e (2026-08-12 audit): the file whose stat stamp gates the cached
+    models/default-model lookup below. ``config_file_path()`` always
+    returns *some* path (falling back to the plain cwd-relative name even
+    when nothing exists yet on disk, per its own docstring), so a missing
+    file still gets a stable, stat-able key -- ``os.stat`` on it simply
+    raises, ``_cached_read`` treats that as a ``None`` stamp, and the
+    lookup only re-runs once the file actually appears."""
+    try:
+        from ..provider_config import config_file_path
+        return config_file_path()
+    except Exception:
+        return None
+
+
 # §11.10.15: the process-lifetime file cache is bounded — a dashboard
 # server watches many runs for days, and one entry per file per run must
 # not become one entry per hour of run activity.
@@ -134,6 +149,11 @@ class RunState:
         # must land regardless — jobs.jsonl's latest-record-wins merge is
         # the UI's authority, and the event stops the thread's own final
         # status from clobbering the cancel.
+        # §E20d (2026-08-12 audit): entries are popped by ``_job_thread``'s
+        # ``on_done`` callback once a job reaches a terminal state (done,
+        # failed, or cancelled) -- see ``_spawn_job``/``_remove_job_cancel_
+        # event``. Without that, this dict only ever grew across every job
+        # a long-lived ``serve`` process ever ran.
         self._job_cancel_events: dict[str, threading.Event] = {}
         # Parse-on-change cache for the per-snapshot file reads: keyed by
         # path, value is (stat stamp, parsed result). Depends on the
@@ -206,6 +226,41 @@ class RunState:
         path = approvals_path(run_dir)
         return self._cached_read(path, lambda: approval_store.read_all(run_dir))
 
+    def _cached_dir_mtime(self, run_dir: Path) -> float:
+        """§E20e (2026-08-12 audit): ``list_runs()`` calls this once per run
+        directory under ``runs_root``, on *every* ``snapshot()`` call — not
+        just for the attached run, for all of them, every SSE tick. The
+        underlying ``_dir_mtime`` is a full ``rglob("*")`` over every file
+        in the run (chunks, spine units, every node's ``out``/``scratch``/
+        ``audit``/trace files), purely to find a "most recently active"
+        sort key. Cached via ``_cached_read``, keyed on the run directory's
+        *own* stat stamp — the same "accepted staleness" caveat
+        ``_cached_tree`` already documents for ``tree.json`` applies here
+        too, slightly wider: a write to a file nested inside e.g.
+        ``out/<node>.md`` doesn't bump the top-level run directory's own
+        mtime, so the cached value only refreshes when something is
+        created/removed directly inside the run dir (which still happens
+        repeatedly as a run progresses — ``tree.json``, ``contract.md``,
+        ``audit/``, ``out/`` etc. each get created once). This is a display
+        sort key, not correctness-bearing state, so that tradeoff is fine."""
+        return self._cached_read(run_dir, lambda: _dir_mtime(run_dir))
+
+    def _cached_models_and_default(self) -> tuple[list[str], str]:
+        """§E20e (2026-08-12 audit): ``list_available_models()``/``resolve()``
+        each independently call ``provider_config.read_config_file()``,
+        which re-reads and re-JSON-parses ``provider.json`` from scratch —
+        previously done on *every* ``snapshot()`` call, i.e. every
+        ``_STREAM_INTERVAL`` tick per connected SSE client, forever, even
+        though the file almost never changes mid-run. Cached via the same
+        stat-stamp ``_cached_read`` pattern every other per-snapshot disk
+        read in this file already uses, keyed on the resolved config path
+        itself so a config file that appears/changes/disappears is picked
+        up on the next tick."""
+        path = _provider_config_stat_path()
+        if path is None:
+            return _available_models_and_default()
+        return self._cached_read(path, _available_models_and_default)
+
     # ------------------------------------------------------------------
     # Run scanning / attachment (read-only browsing across runs_root)
     # ------------------------------------------------------------------
@@ -232,7 +287,7 @@ class RunState:
                     "phase": str(phase.get("phase", "")),
                     "status": str(phase.get("status", "created")),
                     "detail": str(phase.get("detail", "")),
-                    "mtime": _dir_mtime(entry),
+                    "mtime": self._cached_dir_mtime(entry),
                     "attached": entry.name == self._attached,
                     "hosted": self.is_hosted(entry.name),
                     "pending_approvals": sum(1 for item in approvals if item.status == "pending"),
@@ -294,7 +349,7 @@ class RunState:
     # Snapshots (always read fresh; the disk is authoritative)
     # ------------------------------------------------------------------
     def snapshot(self) -> dict[str, Any]:
-        models, default_model = _available_models_and_default()
+        models, default_model = self._cached_models_and_default()
         run_dir = self._attached_dir()
         if run_dir is None:
             return {
@@ -453,14 +508,17 @@ class RunState:
             return direct
 
         if node_id in {"main", "root", "harness"}:
-            snap = self.snapshot()
-            current_phase = snap.get("phase")
+            # §E20g (2026-08-12 audit): this used to call ``self.snapshot()``
+            # just to read ``phase`` and ``subagents`` back out of it — a
+            # full snapshot build (tree summary, tier/escalation history,
+            # models lookup, the whole run list) for a lookup that only
+            # needs two narrow pieces of state. Read those directly instead.
+            current_phase = str((_read_json(phase_path(run_dir)) or {}).get("phase", ""))
             if current_phase:
                 phase_logdir = _last_logdir(node_trace_path(run_dir, current_phase))
                 if phase_logdir is not None:
                     return phase_logdir
-            subagents = snap.get("subagents") or []
-            for sub in subagents:
+            for sub in self.subagents(events=self._cached_events(run_dir)):
                 if sub.get("live"):
                     sub_id = sub.get("id")
                     if sub_id:
@@ -822,11 +880,26 @@ class RunState:
         cancel_event = threading.Event()
         with self._lock:
             self._job_cancel_events[job_id] = cancel_event
+        # §E20d (2026-08-12 audit): the counterpart to §E9's hosted-run
+        # cleanup, same pattern -- ``on_done`` runs in ``_job_thread``'s
+        # ``finally`` block regardless of how the job ends (done/failed/
+        # cancelled, or cancelled-before-start), so a long-lived ``serve``
+        # process running many jobs over days doesn't grow
+        # ``_job_cancel_events`` forever. Without this, every amend/triage/
+        # reopen/redispatch job that ever ran left a permanent entry.
+        on_done = lambda: self._remove_job_cancel_event(job_id)  # noqa: E731
         thread = threading.Thread(
             target=_job_thread, args=(run_dir, kind, job_id, target),
-            kwargs={**kwargs, "cancel_event": cancel_event}, daemon=True,
+            kwargs={**kwargs, "cancel_event": cancel_event, "on_done": on_done}, daemon=True,
         )
         thread.start()
+
+    def _remove_job_cancel_event(self, job_id: str) -> None:
+        """§E20d: pop this job's cancel event once its thread is done --
+        the counterpart to ``_spawn_job``'s ``self._job_cancel_events[job_id]
+        = cancel_event``."""
+        with self._lock:
+            self._job_cancel_events.pop(job_id, None)
 
     def cancel_job(self, job_id: str) -> bool:
         """§DASHBOARD-UX §11: cancel a running dashboard job (amend/triage/
@@ -1112,15 +1185,22 @@ class RunState:
         if text and text.strip():
             return own_path
         if node_id in {"main", "root", "harness"}:
-            snap = self.snapshot()
-            current_phase = snap.get("phase")
+            # §E20g (2026-08-12 audit): resolving "main" used to call
+            # ``self.snapshot()`` — a full snapshot build (tree summary,
+            # tier/escalation history, models lookup, the whole run list —
+            # everything ``snapshot()`` assembles) just to read back
+            # ``phase`` and ``subagents``. Both are available far more
+            # narrowly: ``phase.json`` directly, and ``self.subagents()``
+            # (fed the already-cached event log, so it's not even a fresh
+            # events.jsonl read) — the same data ``mainAgentId()`` on the
+            # client side computes purely from ``snap.subagents`` already.
+            current_phase = str((_read_json(phase_path(run_dir)) or {}).get("phase", ""))
             if current_phase:
-                phase_path = node_trace_path(run_dir, current_phase)
-                phase_text = _read_text(phase_path)
+                phase_trace_path = node_trace_path(run_dir, current_phase)
+                phase_text = _read_text(phase_trace_path)
                 if phase_text and phase_text.strip():
-                    return phase_path
-            subagents = snap.get("subagents") or []
-            for sub in subagents:
+                    return phase_trace_path
+            for sub in self.subagents(events=self._cached_events(run_dir)):
                 if sub.get("live"):
                     sub_id = sub.get("id")
                     if sub_id:
@@ -1420,12 +1500,20 @@ def asyncio_run(coro: Any) -> Any:
 
 def _job_thread(
     run_dir: Path, kind: str, job_id: str, target: Any,
-    cancel_event: threading.Event | None = None, **kwargs: Any,
+    cancel_event: threading.Event | None = None,
+    on_done: Callable[[], None] | None = None,
+    **kwargs: Any,
 ) -> None:
     """§DASHBOARD-UX §11: a job's thread honours its cancel event both
     before starting and after the target returns — a mid-provider-call job
     can't be interrupted, but once the call lands, ``cancelled`` must be
-    the final record, not the target's own ``done``/``failed`` write."""
+    the final record, not the target's own ``done``/``failed`` write.
+
+    §E20d (2026-08-12 audit): ``on_done`` runs in ``finally`` regardless of
+    which branch below fires, same "clean up no matter how this returns"
+    contract as ``_host_driver``'s own ``on_done`` (§E9) -- it's how
+    ``RunState._job_cancel_events`` stops growing across every job a
+    long-lived ``serve`` process ever runs."""
     try:
         if cancel_event is not None and cancel_event.is_set():
             _finish_job(run_dir, job_id, kind, "cancelled", "cancelled by operator before start")
@@ -1438,6 +1526,9 @@ def _job_thread(
             _finish_job(run_dir, job_id, kind, "cancelled", "cancelled by operator")
         else:
             _finish_job(run_dir, job_id, kind, "failed", str(exc))
+    finally:
+        if on_done is not None:
+            on_done()
 
 
 def _finish_job(run_dir: Path, job_id: str, kind: str, status: str, detail: str) -> None:

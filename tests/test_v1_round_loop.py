@@ -742,5 +742,97 @@ class WarnGatesNeverBlockTest(unittest.TestCase):
             self.assertTrue(line["warned_gates"][0]["passed"])
 
 
+class HaltStopsAtRoundBoundaryTest(unittest.TestCase):
+    """PLAN-AUDIT.md §E15: an injected ``should_halt`` that already reads
+    True must stop the loop before the orchestrator is even asked — no
+    dispatch, no mutation, no partial progress recorded."""
+
+    def test_should_halt_true_prevents_any_dispatch(self) -> None:
+        with tempfile.TemporaryDirectory() as root_str:
+            root = Path(root_str)
+            run_dir = create_run_dir(root, "run-halt")
+            prompt_dir = root / "prompts"
+            prompt_dir.mkdir(parents=True, exist_ok=True)
+
+            # Two independent (no depends_on) nodes: a ready set of two
+            # means §E18's single-ready-node shortcut does not apply, so
+            # an un-halted loop would genuinely need to ask the
+            # orchestrator. An empty response queue makes any provider
+            # call raise loudly, so a passing test proves should_halt
+            # kept the call from ever happening.
+            _write_tree(
+                tree_path(run_dir),
+                [
+                    {"id": "a", "brief": "first", "artifact": "out/a.md", "gates": ["nonempty"]},
+                    {"id": "b", "brief": "second", "artifact": "out/b.md", "gates": ["nonempty"]},
+                ],
+            )
+            before = tree_path(run_dir).read_text(encoding="utf-8")
+
+            adapter_factory = _adapter_factory(root, run_dir, prompt_dir)
+            env = LocalEnvironment(tmp_dir=str(prompt_dir))
+            provider = FakeProvider([])
+
+            tree = asyncio.run(
+                run_round_loop(
+                    run_dir,
+                    tree_path(run_dir),
+                    writer_adapter_factory=adapter_factory,
+                    env=env,
+                    provider=provider,
+                    prompt_for_node=lambda node: f"do {node.id}",
+                    writer_budget=EpisodeBudget(max_duration_seconds=30),
+                    should_halt=lambda: True,
+                )
+            )
+
+            self.assertEqual(provider.calls, [], "the orchestrator must never be asked")
+            self.assertEqual(tree.nodes["a"].status, "pending")
+            self.assertEqual(tree.nodes["a"].attempts, 0)
+            self.assertEqual(tree.nodes["b"].status, "pending")
+            self.assertEqual(tree.nodes["b"].attempts, 0)
+            self.assertFalse((root / "a.pid").exists(), "node a's writer must never run when halted")
+            self.assertFalse((root / "b.pid").exists(), "node b's writer must never run when halted")
+
+            # No partial mutation at all: tree.json on disk is untouched.
+            after = tree_path(run_dir).read_text(encoding="utf-8")
+            self.assertEqual(before, after)
+
+            log = EventLog(events_path(run_dir))
+            dispatch_events = [
+                e
+                for e in log.read_all()
+                if e.get("type") in ("node_dispatch_decided", "node_dispatched", "episode_completed")
+            ]
+            self.assertEqual(dispatch_events, [])
+
+    def test_should_halt_none_is_byte_identical_to_before(self) -> None:
+        """Default ``should_halt=None`` must reproduce today's exact
+        behavior — a single-node tree still runs to completion."""
+        with tempfile.TemporaryDirectory() as root_str:
+            root = Path(root_str)
+            run_dir = create_run_dir(root, "run-nohalt")
+            prompt_dir = root / "prompts"
+            prompt_dir.mkdir(parents=True, exist_ok=True)
+
+            _write_tree(
+                tree_path(run_dir),
+                [{"id": "a", "brief": "first", "artifact": "out/a.md", "gates": ["nonempty"]}],
+            )
+            provider = FakeProvider([])
+            tree = asyncio.run(
+                run_round_loop(
+                    run_dir,
+                    tree_path(run_dir),
+                    writer_adapter_factory=_adapter_factory(root, run_dir, prompt_dir),
+                    env=LocalEnvironment(tmp_dir=str(prompt_dir)),
+                    provider=provider,
+                    prompt_for_node=lambda node: f"do {node.id}",
+                    writer_budget=EpisodeBudget(max_duration_seconds=30),
+                )
+            )
+            self.assertEqual(tree.nodes["a"].status, "passed")
+
+
 if __name__ == "__main__":
     unittest.main()

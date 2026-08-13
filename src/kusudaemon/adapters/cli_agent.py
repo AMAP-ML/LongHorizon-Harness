@@ -112,6 +112,17 @@ class CommandAgentAdapter:
             timeout=budget.max_duration_seconds,
             tee_path=live_trajectory_path,
         )
+        # PLAN-AUDIT.md §E20c: the prompt file's only job is being read by
+        # the subprocess (`< {prompt_path}`), which has already happened by
+        # the time env.exec returns above -- success, timeout, or error
+        # alike. Left alone, one accumulates per episode *and* per retry
+        # attempt (a large tree with retries reaches hundreds of these).
+        # Best-effort and after the fact: a cleanup failure must never fail
+        # an otherwise-completed episode.
+        try:
+            await env.exec(f"rm -f {shlex.quote(prompt_path)}", timeout=60)
+        except Exception:
+            pass
         duration_ms = int((time.monotonic() - start) * 1000)
         if result.termination_reason == "timeout":
             status = "timeout"

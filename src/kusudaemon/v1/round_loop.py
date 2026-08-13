@@ -253,8 +253,22 @@ async def run_round_loop(
     on_node_passed: NodePassedHook | None = None,
     max_parallel: int = 1,
     provider_concurrency: int | None = None,
+    should_halt: Callable[[], bool] | None = None,
 ) -> TaskTree:
     """Drive the Orchestrator/Writer/Reviewer round loop for ``tree.json``.
+
+    PLAN-AUDIT.md §E15: ``should_halt`` (default ``None``, byte-identical to
+    every pre-§E15 caller and test — nothing calls it, this loop never
+    halts) lets an operator's Halt control take effect *inside* a long
+    ``execute`` phase instead of only at the driver's phase boundaries.
+    Checked at three points, none of which interrupt a turn already in
+    flight (PLAN.md §10 "never interrupt mid-turn"): (a) before each
+    round's orchestrator dispatch decision, (b) before that round's wave is
+    marked dispatched and actually sent out, and (c) before each iteration
+    of the in-place attempt-retry loop. A hit only ever skips *starting*
+    new work — any ``dispatch``/``review`` already awaited runs to
+    completion — and the tree is returned exactly as it stood at the halt
+    point: nothing is marked failed or blocked on account of halting.
 
     PLAN.md §C2: ``max_parallel > 1`` runs each round as a **wave** — the
     orchestrator's dispatch decision (one call, exactly as before) names
@@ -351,6 +365,10 @@ async def run_round_loop(
     # process left off.
     first_round = _next_round_index(run_dir)
     for offset in range(max_rounds):
+        # §E15 (a): before the orchestrator's dispatch decision — a hit
+        # here means no call is even made for a round that will never run.
+        if should_halt is not None and should_halt():
+            break
         round_index = first_round + offset
         decision = decide_next_action_with_policy(
             tree,
@@ -373,6 +391,12 @@ async def run_round_loop(
                     "reason": decision.reason,
                 }
             )
+            break
+
+        # §E15 (b): before this round's wave is committed (nodes marked
+        # "dispatched" and actually sent out) — a hit here leaves the tree
+        # exactly as the previous round left it, no partial mutation.
+        if should_halt is not None and should_halt():
             break
 
         # §C2 wave: the decided node first, then the next ready nodes in
@@ -423,6 +447,11 @@ async def run_round_loop(
         for chunk in chunks(wave):
             for node in chunk:
                 while node.status == "pending" and node.attempts < max_attempts:
+                    # §E15 (c): before starting a new retry attempt — the
+                    # node is simply left "pending" (its state from the
+                    # just-failed attempt), not marked failed or blocked.
+                    if should_halt is not None and should_halt():
+                        break
                     node.status = "dispatched"
                     tree.save(tree_path)
                     await dispatch(node)

@@ -116,6 +116,39 @@ class ToolCallAndDiffExtractionTest(unittest.TestCase):
         self.assertIn("x = 1", entries[-1].text)
 
 
+class HeartbeatAndDedupeRemovalTest(unittest.TestCase):
+    """PLAN-AUDIT.md §E20l/§F3: the worker now strips `<think>` tags from
+    what it yields onward (exactly one producer emits thinking), which made
+    §E20j's `entries[-50:]` lookback-window dedupe heuristic unnecessary and
+    it was deleted outright -- a message's own `<think>` content must always
+    become a thinking entry now, regardless of how many prior thinking
+    entries already exist. Also covers the worker's new heartbeat line,
+    which must never produce a visible trace entry."""
+
+    def test_thinking_entry_not_dropped_after_many_prior_thinking_entries(self) -> None:
+        # 60 prior "live" thinking lines (more than the old 50-entry
+        # lookback window), then a message whose own content still carries
+        # a <think> block -- must still be extracted, not silently dropped.
+        heartbeats = [
+            json.dumps({"type": "thinking", "content": f"live thought {i}"}) for i in range(60)
+        ]
+        raw = "\n".join(heartbeats + [_msg("assistant", "<think>own thought</think>final")])
+        entries = rendering.parse_trace(raw)
+        thinking_texts = [e.text for e in entries if e.role == "thinking"]
+        self.assertIn("own thought", thinking_texts)
+        self.assertEqual(entries[-1], rendering.TraceEntry("assistant", "final"))
+
+    def test_heartbeat_line_produces_no_entry(self) -> None:
+        raw = "\n".join(
+            [
+                json.dumps({"type": "heartbeat", "ts": 12345.0}),
+                _msg("assistant", "still here"),
+            ]
+        )
+        entries = rendering.parse_trace(raw)
+        self.assertEqual(entries, [rendering.TraceEntry("assistant", "still here")])
+
+
 class ErrorClassificationTest(unittest.TestCase):
     def test_error_prefixed_system_message_is_reclassified(self) -> None:
         entries = rendering.parse_trace(_msg("system", "Error: command not found"))

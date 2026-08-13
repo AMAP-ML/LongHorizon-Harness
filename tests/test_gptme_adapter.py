@@ -22,6 +22,9 @@ Coverage:
 
 from __future__ import annotations
 
+import contextlib
+import io
+import json
 import os
 import sys
 import unittest
@@ -30,6 +33,7 @@ from pathlib import Path
 _REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(_REPO_ROOT / "src"))
 
+from kusudaemon.adapters._gptme_worker import _wrap_thinking_stream  # noqa: E402
 from kusudaemon.adapters.gptme_adapter import (  # noqa: E402
     _WORKER_SCRIPT,
     GptmeAdapter,
@@ -183,6 +187,103 @@ class GptmeVisibleOutputTest(unittest.TestCase):
             ]
         )
         self.assertEqual(gptme_visible_output(raw), "counted")
+
+
+class ThinkingStreamWrapperTest(unittest.TestCase):
+    """PLAN-AUDIT.md §E19/§F3/§E20l: `_wrap_thinking_stream` wraps gptme's
+    `gptme.llm._stream` to intercept `<think>` spans for live thinking
+    display. Exercised directly against a fake `_StreamWithMetadata`-shaped
+    object (a plain object with a `.gen` generator attribute, matching the
+    real gptme 0.32.1 shape confirmed by hand) -- no real gptme install
+    involved, same convention as the rest of this file."""
+
+    def test_preserves_generator_return_value_as_metadata(self) -> None:
+        # §E19: gptme's own _StreamWithMetadata.__iter__ reads a stream's
+        # usage/cost metadata back off its generator's StopIteration.value.
+        # The old wrapper's plain `for chunk in orig_gen: yield chunk` loop
+        # discarded that value entirely.
+        sentinel_metadata = {"usage": {"total_tokens": 42}}
+
+        def fake_gen():
+            yield "hello "
+            yield "world"
+            return sentinel_metadata
+
+        class _FakeStream:
+            def __init__(self) -> None:
+                self.gen = fake_gen()
+
+        wrapped = _wrap_thinking_stream(lambda *a, **kw: _FakeStream())
+        stream_obj = wrapped()
+
+        chunks: list[str] = []
+        metadata = None
+        gen = stream_obj.gen
+        while True:
+            try:
+                chunks.append(next(gen))
+            except StopIteration as stop:
+                metadata = stop.value
+                break
+
+        self.assertEqual(chunks, ["hello ", "world"])
+        self.assertEqual(metadata, sentinel_metadata)
+
+    def test_missing_gen_attribute_degrades_without_raising(self) -> None:
+        # §E19: a gptme version whose stream object has no `.gen` at all
+        # (a shape change, or no _StreamWithMetadata) must degrade to no
+        # live-thinking interception rather than raising AttributeError and
+        # failing the whole episode.
+        class _FakeStreamNoGen:
+            pass
+
+        wrapped = _wrap_thinking_stream(lambda *a, **kw: _FakeStreamNoGen())
+        stream_obj = wrapped()  # must not raise
+        self.assertFalse(hasattr(stream_obj, "gen"))
+
+    def test_think_tags_stripped_from_yielded_chunks_and_emitted_once(self) -> None:
+        # §E20l: the yielded chunk must have the <think>...</think> span
+        # removed, not just extracted-and-also-left-in-place -- otherwise
+        # the tags land in the stored message content too and get
+        # re-extracted a second time downstream by dashboard/rendering.py.
+        def fake_gen():
+            yield "before <think>reasoning "
+            yield "continues</think> after"
+            return None
+
+        class _FakeStream:
+            def __init__(self) -> None:
+                self.gen = fake_gen()
+
+        wrapped = _wrap_thinking_stream(lambda *a, **kw: _FakeStream())
+        stream_obj = wrapped()
+
+        captured = io.StringIO()
+        with contextlib.redirect_stdout(captured):
+            chunks = list(stream_obj.gen)
+
+        self.assertEqual(chunks, ["before ", " after"])
+        for chunk in chunks:
+            self.assertNotIn("<think>", chunk)
+            self.assertNotIn("</think>", chunk)
+
+        thinking_lines = [json.loads(line) for line in captured.getvalue().splitlines() if line.strip()]
+        self.assertTrue(thinking_lines)
+        self.assertTrue(all(e["type"] == "thinking" for e in thinking_lines))
+        self.assertEqual("".join(e["content"] for e in thinking_lines), "reasoning continues")
+
+    def test_chunk_with_no_think_tag_passes_through_unchanged(self) -> None:
+        def fake_gen():
+            yield "plain content, no tags"
+            return None
+
+        class _FakeStream:
+            def __init__(self) -> None:
+                self.gen = fake_gen()
+
+        wrapped = _wrap_thinking_stream(lambda *a, **kw: _FakeStream())
+        stream_obj = wrapped()
+        self.assertEqual(list(stream_obj.gen), ["plain content, no tags"])
 
 
 if __name__ == "__main__":
