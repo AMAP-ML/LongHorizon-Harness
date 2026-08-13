@@ -211,6 +211,9 @@ class RunOptions:
     workspace_root: str | None = None
 
     def __post_init__(self) -> None:
+        if isinstance(self.research_plan, str):
+            from .backends import parse_research_plan
+            self.research_plan = parse_research_plan(self.research_plan)
         if not self.workspace_root and self.work_object is not None and self.work_object.root is not None:
             self.workspace_root = str(self.work_object.root.resolve())
 

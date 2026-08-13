@@ -43,6 +43,7 @@ one subtree rather than by individual filename (see
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 from typing import Any
 
@@ -278,6 +279,14 @@ def parse_research_plan(raw: Any) -> dict[str, list[ResearchQuery]]:
     defaults to ``"web_search"`` (normalized to ``"web"`` by ``Probe``
     construction — see ``v4/research.py``).
     """
+    if isinstance(raw, str):
+        raw = raw.strip()
+        if not raw:
+            return {}
+        try:
+            raw = json.loads(raw)
+        except json.JSONDecodeError as exc:
+            raise ValueError(f"invalid research_plan JSON: {exc}") from exc
     if not raw:
         return {}
     items: list[dict[str, Any]]
@@ -291,10 +300,9 @@ def parse_research_plan(raw: Any) -> dict[str, list[ResearchQuery]]:
                     continue
                 items.append({"node_id": node_id, **query})
     elif isinstance(raw, list):
-
         items = [item for item in raw if isinstance(item, dict)]
     else:
-        raise ValueError("research_plan must be a list or dict")
+        raise ValueError("research_plan must be a list, dict, or JSON string")
 
     plan: dict[str, list[ResearchQuery]] = {}
     for item in items:
