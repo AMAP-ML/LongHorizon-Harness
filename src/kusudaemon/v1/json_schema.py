@@ -81,5 +81,10 @@ def validate(instance: Any, schema: dict[str, Any], path: str = "$") -> list[str
 
 
 def describe_schema(schema: dict[str, Any]) -> str:
-    """Render a schema for inclusion in a prompt (PLAN.md §12 fallback path)."""
-    return json.dumps(schema, indent=2, sort_keys=True)
+    """Render a schema for inclusion in a prompt (PLAN.md §12 fallback path).
+
+    A3-1 (IMPLEMENTATION-PLAN-COST-AND-LIVE.md): compact separators instead
+    of ``indent=2`` — halves the prose copy with no semantic loss, ~100
+    tokens saved on every structured call.
+    """
+    return json.dumps(schema, separators=(",", ":"), sort_keys=True)

@@ -84,7 +84,7 @@ class _ScriptedDriver(RecursiveDriver):
 
 
 class RunDirResolvedTest(unittest.TestCase):
-    """A relative run_dir (the dashboard's default runs_root is the
+    """A relative run_dir (the dashboard's old default runs_root was the
     relative "./.kusudaemon/runs") used to flow straight into
     workspace_path/prompt_dir, which cli_agent.py's command template embeds
     as `cd {workspace_path} && ... < {prompt_path}` -- since prompt_path
@@ -339,7 +339,7 @@ class ExplorerReasoningTest(unittest.TestCase):
             self._reasoning_text = reasoning_text
             self.on_reasoning_calls = 0
 
-        def complete_json(self, messages, schema, *, temperature=0.0, retries=2, on_reasoning=None):
+        def complete_json(self, messages, schema, *, temperature=0.0, retries=2, on_reasoning=None, streaming=False):
             if on_reasoning is not None:
                 on_reasoning(self._reasoning_text)
                 self.on_reasoning_calls += 1
@@ -558,11 +558,10 @@ class CorruptTreeResumeTest(unittest.TestCase):
 
 
 class WorkspaceCliDefaultRunsRootTest(unittest.TestCase):
-    """PLAN.md §A3 point 1 / §B1: `--workspace <path>` on run.py's CLI
-    entry point measures a WorkObject and, absent an explicit
-    --runs-root, defaults the run directory to
-    <workspace>/.kusudaemon/runs/<run-id> -- so a workspace-mode run's
-    bookkeeping lands inside the project it was launched from."""
+    """`--workspace <path>` on run.py's CLI entry point measures a
+    WorkObject and, absent an explicit --runs-root, defaults the run
+    directory to ~/.kusudaemon/runs/<run-id> — runs are harness-owned
+    state, never stored inside the workspace they edit."""
 
     def _run_entry(self, argv: list[str]) -> dict:
         from types import SimpleNamespace
@@ -592,14 +591,14 @@ class WorkspaceCliDefaultRunsRootTest(unittest.TestCase):
         self.assertEqual(rc, 0)
         return captured
 
-    def test_workspace_flag_defaults_runs_root_inside_the_workspace(self) -> None:
+    def test_workspace_flag_defaults_runs_root_to_home(self) -> None:
         with tempfile.TemporaryDirectory() as workspace_str:
             workspace_root = Path(workspace_str).resolve()
             (workspace_root / "app.py").write_text("print(1)\n", encoding="utf-8")
             captured = self._run_entry(
                 ["--run-id", "r1", "--goal", "fix the bug", "--workspace", str(workspace_root)]
             )
-        self.assertEqual(captured["run_dir"], workspace_root / ".kusudaemon" / "runs" / "r1")
+        self.assertEqual(captured["run_dir"], Path.home() / ".kusudaemon" / "runs" / "r1")
         work = captured["options"].work_object
         self.assertIsNotNone(work)
         self.assertEqual(work.kind, "workspace")
@@ -622,7 +621,7 @@ class WorkspaceCliDefaultRunsRootTest(unittest.TestCase):
             )
         self.assertEqual(captured["run_dir"], runs_root / "r1")
 
-    def test_no_workspace_keeps_todays_default_runs_root(self) -> None:
+    def test_no_workspace_defaults_runs_root_to_home(self) -> None:
         cwd = Path.cwd()
         with tempfile.TemporaryDirectory() as cwd_str:
             try:
@@ -630,7 +629,7 @@ class WorkspaceCliDefaultRunsRootTest(unittest.TestCase):
                 captured = self._run_entry(["--run-id", "r1", "--goal", "summarize this"])
             finally:
                 os.chdir(cwd)
-        self.assertEqual(captured["run_dir"], Path(cwd_str).resolve() / ".kusudaemon" / "runs" / "r1")
+        self.assertEqual(captured["run_dir"], Path.home() / ".kusudaemon" / "runs" / "r1")
         self.assertIsNone(captured["options"].work_object)
 
 
@@ -812,6 +811,61 @@ class PhaseIntakeAdaptiveTest(unittest.TestCase):
 
         asyncio.run(scenario())
 
+    def test_intake_round1_reuses_the_classify_question_set_without_a_call(self) -> None:
+        """A5-2: when tier.json carries intake_round1 (the question set the
+        merged classify call produced), round 1 re-asks those exact
+        questions with no provider call — only round 2, triggered by a
+        non-blank answer, spends build_question_set."""
+
+        import asyncio
+
+        async def scenario() -> None:
+            with tempfile.TemporaryDirectory() as root_str:
+                run_dir = Path(root_str) / "run"
+                create_run_dir(run_dir.parent, run_dir.name)
+                tier_path(run_dir).write_text(
+                    json.dumps(
+                        {
+                            "tier": "T2",
+                            "needs_intake": True,
+                            "estimate": {
+                                "ambiguities": ["which module does this touch?"],
+                                "objections": [],
+                            },
+                            "intake_round1": {
+                                "questions": [
+                                    {
+                                        "id": "q1",
+                                        "text": "Which module does this touch?",
+                                        "default_assumption": "the whole repo",
+                                    }
+                                ],
+                                "objections": [],
+                            },
+                            "ts": 0,
+                        }
+                    ),
+                    encoding="utf-8",
+                )
+                # Only ONE canned response: round 2's build_question_set.
+                # If round 1 tried to build its own set, FakeProvider would
+                # run out of responses and fail the test loudly.
+                provider = FakeProvider([{"questions": [], "objections": []}])
+                driver = self._driver(run_dir, provider)
+                with approval_store.Approver(
+                    run_dir, poll_interval=0.02, answers={"q1": "the auth module"}
+                ):
+                    await driver._phase_intake()
+
+                self.assertEqual(len(provider.calls), 1)  # round 2 only
+                approval = approval_store.read_all(run_dir)[0]
+                self.assertEqual(approval.kind, "intake_questions")
+                self.assertEqual(approval.questions[0]["text"], "Which module does this touch?")
+                text = spec_path(driver.run_dir).read_text(encoding="utf-8")
+                self.assertIn("the auth module", text)
+
+        asyncio.run(scenario())
+
 
 class RunOptionsTierOverrideRoundTripTest(unittest.TestCase):
     """PLAN.md §B2: tier_override round-trips through to_spec/from_spec —
@@ -827,6 +881,25 @@ class RunOptionsTierOverrideRoundTripTest(unittest.TestCase):
         options = RunOptions(goal="g")
         restored = RunOptions.from_spec(options.to_spec())
         self.assertIsNone(restored.tier_override)
+
+
+class RunOptionsInlineSpansDefaultTest(unittest.TestCase):
+    """A6-4 (IMPLEMENTATION-PLAN-COST-AND-LIVE.md): inline spans are on by
+    default — inlining retrieved source spans removes the 2-5 `read`-turn
+    round trips a writer episode otherwise pays to discover its inputs. The
+    default must survive a to_spec/from_spec round trip (resume builds
+    options from disk)."""
+
+    def test_default_is_true_and_round_trips(self) -> None:
+        options = RunOptions(goal="g")
+        self.assertTrue(options.inline_spans)
+        restored = RunOptions.from_spec(options.to_spec())
+        self.assertTrue(restored.inline_spans)
+
+    def test_off_setting_round_trips(self) -> None:
+        options = RunOptions(goal="g", inline_spans=False)
+        restored = RunOptions.from_spec(options.to_spec())
+        self.assertFalse(restored.inline_spans)
 
 
 class EscalateRunFunctionTest(unittest.TestCase):
@@ -1076,10 +1149,11 @@ def _driver_with_provider(run_dir: Path, provider: FakeProvider, *, document_rev
 
 
 class PhaseReviewT2DocumentReviewTest(unittest.TestCase):
-    """PLAN.md §A9/§B6: T2 gets the 3-pass cross-leaf consistency check
-    (document_review passes 1-3) unconditionally, as part of what tier T2
-    *is* -- not gated behind ``RunOptions.document_review`` the way T3's
-    extra depth pass still is."""
+    """PLAN.md §A9/§B6: T2 gets the cross-leaf consistency check — one
+    merged per-window call covering coverage/duplication/contract
+    compliance (A5-4) — unconditionally, as part of what tier T2 *is*,
+    not gated behind ``RunOptions.document_review`` the way T3's extra
+    depth pass still is."""
 
     def test_t2_runs_document_review_even_with_the_flag_off(self) -> None:
         import asyncio
@@ -1091,17 +1165,12 @@ class PhaseReviewT2DocumentReviewTest(unittest.TestCase):
                 _write_tier(run_dir, "T2")
                 _populate_two_leaf_tree(run_dir)
 
-                provider = FakeProvider(
-                    [
-                        {"items": [], "verdict": "pass"},  # coverage
-                        {"items": [], "verdict": "pass"},  # duplication
-                        {"items": [], "verdict": "pass"},  # contract_compliance
-                    ]
-                )
+                # A5-4: the three checks are fused — one call per window.
+                provider = FakeProvider([{"items": [], "verdict": "pass"}])
                 driver = _driver_with_provider(run_dir, provider)
                 outcome = await driver._phase_review()
                 self.assertIsNone(outcome)
-                self.assertEqual(len(provider.calls), 3)
+                self.assertEqual(len(provider.calls), 1)
 
         asyncio.run(scenario())
 
@@ -1114,7 +1183,7 @@ class PhaseReviewT2DocumentReviewTest(unittest.TestCase):
                 _ScriptedDriver(run_dir)
                 _write_tier(run_dir, "T2")
                 _populate_two_leaf_tree(run_dir)
-                provider = FakeProvider([{"items": [], "verdict": "pass"} for _ in range(3)])
+                provider = FakeProvider([{"items": [], "verdict": "pass"}])
                 driver = _driver_with_provider(run_dir, provider)
                 await driver._phase_review()
                 record = json.loads(tier_path(run_dir).read_text(encoding="utf-8"))
@@ -1593,6 +1662,116 @@ class PhaseResearchAutoProbePlanTest(unittest.TestCase):
 
         asyncio.run(scenario())
 
+    def test_probe_plan_json_is_consumed_without_a_provider_call(self) -> None:
+        """A5-3: probe_plan.json (written by _phase_plan from the plan
+        call's own probes) is consumed directly — zero plan_probes calls,
+        and the research loop still dispatches the stored probe."""
+
+        import asyncio
+        from kusudaemon.types import EpisodeResult
+
+        async def scenario() -> None:
+            with tempfile.TemporaryDirectory() as root_str:
+                run_dir = Path(root_str) / "run"
+                create_run_dir(run_dir.parent, run_dir.name)
+                self._write_tree(run_dir)
+                (run_dir / "probe_plan.json").write_text(
+                    json.dumps(
+                        {
+                            "probes": [
+                                {
+                                    "node_id": "n0",
+                                    "slug": "ctx",
+                                    "question": "what is n0 about?",
+                                    "kind": "workspace",
+                                }
+                            ]
+                        }
+                    ),
+                    encoding="utf-8",
+                )
+                provider = FakeProvider([])  # any plan_probes call would raise
+
+                class _InMemProbe:
+                    has_file_tools = False
+                    supports_session_resume = False
+
+                    async def run_episode(self, prompt, env, budget, live_trajectory_path=None, **kwargs) -> EpisodeResult:
+                        return EpisodeResult(status="done", actions_log="merged plan finding", duration_ms=1, metadata={})
+
+                driver = RecursiveDriver(
+                    run_dir,
+                    provider=provider,  # type: ignore[arg-type]
+                    options=RunOptions(goal="g", auto_probe_plan=True, research_plan={}),
+                    writer_adapter_factory=lambda node: (_ for _ in ()).throw(
+                        AssertionError("no writer dispatch expected")
+                    ),
+                    research_adapter_factory=lambda node, query: _InMemProbe(),
+                    poll_interval=0.02,
+                )
+                await driver._phase_research()
+
+                self.assertEqual(len(provider.calls), 0)
+                events = EventLog(events_path(run_dir)).read_all()
+                consumed = [e for e in events if e.get("type") == "probe_plan_from_plan_call_consumed"]
+                self.assertEqual(len(consumed), 1)
+                self.assertEqual(consumed[0]["total_probes"], 1)
+                from kusudaemon.v4.run_dir import research_finding_path
+                self.assertTrue(research_finding_path(run_dir, "n0", "ctx").exists())
+
+        asyncio.run(scenario())
+
+    def test_probe_plan_json_with_no_resolvable_ids_falls_back_to_windowed_planner(self) -> None:
+        """A5-3: a stale/all-dropped plan file must not suppress a real
+        probe pass — when every stored suggestion fails validation
+        (unknown node ids), _build_auto_probe_plan falls back to
+        plan_probes (one windowed call)."""
+
+        import asyncio
+
+        async def scenario() -> None:
+            with tempfile.TemporaryDirectory() as root_str:
+                run_dir = Path(root_str) / "run"
+                create_run_dir(run_dir.parent, run_dir.name)
+                self._write_tree(run_dir)
+                (run_dir / "probe_plan.json").write_text(
+                    json.dumps(
+                        {"probes": [{"node_id": "ghost", "slug": "x", "question": "q?"}]}
+                    ),
+                    encoding="utf-8",
+                )
+                provider = FakeProvider(
+                    [
+                        {
+                            "probes": [
+                                {
+                                    "node_id": "n1",
+                                    "slug": "ctx",
+                                    "question": "what is n1 about?",
+                                    "kind": "web",
+                                }
+                            ]
+                        }
+                    ]
+                )
+                driver = RecursiveDriver(
+                    run_dir,
+                    provider=provider,  # type: ignore[arg-type]
+                    options=RunOptions(goal="g", auto_probe_plan=True, research_plan={}),
+                    writer_adapter_factory=lambda node: (_ for _ in ()).throw(
+                        AssertionError("no writer dispatch expected")
+                    ),
+                    research_adapter_factory=lambda node, query: (_ for _ in ()).throw(
+                        AssertionError("no research dispatch expected — only plan building under test")
+                    ),
+                    poll_interval=0.02,
+                )
+                plan = driver._build_auto_probe_plan()
+                self.assertEqual(len(provider.calls), 1)  # the windowed fallback
+                self.assertIn("n1", plan)
+
+        asyncio.run(scenario())
+
     def test_operator_supplied_research_plan_wins_over_auto_plan(self) -> None:
         import asyncio
         from kusudaemon.types import EpisodeResult
@@ -1828,16 +2007,12 @@ class PhaseReviewT2DocumentReviewCacheTest(unittest.TestCase):
                 _populate_two_leaf_tree(run_dir)
 
                 first_provider = FakeProvider(
-                    [
-                        {"items": [], "verdict": "pass"},  # coverage
-                        {"items": [], "verdict": "pass"},  # duplication
-                        {"items": [], "verdict": "pass"},  # contract_compliance
-                    ]
+                    [{"items": [], "verdict": "pass"}]  # the one merged windowed call
                 )
                 driver = _driver_with_provider(run_dir, first_provider)
                 outcome = await driver._phase_review()
                 self.assertIsNone(outcome)
-                self.assertEqual(len(first_provider.calls), 3)
+                self.assertEqual(len(first_provider.calls), 1)
 
                 cache_path = run_dir / "audit" / "document_review.json"
                 self.assertTrue(cache_path.exists())
@@ -1871,10 +2046,10 @@ class PhaseReviewT2DocumentReviewCacheTest(unittest.TestCase):
                 _write_tier(run_dir, "T2")
                 _populate_two_leaf_tree(run_dir)
 
-                first_provider = FakeProvider([{"items": [], "verdict": "pass"} for _ in range(3)])
+                first_provider = FakeProvider([{"items": [], "verdict": "pass"}])
                 driver = _driver_with_provider(run_dir, first_provider)
                 await driver._phase_review()
-                self.assertEqual(len(first_provider.calls), 3)
+                self.assertEqual(len(first_provider.calls), 1)
 
                 # Simulate a repair: a new manifest line for "alpha" with a
                 # different promotion changes what build_document_index
@@ -1888,11 +2063,11 @@ class PhaseReviewT2DocumentReviewCacheTest(unittest.TestCase):
                     promotion="The alpha section now covers new ground.",
                 )
 
-                second_provider = FakeProvider([{"items": [], "verdict": "pass"} for _ in range(3)])
+                second_provider = FakeProvider([{"items": [], "verdict": "pass"}])
                 driver2 = _driver_with_provider(run_dir, second_provider)
                 await driver2._phase_review()
                 self.assertEqual(
-                    len(second_provider.calls), 3, "a changed promotion must re-run the pass"
+                    len(second_provider.calls), 1, "a changed promotion must re-run the pass"
                 )
 
         asyncio.run(scenario())

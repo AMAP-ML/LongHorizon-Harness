@@ -79,7 +79,7 @@ class SurveyChunksTest(unittest.TestCase):
             def __init__(self) -> None:
                 self.on_reasoning_seen: list[object] = []
 
-            def complete_json(self, messages, schema, *, temperature=0.0, retries=2, on_reasoning=None):
+            def complete_json(self, messages, schema, *, temperature=0.0, retries=2, on_reasoning=None, streaming=False):
                 self.on_reasoning_seen.append(on_reasoning)
                 return {"boundaries": []}
 

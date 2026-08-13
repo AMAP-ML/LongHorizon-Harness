@@ -51,6 +51,7 @@ from kusudaemon.v4.probe_planner import (  # noqa: E402
     candidate_nodes,
     needs_probe,
     plan_probes,
+    research_plan_from_suggestions,
 )
 from kusudaemon.v4.research import Probe, ResearchQuery  # noqa: E402
 
@@ -61,6 +62,8 @@ def _node(
     *,
     shape: str = "prose-dominant",
     gates: tuple[str, ...] = ("nonempty",),
+    status: str = "pending",
+    parent: str = "",
 ) -> TaskNode:
     return TaskNode(
         id=node_id,
@@ -68,6 +71,8 @@ def _node(
         artifact=f"out/{node_id}.md",
         gates=list(gates),
         shape=shape,
+        status=status,
+        parent=parent,
     )
 
 
@@ -381,6 +386,56 @@ class PlanProbesSchemaValidationTest(unittest.TestCase):
         # required fields after stripping.
         self.assertEqual(len(plan["n1"]), 1)
         self.assertEqual(plan["n1"][0].question, "valid question?")
+
+
+class ResearchPlanFromSuggestionsTest(unittest.TestCase):
+    """A5-3: the plan call's own probe suggestions are folded into the
+    research phase without a separate windowed call — this is the
+    validation boundary: unknown ids, split parents, and nodes with
+    children are dropped, and per-node dedup matches plan_probes'."""
+
+    def test_suggestions_become_a_research_plan(self) -> None:
+        tree = TaskTree(
+            nodes={
+                "n1": _node(
+                    "n1",
+                    "problem set one with at least twelve words in the brief here now",
+                    shape="problem-set-dominant",
+                )
+            }
+        )
+        suggestions = [
+            ProbeSuggestion(node_id="n1", slug="ctx", question="what is it?", kind="web"),
+            ProbeSuggestion(node_id="n1", slug="ctx", question="what is it?", kind="web"),
+            ProbeSuggestion(node_id="n1", slug="local", question="where is the code?", kind="workspace"),
+        ]
+        plan = research_plan_from_suggestions(suggestions, tree)
+        self.assertEqual(len(plan["n1"]), 2)  # dedup collapses the twin
+        self.assertEqual([q.kind for q in plan["n1"]], ["web", "workspace"])
+
+    def test_unknown_ids_are_dropped(self) -> None:
+        tree = TaskTree(nodes={})
+        plan = research_plan_from_suggestions(
+            [ProbeSuggestion(node_id="ghost", slug="x", question="q?")], tree
+        )
+        self.assertEqual(plan, {})
+
+    def test_split_parents_and_nodes_with_children_are_dropped(self) -> None:
+        tree = TaskTree(
+            nodes={
+                "parent": _node("parent", "a brief that qualifies as candidate material here", status="split"),
+                "parent.child": _node("parent.child", "a brief for a leaf here with enough words", parent="parent"),
+            }
+        )
+        plan = research_plan_from_suggestions(
+            [
+                ProbeSuggestion(node_id="parent", slug="p", question="q?"),
+                ProbeSuggestion(node_id="parent.child", slug="c", question="q?"),
+            ],
+            tree,
+        )
+        # The split parent is terminal-for-writers; only the leaf survives.
+        self.assertEqual(list(plan.keys()), ["parent.child"])
 
 
 if __name__ == "__main__":

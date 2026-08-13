@@ -25,7 +25,7 @@ from .backends import parse_research_plan
 from .driver import RunOptions, RecursiveDriver
 from .run_dir import resolve_runs_root, run_spec_path, events_path, halt_path
 
-_RUNS_ROOT_DEFAULT = "./.kusudaemon/runs"
+_RUNS_ROOT_DEFAULT = "~/.kusudaemon/runs"
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -37,9 +37,8 @@ def build_parser() -> argparse.ArgumentParser:
         "--runs-root",
         default=None,
         help=f"Base directory holding one isolated subfolder per run. "
-        f"Defaults to {_RUNS_ROOT_DEFAULT}, or <workspace>/.kusudaemon/runs "
-        "when --workspace is given (PLAN.md §A3 point 1: the run dir stays "
-        "inside the project it was launched from).",
+        f"Defaults to {_RUNS_ROOT_DEFAULT} (a run is harness-owned state, "
+        "never stored inside the workspace it edits).",
     )
     parser.add_argument("--run-id", default=None, help="Run id; defaults to a timestamp + uuid. Reusing one resumes it.")
     parser.add_argument("--goal", default="", help="Task goal (or @path).")
@@ -107,6 +106,15 @@ def build_parser() -> argparse.ArgumentParser:
         "9): the classifier still runs; the effective tier is "
         "max(measured, this).",
     )
+    parser.add_argument(
+        "--no-intake",
+        action="store_true",
+        help="Skip intake entirely (no clarifying questions, no objection "
+        "surfacing; spec.md gets the minimal rendering). With this set, the "
+        "classify phase also skips its estimate call when the free size "
+        "signals already force >= T2 (IMPLEMENTATION-PLAN-COST-AND-LIVE.md "
+        "A5-1).",
+    )
     return parser
 
 
@@ -172,14 +180,11 @@ def run_from_args(argv: list[str] | None = None, *, env: Environment | None = No
     load_env_file()
     args = build_parser().parse_args(argv)
     run_id = args.run_id or f"{time.strftime('%Y%m%dT%H%M%SZ', time.gmtime())}_{uuid.uuid4().hex[:8]}"
-    # PLAN.md §A3 point 1: --workspace's own default for --runs-root, so a
-    # workspace-mode run's bookkeeping lands inside the project it was
-    # launched from (types.py's existing repo-local rule) without the
-    # caller having to spell out --runs-root every time. An explicit
-    # --runs-root still wins either way.
-    runs_root_arg = args.runs_root or (
-        f"{args.workspace.rstrip('/')}/.kusudaemon/runs" if args.workspace else _RUNS_ROOT_DEFAULT
-    )
+    # Runs live under ~/.kusudaemon/runs by default — for --workspace mode
+    # too (the run dir is harness-owned bookkeeping, and keeping it out of
+    # the repo means a workspace scan never sees it and a repo can't grow a
+    # hidden state folder). An explicit --runs-root still wins.
+    runs_root_arg = args.runs_root or _RUNS_ROOT_DEFAULT
     # §D0b: resolve once, here, against the *root* — resolving only the
     # run_dir/spec join (as the driver's own .resolve() does) still leaves
     # a relative runs_root anchored to whatever cwd this process happened
@@ -228,6 +233,7 @@ def run_from_args(argv: list[str] | None = None, *, env: Environment | None = No
             survey_mode=args.survey_mode,
             inline_spans=args.inline_spans,
             tier_override=args.tier,
+            no_intake=args.no_intake,
         )
 
     driver = RecursiveDriver(

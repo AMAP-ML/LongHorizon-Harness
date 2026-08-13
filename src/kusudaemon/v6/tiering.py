@@ -183,7 +183,11 @@ def estimate_scope(
     on_reasoning: Callable[[str], None] | None = None,
 ) -> ScopeEstimate:
     """PLAN.md §A4.2: exactly one ``complete_json`` call. Advisory only —
-    ``classify`` below is what actually decides the tier."""
+    ``classify`` below is what actually decides the tier. This is the
+    legacy narrow call (used by tests and callers that want the estimate
+    alone); the pipeline's classify phase uses ``estimate_scope_full``
+    (A5-2), which folds intake round-1 question generation into this same
+    call."""
     messages = [
         {"role": "system", "content": _ESTIMATE_SYSTEM_PROMPT},
         {
@@ -199,6 +203,138 @@ def estimate_scope(
         ambiguities=tuple(str(item) for item in (payload.get("ambiguities") or [])),
         objections=tuple(str(item) for item in (payload.get("objections") or [])),
     )
+
+
+# A5-2 (IMPLEMENTATION-PLAN-COST-AND-LIVE.md): the merged classify call.
+# ``ESTIMATE_SCHEMA``'s free-text ``ambiguities`` disappears — the model
+# decides in one pass which ambiguities need the operator (those become
+# ``questions`` with default assumptions, intake's consumable form) and
+# which are genuine conflicts (those become structured ``objections``),
+# exactly the split ``build_question_set`` used to perform in a second
+# round trip over nearly identical context. Round 2 of intake still calls
+# ``build_question_set`` separately (it needs the transcript), so nothing
+# is lost — one call and one goal+digest context saved on every T1+ run.
+FULL_SCOPE_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "required": [
+        "files_touched",
+        "artifacts",
+        "answerable_without_exploration",
+        "questions",
+        "objections",
+    ],
+    "additionalProperties": False,
+    "properties": {
+        "files_touched": {"type": "string", "enum": list(FILES_TOUCHED_VALUES)},
+        "artifacts": {"type": "integer", "minimum": 1, "maximum": 50},
+        "answerable_without_exploration": {"type": "boolean"},
+        "questions": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "required": ["id", "text", "default_assumption"],
+                "additionalProperties": False,
+                "properties": {
+                    "id": {"type": "string", "minLength": 1, "maxLength": 40},
+                    "text": {"type": "string", "minLength": 1, "maxLength": 200},
+                    "default_assumption": {"type": "string", "maxLength": 300},
+                },
+            },
+            "maxItems": 4,
+        },
+        "objections": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "required": ["claim", "why", "options"],
+                "additionalProperties": False,
+                "properties": {
+                    "claim": {"type": "string", "minLength": 1, "maxLength": 200},
+                    "why": {"type": "string", "maxLength": 300},
+                    "options": {
+                        "type": "array",
+                        "items": {"type": "string", "maxLength": 150},
+                        "maxItems": 4,
+                    },
+                },
+            },
+            "maxItems": 8,
+        },
+    },
+}
+
+_FULL_SCOPE_SYSTEM_PROMPT = (
+    _ESTIMATE_SYSTEM_PROMPT
+    + " Additionally, decide which of the goal's genuine ambiguities need "
+    "the operator's input: for each, emit a short clarifying question with "
+    "a default_assumption (what to assume if nobody answers — a real "
+    "fallback decision, not a restatement of the question). Omit any "
+    "ambiguity that does not actually need the operator — an empty "
+    "questions list is a valid, good answer. Separately restate every "
+    "genuine objection as a concrete conflict: claim (what's contradictory "
+    "or missing), why (the actual tension), and up to 4 options for how "
+    "the operator could resolve it (options may be empty for a pure "
+    "objection with no natural menu of fixes). Respond with a single JSON "
+    "object only."
+)
+
+
+def estimate_scope_full(
+    goal: str,
+    work: WorkObject,
+    provider: OpenAICompatibleProvider,
+    *,
+    on_reasoning: Callable[[str], None] | None = None,
+    streaming: bool = False,
+) -> tuple[ScopeEstimate, "QuestionSet"]:
+    """A5-2: the merged classify + intake-round-1 call — one
+    ``complete_json`` where the legacy ``estimate_scope`` plus a
+    ``build_question_set`` round-trip used to be two. Returns the
+    ``ScopeEstimate`` (``ambiguities``/``objections`` populated from the
+    structured output so ``classify``'s T0 check keeps working) and the
+    round-1 ``QuestionSet`` the driver stores in ``tier.json`` so a resume
+    can re-ask the exact same questions without re-calling the model.
+
+    Imported lazily: ``QuestionSet`` lives in v2/intake.py, and this
+    module is imported by the CLI's tier command too — the type is only
+    needed where the merged call is actually used.
+    """
+    from ..v2.intake import IntakeObjection, IntakeQuestion, QuestionSet
+
+    messages = [
+        {"role": "system", "content": _FULL_SCOPE_SYSTEM_PROMPT},
+        {
+            "role": "user",
+            "content": f"Goal: {goal}\n\nWork object digest:\n{_work_digest(work)}",
+        },
+    ]
+    payload = provider.complete_json(
+        messages, FULL_SCOPE_SCHEMA, on_reasoning=on_reasoning, streaming=streaming
+    )
+    questions = tuple(
+        IntakeQuestion(
+            id=str(item.get("id") or f"q{index + 1}"),
+            text=str(item.get("text", "")),
+            default_assumption=str(item.get("default_assumption", "")),
+        )
+        for index, item in enumerate(payload.get("questions") or [])
+    )
+    objections = tuple(
+        IntakeObjection(
+            claim=str(item.get("claim", "")),
+            why=str(item.get("why", "")),
+            options=tuple(str(option) for option in (item.get("options") or [])),
+        )
+        for item in payload.get("objections") or []
+    )
+    estimate = ScopeEstimate(
+        files_touched=str(payload.get("files_touched", "unknown")),
+        artifacts=int(payload.get("artifacts", 1)),
+        answerable_without_exploration=bool(payload.get("answerable_without_exploration", False)),
+        ambiguities=tuple(question.text for question in questions),
+        objections=tuple(objection.claim for objection in objections),
+    )
+    return estimate, QuestionSet(questions=questions, objections=objections)
 
 
 def _classify_raw(signals: Signals, estimate: ScopeEstimate) -> Tier:

@@ -35,10 +35,11 @@ directory itself: the writer sees ``source.txt``, ``contract.md``, ``out/``,
 ``scratch/``, and its own artifacts — the entire corpus a leaf needs — with
 every other run directory path already out of its sight by construction. In
 workspace mode (``kind="workspace"``, PLAN.md §A3/§B1) the workspace is the
-real repo (``work.root``) instead, and the run directory — wherever it
-happens to be nested, by default ``<root>/.kusudaemon/runs`` — is hidden as
-one subtree rather than by individual filename (see
-``_hidden_paths_and_exceptions_for``).
+real repo (``work.root``) instead, and the run directory — by default
+    ``~/.kusudaemon/runs``, outside the repo entirely, and only nested when
+    a caller explicitly points ``--runs-root`` inside it — is hidden as
+    one subtree rather than by individual filename (see
+    ``_hidden_paths_and_exceptions_for``).
 """
 
 from __future__ import annotations
@@ -126,8 +127,9 @@ def _hidden_paths_and_exceptions_for(
     workspace mode sees no behavior change.
 
     In workspace mode ``workspace_path`` is ``work.root``, a real repo the
-    run dir merely happens to be nested inside (the default
-    ``--workspace`` ``runs_root``, ``<root>/.kusudaemon/runs``). The
+    run dir may happen to be nested inside when a caller points
+    ``--runs-root`` there (the default ``~/.kusudaemon/runs`` is outside
+    the repo). The
     corpus-mode per-file names would resolve to nonexistent paths relative
     to that cwd ("out/" isn't a directory in the repo root); worse, doing
     nothing would leave the ENTIRE run directory readable from the
@@ -160,6 +162,20 @@ def _hidden_paths_and_exceptions_for(
         (run_dir_rel / "scratch" / node.id).as_posix(),
     )
     return hidden, exceptions
+
+
+def hidden_paths_for_node(
+    node: TaskNode, run_dir: str | Path, workspace_root: str | Path
+) -> tuple[tuple[str, ...], tuple[str, ...]]:
+    """The (hidden, exceptions) pair a Writer's prompt and its adapter must
+    agree on (PLAN-AUDIT-COST §A6-1): ``build_writer_adapter`` passes them
+    to the adapter as ``hidden_paths``/``hidden_path_exceptions``, and the
+    driver passes the same pair to ``build_node_prompt`` so the notice can
+    be rendered in the stable region instead of appended by
+    ``cli_agent.run_episode``. ``workspace_root`` is the Writer's cwd
+    (``work.root`` for ``kind="workspace"``, else ``run_dir`` itself) —
+    exactly the two arguments ``build_writer_adapter`` receives."""
+    return _hidden_paths_and_exceptions_for(node, Path(run_dir), Path(workspace_root))
 
 
 def build_writer_adapter(

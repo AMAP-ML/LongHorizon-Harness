@@ -185,6 +185,7 @@ def build_question_set(
     *,
     prior_qa: Sequence[str] = (),
     on_reasoning: Callable[[str], None] | None = None,
+    streaming: bool = False,
 ) -> QuestionSet:
     """PLAN.md §A5.2: exactly one `complete_json` call. `prior_qa` is only
     non-empty on a round-2 call — lines like `"Q: ... A: ..."` from round 1,
@@ -205,7 +206,9 @@ def build_question_set(
         {"role": "system", "content": _QUESTION_SET_SYSTEM_PROMPT},
         {"role": "user", "content": "\n\n".join(sections)},
     ]
-    payload = provider.complete_json(messages, QUESTION_SET_SCHEMA, on_reasoning=on_reasoning)
+    payload = provider.complete_json(
+        messages, QUESTION_SET_SCHEMA, on_reasoning=on_reasoning, streaming=streaming
+    )
     questions = tuple(
         IntakeQuestion(
             id=str(item.get("id") or f"q{index + 1}"),
@@ -260,6 +263,8 @@ def run_intake(
     provider: OpenAICompatibleProvider,
     ask_fn: AskFn,
     on_reasoning: Callable[[str], None] | None = None,
+    initial_question_set: QuestionSet | None = None,
+    streaming: bool = False,
 ) -> GlobalRubric:
     """PLAN.md §A5/§B3: bounded, adaptive intake, and freezes the result
     into `spec.md` (§5: "frozen: goal, global rubric, approved
@@ -275,6 +280,15 @@ def run_intake(
     one non-blank answer *and* a fresh `build_question_set` call still
     returns questions — "a silent operator ends intake immediately rather
     than being asked again."
+
+    `initial_question_set` (A5-2, IMPLEMENTATION-PLAN-COST-AND-LIVE.md): a
+    round-1 QuestionSet that the classify call already produced (the merged
+    `estimate_scope_full`). When given, round 1 skips `build_question_set`
+    entirely — the questions/objections are already in hand — and only a
+    round 2 calls it (fed round 1's transcript, per the docstring on
+    `build_question_set`). The `ambiguities`/`objections` params are then
+    unused; they remain for the legacy call path (round 1 builds its own
+    question set from them).
 
     **Objections have no separate acknowledge/dismiss action in this
     implementation.** §A5 leaves that choice open ("if you want an operator
@@ -303,9 +317,14 @@ def run_intake(
 
     while keep_going and round_index < MAX_INTAKE_ROUNDS:
         round_index += 1
-        question_set = build_question_set(
-            goal, pending_ambiguities, pending_objections, provider, prior_qa=prior_qa, on_reasoning=on_reasoning
-        )
+        if round_index == 1 and initial_question_set is not None:
+            # A5-2: classify already produced this round's question set in
+            # the merged estimate call — no model call here.
+            question_set = initial_question_set
+        else:
+            question_set = build_question_set(
+                goal, pending_ambiguities, pending_objections, provider, prior_qa=prior_qa, on_reasoning=on_reasoning
+            )
         if round_index == 1:
             unresolved_objections = [_objection_line(o) for o in question_set.objections]
         if not question_set.questions:

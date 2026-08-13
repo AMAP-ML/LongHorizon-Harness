@@ -222,7 +222,7 @@ class EvalSuiteShipGateTest(unittest.TestCase):
         report = run_eval_suite_sync(runs=1)
         by_tier = report.calls_by_tier
 
-        for tier, expected in (("T0", 1), ("T1", 1), ("T2", 5), ("T3", 2)):
+        for tier, expected in (("T0", 1), ("T1", 1), ("T2", 3), ("T3", 2)):
             self.assertIn(tier, by_tier, f"tier {tier} should have run")
             self.assertEqual(
                 by_tier[tier]["mean_calls"], float(expected), f"{tier} first-run+resume call cost"
@@ -234,7 +234,7 @@ class EvalSuiteShipGateTest(unittest.TestCase):
         for m in report.measurements:
             self.assertEqual(m.tier_measured, m.tier_final)
             self.assertEqual(m.tier_final, m.tier_override or m.tier_final)
-        for tier, first_run, resume in (("T0", 1, 0), ("T1", 1, 0), ("T2", 5, 0), ("T3", 2, 0)):
+        for tier, first_run, resume in (("T0", 1, 0), ("T1", 1, 0), ("T2", 3, 0), ("T3", 2, 0)):
             runs = [m for m in report.measurements if m.tier_measured == tier]
             for m in runs:
                 self.assertEqual(m.first_run_calls, first_run, m.task_id)

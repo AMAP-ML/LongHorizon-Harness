@@ -12,19 +12,21 @@ not asserted here — ``runner.py`` measures them):
 - T0: 1  (ESTIMATE only; the direct node's review is free — no judgment
          items, ``v1/reviewer.py`` auto-passes)
 - T1: 1  (ESTIMATE only; the one node is built by code, never a plan call)
-- T2: 5  (ESTIMATE + PARTITION + 3 windowed document-review passes —
-         ``v3/document_review.py``'s ``PASSES=3`` over 1 window, with
-         ``keep_depth_pass=False`` per ``driver.py:_phase_review``)
+- T2: 3  (ESTIMATE + PARTITION + 1 merged windowed document-review call —
+         A5-4 fused coverage/duplication/contract into one call per
+         window, with ``keep_depth_pass=False`` per ``driver.py:_phase_
+         review``)
 - T3: 2  (ESTIMATE + PARTITION; pilot auto-approves with a blank edit →
          zero contract-derivation calls; T3's review phase spends
          nothing; ``needs_explore=False`` and short plan briefs keep
          probe/research dispatch at zero)
 
 Resume (a second driver against the same run dir) re-runs the
-tier-scoped phases only: ``review@T2`` re-runs document review → 3 calls;
-T0/T1/T3 resume with zero provider calls (classify/plan/pilot all
-short-circuit on their durable artifacts; execute re-runs the round loop
-over an already-passed tree, which dispatches nothing).
+tier-scoped phases only: ``review@T2`` re-runs document review → 1 call
+(consumed only when the §E17 input-digest cache misses); T0/T1/T3 resume
+with zero provider calls (classify/plan/pilot all short-circuit on their
+durable artifacts; execute re-runs the round loop over an already-passed
+tree, which dispatches nothing).
 
 Every plan brief is deliberately <=7 words with ``prose-dominant`` shape,
 so ``v4/probe_planner.py``'s ``needs_probe`` filter (>=8 words, or a
@@ -39,12 +41,13 @@ from typing import Callable, Optional
 
 from ..v2.survey import SpineUnit
 
-# Canned ESTIMATE response the classifier turns into T0/T1.
+# Canned ESTIMATE response the classifier turns into T0/T1. Structured
+# round-1 question/objection lists (A5-2 merged call, FULL_SCOPE_SCHEMA).
 _T0_ESTIMATE: dict = {
     "files_touched": "1",
     "artifacts": 1,
     "answerable_without_exploration": True,
-    "ambiguities": [],
+    "questions": [],
     "objections": [],
 }
 
@@ -173,7 +176,7 @@ def build_tasks() -> tuple[EvalTask, ...]:
                 "files_touched": "few",
                 "artifacts": 1,
                 "answerable_without_exploration": True,
-                "ambiguities": [],
+                "questions": [],
                 "objections": [],
             },
             corpus=_meeting_notes(),
@@ -187,7 +190,7 @@ def build_tasks() -> tuple[EvalTask, ...]:
                 "files_touched": "few",
                 "artifacts": 3,
                 "answerable_without_exploration": True,
-                "ambiguities": [],
+                "questions": [],
                 "objections": [],
             },
             plan=_corpus_plan(
@@ -212,7 +215,7 @@ def build_tasks() -> tuple[EvalTask, ...]:
                 "files_touched": "few",
                 "artifacts": 2,
                 "answerable_without_exploration": True,
-                "ambiguities": [],
+                "questions": [],
                 "objections": [],
             },
             plan=_corpus_plan(
@@ -242,7 +245,7 @@ def build_tasks() -> tuple[EvalTask, ...]:
                 "files_touched": "many",
                 "artifacts": 12,
                 "answerable_without_exploration": True,
-                "ambiguities": [],
+                "questions": [],
                 "objections": [],
             },
             plan=_workspace_plan(lambda i: f"Document the refactored layout of area {i}."),

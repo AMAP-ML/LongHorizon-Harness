@@ -166,7 +166,11 @@ def _derive_contract_rules(
         {
             "role": "user",
             "content": (
-                f"Original artifact (excerpt):\n{original[:2000]}\n\nDiff:\n{diff_text[:4000]}"
+                # A7-2 (IMPLEMENTATION-PLAN-COST-AND-LIVE.md): the original
+                # excerpt is mostly redundant with the diff's context lines —
+                # a 500-char head is enough to anchor the file the diff is
+                # against.
+                f"Original artifact (excerpt):\n{original[:500]}\n\nDiff:\n{diff_text[:4000]}"
             ),
         },
     ]

@@ -46,7 +46,7 @@ def main(argv: list[str] | None = None) -> int:
             parser.print_help()
             return 2
         args.pipeline_command = "serve"
-        args.runs_root = "./.kusudaemon/runs"
+        args.runs_root = "~/.kusudaemon/runs"
         args.host = "127.0.0.1"
         args.port = 8765
         args.run_id = None

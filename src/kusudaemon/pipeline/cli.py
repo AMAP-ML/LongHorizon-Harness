@@ -38,7 +38,7 @@ from .run_dir import (
     tree_path,
 )
 
-_RUNS_ROOT_DEFAULT = "./.kusudaemon/runs"
+_RUNS_ROOT_DEFAULT = "~/.kusudaemon/runs"
 
 
 def build_pipeline_parser() -> argparse.ArgumentParser:
@@ -52,8 +52,7 @@ def build_pipeline_parser() -> argparse.ArgumentParser:
     run_parser.add_argument(
         "--runs-root",
         default=None,
-        help=f"Defaults to {_RUNS_ROOT_DEFAULT}, or <workspace>/.kusudaemon/runs "
-        "when --workspace is given.",
+        help=f"Defaults to {_RUNS_ROOT_DEFAULT} (harness-owned state, never inside the workspace).",
     )
     run_parser.add_argument("--run-id", default=None, help="Reuse an id to resume an existing run dir.")
     run_parser.add_argument("--goal", default="", help="Task goal (or @path).")
@@ -112,6 +111,12 @@ def build_pipeline_parser() -> argparse.ArgumentParser:
         help="Force a tier floor, never a ceiling (PLAN.md §A4.4 invariant "
         "9): the classifier still runs; the effective tier is "
         "max(measured, this).",
+    )
+    run_parser.add_argument(
+        "--no-intake",
+        action="store_true",
+        help="Skip intake entirely; with it set, classify also skips its "
+        "estimate call when signals already force >= T2 (A5-1).",
     )
     run_parser.add_argument("--detach", action="store_true", help="Run in a background subprocess and return immediately.")
 
@@ -242,12 +247,11 @@ def _expand_source_arg(raw: str) -> str:
 def cmd_run_detach(argv: argparse.Namespace) -> int:
     run_id = argv.run_id or _default_run_id()
     workspace = getattr(argv, "workspace", None)
-    # Same default --workspace -> runs_root rule as run.py's own
-    # run_from_args (kept in sync here because --detach resolves the run
-    # dir itself, below, before run.py ever parses its own argv).
-    runs_root_arg = argv.runs_root or (
-        f"{workspace.rstrip('/')}/.kusudaemon/runs" if workspace else _RUNS_ROOT_DEFAULT
-    )
+    # Runs live under ~/.kusudaemon/runs regardless of --workspace (same
+    # rule as run.py's own run_from_args, kept in sync here because
+    # --detach resolves the run dir itself, below, before run.py ever
+    # parses its own argv).
+    runs_root_arg = argv.runs_root or _RUNS_ROOT_DEFAULT
     # §11.10.8: the corpus must not ride through argv — an inline (non-@file)
     # corpus hits E2BIG well before "corpus-scale". Write it into the run
     # dir once (source.txt is exactly where driver._write_source_and_spec
@@ -283,6 +287,8 @@ def cmd_run_detach(argv: argparse.Namespace) -> int:
         command += ["--survey-mode", argv.survey_mode]
     if argv.inline_spans:
         command += ["--inline-spans"]
+    if getattr(argv, "no_intake", False):
+        command += ["--no-intake"]
     for flag, value in (
         ("--model", argv.model),
         ("--compile-command", argv.compile_command),

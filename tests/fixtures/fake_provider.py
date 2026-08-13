@@ -30,6 +30,7 @@ class FakeProvider:
         temperature: float = 0.0,
         retries: int = 2,
         on_reasoning: Callable[[str], None] | None = None,
+        streaming: bool = False,
     ) -> dict[str, Any]:
         self.calls.append((messages, schema))
         if not self._responses:

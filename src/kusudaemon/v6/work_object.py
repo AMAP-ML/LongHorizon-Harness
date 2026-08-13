@@ -57,9 +57,10 @@ _SNIFF_BYTES = 8192
 
 # Directories that are never workspace content, regardless of .gitignore --
 # VCS internals, dependency trees, and build output. ".kusudaemon" is here
-# too: the default --workspace runs_root nests the run directory (and hence
-# every OTHER node's artifacts) inside the repo itself (PLAN.md §A3 point
-# 1), and it must never be walked as if it were task content.
+# too: runs now default to ~/.kusudaemon/runs (outside the repo), but a
+# caller can still point --runs-root inside a workspace, and the run
+# directory (hence every OTHER node's artifacts) must never be walked as
+# if it were task content.
 _BUILTIN_DENY_DIRS = frozenset(
     {
         ".git", ".hg", ".svn", ".kusudaemon",

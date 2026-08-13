@@ -84,6 +84,14 @@ class NodeTemplate:
     warn_gates: tuple[str, ...] = ()
     judgment: tuple[str, ...] = ()
     rubric: dict[str, str] = field(default_factory=dict)
+    # The episode's tool allowlist for a node of this shape (PLAN-AUDIT-COST
+    # §A6-3). Empty means "no opinion" — the adapter keeps its
+    # ``DEFAULT_TOOL_ALLOWLIST`` fallback (T0/T1 direct nodes and
+    # generic-shape leaves never carry a template opinion). gptme's system
+    # prompt rebuilds per episode and its tool-doc blocks are the largest
+    # stable prefix component, so a narrower allowlist is a real per-episode
+    # token saving: a prose leaf needs ``read``/``save``, not ``shell``.
+    tools: tuple[str, ...] = ()
     # Optional ``glossary.json`` content supplied as the contract-substituted
     # judgment text for templates whose rubric *is* a glossary up-front
     # (used by ``terms_defined``). The harness writes this to the run dir
@@ -110,12 +118,14 @@ _GENERIC = NodeTemplate(name="generic")
 # text is contract-substitutable: when the driver freezes a contract whose
 # own §4.4-derived rules say "use SI units," that rule becomes part of the
 # judgment text rather than being elided — the template just names the
-# slot for it.
+# slot for it. §A6-3: keeps ``shell`` (computing/checking answers is the
+# point of a problem set) but drops ``patch``.
 _PROBLEM_SET = NodeTemplate(
     name="problem-set",
     shapes=("problem-set-dominant",),
     warn_gates=("headers:std", "problems>=5"),
     judgment=("worked_examples_reachable",),
+    tools=("read", "save", "shell"),
     rubric={
         "worked_examples_reachable": (
             "Each worked example reaches its stated answer following a "
@@ -128,12 +138,15 @@ _PROBLEM_SET = NodeTemplate(
 # A derivation-dominant leaf: the math notation has to be syntactically
 # balanced before any reviewer can fairly judge whether the algebra is
 # right — ``latex_balanced`` is the structural precondition for an
-# operator-style judgment about derivation correctness.
+# operator-style judgment about derivation correctness. §A6-3: keeps
+# ``shell`` (a derivation writer plausibly wants to verify a step
+# computationally) but drops ``patch``.
 _DERIVATION = NodeTemplate(
     name="derivation",
     shapes=("derivation-dominant",),
     warn_gates=("headers:std", "latex_balanced"),
     judgment=("derivation_self_consistent",),
+    tools=("read", "save", "shell"),
     rubric={
         "derivation_self_consistent": (
             "Each step follows from the one before it; a derivation that "
@@ -145,12 +158,14 @@ _DERIVATION = NodeTemplate(
 
 # A reference-dominant leaf — a glossary/appendix. ``terms_defined``
 # checks every bold or bracket-quoted candidate term against the on-disk
-# glossary.json the driver writes once the leaf is published.
+# glossary.json the driver writes once the leaf is published. §A6-3: like
+# prose, writing-only — ``read``/``save``, no ``shell``/``patch``.
 _REFERENCE = NodeTemplate(
     name="reference",
     shapes=("reference-dominant",),
     warn_gates=("headers:std", "terms_defined", "refs_resolve"),
     judgment=("every_term_defined_once",),
+    tools=("read", "save"),
     rubric={
         "every_term_defined_once": (
             "Every term in this reference is defined exactly once, on its "
@@ -167,10 +182,16 @@ _REFERENCE = NodeTemplate(
 # semantic bar for prose. Writing too many judgment items here is the
 # monotonic-inflation failure §4.4 forbade for the contract, repeated at
 # the leaf layer.
+#
+# §A6-3: ``tools=("read", "save")`` — a prose leaf writes one artifact from
+# its inputs; it never executes anything, so gptme's ``shell`` (the largest
+# tool-doc block) and ``patch`` (unneeded when ``save`` can rewrite the
+# artifact wholesale) leave the episode prompt.
 _PROSE = NodeTemplate(
     name="prose",
     shapes=("prose-dominant",),
     warn_gates=("headers:std",),
+    tools=("read", "save"),
 )
 
 _BUILTIN_TEMPLATES: tuple[NodeTemplate, ...] = (
@@ -238,6 +259,12 @@ def apply_template_to_node(
       (see ``merge_template_into_tree``).
     - ``judgment``/``rubric``: union; existing entries win (the operator
       who froze a contract-derived rubric trumps a template default).
+    - ``tools``: set only when the node carries none — an explicitly
+      tooled node (a hand-authored tree, a split child that inherited its
+      parent's set) keeps its own list. §A6-3's per-shape allowlists
+      therefore reach planner-built leaves while T0/T1 direct nodes
+      (no shape, ``generic`` template, empty tools) keep the adapter's
+      ``DEFAULT_TOOL_ALLOWLIST`` fallback.
     - ``glossary``: the node carries it as a free field (no live use yet
       from this function — the driver writes the glossary to run_dir,
       not the node — but the template provides the content so the driver
@@ -284,6 +311,10 @@ def apply_template_to_node(
     merged_rubric = dict(template.rubric)
     merged_rubric.update(node.rubric)
     node.rubric = merged_rubric
+    # tools: the node's own list wins; a tool-less node takes the
+    # template's per-shape allowlist (§A6-3).
+    if not node.tools and template.tools:
+        node.tools = list(template.tools)
 
 
 def merge_template_into_tree(

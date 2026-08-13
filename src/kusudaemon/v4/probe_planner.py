@@ -224,6 +224,33 @@ def _render_window(nodes: list[TaskNode]) -> str:
     return "\n".join(lines)
 
 
+def research_plan_from_suggestions(
+    suggestions: list[ProbeSuggestion], tree: TaskTree
+) -> dict[str, list[ResearchQuery]]:
+    """A5-3 (IMPLEMENTATION-PLAN-COST-AND-LIVE.md): turn probe suggestions
+    that came out of the plan call (v2/planner.py's ``probe_sink``) into a
+    ResearchPlan, with the same validation ``plan_probes`` applies to
+    window responses: ids not present in the tree are dropped, ids naming
+    non-leaf nodes (split parents, ``status == "split"``, or anything with
+    a child edge) are dropped — a probe must target a leaf the research
+    loop will actually serve — and per-node dedup runs through the same
+    ``_merge_into_plan`` the windowed planner uses."""
+    plan: dict[str, list[ResearchQuery]] = {}
+    by_node: dict[str, list[ProbeSuggestion]] = {}
+    for suggestion in suggestions:
+        if suggestion.node_id not in tree.nodes:
+            continue
+        node = tree.nodes[suggestion.node_id]
+        if node.status == "split" or any(
+            other.parent == suggestion.node_id for other in tree.nodes.values()
+        ):
+            continue
+        by_node.setdefault(suggestion.node_id, []).append(suggestion)
+    for node_id, node_suggestions in by_node.items():
+        _merge_into_plan(plan, node_suggestions)
+    return plan
+
+
 def plan_probes(
     tree: TaskTree,
     provider: OpenAICompatibleProvider,
@@ -232,6 +259,7 @@ def plan_probes(
     stride: int = PROBE_PLANNER_STRIDE,
     max_per_window: int = MAX_PROBES_PER_WINDOW,
     on_reasoning: Callable[[str], None] | None = None,
+    streaming: bool = False,
 ) -> dict[str, list[ResearchQuery]]:
     """Build a ``ResearchPlan`` (the shape ``run_research_loop`` expects) by
     windowing the candidate set and making one ``complete_json`` call per
@@ -255,7 +283,9 @@ def plan_probes(
     for start, end in window_indices(len(candidates), window=window, stride=stride):
         window_nodes = candidates[start:end]
         window_ids = {node.id for node in window_nodes}
-        suggestions = _ask_one_window(provider, window_nodes, on_reasoning=on_reasoning)
+        suggestions = _ask_one_window(
+            provider, window_nodes, on_reasoning=on_reasoning, streaming=streaming
+        )
         accepted = _validate_and_cap(suggestions, window_ids, max_per_window)
         _merge_into_plan(plan, accepted)
     return plan
@@ -265,6 +295,7 @@ def _ask_one_window(
     provider: OpenAICompatibleProvider,
     window_nodes: list[TaskNode],
     on_reasoning: Callable[[str], None] | None = None,
+    streaming: bool = False,
 ) -> list[ProbeSuggestion]:
     """One complete_json call over one window. The schema's
     ``additionalProperties: False`` plus the harness-side validation below
@@ -276,7 +307,9 @@ def _ask_one_window(
         {"role": "system", "content": _SYSTEM_PROMPT},
         {"role": "user", "content": _render_window(window_nodes)},
     ]
-    payload = provider.complete_json(messages, PROBE_SUGGESTIONS_SCHEMA)
+    payload = provider.complete_json(
+        messages, PROBE_SUGGESTIONS_SCHEMA, on_reasoning=on_reasoning, streaming=streaming
+    )
     raw_probes = payload.get("probes")
     if not isinstance(raw_probes, list):
         return []

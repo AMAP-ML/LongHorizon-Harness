@@ -87,11 +87,16 @@ class CommandAgentAdapter:
             self.prompt_dir,
             f"{_episode_prompt_label(live_trajectory_path)}_{uuid.uuid4().hex[:12]}.md",
         )
-        await write_remote_text(
-            env,
-            prompt_path,
-            prompt + _hidden_paths_notice(self.hidden_paths, self.hidden_path_exceptions),
-        )
+        # PLAN-AUDIT-COST §A6-1: writer prompts now carry the notice inside
+        # build_node_prompt (in the stable region, before any per-node
+        # content) so it can join the cached prefix. This append remains for
+        # callers that assemble their own prompts (v4 probes, structural
+        # exploration), which never include the marker — a prompt that
+        # already renders it must not receive it twice.
+        notice = _hidden_paths_notice(self.hidden_paths, self.hidden_path_exceptions)
+        if notice and _HIDDEN_PATHS_MARKER not in prompt:
+            prompt = prompt + notice
+        await write_remote_text(env, prompt_path, prompt)
         # Substituted by explicit replace, not str.format: templates embed literal
         # braces (e.g. Codex passes inline-TOML `-c` overrides) that format() would
         # try to interpret as placeholders.
@@ -163,6 +168,39 @@ class CommandAgentAdapter:
         )
 
 
+_HIDDEN_PATHS_MARKER = "Harness-owned paths (off limits):"
+
+
+def _hidden_paths_notice_block(hidden_paths: tuple[str, ...]) -> str:
+    """The constant half of the notice (PLAN-AUDIT-COST §A6-1): the hidden
+    list itself, identical across every node of a run, so it can sit in the
+    stable, prefix-cacheable region of the prompt (``pipeline/prompts.py``).
+    The per-node exception lines are rendered separately by
+    ``_hidden_path_exceptions_block``."""
+    if not hidden_paths:
+        return ""
+    listed = "\n".join(f"- {path}" for path in hidden_paths)
+    return (
+        f"\n\n{_HIDDEN_PATHS_MARKER}\n"
+        f"{listed}\n"
+        "These hold this run's own logs, prompts, and harness state — including "
+        "OTHER nodes' artifacts and scratch notes. Never read, list, search, or "
+        "modify them, and never treat their contents as task input or evidence."
+    )
+
+
+def _hidden_path_exceptions_block(hidden_path_exceptions: tuple[str, ...]) -> str:
+    """The per-node half of the notice (§A6-1): the node's own two paths,
+    carved out of the constant hidden list above (PLAN.md §D2)."""
+    if not hidden_path_exceptions:
+        return ""
+    exceptions = "\n".join(f"- {path}" for path in hidden_path_exceptions)
+    return (
+        "\n\nException — these are yours, and writing to them is the point:\n"
+        f"{exceptions}"
+    )
+
+
 def _hidden_paths_notice(
     hidden_paths: tuple[str, ...], hidden_path_exceptions: tuple[str, ...] = ()
 ) -> str:
@@ -178,23 +216,9 @@ def _hidden_paths_notice(
     touch — so the instruction to write ``out/<id>.md`` and the notice to
     stay out of ``out/`` don't contradict each other (§D0/§D2).
     """
-    if not hidden_paths:
-        return ""
-    listed = "\n".join(f"- {path}" for path in hidden_paths)
-    notice = (
-        "\n\nHarness-owned paths (off limits):\n"
-        f"{listed}\n"
-        "These hold this run's own logs, prompts, and harness state — including "
-        "OTHER nodes' artifacts and scratch notes. Never read, list, search, or "
-        "modify them, and never treat their contents as task input or evidence."
+    return _hidden_paths_notice_block(hidden_paths) + _hidden_path_exceptions_block(
+        hidden_path_exceptions
     )
-    if hidden_path_exceptions:
-        exceptions = "\n".join(f"- {path}" for path in hidden_path_exceptions)
-        notice += (
-            "\n\nException — these are yours, and writing to them is the point:\n"
-            f"{exceptions}"
-        )
-    return notice
 
 
 def _episode_prompt_label(live_trajectory_path: str | None) -> str:

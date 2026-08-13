@@ -50,6 +50,7 @@ from kusudaemon.v6.tiering import (  # noqa: E402
     classify,
     escalate,
     estimate_scope,
+    estimate_scope_full,
     measure_signals,
     phases_for,
     tier_max,
@@ -111,6 +112,95 @@ class MeasureSignalsTest(unittest.TestCase):
         signals = Signals(work_tokens=1, work_files=1, goal_tokens=1)
         with self.assertRaises(Exception):
             signals.work_tokens = 2  # type: ignore[misc]
+
+
+# ----------------------------------------------------------------------
+# estimate_scope_full: the merged classify + intake-round-1 call (A5-2)
+# ----------------------------------------------------------------------
+class EstimateScopeFullTest(unittest.TestCase):
+    """IMPLEMENTATION-PLAN-COST-AND-LIVE.md A5-2: one complete_json call
+    where legacy estimate_scope plus a build_question_set round-trip used
+    to be two. The estimate's ambiguities/objections are populated from the
+    structured questions/objections so classify's T0 check keeps working."""
+
+    def test_one_call_returns_estimate_and_round1_question_set(self) -> None:
+        provider = FakeProvider(
+            [
+                {
+                    "files_touched": "few",
+                    "artifacts": 3,
+                    "answerable_without_exploration": False,
+                    "questions": [
+                        {
+                            "id": "tone",
+                            "text": "What tone should the output use?",
+                            "default_assumption": "neutral, plain",
+                        }
+                    ],
+                    "objections": [
+                        {
+                            "claim": "goal wants both a summary and a full rewrite",
+                            "why": "the two deliverables conflict in length",
+                            "options": ["summary only", "rewrite only", "both"],
+                        }
+                    ],
+                }
+            ]
+        )
+        estimate, question_set = estimate_scope_full("do the thing", work_object_none(), provider)
+        self.assertEqual(len(provider.calls), 1)
+        self.assertEqual(estimate.files_touched, "few")
+        self.assertEqual(estimate.answerable_without_exploration, False)
+        # classify's T0/T1 check reads ambiguities/objections off the
+        # estimate — the merged call keeps them populated from the
+        # structured output.
+        self.assertEqual(estimate.ambiguities, ("What tone should the output use?",))
+        self.assertEqual(estimate.objections, ("goal wants both a summary and a full rewrite",))
+        self.assertEqual(len(question_set.questions), 1)
+        question = question_set.questions[0]
+        self.assertEqual(question.id, "tone")
+        self.assertEqual(question.default_assumption, "neutral, plain")
+        self.assertEqual(len(question_set.objections), 1)
+        self.assertEqual(question_set.objections[0].claim, "goal wants both a summary and a full rewrite")
+        self.assertEqual(question_set.objections[0].options, ("summary only", "rewrite only", "both"))
+
+    def test_empty_question_set_is_valid(self) -> None:
+        provider = FakeProvider(
+            [
+                {
+                    "files_touched": "1",
+                    "artifacts": 1,
+                    "answerable_without_exploration": True,
+                    "questions": [],
+                    "objections": [],
+                }
+            ]
+        )
+        estimate, question_set = estimate_scope_full("tiny fix", work_object_none(), provider)
+        self.assertEqual(len(provider.calls), 1)
+        self.assertEqual(estimate.ambiguities, ())
+        self.assertEqual(estimate.objections, ())
+        self.assertEqual(question_set.questions, ())
+        self.assertEqual(question_set.objections, ())
+
+    def test_digest_never_includes_file_contents(self) -> None:
+        with tempfile.TemporaryDirectory() as root_str:
+            root = Path(root_str)
+            (root / "secret.txt").write_text("THE_SECRET_CONTENT_MUST_NOT_LEAK", encoding="utf-8")
+            work = measure_workspace(root)
+            provider = FakeProvider(
+                [
+                    {
+                        "files_touched": "1", "artifacts": 1,
+                        "answerable_without_exploration": True,
+                        "questions": [], "objections": [],
+                    }
+                ]
+            )
+            estimate_scope_full("edit secret.txt", work, provider)
+            sent = json.dumps(provider.calls[0][0])
+            self.assertNotIn("THE_SECRET_CONTENT_MUST_NOT_LEAK", sent)
+            self.assertIn("secret.txt", sent)  # the path is fine; the content is not
 
 
 # ----------------------------------------------------------------------
@@ -435,7 +525,7 @@ class T0ShipGateCallCountTest(unittest.TestCase):
                         {
                             "files_touched": "1", "artifacts": 1,
                             "answerable_without_exploration": True,
-                            "ambiguities": [], "objections": [],
+                            "questions": [], "objections": [],
                         }
                     ]
                 )
@@ -459,6 +549,86 @@ class T0ShipGateCallCountTest(unittest.TestCase):
                 self.assertLessEqual(len(provider.calls), 3)
 
         asyncio.run(scenario())
+
+
+class ClassifyNoIntakeSkipTest(unittest.TestCase):
+    """IMPLEMENTATION-PLAN-COST-AND-LIVE.md A5-1: with --no-intake and
+    free signals already forcing >= T2 (work_tokens >= 150_000), the
+    classify phase spends zero estimate calls — measured tier falls out of
+    classify() on the empty estimate, which resolves to T2."""
+
+    def _big_work(self) -> WorkObject:
+        return _work(est_tokens=300_000, top_dirs=(("src", 250_000),))
+
+    def _driver(self, run_dir: Path, provider: FakeProvider, **options_kwargs) -> RecursiveDriver:
+        kwargs = dict(
+            goal="Refactor the entire workspace across every module.",
+            work_object=self._big_work(),
+            no_intake=True,
+        )
+        kwargs.update(options_kwargs)
+        return RecursiveDriver(
+            run_dir,
+            provider=provider,  # type: ignore[arg-type]
+            options=RunOptions(**kwargs),
+            writer_adapter_factory=lambda node: (_ for _ in ()).throw(
+                AssertionError("no writer dispatch expected")
+            ),
+            research_adapter_factory=lambda node, query: (_ for _ in ()).throw(
+                AssertionError("no research dispatch expected")
+            ),
+        )
+
+    def test_no_intake_big_signals_skip_the_estimate_call_and_measure_t2(self) -> None:
+        import asyncio
+
+        async def scenario() -> None:
+            with tempfile.TemporaryDirectory() as root_str:
+                run_dir = Path(root_str) / "run"
+                create_run_dir(run_dir.parent, run_dir.name)
+                provider = FakeProvider([])  # zero canned responses
+                driver = self._driver(run_dir, provider)
+                await driver._phase_classify()
+                self.assertEqual(len(provider.calls), 0)
+                record = json.loads(tier_path(run_dir).read_text(encoding="utf-8"))
+                self.assertEqual(record["tier"], "T2")
+                self.assertEqual(record["measured_tier"], "T2")
+                self.assertFalse(record["needs_intake"])
+                # T2 has an explore phase, so needs_explore stays honest.
+                self.assertTrue(record["needs_explore"])
+
+        asyncio.run(scenario())
+
+    def test_no_intake_small_signals_still_measure(self) -> None:
+        import asyncio
+
+        async def scenario() -> None:
+            with tempfile.TemporaryDirectory() as root_str:
+                run_dir = Path(root_str) / "run"
+                create_run_dir(run_dir.parent, run_dir.name)
+                provider = FakeProvider(
+                    [
+                        {
+                            "files_touched": "1", "artifacts": 1,
+                            "answerable_without_exploration": True,
+                            "questions": [], "objections": [],
+                        }
+                    ]
+                )
+                driver = self._driver(run_dir, provider, work_object=_work(est_tokens=10))
+                await driver._phase_classify()
+                self.assertEqual(len(provider.calls), 1)
+                record = json.loads(tier_path(run_dir).read_text(encoding="utf-8"))
+                self.assertIn(record["tier"], ("T0", "T1"))
+                self.assertFalse(record["needs_intake"])
+
+        asyncio.run(scenario())
+
+    def test_no_intake_round_trips_through_spec(self) -> None:
+        options = RunOptions(goal="g", no_intake=True)
+        restored = RunOptions.from_spec(options.to_spec())
+        self.assertTrue(restored.no_intake)
+        self.assertFalse(RunOptions.from_spec(RunOptions(goal="g").to_spec()).no_intake)
 
 
 class TierOverrideFloorTest(unittest.TestCase):

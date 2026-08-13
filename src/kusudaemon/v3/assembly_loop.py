@@ -96,6 +96,7 @@ async def run_assembly_loop(
     max_attempts: int = 3,
     filename: str = "main.md",
     document_review: bool = False,
+    workspace_root: str | Path | None = None,
 ) -> AssemblyRunResult:
     run_dir = Path(run_dir)
     tree = TaskTree.load(tree_path)
@@ -108,7 +109,7 @@ async def run_assembly_loop(
         return _escalate(log, checks, "cross-cutting checks failed before assembly")
 
     try:
-        assembly = assemble(run_dir, tree, filename=filename)
+        assembly = assemble(run_dir, tree, filename=filename, workspace_root=workspace_root)
     except AssemblyNotReadyError as exc:
         return _escalate(log, checks, str(exc))
 
@@ -157,7 +158,7 @@ async def run_assembly_loop(
         # raise — that must escalate like every other not-ready state, not
         # escape the loop as an uncaught AssemblyNotReadyError.
         try:
-            assembly = assemble(run_dir, tree, filename=filename)
+            assembly = assemble(run_dir, tree, filename=filename, workspace_root=workspace_root)
         except AssemblyNotReadyError as exc:
             return _escalate(log, checks, str(exc))
         compile_result = await run_compile(run_dir, env, compile_command)

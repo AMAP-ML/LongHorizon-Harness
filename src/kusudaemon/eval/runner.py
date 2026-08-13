@@ -38,14 +38,16 @@ from ..v6.work_object import WorkObject, measure_workspace, survey_workspace
 from . import measure
 from .tasks import EvalTask, PASS_VERDICT, build_tasks
 
-# A T2 review phase costs exactly three windowed document-review passes
-# (v3/document_review.py's PASSES=3 over a single window, keep_depth_pass
-# = False per driver._phase_review). "review" is a tier-scoped phase, so a
-# T2 resume re-runs it and needs the same three responses again; T0/T1/T3
-# resumes spend zero provider calls (classify/plan/pilot short-circuit on
-# their durable artifacts and the execute round loop replays an
-# already-passed tree without dispatching anything).
-_T2_REVIEW_CALLS = 3
+# A T2 review phase costs exactly one merged windowed document-review
+# call (IMPLEMENTATION-PLAN-COST-AND-LIVE.md A5-4: coverage, duplication,
+# and contract compliance fused into one call per window, with the depth
+# pass disabled per driver._phase_review). "review" is a tier-scoped
+# phase, so a T2 resume re-runs it and needs the same response again
+# (though §E17's input-digest cache normally consumes it on a clean
+# resume); T0/T1/T3 resumes spend zero provider calls (classify/plan/
+# pilot short-circuit on their durable artifacts and the execute round
+# loop replays an already-passed tree without dispatching anything).
+_T2_REVIEW_CALLS = 1
 
 
 class _ScriptedProvider:
@@ -66,6 +68,7 @@ class _ScriptedProvider:
         temperature: float = 0.0,
         retries: int = 2,
         on_reasoning: Callable[[str], None] | None = None,
+        streaming: bool = False,
     ) -> dict[str, Any]:
         self.calls.append((messages, schema))
         if not self._responses:

@@ -55,7 +55,7 @@ from ..v6.tiering import (
     Tier,
     classify,
     escalate,
-    estimate_scope,
+    estimate_scope_full,
     max_explorers_for,
     measure_signals,
     phases_for,
@@ -72,7 +72,14 @@ from ..v1.round_loop import run_round_loop
 from ..v1.run_dir import ensure_audit_dir
 from ..v1.tree import TaskNode, TaskTree
 from ..v2.contract import ContractRule, freeze_contract, render_spec_rubric_to_contract
-from ..v2.intake import GlobalRubric, IntakeObjection, IntakeQuestion, render_spec_md, run_intake
+from ..v2.intake import (
+    GlobalRubric,
+    IntakeObjection,
+    IntakeQuestion,
+    QuestionSet,
+    render_spec_md,
+    run_intake,
+)
 from ..v2.pilot import (
     approve_pilot,
     run_pilot,
@@ -107,7 +114,7 @@ from ..v4.research_loop import run_research_loop
 from ..v4.run_dir import research_finding_path
 from . import approvals as approval_store
 from .backends import parse_research_plan
-from .liveness import record_driver_start
+from .liveness import record_driver_start, record_heartbeat, start_heartbeat_thread
 from .prompts import build_node_prompt
 from .run_dir import halt_path, phase_path, run_spec_path, source_path, tier_path, tree_path
 
@@ -195,13 +202,32 @@ class RunOptions:
     # who know their provider/workspace can tolerate it should raise it.
     max_parallel: int = 1
     document_review: bool = False
-    survey_mode: str = "model"
-    inline_spans: bool = False
+    # A2-1 (IMPLEMENTATION-PLAN-COST-AND-LIVE.md): deterministic
+    # (embedding-based) survey is the default — model-mode surveying issued
+    # ⌈n_chunks/8⌉ calls and was the dominant cost on large corpora.
+    # _phase_survey already logs `survey_fallback` and degrades to the model
+    # path when the retrieval extra isn't installed.
+    survey_mode: str = "embedding"
+    # A6-4 (IMPLEMENTATION-PLAN-COST-AND-LIVE.md): inline spans are on by
+    # default — a writer episode that must *discover* its inputs with `read`
+    # calls pays a full extra round trip per input with the whole
+    # conversation resent each time; inlining the retrieved spans (BM25 +
+    # dense, v2/retrieval.py, degrading gracefully to BM25-only or a plain
+    # path list when the index is missing) lets most episodes write in one
+    # turn. Bigger single prompt, strictly fewer turns.
+    inline_spans: bool = True
     # PLAN.md §A4.4/§B2: a floor, never a ceiling (invariant 9) — the
     # classifier still runs and still measures a real tier; the tier
     # actually used for phases_for() is max(measured, tier_override).
     # One of "T0"/"T1"/"T2"/"T3", or None for "no forced floor".
     tier_override: str | None = None
+    # A5-1 (IMPLEMENTATION-PLAN-COST-AND-LIVE.md): when set, intake never
+    # runs — no questions, no objection surfacing; spec.md gets the
+    # minimal rendering at the intake phase. Also lets the classify phase
+    # skip its estimate call outright when the free size signals already
+    # force ≥T2 (work_tokens >= 150_000): with intake disabled the call's
+    # only remaining value (T0/T1 gating, intake triggering) is moot.
+    no_intake: bool = False
     # PLAN.md §C3: when true and no explicit research_plan was supplied,
     # _phase_research builds one from the probe planner (windowed
     # complete_json over candidate leaves). The operator-supplied
@@ -241,6 +267,7 @@ class RunOptions:
             "survey_mode": self.survey_mode,
             "inline_spans": self.inline_spans,
             "tier_override": self.tier_override,
+            "no_intake": self.no_intake,
             "auto_probe_plan": self.auto_probe_plan,
         }
         if ws_root:
@@ -281,9 +308,10 @@ class RunOptions:
             dispatch_policy=str(data.get("dispatch_policy", "model")),
             max_parallel=int(data.get("max_parallel", 1)),
             document_review=bool(data.get("document_review", False)),
-            survey_mode=str(data.get("survey_mode", "model")),
-            inline_spans=bool(data.get("inline_spans", False)),
+            survey_mode=str(data.get("survey_mode", "embedding")),
+            inline_spans=bool(data.get("inline_spans", True)),
             tier_override=data.get("tier_override"),
+            no_intake=bool(data.get("no_intake", False)),
             auto_probe_plan=bool(data.get("auto_probe_plan", True)),
         )
 
@@ -387,7 +415,7 @@ class RecursiveDriver:
         # Resolved, not just wrapped: workspace_path/prompt_dir (below) are
         # both derived from this and fed into a shell command shaped
         # `cd {workspace_path} && ... < {prompt_path}` (cli_agent.py). If
-        # run_dir stays relative (the dashboard's default runs_root is
+        # run_dir stays relative (a caller's relative --runs-root, e.g.
         # "./.kusudaemon/runs"), prompt_path -- which already has run_dir's
         # own prefix baked in via prompt_dir -- gets re-resolved relative to
         # the *new* cwd after `cd`, doubling that prefix and pointing at a
@@ -445,39 +473,51 @@ class RecursiveDriver:
         "execute" must be tracked per-tier rather than once ever (it means
         something structurally different at T0 than at T2)."""
         report = await self._run_phase("classify", round_index=0)
-        ran: set[str] = {"classify"}
-        round_index = 1
-        if report.status == "done":
-            while True:
-                tier = self._current_tier()
-                next_phase: str | None = None
-                next_key: str | None = None
-                for candidate in phases_for(tier):
-                    key = self._ran_key(candidate, tier)
-                    if key not in ran:
-                        next_phase, next_key = candidate, key
+        # B2-3: a heartbeat thread keeps driver.pid.json's heartbeat_ts
+        # fresh while this driver thread is alive — the signal that lets
+        # liveness tell a working driver from a dead one even when the
+        # driver is a thread inside the long-lived serve process. Stopped
+        # in the finally below, so a completed run's heartbeat goes stale
+        # and liveness stops considering it active (phase.json is terminal
+        # by then anyway).
+        heartbeat = start_heartbeat_thread(self.run_dir)
+        try:
+            report = await self._run_phase("classify", round_index=0)
+            ran: set[str] = {"classify"}
+            round_index = 1
+            if report.status == "done":
+                while True:
+                    tier = self._current_tier()
+                    next_phase: str | None = None
+                    next_key: str | None = None
+                    for candidate in phases_for(tier):
+                        key = self._ran_key(candidate, tier)
+                        if key not in ran:
+                            next_phase, next_key = candidate, key
+                            break
+                    if next_phase is None:
                         break
-                if next_phase is None:
-                    break
-                if self._halted():
-                    self._set_phase(next_phase, _HALTED, detail=f"halted before {next_phase}")
-                    self._log({"node_id": "-", "role": "harness", "round": round_index, "type": "halting"})
-                    report = RunReport(status="halted", phase=next_phase, detail="halted by operator")
-                    break
-                report = await self._run_phase(next_phase, round_index=round_index)
-                if report.status != "done":
-                    break
-                round_index += 1
-                ran.add(next_key)
-        if report.status == "done" and next_phase is None:
-            report = RunReport(status="done", phase=phases_for(self._current_tier())[-1])
-        report.tree_counts = _count_statuses(self._load_tree())
-        # §11.9: run_completed is a claim about the run's outcome — logging
-        # it after a halt/escalate/error made the event log disagree with
-        # the report.
-        if report.status == "done":
-            self._log({"node_id": "-", "role": "harness", "round": 0, "type": "run_completed"})
-        return report
+                    if self._halted():
+                        self._set_phase(next_phase, _HALTED, detail=f"halted before {next_phase}")
+                        self._log({"node_id": "-", "role": "harness", "round": round_index, "type": "halting"})
+                        report = RunReport(status="halted", phase=next_phase, detail="halted by operator")
+                        break
+                    report = await self._run_phase(next_phase, round_index=round_index)
+                    if report.status != "done":
+                        break
+                    round_index += 1
+                    ran.add(next_key)
+            if report.status == "done" and next_phase is None:
+                report = RunReport(status="done", phase=phases_for(self._current_tier())[-1])
+            report.tree_counts = _count_statuses(self._load_tree())
+            # §11.9: run_completed is a claim about the run's outcome — logging
+            # it after a halt/escalate/error made the event log disagree with
+            # the report.
+            if report.status == "done":
+                self._log({"node_id": "-", "role": "harness", "round": 0, "type": "run_completed"})
+            return report
+        finally:
+            heartbeat.stop()
 
     @staticmethod
     def _ran_key(phase: str, tier: str) -> str:
@@ -604,6 +644,25 @@ class RecursiveDriver:
         pure waste. Any other forced floor (T0/T1/T2) still measures for
         real, because ``max(measured, floor)`` can still come out higher
         than the floor itself.
+
+        A5-1 (IMPLEMENTATION-PLAN-COST-AND-LIVE.md) adds a second skip: an
+        explicitly intake-disabled run (``--no-intake``) whose free size
+        signals already force ≥T2 (``work_tokens >= 150_000``) — the call
+        would only gate T0/T1 and trigger intake, both moot. Measured tier
+        then falls out of ``classify`` on the empty estimate, which
+        resolves to T2.
+
+        A5-2: the call itself is the merged ``estimate_scope_full`` —
+        scope estimate plus intake round-1 questions/objections in one
+        response. The round-1 set is stored in ``tier.json`` under
+        ``intake_round1`` so a resume re-asks the exact same questions
+        without re-calling the model.
+
+        A5-5: ``needs_explore`` folds in the T1 gate — a T1 run explores
+        only when the estimator could not bound the blast radius
+        (``files_touched == "unknown"``), which ``classify`` forces to ≥T2
+        anyway; the formula keeps the stored record honest for an
+        operator-forced ``tier set T1``.
         """
         work = self._effective_work_object()
         goal = self.options.goal.strip()
@@ -611,23 +670,66 @@ class RecursiveDriver:
             raise ValueError("goal is required")
         signals = measure_signals(goal, work)
         override = (self.options.tier_override or "").upper() or None
-        if override == "T3":
+        intake_disabled = self.options.no_intake
+        if override == "T3" or (intake_disabled and signals.work_tokens >= 150_000):
             estimate = ScopeEstimate()
-            measured: Tier = "T3"
+            question_set = QuestionSet()
+            measured: Tier = "T3" if override == "T3" else classify(signals, estimate)
+            if intake_disabled and signals.work_tokens >= 150_000 and override != "T3":
+                self._log(
+                    {
+                        "node_id": "-",
+                        "role": "harness",
+                        "round": 0,
+                        "type": "scope_estimate_skipped",
+                        "reason": (
+                            "signals.work_tokens >= 150_000 forces >= T2 and "
+                            "--no-intake disables the intake trigger; the "
+                            "estimate call would buy nothing"
+                        ),
+                    }
+                )
         else:
-            estimate = estimate_scope(
-                goal, work, self.provider, on_reasoning=self._reasoning_sink("phase-classify")
+            estimate, question_set = estimate_scope_full(
+                goal,
+                work,
+                self.provider,
+                on_reasoning=self._reasoning_sink("phase-classify"),
+                streaming=True,
             )
             measured = classify(signals, estimate)
         tier: Tier = tier_max(measured, override) if override else measured
+        intake_round1 = {
+            "questions": [
+                {
+                    "id": question.id,
+                    "text": question.text,
+                    "default_assumption": question.default_assumption,
+                }
+                for question in question_set.questions
+            ],
+            "objections": [
+                {"claim": objection.claim, "why": objection.why, "options": list(objection.options)}
+                for objection in question_set.objections
+            ],
+        }
         payload = {
             "tier": tier,
             "measured_tier": measured,
             "override": override,
             "signals": asdict(signals),
             "estimate": asdict(estimate),
-            "needs_intake": bool(estimate.ambiguities or estimate.objections),
-            "needs_explore": not estimate.answerable_without_exploration,
+            "needs_intake": bool(
+                question_set.questions or question_set.objections
+            )
+            and not intake_disabled,
+            # A5-5: T1 explores only when the estimator couldn't bound the
+            # blast radius (files_touched == "unknown"); classify() forces
+            # >= T2 for "unknown", so this can only fire on an
+            # operator-forced T1 (tier set command).
+            "needs_explore": not estimate.answerable_without_exploration
+            and (tier != "T1" or estimate.files_touched == "unknown"),
+            "intake_round1": intake_round1 if question_set.questions or question_set.objections else None,
             "ts": time.time(),
         }
         write_text_atomic(
@@ -712,6 +814,24 @@ class RecursiveDriver:
         goal = self.options.goal.strip()
         if not goal:
             raise ValueError("goal is required")
+        if self.options.no_intake:
+            # A5-1: --no-intake — the operator waived clarification and
+            # objection surfacing up front. spec.md still has to exist with
+            # a "## Goal" section (both for _phase_done("intake") and
+            # because build_node_prompt's _goal_and_rubric_block reads it),
+            # so it's written directly — zero provider calls either way.
+            self._log(
+                {
+                    "node_id": "-",
+                    "role": "harness",
+                    "round": 0,
+                    "type": "phase_skipped",
+                    "phase": "intake",
+                    "reason": "--no-intake: operator waived clarification",
+                }
+            )
+            self._write_minimal_spec(goal)
+            return
         needs_intake = bool(self._read_tier_record().get("needs_intake", True))
         if not needs_intake:
             # PLAN.md §A4.3: "intake? fires only when ambiguities or
@@ -735,9 +855,38 @@ class RecursiveDriver:
             )
             self._write_minimal_spec(goal)
             return
-        estimate = self._read_tier_record().get("estimate") or {}
+        record = self._read_tier_record()
+        estimate = record.get("estimate") or {}
         ambiguities = [str(item) for item in (estimate.get("ambiguities") or [])]
         objections = [str(item) for item in (estimate.get("objections") or [])]
+        # A5-2: the classify call already produced round 1's question set
+        # in the merged estimate call; tier.json carries it so a resume
+        # re-asks the exact same questions without a fresh model call.
+        initial_question_set: QuestionSet | None = None
+        round1 = record.get("intake_round1") or {}
+        questions = [item for item in (round1.get("questions") or []) if isinstance(item, dict)]
+        objections_out = [
+            item for item in (round1.get("objections") or []) if isinstance(item, dict)
+        ]
+        if questions or objections_out:
+            initial_question_set = QuestionSet(
+                questions=tuple(
+                    IntakeQuestion(
+                        id=str(item.get("id") or f"q{index + 1}"),
+                        text=str(item.get("text", "")),
+                        default_assumption=str(item.get("default_assumption", "")),
+                    )
+                    for index, item in enumerate(questions)
+                ),
+                objections=tuple(
+                    IntakeObjection(
+                        claim=str(item.get("claim", "")),
+                        why=str(item.get("why", "")),
+                        options=tuple(str(option) for option in (item.get("options") or [])),
+                    )
+                    for item in objections_out
+                ),
+            )
         run_intake(
             self.run_dir,
             goal,
@@ -746,6 +895,8 @@ class RecursiveDriver:
             self.provider,
             self._ask_intake_round,
             on_reasoning=self._reasoning_sink("phase-intake"),
+            initial_question_set=initial_question_set,
+            streaming=True,
         )
 
     def _write_minimal_spec(self, goal: str) -> None:
@@ -814,7 +965,7 @@ class RecursiveDriver:
 
     async def _phase_survey(self) -> None:
         from ..v2.embeddings import embeddings_available
-        from ..v2.survey import survey_chunks_deterministic
+        from ..v2.survey import prefold_chunks, survey_chunks_deterministic
 
         work = self.options.work_object
         if work is not None and work.kind == "workspace":
@@ -859,6 +1010,14 @@ class RecursiveDriver:
             if subagent_id:
                 self._log({"node_id": subagent_id, "role": "explorer", "round": 0, "type": "session_captured", "phase": "survey"})
             try:
+                # A2-4 (IMPLEMENTATION-PLAN-COST-AND-LIVE.md): pre-fold chunks
+                # up to ~min-unit size before surveying. assemble_spine folds
+                # sub-800-token units away afterward anyway, so surveying the
+                # merged list loses no resolution while cutting the model-mode
+                # call count ~5–8× and the embedding-mode vector count with
+                # it. is_large_corpus is computed from the raw chunks above so
+                # the explorer-subagent decision is unchanged.
+                chunks = prefold_chunks(chunks)
                 if self.options.survey_mode == "embedding" and embeddings_available():
                     votes = survey_chunks_deterministic(chunks)
                 else:
@@ -890,7 +1049,9 @@ class RecursiveDriver:
                         if subagent_id
                         else None
                     )
-                    votes = survey_chunks(chunks, self.provider, on_reasoning=on_reasoning)
+                    votes = survey_chunks(
+                        chunks, self.provider, on_reasoning=on_reasoning, streaming=True
+                    )
             finally:
                 if subagent_id:
                     # "episode_completed", not the made-up "session_ended" this
@@ -1060,6 +1221,7 @@ class RecursiveDriver:
         )
 
     async def _phase_plan(self) -> None:
+        probe_sink: list[dict[str, Any]] = []
         tree = build_tree(
             load_spine(self.run_dir),
             self.provider,
@@ -1067,7 +1229,28 @@ class RecursiveDriver:
             log=self.log,
             unit_summary_for=self._explore_summary_for,
             on_reasoning=self._reasoning_sink("phase-plan"),
+            probe_sink=probe_sink,
+            streaming=True,
         )
+        # A5-3: fold the plan call's own probe suggestions (≤2, top-level
+        # only) into the research phase — written to disk now so a resume
+        # re-uses them without re-calling the model; _build_auto_probe_plan
+        # prefers them over the separate windowed plan_probes call.
+        if probe_sink:
+            probe_plan_path = self.run_dir / "probe_plan.json"
+            write_text_atomic(
+                probe_plan_path,
+                json.dumps({"probes": probe_sink}, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+            )
+            self._log(
+                {
+                    "node_id": "-",
+                    "role": "harness",
+                    "round": 0,
+                    "type": "probe_plan_from_plan_call",
+                    "detail": f"{len(probe_sink)} probe suggestions folded into the plan call",
+                }
+            )
         # PLAN.md §C1: the planner's per-leaf ``apply_template_to_node``
         # cannot know run_dir, so re-apply with the absolute glossary path
         # (idempotent union — a leaf that already carries the template's
@@ -1141,7 +1324,7 @@ class RecursiveDriver:
                 await run_pilot(
                     self.run_dir,
                     node,
-                    build_node_prompt(node, self.run_dir),
+                    self._prompt_for_node(node),
                     self.writer_adapter_factory(node),
                     self.env,
                     EpisodeBudget(max_duration_seconds=_budget_seconds(node)),
@@ -1223,14 +1406,62 @@ class RecursiveDriver:
         return, not a skip — ``_phase_research``'s caller may still have
         its own skip logic. Logged as a single harness event so the
         dashboard can show "auto probe planner ran, produced N probes"
-        without parsing ``events.jsonl`` for ``node_dispatched`` lines."""
+        without parsing ``events.jsonl`` for ``node_dispatched`` lines.
+
+        A5-3 (IMPLEMENTATION-PLAN-COST-AND-LIVE.md): when the plan call
+        already folded probe suggestions into ``probe_plan.json`` (≤2,
+        top-level only, written by ``_phase_plan``), those are used instead
+        — the separate windowed ``plan_probes`` call is skipped entirely.
+        Suggestions naming missing/non-leaf nodes are dropped by
+        ``research_plan_from_suggestions``; an empty consumed plan falls
+        back to the windowed planner (a stale plan file must not suppress
+        a real probe pass)."""
         if not (self.run_dir / "tree.json").exists():
             return {}
         try:
             tree = TaskTree.load(tree_path(self.run_dir))
         except Exception:
             return {}
-        plan = plan_probes(tree, self.provider, on_reasoning=self._reasoning_sink("phase-research"))
+        from ..v4.probe_planner import ProbeSuggestion, research_plan_from_suggestions
+
+        plan_file = self.run_dir / "probe_plan.json"
+        if plan_file.is_file():
+            try:
+                payload = json.loads(plan_file.read_text(encoding="utf-8"))
+                raw = payload.get("probes") if isinstance(payload, dict) else None
+            except (OSError, json.JSONDecodeError):
+                raw = None
+            if isinstance(raw, list):
+                suggestions = [
+                    ProbeSuggestion(
+                        node_id=str(item.get("node_id", "")),
+                        slug=str(item.get("slug", "")),
+                        question=str(item.get("question", "")),
+                        kind=str(item.get("kind") or "web"),
+                    )
+                    for item in raw
+                    if isinstance(item, dict)
+                ]
+                plan = research_plan_from_suggestions(suggestions, tree)
+                if plan:
+                    total_probes = sum(len(qs) for qs in plan.values())
+                    self._log(
+                        {
+                            "node_id": "-",
+                            "role": "harness",
+                            "round": 0,
+                            "type": "probe_plan_from_plan_call_consumed",
+                            "total_probes": total_probes,
+                            "nodes_with_probes": len(plan),
+                        }
+                    )
+                    return plan
+        plan = plan_probes(
+            tree,
+            self.provider,
+            on_reasoning=self._reasoning_sink("phase-research"),
+            streaming=True,
+        )
         total_probes = sum(len(qs) for qs in plan.values())
         self._log(
             {
@@ -1287,7 +1518,7 @@ class RecursiveDriver:
                 self.provider,
                 writer_adapter_factory=self.writer_adapter_factory,
                 env=self.env,
-                prompt_for_node=lambda node: build_node_prompt(node, self.run_dir),
+                prompt_for_node=lambda node: self._prompt_for_node(node),
                 budget=EpisodeBudget(),
                 log=self.log,
                 max_attempts=DIRECT_MAX_ATTEMPTS,
@@ -1308,8 +1539,8 @@ class RecursiveDriver:
             writer_adapter_factory=self.writer_adapter_factory,
             env=self.env,
             provider=self.provider,
-            prompt_for_node=lambda node: build_node_prompt(
-                node, self.run_dir, inline_spans=self.options.inline_spans
+            prompt_for_node=lambda node: self._prompt_for_node(
+                node, inline_spans=self.options.inline_spans
             ),
             writer_budget_for=lambda node: EpisodeBudget(
                 max_duration_seconds=_budget_seconds(node)
@@ -1414,7 +1645,7 @@ class RecursiveDriver:
             self.provider,
             writer_adapter_factory=self.writer_adapter_factory,
             env=self.env,
-            prompt_for_node=lambda node: build_node_prompt(node, self.run_dir),
+            prompt_for_node=lambda node: self._prompt_for_node(node),
             budget=EpisodeBudget(),
             log=self.log,
             max_attempts=DIRECT_MAX_ATTEMPTS,
@@ -1578,6 +1809,7 @@ class RecursiveDriver:
             keep_depth_pass=keep_depth_pass,
             log=self.log,
             on_reasoning=self._reasoning_sink("phase-review"),
+            streaming=True,
         )
         self._write_document_review_cache(digest, review)
         return review
@@ -1707,6 +1939,7 @@ class RecursiveDriver:
             max_repairs=3,
             max_attempts=self.options.max_attempts,
             document_review=run_full_document_review,
+            workspace_root=self.options.workspace_root,
         )
         if result.escalated:
             return False
@@ -1745,6 +1978,7 @@ class RecursiveDriver:
                     writer_budget=EpisodeBudget(),
                     max_repairs=3,
                     max_attempts=self.options.max_attempts,
+                    workspace_root=self.options.workspace_root,
                 )
         return None if not result.escalated else False
 
@@ -1833,6 +2067,11 @@ class RecursiveDriver:
         phase_path(self.run_dir).write_text(
             json.dumps(payload, ensure_ascii=False, sort_keys=True) + "\n", encoding="utf-8"
         )
+        # B2-3: every phase transition refreshes the heartbeat — a phase
+        # boundary is the moment liveness most needs to know the driver is
+        # still alive. (The heartbeat thread covers the long waits between
+        # boundaries.)
+        record_heartbeat(self.run_dir)
 
     def _append_explorer_reasoning(self, node_id: str, text: str) -> None:
         """Append one ``{"type": "reasoning", ...}`` line to the explorer
@@ -1902,6 +2141,37 @@ class RecursiveDriver:
             )
 
         return factory
+
+    def _writer_workspace_path(self) -> Path:
+        """The Writer's cwd for the current run — ``work.root`` for
+        ``kind="workspace"``, else ``run_dir`` itself (PLAN.md §A3). Shared
+        by ``_default_writer_factory`` and ``_prompt_for_node`` so the
+        adapter's ``hidden_paths`` and the prompt's notice always agree."""
+        work = self.options.work_object
+        if work is not None and work.kind == "workspace" and work.root is not None:
+            return Path(work.root)
+        return Path(self.run_dir)
+
+    def _prompt_for_node(
+        self, node: TaskNode, *, inline_spans: bool | None = None
+    ) -> str:
+        """``build_node_prompt`` with the run's hidden-paths pair injected
+        (PLAN-AUDIT-COST §A6-1): the same (hidden, exceptions) tuples
+        ``build_writer_adapter`` hands the episode's adapter, so the notice
+        renders once, in the stable region, instead of being appended by
+        ``cli_agent.run_episode`` after all per-node content."""
+        from .backends import hidden_paths_for_node
+
+        hidden, exceptions = hidden_paths_for_node(
+            node, self.run_dir, self._writer_workspace_path()
+        )
+        kwargs = dict(
+            hidden_paths=hidden,
+            hidden_path_exceptions=exceptions,
+        )
+        if inline_spans is not None:
+            kwargs["inline_spans"] = inline_spans
+        return build_node_prompt(node, self.run_dir, **kwargs)
 
     def _default_research_factory(self) -> ResearchAdapterFactory:
         def factory(node: TaskNode, query: ResearchQuery) -> AgentAdapter:

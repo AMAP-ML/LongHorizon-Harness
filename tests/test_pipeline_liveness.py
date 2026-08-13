@@ -20,9 +20,13 @@ from pathlib import Path
 _REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(_REPO_ROOT / "src"))
 
+from kusudaemon.pipeline.approvals import Approval  # noqa: E402
+from kusudaemon.pipeline.approvals import append as append_approval
 from kusudaemon.pipeline.liveness import (  # noqa: E402
     DEFAULT_STALL_AFTER_SECONDS,
+    HEARTBEAT_STALL_AFTER_SECONDS,
     record_driver_start,
+    record_heartbeat,
     run_liveness,
 )
 from kusudaemon.pipeline.run_dir import phase_path  # noqa: E402
@@ -38,7 +42,60 @@ class RunLivenessTest(unittest.TestCase):
     def test_non_in_progress_phase_is_never_stalled(self) -> None:
         with tempfile.TemporaryDirectory() as root_str:
             run_dir = Path(root_str)
+            _write_phase(run_dir, status="done")
+            record_driver_start(run_dir)
+            liveness = run_liveness(run_dir)
+        self.assertFalse(liveness.stalled)
+
+    def test_waiting_for_approval_with_pending_approval_is_not_stalled(self) -> None:
+        # B2-2: waiting_for_approval is healthy only while there is actually
+        # a pending approval to wait on.
+        with tempfile.TemporaryDirectory() as root_str:
+            run_dir = Path(root_str)
             _write_phase(run_dir, status="waiting_for_approval")
+            append_approval(
+                run_dir,
+                Approval.create("pilot", title="Approve the pilot artifact", allow_input=False),
+            )
+            record_driver_start(run_dir)
+            liveness = run_liveness(run_dir)
+        self.assertFalse(liveness.stalled)
+
+    def test_waiting_for_approval_with_no_pending_approval_is_stalled(self) -> None:
+        # B2-2: a driver parked on a human with nothing pending is dead by
+        # definition — the driver writes the pending record *before* the
+        # phase flips, so zero pending means nothing is polling.
+        with tempfile.TemporaryDirectory() as root_str:
+            run_dir = Path(root_str)
+            _write_phase(run_dir, status="waiting_for_approval")
+            record_driver_start(run_dir)
+            liveness = run_liveness(run_dir)
+        self.assertTrue(liveness.stalled)
+        self.assertIn("approval", liveness.reason)
+
+    def test_stale_heartbeat_is_stalled_even_with_live_pid(self) -> None:
+        # B2-3: a dashboard-hosted driver is a thread inside the always-alive
+        # serve process — pid liveness can never detect a dead driver thread;
+        # only the heartbeat can.
+        with tempfile.TemporaryDirectory() as root_str:
+            run_dir = Path(root_str)
+            _write_phase(run_dir, status="in_progress")
+            record_driver_start(run_dir)  # live pid, heartbeat written now
+            record_heartbeat(run_dir)  # ensure fresh
+            import socket
+
+            job_path = run_dir / "driver.pid.json"
+            payload = json.loads(job_path.read_text(encoding="utf-8"))
+            payload["heartbeat_ts"] = time.time() - (HEARTBEAT_STALL_AFTER_SECONDS + 60)
+            job_path.write_text(json.dumps(payload), encoding="utf-8")
+            liveness = run_liveness(run_dir)
+        self.assertTrue(liveness.stalled)
+        self.assertIn("heartbeat", liveness.reason)
+
+    def test_fresh_heartbeat_is_not_stalled(self) -> None:
+        with tempfile.TemporaryDirectory() as root_str:
+            run_dir = Path(root_str)
+            _write_phase(run_dir, status="in_progress")
             record_driver_start(run_dir)
             liveness = run_liveness(run_dir)
         self.assertFalse(liveness.stalled)

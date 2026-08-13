@@ -87,9 +87,13 @@ const state = {
   approvalDrafts: {},
   approvalAnswerDrafts: {},
   pilotDrafts: {},
-  newRun: { runId: "", goal: "", source: "", model: "", compile: "", workspace: "", tier: "", dispatch_policy: "model", survey_mode: "model", max_rounds: 100, max_attempts: 3, max_parallel: 1, document_review: false, inline_spans: false, auto_probe_plan: true },
+  newRun: { runId: "", goal: "", source: "", model: "", compile: "", workspace: "", tier: "", dispatch_policy: "model", survey_mode: "embedding", max_rounds: 100, max_attempts: 3, max_parallel: 1, document_review: false, inline_spans: false, auto_probe_plan: true },
   // §3/§6/§7/§10 additions
-  sseLive: true,
+  // B1-3 (IMPLEMENTATION-PLAN-COST-AND-LIVE.md): honest sseLive — true only
+  // while the EventSource is actually delivering; lastSnapshotAt feeds the
+  // B1-4 watchdog (a silently stalled stream produces no error and no data).
+  sseLive: false,
+  lastSnapshotAt: 0,
   authRequired: false,
   authToken: "",
   authDraft: "",
@@ -111,7 +115,7 @@ const state = {
   // the index to resume fetching from, `entries` accumulate client-side so
   // a tick only ever asks the server for what's new (?since=next) instead
   // of re-fetching and re-rendering the whole trace every ~1.5s.
-  mainThinking: { agentId: null, entries: [], next: 0 },
+  mainThinking: { agentId: null, entries: [], next: 0, sortAnchor: undefined },
 };
 
 const root = document.getElementById("app");
@@ -188,6 +192,14 @@ async function guarded(fn) {
   }
 }
 
+// B2-1 (IMPLEMENTATION-PLAN-COST-AND-LIVE.md): every mutating action
+// optimistically refetches the snapshot so the UI is correct even when the
+// SSE stream is down — e.g. an intake approval that resolved on disk while
+// the phase.json still says waiting_for_approval.
+function refreshSnapshot() {
+  return apiGet("/api/snapshot").then(applySnapshot).catch(() => {});
+}
+
 // §5.5: every mutating UI action records the equivalent CLI command, shown
 // on the Terminal tab — the escape-hatch-and-teaching-device line.
 function recordCli(kind, detail) {
@@ -228,7 +240,7 @@ function resumeRun() {
         // run was launched from) — re-hosting would race two drivers. The
         // right resume there is un-halting: the live driver polls halt.flag
         // at its next phase boundary and continues on its own.
-        apiPost("/api/halt", { value: false }).then(() => showToast("driver already running — cleared halt flag (it resumes at the next phase boundary)"));
+        apiPost("/api/halt", { value: false }).then(() => showToast("driver already running — cleared halt flag (it resumes at the next phase boundary)")).then(refreshSnapshot);
       } else {
         showToast(msg, true);
       }
@@ -307,15 +319,18 @@ function loadMainThinking() {
       if (state.mainThinking.agentId !== id) return; // followed agent changed mid-flight
       const fresh = d.entries || [];
       if (fresh.length) {
-        // Entries have no timestamp of their own (server.py's thinking
-        // route only ever returned {role, text}) -- they're a live tail,
-        // so "now" (with a tiny per-entry increment to preserve arrival
-        // order) is the correct sort key for interleaving them into the
-        // feed's chronological array alongside real event/approval
-        // timestamps.
-        const base = Date.now() / 1000;
+        // B4-5 (IMPLEMENTATION-PLAN-COST-AND-LIVE.md): entries now carry a
+        // server-side monotonic `ts` (index in the trace). Anchor the
+        // stream's sort keys once per agent so ordering between ticks is
+        // strictly by trace order — the old per-tick Date.now() stamping
+        // interleaved slow ticks' entries into the wrong place relative to
+        // the events' server timestamps.
+        if (state.mainThinking.sortAnchor === undefined) {
+          state.mainThinking.sortAnchor = Date.now() / 1000;
+        }
+        const base = state.mainThinking.sortAnchor;
         fresh.forEach((entry, i) => {
-          state.mainThinking.entries.push(Object.assign({}, entry, { sort: base + i * 0.001 }));
+          state.mainThinking.entries.push(Object.assign({}, entry, { sort: base + (entry.ts !== undefined ? entry.ts : i) * 0.001 }));
         });
         state.mainThinking.total = d.total;
         state.mainThinking.next = d.next;
@@ -374,13 +389,13 @@ function applySnapshot(snap) {
   const prevPending = (state.snapshot.pending_approvals || []).map((a) => a.approval_id);
   const nextPending = (snap.pending_approvals || []).map((a) => a.approval_id);
   state.snapshot = snap;
+  state.lastSnapshotAt = Date.now();
   // §10: escalation fired → rail tier chip flashes once.
   const esc = (snap.escalation_history || []).length;
   if (esc > prevEsc && !state.escalationFlash) {
     state.escalationFlash = true;
     setTimeout(() => { state.escalationFlash = false; render(); }, 1800);
   }
-  state.sseLive = true;
   updateChrome(nextPending.length > 0);
   if (state.selectedNode) {
     // §F5: always poll thinking for the selected node, not just when live.
@@ -422,19 +437,31 @@ function updateChrome(hasPending) {
 }
 
 let pollingTimer = null;
+let _es = null; // B1-1: keep the EventSource so startLive() can be idempotent
 
 function startLive() {
+  // B1-1 (IMPLEMENTATION-PLAN-COST-AND-LIVE.md): repeated attaches must not
+  // stack EventSources — close any existing one first.
+  if (_es) {
+    try { _es.close(); } catch (e) {}
+    _es = null;
+  }
   try {
-    const es = new EventSource("/api/stream");
-    es.addEventListener("snapshot", (ev) => {
+    _es = new EventSource("/api/stream");
+    _es.addEventListener("snapshot", (ev) => {
       if (pollingTimer) {
         clearInterval(pollingTimer);
         pollingTimer = null;
       }
+      state.sseLive = true;
       applySnapshot(JSON.parse(ev.data));
     });
-    es.onerror = () => {
-      es.close();
+    _es.onerror = () => {
+      state.sseLive = false;
+      if (_es) {
+        try { _es.close(); } catch (e) {}
+        _es = null;
+      }
       startPolling();
     };
   } catch (e) {
@@ -804,6 +831,7 @@ function renderApprovalEntry(a, snap) {
               } else {
                 showToast("Approval resolved");
               }
+              return refreshSnapshot();
             })),
           }, `[${i + 1}] ${opt.label}`)
         );
@@ -834,6 +862,7 @@ function renderApprovalEntry(a, snap) {
           await apiPost(`/api/approvals/${encodeURIComponent(a.approval_id)}/resolve`, { action: "answer", answers });
           recordCli("approve");
           showToast("Answers submitted");
+          await refreshSnapshot();
         }) }, "Submit Answers")
       );
     }
@@ -849,6 +878,7 @@ function renderApprovalEntry(a, snap) {
           recordCli("approve");
           delete state.approvalDrafts[a.approval_id];
           showToast("Submitted answer");
+          await refreshSnapshot();
         }) }, "Submit Input")
       );
       actionBtns.push(
@@ -857,6 +887,7 @@ function renderApprovalEntry(a, snap) {
           recordCli("approve");
           delete state.approvalDrafts[a.approval_id];
           showToast("Accepted default");
+          await refreshSnapshot();
         }) }, "Use Default")
       );
     }
@@ -976,7 +1007,9 @@ function renderRail() {
     el("div", { class: "rail-left" }, segs.length ? segs : [el("span", { class: "rail-no-phase" }, "—")]),
     el("div", { class: "rail-right" }, [
       el("span", { class: "rail-hosted", title: `${snap.hosted_count || 0} runs hosted · cap ${snap.max_concurrent_runs}` }, `${snap.hosted_count || 0}/${snap.max_concurrent_runs}`),
-      el("span", { class: "rail-live" + (state.sseLive ? " on" : ""), title: state.sseLive ? "SSE live" : "SSE dropped — 2s polling" }, state.sseLive ? "🟢 LIVE" : "🔄 ⟳"),
+      // B1-4: reconnect affordance — the badge re-establishes the SSE stream
+      // when it has fallen back to polling.
+      el("span", { class: "rail-live" + (state.sseLive ? " on" : ""), title: state.sseLive ? "SSE live" : "SSE dropped — click to reconnect, else 2s polling", onclick: state.sseLive ? null : () => startLive() }, state.sseLive ? "🟢 LIVE" : "🔄 ⟳"),
       el("span", { class: "rail-a40" }, snap.elapsed ? fmtDur(snap.elapsed) : "—"),
     ]),
   ]);
@@ -1003,10 +1036,21 @@ function renderHeaderRow() {
     el("span", { class: "pulse-dot" }, "●"),
     ` AGENT THINKING LIVE (${liveSub.id})`,
   ]) : null;
+  // B2-4 (IMPLEMENTATION-PLAN-COST-AND-LIVE.md): a run whose phase.json is
+  // live-ish but that no driver thread is hosting is a dead run — surface it
+  // directly instead of waiting for the stalled detector.
+  const _TERMINAL_STATUSES = ["done", "error", "failed"];
+  const noDriver = snap.attached && snap.hosted === false && !_TERMINAL_STATUSES.includes(snap.phase_status);
+  const noDriverBadge = noDriver ? el("span", {
+    class: "hdr-tier-badge hdr-nodriver-badge",
+    title: "No driver thread is hosting this run — nothing polls approvals.jsonl or advances phase.json",
+    style: "color:var(--accent-red); cursor:pointer;",
+    onclick: () => guarded(resumeRun),
+  }, "⚠ no driver attached — Resume") : null;
   return el("div", { class: "hdr-run" }, [
     el("div", { class: "hdr-run-id" }, [
       el("span", { class: "runId", style: "cursor:pointer;", title: "switch run", onclick: () => { state.runSwitcherOpen = true; render(); } }, snap.run_id),
-      tierChip, escChip, liveSubBadge,
+      tierChip, escChip, liveSubBadge, noDriverBadge,
       snap.halted ? el("span", { class: "hdr-tier-badge hdr-halt-badge" }, "⏸ halted") : null,
     ]),
     el("div", { class: "hdr-goal", title: snap.goal }, snap.goal || "—"),
@@ -1015,12 +1059,12 @@ function renderHeaderRow() {
       el("span", { class: "dim" }, snap.phase_detail || ""),
     ]),
     el("div", { class: "hdr-buttons" }, [
-      snap.control_enabled && tier !== "T3" ? el("button", { class: "btn-tiny", onclick: () => { if (confirm("Escalate tier (+1, T3 max)?") ) guarded(() => apiPost("/api/escalate", {}).then(() => { recordCli("escalate"); showToast("Tier escalated"); })); } }, "⇡ escalate") : null,
+      snap.control_enabled && tier !== "T3" ? el("button", { class: "btn-tiny", onclick: () => { if (confirm("Escalate tier (+1, T3 max)?") ) guarded(() => apiPost("/api/escalate", {}).then(() => { recordCli("escalate"); showToast("Tier escalated"); }).then(refreshSnapshot)); } }, "⇡ escalate") : null,
       snap.stalled ? el("button", { class: "btn-tiny", style: "color:var(--accent-red);", onclick: () => guarded(resumeRun) }, "☠ Resume") : null,
       snap.control_enabled && !snap.stalled && !snap.halted && (snap.phase_status === "error" || snap.phase_status === "failed" || snap.phase_status === "escalated" || snap.phase_status === "blocked" || snap.phase_status === "paused")
         ? el("button", { class: "btn-tiny", onclick: () => guarded(() => {
             if (snap.hosted) {
-              return apiPost("/api/halt", { value: false }).then(() => showToast("Resume requested"));
+              return apiPost("/api/halt", { value: false }).then(() => showToast("Resume requested")).then(refreshSnapshot);
             }
             resumeRun();
           }) }, "▶ Resume")
@@ -1028,11 +1072,11 @@ function renderHeaderRow() {
       snap.control_enabled ? el("button", { class: "btn-tiny", onclick: () => guarded(() => {
         if (snap.halted) {
           if (snap.hosted) {
-            return apiPost("/api/halt", { value: false }).then(() => showToast("Resume requested"));
+            return apiPost("/api/halt", { value: false }).then(() => showToast("Resume requested")).then(refreshSnapshot);
           }
           return resumeRun();
         }
-        return apiPost("/api/halt", { value: true }).then(() => { recordCli("halt"); showToast("Halting after current phase"); });
+        return apiPost("/api/halt", { value: true }).then(() => { recordCli("halt"); showToast("Halting after current phase"); }).then(refreshSnapshot);
       }) }, snap.halted ? "▶ Resume" : "⏸") : null,
     ]),
   ]);
@@ -1487,6 +1531,7 @@ async function cmdEscalate() {
     await apiPost("/api/escalate", {});
     recordCli("escalate");
     showToast("Tier escalated");
+    await refreshSnapshot();
   }
 }
 async function cmdTaskTree() {
@@ -1515,6 +1560,7 @@ async function _redispatchAction(nodeId) {
   await apiPost(`/api/node/${encodeURIComponent(nodeId)}/redispatch`, {});
   recordCli("redispatch", nodeId);
   showToast("Redispatch approval queued");
+  await refreshSnapshot();
 }
 
 function buildCommands() {
@@ -1555,6 +1601,7 @@ function buildCommands() {
       await apiPost("/api/reopen", { node_id: nodeArg, defect: reason, is_manual: true });
       recordCli("reopen", nodeArg);
       showToast("Node reopened");
+      await refreshSnapshot();
     } },
     interject: { key: "interject", trigger: "interject", label: "Message agent", usage: "> interject <text> or just type below", timeout: 20, run: async (text) => {
       const target = state.targetAgentManual ? state.targetAgentId : (liveSubId() || "main");
@@ -1653,8 +1700,12 @@ function attachRun(runId) {
       state.workbenchTab = "tree";
       state.treeFilter = "";
       state.chatFeedPinned = true;
-      state.mainThinking = { agentId: null, entries: [], next: 0 };
+      state.mainThinking = { agentId: null, entries: [], next: 0, sortAnchor: undefined };
       apiGet("/api/snapshot").then(applySnapshot).catch(() => {});
+      // B1-1 (IMPLEMENTATION-PLAN-COST-AND-LIVE.md): the snapshot fetch alone
+      // left the page frozen at page-load state — the live stream was never
+      // started from the attach path.
+      startLive();
     })
     .catch((err) => showToast(String(err.message || err), true));
 }
@@ -1690,7 +1741,7 @@ function renderContextMenu() {
   } else if (m.nodeId !== undefined) {
     items.push(el("div", { class: "ctx-item", onclick: () => { state.contextMenu = null; openNode(m.nodeId, "overview"); render(); } }, "node overview"));
     items.push(el("div", { class: "ctx-item", onclick: () => { state.contextMenu = null; openReopen(m.nodeId); render(); } }, "reopen (repair)"));
-    items.push(el("div", { class: "ctx-item", onclick: () => { state.contextMenu = null; render(); guarded(() => apiPost(`/api/node/${encodeURIComponent(m.nodeId)}/redispatch`, {}).then(() => { recordCli("redispatch", m.nodeId); showToast("Redispatch approval queued"); })); } }, "redispatch"));
+    items.push(el("div", { class: "ctx-item", onclick: () => { state.contextMenu = null; render(); guarded(() => apiPost(`/api/node/${encodeURIComponent(m.nodeId)}/redispatch`, {}).then(() => { recordCli("redispatch", m.nodeId); showToast("Redispatch approval queued"); }).then(refreshSnapshot)); } }, "redispatch"));
     items.push(el("div", { class: "ctx-item", onclick: () => { state.contextMenu = null; render(); navigator.clipboard && navigator.clipboard.writeText(m.nodeId).then(() => showToast("copied id")); } }, "copy id"));
   }
   return el("div", { class: "overlay ctx-overlay", onclick: () => { state.contextMenu = null; render(); } }, [
@@ -1996,12 +2047,14 @@ function renderPilotEditor() {
     await apiPost(`/api/approvals/${encodeURIComponent(a.approval_id)}/pilot-save`, { node_id: (a.context && a.context.node_id) || d.id, text: state.pilotDrafts[draftKey] || "" });
     recordCli("pilot", a.context && a.context.node_id || d.id);
     showToast("Pilot edit saved & approval resolved");
+    await refreshSnapshot();
   }) }, "Save & approve edit");
   const asIsBtn = el("button", { disabled: state.busy ? "" : null, onclick: () => guarded(async () => {
     if (confirm("Approve this pilot as-is (accepts the Writer's output without changes)?")) {
       await apiPost(`/api/approvals/${encodeURIComponent(a.approval_id)}/resolve`, { action: "approve" });
       recordCli("pilot", a.context && a.context.node_id || d.id);
       showToast("Approved as-is");
+      await refreshSnapshot();
     }
   }) }, "Approve as-is");
   const editor = el("textarea", { class: "pilot-editor", "data-key": `pilot-${draftKey}`, name: `pilot-edit-${draftKey}`, "aria-label": "edited pilot artifact — the frozen original is shown for comparison", rows: "10" });
@@ -2566,18 +2619,28 @@ document.addEventListener("DOMContentLoaded", () => {
     .then((d) => {
       state.authRequired = false;
       const runs = d.runs || [];
-      if (state.snapshot && state.snapshot.attached) {
-        startLive();
-      } else if (runs.length) {
-        attachRun(runs[0].id);
-      } else {
-        startLive();
+      // B1-2 (IMPLEMENTATION-PLAN-COST-AND-LIVE.md): boot used to take the
+      // attachRun branch and never start the stream — the state.snapshot
+      // literal is {attached:false} at boot, so the "already attached" check
+      // was always false and the attach path never called startLive().
+      if (!state.snapshot || !state.snapshot.attached) {
+        if (runs.length) attachRun(runs[0].id);
       }
+      startLive(); // always, in every branch
     })
     .catch((err) => {
       state.authRequired = true;
       scheduleAll();
     });
+  // B1-4 (IMPLEMENTATION-PLAN-COST-AND-LIVE.md): a silently stalled stream
+  // (proxy buffering, sleeping laptop) produces no error and no data. If no
+  // snapshot has arrived in >6 s (4× the 1.5 s server push), fall back to
+  // polling.
+  setInterval(() => {
+    if (state.sseLive && Date.now() - state.lastSnapshotAt > 6000) {
+      startPolling();
+    }
+  }, 10000);
   setInterval(() => {
     const now = new Date();
     const clock = document.querySelector(".rail-a40");

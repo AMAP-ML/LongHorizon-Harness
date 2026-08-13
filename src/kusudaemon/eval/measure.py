@@ -196,7 +196,7 @@ def _leaf_nodes(run_dir: Path) -> list[TaskNode]:
 def per_leaf_segment_tokens(
     run_dir: Path,
     *,
-    inline_spans: bool = False,
+    inline_spans: bool = True,
 ) -> list[dict[str, int]]:
     """The §C5 "mean input tokens per leaf broken down by prompt segment"
     instrument, applied post-hoc: rebuild each leaf's prompt with
@@ -218,9 +218,10 @@ def per_leaf_segment_tokens(
     return rows
 
 
-def mean_tokens_by_segment(run_dir: Path, *, inline_spans: bool = False) -> dict[str, float]:
+def mean_tokens_by_segment(run_dir: Path, *, inline_spans: bool = True) -> dict[str, float]:
     """Column means over ``per_leaf_segment_tokens``, ordered by the
-    prompt-assembly order of the labels (brief first, retry last). Labels
+    prompt-assembly order of the labels (§8: goal_and_rubric first, retry
+    last — see ``prompts.build_node_prompt``). Labels
     absent from a leaf are not counted as zeros — a leaf with no contract
     did not pay for a contract segment, and padding it with zeros would
     understate the mean for leaves that did."""

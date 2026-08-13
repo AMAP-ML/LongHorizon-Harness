@@ -171,11 +171,28 @@ class RunState:
         # Bounded and locked the same way as ``_file_cache``.
         self._trace_cache: dict[str, "_TraceCacheEntry"] = {}
 
-    def _cached_read(self, path: Path, loader: Callable[[], Any]) -> Any:
+    def _cached_read(
+        self,
+        path: Path,
+        loader: Callable[[], Any],
+        *,
+        stat_paths: tuple[Path, ...] | None = None,
+    ) -> Any:
         """``loader()`` result cached until the file's (st_size, st_mtime_ns)
         changes — the dashboard's hot path (a snapshot every _STREAM_INTERVAL
         per client) stops re-parsing files that haven't moved
         (PLAN-zeromem.md §10.2).
+
+        ``stat_paths`` replaces the single stamped path with a set of
+        paths whose combined stamps must ALL be unchanged for the cache to
+        hit (B4-2, IMPLEMENTATION-PLAN-COST-AND-LIVE.md): a directory's
+        mtime changes only when entries are created directly inside it,
+        never when a nested file is appended, so stamping a run directory
+        alone misses the activity that matters, and stamping only
+        ``events.jsonl`` misses a brand-new top-level entry (contract.md at
+        intake, phase.json at a phase flip). Missing paths are skipped, so
+        a not-yet-created ``events.jsonl`` degrades to the directory stamp
+        alone rather than disabling the cache.
 
         §11.10.15: bounded at ``_CACHE_MAX_ENTRIES`` (FIFO eviction — a
         server meant to run for days is a process, not a garbage collector),
@@ -194,11 +211,17 @@ class RunState:
         rewrites an append-only log in place, this breaks silently.
         """
         key = str(path)
-        try:
-            stat = os.stat(path)
-            stamp = (stat.st_size, stat.st_mtime_ns)
-        except OSError:
-            stamp = None
+        stamp: tuple[tuple[int, int], ...] | None
+        if stat_paths is None:
+            stat_paths = (path,)
+        stamps = []
+        for stamped in stat_paths:
+            try:
+                stat = os.stat(stamped)
+            except OSError:
+                continue
+            stamps.append((stat.st_size, stat.st_mtime_ns))
+        stamp = tuple(stamps) if stamps else None
         with self._cache_lock:
             cached = self._file_cache.get(key)
             if cached is not None and cached[0] == stamp:
@@ -233,16 +256,23 @@ class RunState:
         underlying ``_dir_mtime`` is a full ``rglob("*")`` over every file
         in the run (chunks, spine units, every node's ``out``/``scratch``/
         ``audit``/trace files), purely to find a "most recently active"
-        sort key. Cached via ``_cached_read``, keyed on the run directory's
-        *own* stat stamp — the same "accepted staleness" caveat
-        ``_cached_tree`` already documents for ``tree.json`` applies here
-        too, slightly wider: a write to a file nested inside e.g.
-        ``out/<node>.md`` doesn't bump the top-level run directory's own
-        mtime, so the cached value only refreshes when something is
-        created/removed directly inside the run dir (which still happens
-        repeatedly as a run progresses — ``tree.json``, ``contract.md``,
-        ``audit/``, ``out/`` etc. each get created once). This is a display
-        sort key, not correctness-bearing state, so that tradeoff is fine."""
+        sort key. Cached via ``_cached_read``.
+
+        B4-2 (IMPLEMENTATION-PLAN-COST-AND-LIVE.md): stamped on
+        ``events.jsonl`` *and* the run directory itself, not the run
+        directory alone — a directory's mtime changes only when entries
+        are created or removed directly inside it, never when a nested
+        file is appended, so keying on the directory froze the run-list
+        sort order while a run progressed. The events stamp catches nested
+        activity; the directory stamp catches brand-new top-level entries
+        (contract.md at intake, phase.json at a phase flip)."""
+        events = events_path(run_dir)
+        if events.exists():
+            return self._cached_read(
+                run_dir,
+                lambda: _dir_mtime(run_dir),
+                stat_paths=(events, run_dir),
+            )
         return self._cached_read(run_dir, lambda: _dir_mtime(run_dir))
 
     def _cached_models_and_default(self) -> tuple[list[str], str]:
@@ -539,6 +569,35 @@ class RunState:
         for node_id in order:
             node_events = by_node[node_id]
             result.append(_summarize_subagent(run_dir, node_id, node_events, logdir_for=self._cached_logdir))
+        # B3-3 (IMPLEMENTATION-PLAN-COST-AND-LIVE.md): synthesize a
+        # pseudo-subagent for the current phase. The driver writes phase-level
+        # provider reasoning (classify/intake/plan/...) to
+        # scratch/phase-<phase>/trace.jsonl, but every phase-level event logs
+        # node_id "-" and is filtered out above — so the trace was written,
+        # correct, and never fetched by anything. Emitting it here lets
+        # mainAgentId()/the thinking feed find it with no other changes.
+        phase_record = _read_json(phase_path(run_dir)) or {}
+        phase_name = str(phase_record.get("phase", ""))
+        if phase_name:
+            pseudo_id = f"phase-{phase_name}"
+            if _safe_node_id(pseudo_id):
+                trace = node_trace_path(run_dir, pseudo_id)
+                if trace.exists() and trace.stat().st_size > 0:
+                    phase_status = str(phase_record.get("status", ""))
+                    result.append(
+                        {
+                            "id": pseudo_id,
+                            "kind": "phase",
+                            "role": "harness",
+                            "status": phase_status,
+                            "derived_status": "thinking" if phase_status == "in_progress" else "done",
+                            "attempts": 0,
+                            "duration_ms": 0,
+                            "error": None,
+                            "live": phase_status == "in_progress",
+                            "has_logdir": _last_logdir(trace) is not None,
+                        }
+                    )
         return result
 
     def _cached_logdir(self, trace_path: Path) -> Path | None:
@@ -1443,11 +1502,36 @@ def _host_driver(run_dir: Path, driver: RecursiveDriver, *, on_done: Callable[[]
     try:
         try:
             import asyncio
+            import traceback
 
             report = asyncio.run(driver.run())
             _set_phase(run_dir, report.phase, report.status, report.detail)
         except Exception as exc:  # noqa: BLE001 — surface into phase.json, not the thread
-            _set_phase(run_dir, "error", "error", str(exc))
+            # B2-5 (IMPLEMENTATION-PLAN-COST-AND-LIVE.md): an exception
+            # escaping _host_driver previously wrote only a bare str(exc)
+            # into phase.json — no traceback, and no event, so a driver
+            # that died outside _run_phase's own try (phases_for,
+            # _current_tier, _read_tier_record, ...) vanished silently:
+            # hosted_count dropped to 0 and phase.json kept whatever status
+            # the last _set_phase wrote. Write the traceback into detail
+            # and append a driver_crashed event so the failure is visible
+            # in the dashboard feed.
+            tb = traceback.format_exc()
+            _set_phase(run_dir, "error", "error", f"{exc}\n{tb}")
+            try:
+                EventLog(events_path(run_dir)).append(
+                    {
+                        "node_id": "-",
+                        "role": "harness",
+                        "round": 0,
+                        "type": "driver_crashed",
+                        "error": str(exc),
+                        "traceback": tb,
+                        "ts": _now(),
+                    }
+                )
+            except OSError:
+                pass
     finally:
         if on_done is not None:
             on_done()

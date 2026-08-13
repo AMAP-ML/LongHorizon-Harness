@@ -309,7 +309,7 @@ class SubagentsInterjectDiffThinkingTest(_ServerTestCase):
         )
         status, payload = self._get("/api/node/1/thinking")
         self.assertEqual(status, 200)
-        self.assertEqual(payload["entries"], [{"role": "assistant", "text": "working on it"}])
+        self.assertEqual(payload["entries"], [{"role": "assistant", "text": "working on it", "ts": 0}])
 
     def test_diff_against_a_prior_version(self) -> None:
         versions_dir = self.run_dir / "out" / ".versions" / "1"

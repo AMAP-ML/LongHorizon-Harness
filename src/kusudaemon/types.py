@@ -23,10 +23,10 @@ def _launch_directory() -> str:
 
 
 DEFAULT_WORKSPACE_PATH = _launch_directory()
-# Repo-local, not $HOME: everything this harness writes lives inside the
-# project folder it was launched from (matches provider_config.py's
-# DEFAULT_CONFIG_PATH and pipeline/run.py's ./.kusudaemon/runs default).
-DEFAULT_TMP_DIR = f"{Path(DEFAULT_WORKSPACE_PATH) / '.kusudaemon'}/tmp"
+# Runs and temp state live under $HOME/.kusudaemon — harness-owned state
+# is never stored inside the project it was launched from (matches
+# pipeline/run.py's ~/.kusudaemon/runs default).
+DEFAULT_TMP_DIR = f"{Path.home() / '.kusudaemon'}/tmp"
 
 
 @dataclass

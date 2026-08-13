@@ -64,6 +64,35 @@ class BuildNodePromptTest(unittest.TestCase):
         self.assertIn("Rewrite the artifact from scratch", prompt)
         self.assertNotIn("MINIMAL", prompt)
 
+    # A6-5 (IMPLEMENTATION-PLAN-COST-AND-LIVE.md): a retry is a fresh
+    # subprocess that would otherwise re-read every input, including a
+    # `read` turn to fetch its own previous artifact — inline it instead.
+
+    def test_retry_inlines_the_previous_artifact(self) -> None:
+        node = _node(attempts=1, last_defect="nonempty: artifact is empty")
+        with tempfile.TemporaryDirectory() as run_dir:
+            Path(run_dir, "out").mkdir()
+            Path(run_dir, "out", "a.md").write_text("Draft text that failed.", encoding="utf-8")
+            prompt = build_node_prompt(node, run_dir)
+        self.assertIn("Draft text that failed.", prompt)
+        self.assertIn("fix it in place", prompt)
+
+    def test_retry_with_empty_prior_artifact_does_not_inline(self) -> None:
+        # An empty out/<node>.md is an honest gate failure (v0 runner's
+        # fallback) — nothing to fix in place, so no inline block.
+        node = _node(attempts=1, last_defect="nonempty: artifact is empty")
+        with tempfile.TemporaryDirectory() as run_dir:
+            Path(run_dir, "out").mkdir()
+            Path(run_dir, "out", "a.md").write_text("   ", encoding="utf-8")
+            prompt = build_node_prompt(node, run_dir)
+        self.assertNotIn("fix it in place", prompt)
+
+    def test_retry_without_prior_artifact_does_not_inline(self) -> None:
+        node = _node(attempts=1, last_defect="nonempty: artifact is empty")
+        with tempfile.TemporaryDirectory() as run_dir:
+            prompt = build_node_prompt(node, run_dir)
+        self.assertNotIn("fix it in place", prompt)
+
 
 class ArtifactPathInstructionTest(unittest.TestCase):
     """PLAN.md §D0: the artifact path appeared in no Writer prompt, in any
@@ -205,11 +234,16 @@ class InlineSpansTest(unittest.TestCase):
     leave the default output byte-for-byte unchanged."""
 
     def _assert_default_unmodified(self, node: TaskNode, run_dir: Path) -> None:
+        # §8 ordering (PLAN-AUDIT-COST §A6-2): goal_and_rubric → contract →
+        # hidden_paths → artifact_instruction → judgment_rubric → brief →
+        # inputs. With no spec.md, contract, or hidden paths, the stable
+        # blocks are absent and the prompt begins with the artifact
+        # instruction, then the brief, then inputs.
         expected = (
-            "Your brief: Write the intro.\n\n"
             f"Write your artifact to `{run_dir / 'out' / 'a.md'}` using your file "
             "tools (e.g. gptme's save/patch). That file is the deliverable; "
             "nothing else you write or say is.\n\n"
+            "Your brief: Write the intro.\n\n"
             "Inputs (read them with your tools before writing, and cite them "
             f"where relevant):\n- {run_dir / 'spine' / 'unit-01.md'}"
         )
@@ -254,6 +288,81 @@ class InlineSpansTest(unittest.TestCase):
             run_dir = _retrieval_run(Path(root_str))
             prompt = build_node_prompt(node, run_dir, inline_spans=True)
         self.assertEqual(prompt.count("[unit-01 \u00b7 chunk "), 3)
+
+
+class HiddenPathsNoticeTest(unittest.TestCase):
+    """PLAN-AUDIT-COST §A6-1: the hidden-paths notice moves into
+    build_node_prompt, in the stable region (before any per-node content),
+    split into a constant block (the hidden list) and a per-node block (the
+    exceptions)."""
+
+    def test_constant_block_precedes_artifact_instruction_and_brief(self) -> None:
+        node = _node()
+        with tempfile.TemporaryDirectory() as run_dir:
+            prompt = build_node_prompt(
+                node,
+                run_dir,
+                hidden_paths=("events.jsonl", "out/", "scratch/"),
+                hidden_path_exceptions=("out/a.md", "scratch/a"),
+            )
+        self.assertIn("Harness-owned paths (off limits):", prompt)
+        self.assertIn("- events.jsonl", prompt)
+        self.assertIn("- out/", prompt)
+        self.assertIn("Exception — these are yours", prompt)
+        self.assertIn("- out/a.md", prompt)
+        self.assertIn("- scratch/a", prompt)
+        self.assertLess(
+            prompt.index("Harness-owned paths"),
+            prompt.index("Write your artifact to"),
+        )
+        self.assertLess(
+            prompt.index("Harness-owned paths"),
+            prompt.index("Your brief:"),
+        )
+
+    def test_exceptions_block_comes_after_constant_block(self) -> None:
+        with tempfile.TemporaryDirectory() as run_dir:
+            prompt = build_node_prompt(
+                _node(),
+                run_dir,
+                hidden_paths=("out/",),
+                hidden_path_exceptions=("out/a.md",),
+            )
+        self.assertLess(
+            prompt.index("- out/\n"),
+            prompt.index("- out/a.md"),
+        )
+
+    def test_no_hidden_paths_means_no_notice(self) -> None:
+        with tempfile.TemporaryDirectory() as run_dir:
+            prompt = build_node_prompt(_node(), run_dir)
+        self.assertNotIn("Harness-owned paths", prompt)
+        self.assertNotIn("Exception — these are yours", prompt)
+
+    def test_segments_are_labeled_and_ordered_for_the_instrument(self) -> None:
+        # The segment_tokens hook must see the notice as two labeled
+        # segments sitting between contract and artifact_instruction.
+        labels: list[str] = []
+        with tempfile.TemporaryDirectory() as root_str:
+            run_dir = Path(root_str)
+            freeze_contract(run_dir, [ContractRule(source="p1", shape="prose", text="rule one")])
+            build_node_prompt(
+                _node(),
+                run_dir,
+                hidden_paths=("out/",),
+                hidden_path_exceptions=("out/a.md",),
+                segment_tokens=lambda label, _tokens: labels.append(label),
+            )
+        self.assertIn("contract", labels)
+        self.assertIn("hidden_paths", labels)
+        self.assertIn("hidden_path_exceptions", labels)
+        self.assertEqual(
+            labels.index("contract") < labels.index("hidden_paths") < labels.index(
+                "hidden_path_exceptions"
+            ),
+            True,
+        )
+        self.assertLess(labels.index("hidden_path_exceptions"), labels.index("artifact_instruction"))
 
 
 if __name__ == "__main__":

@@ -32,9 +32,14 @@ import os
 import threading
 from pathlib import Path
 
+from ..adapters.cli_agent import (
+    _hidden_path_exceptions_block,
+    _hidden_paths_notice_block,
+)
 from ..v0.run_dir import spec_path
 from ..v1.gates import estimate_tokens
 from ..v1.manifest import read_all_manifest_entries
+from ..v1.reviewer import DEFAULT_ARTIFACT_CAP_TOKENS, cap_artifact_text
 from ..v1.tree import TaskNode
 from ..v2.contract import load_contract
 from ..v2.retrieval import DEFAULT_TOP_K, retrieve_spans
@@ -183,6 +188,8 @@ def build_node_prompt(
     inline_spans: bool = False,
     top_k: int = DEFAULT_TOP_K,
     segment_tokens: Callable[[str, int], None] | None = None,
+    hidden_paths: tuple[str, ...] = (),
+    hidden_path_exceptions: tuple[str, ...] = (),
 ) -> str:
     """Assemble a Writer's prompt. ``segment_tokens`` (PLAN.md §C5's
     "mean input tokens per leaf broken down by prompt segment" instrument)
@@ -190,16 +197,25 @@ def build_node_prompt(
     token_count)`` after the whole prompt is assembled — deterministic,
     zero side effects, and the eval harness uses it to report which part
     of a leaf's prompt actually costs tokens. Default None reproduces
-    exactly the pre-instrument behavior."""
+    exactly the pre-instrument behavior.
+
+    §8's ordering is load-bearing for prefix caching (PLAN-AUDIT-COST
+    §A6-2): most-stable first. ``goal_and_rubric`` (spec.md) and
+    ``contract`` (frozen) are constant across the whole run, and the
+    hidden-paths notice's constant half sits with them; everything from
+    the per-node exceptions onward is node-specific. ``hidden_paths`` /
+    ``hidden_path_exceptions`` are the same two tuples
+    ``backends.build_writer_adapter`` hands the adapter — the notice used
+    to be appended by ``cli_agent.run_episode`` after ALL of this, which
+    put its constant ~120 tokens outside every cached prefix (§A6-1)."""
     run_dir = Path(run_dir)
-    segments: list[tuple[str, str]] = [("brief", f"Your brief: {node.brief}")]
+    segments: list[tuple[str, str]] = []
 
     def add(label: str, text: str) -> None:
         text = text.strip()
         if text:
             segments.append((label, text))
 
-    add("artifact_instruction", _artifact_instruction(node, run_dir))
     goal_block = _goal_and_rubric_block(run_dir)
     if goal_block:
         add("goal_and_rubric", goal_block)
@@ -209,6 +225,17 @@ def build_node_prompt(
             "contract",
             "Global contract — every artifact you produce must satisfy it:\n" + contract,
         )
+    add("hidden_paths", _hidden_paths_notice_block(hidden_paths))
+    add("hidden_path_exceptions", _hidden_path_exceptions_block(hidden_path_exceptions))
+    add("artifact_instruction", _artifact_instruction(node, run_dir))
+    if node.judgment and node.rubric:
+        rubric_lines = "\n".join(
+            f"- {judgment_id}: {node.rubric[judgment_id]}"
+            for judgment_id in node.judgment
+            if judgment_id in node.rubric
+        )
+        add("judgment_rubric", f"Judgment rubric the Reviewer will hold you to:\n{rubric_lines}")
+    add("brief", f"Your brief: {node.brief}")
     if node.inputs:
         # §D0b: a path stored on a node (a materialized spine unit, a v4
         # finding) is relative to run_dir; render it absolute so "read them
@@ -253,23 +280,44 @@ def build_node_prompt(
             "Upstream nodes' handoffs (what the nodes you depend on actually "
             "delivered — read them before writing):\n" + promotions,
         )
-    if node.judgment and node.rubric:
-        rubric_lines = "\n".join(
-            f"- {judgment_id}: {node.rubric[judgment_id]}"
-            for judgment_id in node.judgment
-            if judgment_id in node.rubric
-        )
-        add("judgment_rubric", f"Judgment rubric the Reviewer will hold you to:\n{rubric_lines}")
     if node.last_defect:
         # node.attempts is already incremented (by round_loop's transition)
         # before a retry is redispatched, so attempts==1 is building the
         # prompt for the node's 2nd dispatch, attempts>=2 for its 3rd+.
         instruction = _PATCH_RETRY_INSTRUCTION if node.attempts <= 1 else _REGENERATE_RETRY_INSTRUCTION
-        add("retry", instruction + node.last_defect)
+        # A6-5 (IMPLEMENTATION-PLAN-COST-AND-LIVE.md): retries otherwise
+        # re-pay everything — attempt 2+ is a fresh subprocess that re-sends
+        # the system prompt, contract, brief, and re-reads every input,
+        # including a `read` turn to fetch its own previous artifact. Inline
+        # the prior artifact text so a patch-framed retry can fix it in
+        # place without that round trip (capped: the full prior artifact is
+        # on disk at out/<node>.md if the model needs more).
+        retry_block = instruction + node.last_defect
+        prior_artifact = _prior_attempt_artifact(node, run_dir)
+        if prior_artifact is not None:
+            retry_block += (
+                "\n\nYour previous artifact (fix it in place, then save the "
+                f"corrected version over it):\n\n{prior_artifact}"
+            )
+        add("retry", retry_block)
     if segment_tokens is not None:
         for label, text in segments:
             segment_tokens(label, estimate_tokens(text))
     return "\n\n".join(text for _, text in segments)
+
+
+def _prior_attempt_artifact(node: TaskNode, run_dir: Path) -> str | None:
+    """A6-5: the failed attempt's artifact text (``out/<node>.md``), capped,
+    or None when there is nothing to inline (missing, or empty — an empty
+    file is an honest gate failure from the v0 runner's fallback, inlining
+    it would only invite a regenerate)."""
+    try:
+        text = (run_dir / node.artifact).read_text(encoding="utf-8")
+    except OSError:
+        return None
+    if not text.strip():
+        return None
+    return cap_artifact_text(text, DEFAULT_ARTIFACT_CAP_TOKENS)
 
 
 def _non_unit_inputs(node: TaskNode, run_dir: Path) -> list[str]:

@@ -354,7 +354,12 @@ def _get_node_thinking(handler: "DashboardRequestHandler", match: Any, body: dic
         since = 0
     since = max(0, since)
     entries = handler.state.trace_entries(unquote(match.group(1))) or []
-    serialized = [{"role": e.role, "text": e.text} for e in entries]
+    # B4-5 (IMPLEMENTATION-PLAN-COST-AND-LIVE.md): ts = the entry's index in
+    # the trace — a monotonic key the client can sort on. The client used to
+    # stamp entries with its own wall clock, so any clock skew or a slow tick
+    # interleaved thinking into the feed at the wrong place relative to the
+    # events' server timestamps.
+    serialized = [{"role": e.role, "text": e.text, "ts": i} for i, e in enumerate(entries)]
     total = len(serialized)
     truncated = total > MAX_THINKING_ENTRIES
     if since > 0:
@@ -687,6 +692,12 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
 
     # -- SSE -----------------------------------------------------------
     def _serve_stream(self) -> None:
+        # B4-3 (IMPLEMENTATION-PLAN-COST-AND-LIVE.md): do NOT "fix"
+        # protocol_version to HTTP/1.1 here. This handler inherits
+        # BaseHTTPRequestHandler.protocol_version = "HTTP/1.0", which is why
+        # SSE works: HTTP/1.0 bodies are delimited by connection close.
+        # HTTP/1.1 keep-alive would require chunked transfer-encoding, which
+        # this handler does not emit, and would break the stream.
         self.send_response(200)
         self.send_header("Content-Type", "text/event-stream")
         self.send_header("Cache-Control", "no-cache")
@@ -720,6 +731,10 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
         data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
         self.send_response(status)
         self.send_header("Content-Type", "application/json")
+        # B4-4 (IMPLEMENTATION-PLAN-COST-AND-LIVE.md): never let the browser's
+        # heuristic cache serve a stale snapshot — the polling fallback and
+        # the ?since= thinking cursor both depend on fresh responses.
+        self.send_header("Cache-Control", "no-store")
         # §C4: include any pending Set-Cookie header that's been queued
         # for this response. Used by /api/attach to drop the auth cookie
         # alongside its JSON payload.
@@ -882,7 +897,7 @@ def _build_parser():
     import argparse
 
     parser = argparse.ArgumentParser(prog="kusudaemon serve", description="Serve the recursive-decomposition web view over a runs directory.")
-    parser.add_argument("--runs-root", default="./.kusudaemon/runs")
+    parser.add_argument("--runs-root", default="~/.kusudaemon/runs")
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8765)
     parser.add_argument("--run-id", default=None, help="Attach to this run on startup.")

@@ -105,6 +105,11 @@ class OpenAICompatibleProvider:
         base_url: str | None = None,
         api_key: str | None = None,
         transport: Transport | None = None,
+        stream_transport: Callable[
+            [str, dict[str, Any], dict[str, str], Callable[[str], None] | None],
+            dict[str, Any],
+        ]
+        | None = None,
         timeout: float = 300.0,
         max_http_retries: int = _DEFAULT_HTTP_RETRIES,
         base_retry_delay: float = 1.0,
@@ -127,6 +132,7 @@ class OpenAICompatibleProvider:
         else:
             self.timeout = timeout
         self._transport = transport or self._http_transport
+        self._stream_transport_impl = stream_transport or self._http_stream_transport
         self._max_http_retries = max_http_retries
         self._base_retry_delay = base_retry_delay
         self._sleep = sleep
@@ -142,6 +148,20 @@ class OpenAICompatibleProvider:
         self._on_backoff = on_backoff
         self._should_abort = should_abort
         self._on_model_fallback = on_model_fallback
+        # A4-1 (IMPLEMENTATION-PLAN-COST-AND-LIVE.md): the `response_format`
+        # fallback latch is per-provider, not per-call. `None` = unknown (try
+        # with the field); `False` = the endpoint 400'd it once, never send it
+        # again for the life of this provider — otherwise every structured
+        # call on an endpoint that rejects `response_format` burns a wasted
+        # HTTP request first, a literal 2× on request count for the entire
+        # Direct column.
+        self._response_format_ok: bool | None = None
+        # A3-2: `True` once some complete_json call returned schema-valid
+        # JSON under `response_format` — the endpoint has proven it enforces
+        # the schema, so later calls can drop the prose schema copy. `None`
+        # = no proof yet; `False` is unreachable (a 400 flips
+        # `_response_format_ok` and the endpoint never sees the field again).
+        self._format_supported: bool | None = None
         # §11.10.3: concurrent callers (parallel tests, the dashboard, two
         # drivers on one endpoint) share one throttle, so a 429 storm from
         # one run can't starve the endpoint for the other.
@@ -172,25 +192,37 @@ class OpenAICompatibleProvider:
         temperature: float = 0.0,
         retries: int = _DEFAULT_STRUCTURED_RETRIES,
         on_reasoning: Callable[[str], None] | None = None,
+        streaming: bool = False,
     ) -> dict[str, Any]:
-        working_messages: list[dict[str, str]] = [
-            {
-                "role": "system",
-                "content": (
-                    "Respond with a single JSON object only — no prose, no "
-                    f"code fences — matching this schema:\n{describe_schema(schema)}"
-                ),
-            },
-            *messages,
-        ]
+        base_messages: list[dict[str, str]] = list(messages)
         last_error = "empty response"
+
+        def make_messages(with_format: bool) -> list[dict[str, str]]:
+            if with_format and self._format_supported is True:
+                # A3-2 (IMPLEMENTATION-PLAN-COST-AND-LIVE.md): once one call
+                # has returned schema-valid JSON *with* response_format set,
+                # the endpoint has proven it enforces the schema itself — the
+                # 170-240-token prose copy is redundant and gets dropped.
+                # Before that proof (and on any formatless fallback) the prose
+                # stays, because nothing else carries the schema then.
+                return list(base_messages)
+            return [
+                {
+                    "role": "system",
+                    "content": (
+                        "Respond with a single JSON object only — no prose, no "
+                        f"code fences — matching this schema:\n{describe_schema(schema)}"
+                    ),
+                },
+                *base_messages,
+            ]
 
         def make_payload(with_format: bool) -> dict[str, Any]:
             payload = {
                 "model": self.model,
-                "messages": working_messages,
+                "messages": make_messages(with_format),
                 "temperature": temperature,
-                "stream": False,
+                "stream": streaming,
             }
             if with_format:
                 payload["response_format"] = {
@@ -202,10 +234,17 @@ class OpenAICompatibleProvider:
         # §11.10.2: latch the fallback after the first 400 — an endpoint
         # that rejects `response_format` costs one structured-retry per
         # validate-reprompt attempt, not two HTTP requests per attempt.
-        use_format = True
+        # A4-1: the latch is instance state now — once an endpoint 400s,
+        # every later complete_json call skips the field outright instead of
+        # re-learning the rejection on its first request.
+        use_format = self._response_format_ok is not False
         for _attempt in range(retries + 1):
             try:
-                raw = self._call(make_payload(with_format=use_format))
+                raw = self._call(
+                    make_payload(with_format=use_format),
+                    stream=streaming,
+                    on_reasoning=on_reasoning,
+                )
             except ProviderHTTPError as exc:
                 # §12's fallback must be reachable when the *endpoint* (not
                 # the model) rejects structured output: some OpenAI-compatible
@@ -215,8 +254,13 @@ class OpenAICompatibleProvider:
                 # (PLAN-zeromem.md §11.3).
                 if exc.status != 400:
                     raise
+                self._response_format_ok = False
                 use_format = False
-                raw = self._call(make_payload(with_format=False))
+                raw = self._call(
+                    make_payload(with_format=False),
+                    stream=streaming,
+                    on_reasoning=on_reasoning,
+                )
             message = _first_choice_message(raw)
             if on_reasoning is not None:
                 reasoning = message.get("reasoning_content")
@@ -227,13 +271,17 @@ class OpenAICompatibleProvider:
             if parsed is not None:
                 schema_errors = validate(parsed, schema)
                 if not schema_errors:
+                    # A3-2: a schema-valid response under response_format is
+                    # the proof that lets later calls drop the prose copy.
+                    if use_format:
+                        self._format_supported = True
                     return parsed
                 last_error = "; ".join(schema_errors)
             else:
                 last_error = parse_error
 
-            working_messages = [
-                *working_messages,
+            base_messages = [
+                *base_messages,
                 {"role": "assistant", "content": content},
                 {
                     "role": "user",
@@ -244,7 +292,13 @@ class OpenAICompatibleProvider:
             f"structured output failed after {retries + 1} attempts: {last_error}"
         )
 
-    def _call(self, payload: dict[str, Any]) -> dict[str, Any]:
+    def _call(
+        self,
+        payload: dict[str, Any],
+        *,
+        stream: bool = False,
+        on_reasoning: Callable[[str], None] | None = None,
+    ) -> dict[str, Any]:
         headers = {"Content-Type": "application/json", "User-Agent": "kusudaemon/1.0 (Python)"}
         if self.api_key:
             headers["Authorization"] = f"Bearer {self.api_key}"
@@ -258,6 +312,10 @@ class OpenAICompatibleProvider:
         while True:
             try:
                 with self._throttle:
+                    if stream:
+                        return self._stream_transport_impl(
+                            f"{self.base_url}/chat/completions", payload, headers, on_reasoning
+                        )
                     return self._transport(f"{self.base_url}/chat/completions", payload, headers)
             except ProviderHTTPError as exc:
                 if exc.status == 400 or (exc.status < 500 and exc.status != 429):
@@ -336,6 +394,111 @@ class OpenAICompatibleProvider:
             ) from exc
         except urllib.error.URLError as exc:
             raise ProviderError(f"provider request failed: {exc.reason}") from exc
+
+
+    def _http_stream_transport(
+        self,
+        url: str,
+        payload: dict[str, Any],
+        headers: dict[str, str],
+        on_reasoning: Callable[[str], None] | None,
+    ) -> dict[str, Any]:
+        """B3-1 (IMPLEMENTATION-PLAN-COST-AND-LIVE.md): the streaming twin of
+        ``_http_transport``. Consumes the SSE delta stream, accumulates
+        ``delta.content`` into the JSON buffer, and fires ``on_reasoning``
+        per ``delta.reasoning_content``/``delta.reasoning`` chunk as it
+        arrives — so a phase call's trace file grows live instead of only
+        after the whole call completes. Returns the same synthetic
+        ``{choices: [{message: ...}]}`` body ``_first_choice_message``
+        consumes, so validation/reprompt logic upstream is unchanged."""
+        body = json.dumps(payload).encode("utf-8")
+        request = urllib.request.Request(url, data=body, headers=headers, method="POST")
+        try:
+            with urllib.request.urlopen(request, timeout=self.timeout) as response:
+                lines = [line.decode("utf-8", errors="replace").rstrip("\n") for line in response]
+                return _consume_sse_lines(lines, on_reasoning)
+        except urllib.error.HTTPError as exc:
+            detail = exc.read().decode("utf-8", errors="replace")
+            retry_after = _parse_retry_after(exc.headers.get("Retry-After"))
+            raise ProviderHTTPError(
+                exc.code, f"HTTP {exc.code} from provider: {detail[:500]}", retry_after=retry_after
+            ) from exc
+        except urllib.error.URLError as exc:
+            raise ProviderError(f"provider request failed: {exc.reason}") from exc
+
+
+def _consume_sse_lines(
+    lines: list[str], on_reasoning: Callable[[str], None] | None
+) -> dict[str, Any]:
+    """B3-1: parse one SSE response body into the synthetic
+    ``{choices: [{message: ...}]}`` shape ``_first_choice_message`` reads.
+    Pure and sync so unit tests can feed it canned lines without a socket.
+
+    Handles two bodies: proper SSE (``data:`` lines, ``[DONE]`` terminator,
+    per-chunk ``delta.content`` / ``delta.reasoning_content`` /
+    ``delta.reasoning``) and the degenerate case of an endpoint that
+    ignores ``stream: true`` and returns a plain JSON body — then the whole
+    body is parsed directly (an empty content buffer would otherwise fail
+    validation and burn a reprompt).
+    """
+    content_parts: list[str] = []
+    reasoning_parts: list[str] = []
+    event_lines: list[str] = []
+    raw_parts: list[str] = []
+    saw_sse = False
+    for line in lines:
+        raw_parts.append(line)
+        if not line.startswith("data:"):
+            if line == "" and event_lines:
+                saw_sse = True
+                _consume_sse_event(
+                    "\n".join(event_lines), content_parts, reasoning_parts, on_reasoning
+                )
+                event_lines = []
+            continue
+        saw_sse = True
+        data = line[len("data:"):].strip()
+        if data == "[DONE]":
+            event_lines = []
+            break
+        event_lines.append(data)
+    if event_lines:
+        _consume_sse_event("\n".join(event_lines), content_parts, reasoning_parts, on_reasoning)
+    if not content_parts and not reasoning_parts and not saw_sse:
+        parsed = json.loads("\n".join(raw_parts))
+        return parsed
+    return {
+        "choices": [
+            {
+                "message": {
+                    "content": "".join(content_parts),
+                    "reasoning_content": "".join(reasoning_parts),
+                }
+            }
+        ]
+    }
+
+
+def _consume_sse_event(
+    data: str,
+    content_parts: list[str],
+    reasoning_parts: list[str],
+    on_reasoning: Callable[[str], None] | None,
+) -> None:
+    try:
+        chunk = json.loads(data)
+    except json.JSONDecodeError:
+        return
+    choice = (chunk.get("choices") or [{}])[0]
+    delta = choice.get("delta") or choice.get("message") or {}
+    content = delta.get("content")
+    if content:
+        content_parts.append(content)
+    reasoning = delta.get("reasoning_content") or delta.get("reasoning")
+    if reasoning:
+        reasoning_parts.append(reasoning)
+        if on_reasoning is not None:
+            on_reasoning(reasoning)
 
 
 def _parse_retry_after(value: str | None) -> float | None:

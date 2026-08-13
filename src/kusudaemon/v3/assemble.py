@@ -130,6 +130,7 @@ def assemble(
     filename: str = "main.md",
     render: Callable[[TaskNode, str], str] = _default_render,
     require_all_passed: bool = True,
+    workspace_root: str | Path | None = None,
 ) -> AssemblyOutput:
     """Write ``assembly/index.md`` and the concatenated output file. Zero
     model tokens — everything here is a script over already-passed
@@ -146,20 +147,33 @@ def assemble(
     output_path = assembly_output_path(run_dir, filename)
     output_path.write_text(output_text, encoding="utf-8")
 
-    export_workspace_artifacts(run_dir)
+    export_workspace_artifacts(run_dir, workspace_root)
 
     return AssemblyOutput(
         index_path=index_path, output_path=output_path, index=entries, text=output_text
     )
 
 
-def export_workspace_artifacts(run_dir: str | Path) -> list[Path]:
+def export_workspace_artifacts(
+    run_dir: str | Path, workspace_root: str | Path | None = None
+) -> list[Path]:
     """Extract code blocks/files from node artifacts into the workspace directory."""
     import re
     run_dir = Path(run_dir)
-    workspace_root = run_dir.parent.parent if (run_dir.parent.name == "runs" and run_dir.parent.parent.name == ".kusudaemon") else Path.cwd()
-    if workspace_root.name == ".kusudaemon":
-        workspace_root = workspace_root.parent
+    if workspace_root is None:
+        # Heuristic fallback for callers without a work object: the legacy
+        # repo-local layout (`<project>/.kusudaemon/runs/<id>`) derives the
+        # project from the run dir's ancestors; with the ~/.kusudaemon
+        # default the run dir has no project ancestor, so fall back to the
+        # invoking cwd rather than exporting into $HOME.
+        cwd = Path.cwd().resolve()
+        if run_dir.resolve().is_relative_to(cwd) and (
+            run_dir.parent.name == "runs" and run_dir.parent.parent.name == ".kusudaemon"
+        ):
+            workspace_root = run_dir.parent.parent
+        else:
+            workspace_root = cwd
+    workspace_root = Path(workspace_root)
 
     exported: list[Path] = []
     out_dir = run_dir / "out"

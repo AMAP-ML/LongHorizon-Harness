@@ -187,11 +187,13 @@ class RunDocumentReviewTest(unittest.TestCase):
         return run_dir, tree
 
     def test_pass_emits_node_scoped_defects(self) -> None:
-        """§8.10.4 — a verdict naming two ids lands in both nodes' triage."""
+        """§8.10.4 — a verdict naming two ids lands in both nodes' triage.
+        The windowed checks are now fused (A5-4): one call per window
+        covers coverage+duplication+contract, then the depth pass reviews
+        the two shape medians."""
         run_dir, tree = self._three_node_run()
         provider = FakeProvider(
-            _pass_clean(3)
-            + [
+            [
                 {
                     "items": [
                         {
@@ -205,7 +207,7 @@ class RunDocumentReviewTest(unittest.TestCase):
                     "verdict": "fail",
                 }
             ]
-            + _pass_clean(1)
+            + _pass_clean(2)
         )
         result = run_document_review(run_dir, tree, provider)
         self.assertEqual(
@@ -214,15 +216,14 @@ class RunDocumentReviewTest(unittest.TestCase):
         self.assertEqual(result.triage["alpha"].classification, "patchable")
         self.assertEqual(result.triage["beta"].classification, "patchable")
         self.assertFalse(result.escalated)
-        self.assertEqual(result.calls, 5)
+        self.assertEqual(result.calls, 3)
 
     def test_unknown_node_id_is_dropped_not_crashed(self) -> None:
         """§8.10.5 — an invented node id is dropped and logged, while the
         real attribution still lands."""
         run_dir, tree = self._three_node_run()
         provider = FakeProvider(
-            _pass_clean(3)
-            + [
+            [
                 {
                     "items": [
                         {
@@ -236,7 +237,7 @@ class RunDocumentReviewTest(unittest.TestCase):
                     "verdict": "fail",
                 }
             ]
-            + _pass_clean(1)
+            + _pass_clean(2)
         )
         log = EventLog(events_path(run_dir))
         result = run_document_review(run_dir, tree, provider, log=log)
@@ -250,7 +251,9 @@ class RunDocumentReviewTest(unittest.TestCase):
         self.assertEqual(dropped_events[0]["node_ids"], ["ghost"])
 
     def test_unattributable_defect_escalates(self) -> None:
-        """§8.8 — a failing item naming no node goes to escalation."""
+        """§8.8 — a failing item naming no node goes to escalation, and
+        the windowed loop stops immediately (the depth pass would spend
+        calls whose output the caller already discards)."""
         run_dir, tree = self._three_node_run()
         provider = FakeProvider(
             [
@@ -261,12 +264,39 @@ class RunDocumentReviewTest(unittest.TestCase):
                     "verdict": "fail",
                 }
             ]
-            + _pass_clean(4)
         )
         result = run_document_review(run_dir, tree, provider)
         self.assertTrue(result.escalated)
         self.assertIn("unattributable", result.escalation_reason)
         self.assertEqual(result.triage, {})
+        self.assertEqual(result.calls, 1)
+
+    def test_check_field_routes_defects_to_their_originating_check(self) -> None:
+        """A5-4: the merged call's check discriminator names which of the
+        three fused checks found an item; an unknown/missing check logs
+        under the default "coverage" reading, never dropped."""
+        run_dir, tree = self._three_node_run()
+        provider = FakeProvider(
+            [
+                {
+                    "items": [
+                        {"id": "D1", "pass": False, "defect": "duplication!", "check": "duplication"},
+                        {"id": "D2", "pass": False, "defect": "orphan term", "check": "contract_compliance"},
+                        {"id": "D3", "pass": False, "defect": "weird check", "check": "bogus"},
+                    ],
+                    "verdict": "fail",
+                }
+            ]
+        )
+        result = run_document_review(run_dir, tree, provider, keep_depth_pass=False)
+        # Every defect is unattributable -> escalation, and the reason
+        # names the routed check for each.
+        self.assertTrue(result.escalated)
+        # Each item routed to the check named on it; the unknown check fell
+        # back to the default "coverage" reading — never dropped.
+        self.assertIn("duplication: unattributable defect — duplication!", result.escalation_reason)
+        self.assertIn("; contract_compliance: orphan term", result.escalation_reason)
+        self.assertIn("; coverage: weird check", result.escalation_reason)
 
     def test_depth_sample_uses_shape_medians(self) -> None:
         """§8.10.6 — the depth pass reviews exactly what select_pilot_nodes
@@ -274,18 +304,20 @@ class RunDocumentReviewTest(unittest.TestCase):
         run_dir, tree = self._three_node_run()
         expected = sorted(node.id for node in select_pilot_nodes(tree).values())
         self.assertEqual(expected, ["alpha", "gamma"])  # gamma is the median example-heavy
-        provider = FakeProvider(_pass_clean(5))
+        provider = FakeProvider(_pass_clean(3))
         result = run_document_review(run_dir, tree, provider, keep_depth_pass=True)
-        self.assertEqual(result.calls, 5)
+        self.assertEqual(result.calls, 3)
         without = run_document_review(
-            run_dir, tree, FakeProvider(_pass_clean(3)), keep_depth_pass=False
+            run_dir, tree, FakeProvider(_pass_clean(1)), keep_depth_pass=False
         )
-        self.assertEqual(without.calls, 3)
+        self.assertEqual(without.calls, 1)
 
     def test_flattened_depth_pass_reads_full_artifact(self) -> None:
         run_dir, tree = self._three_node_run()
         provider = FakeProvider(
-            _pass_clean(3)
+            [
+                {"items": [], "verdict": "pass"}  # merged windowed call: clean
+            ]
             + [
                 {
                     "items": [
@@ -307,7 +339,8 @@ class RunDocumentReviewTest(unittest.TestCase):
 
     def test_call_count_is_flat_in_node_count(self) -> None:
         """§8.10.7 — 40 and 400-node trees cost the same calls: windows
-        scale, nodes don't."""
+        scale, nodes don't. (A5-4: one merged call per window — the flat
+        count is 1x windows, not 3x.)"""
         from kusudaemon.v3.document_review import DEFAULT_REVIEW_WINDOW, DEFAULT_REVIEW_STRIDE
 
         roots = []
@@ -327,13 +360,13 @@ class RunDocumentReviewTest(unittest.TestCase):
         self.assertEqual(windows_40, 1)
         self.assertEqual(windows_400, 4)
 
-        provider = FakeProvider(_pass_clean(3 * windows_40 + 0))
+        provider = FakeProvider(_pass_clean(windows_40))
         result_40 = run_document_review(run_dir_40, tree_40, provider, keep_depth_pass=False)
-        self.assertEqual(result_40.calls, 3)
+        self.assertEqual(result_40.calls, 1)
 
-        provider_400 = FakeProvider(_pass_clean(3 * windows_400 + 0))
+        provider_400 = FakeProvider(_pass_clean(windows_400))
         result_400 = run_document_review(run_dir_400, tree_400, provider_400, keep_depth_pass=False)
-        self.assertEqual(result_400.calls, 12)
+        self.assertEqual(result_400.calls, 4)
         self.assertGreater(result_400.calls, result_40.calls)
 
 
@@ -345,7 +378,7 @@ class DocumentReviewWiringTest(unittest.TestCase):
         tree = TaskTree(nodes={n: _node(n) for n in NODES})
         run_dir = _run(root, tree)
 
-        provider = FakeProvider(_pass_clean(5))
+        provider = FakeProvider(_pass_clean(3))
         result = asyncio.run(
             run_assembly_loop(
                 run_dir,
@@ -363,7 +396,7 @@ class DocumentReviewWiringTest(unittest.TestCase):
         self.assertIsNotNone(result.review)
         self.assertEqual(result.review.triage, {})
         self.assertEqual(result.repairs, [])
-        self.assertEqual(result.review.calls, 5)
+        self.assertEqual(result.review.calls, 3)
 
     def test_triage_routes_through_existing_repair_path(self) -> None:
         """§8.10.9 — patchable triage dispatches repair.run_repair(patch),
@@ -373,7 +406,9 @@ class DocumentReviewWiringTest(unittest.TestCase):
         tree_path = root / "tree.json"
 
         review_provider = FakeProvider(
-            _pass_clean(3)
+            [
+                {"items": [], "verdict": "pass"}  # merged windowed call: clean
+            ]
             + [
                 {
                     "items": [
@@ -424,7 +459,9 @@ class DocumentReviewWiringTest(unittest.TestCase):
     def test_serialize_triage_round_trips_through_apply_shape(self) -> None:
         run_dir, tree = _three_node_run(Path(tempfile.mkdtemp()))
         provider = FakeProvider(
-            _pass_clean(3)
+            [
+                {"items": [], "verdict": "pass"}  # merged windowed call: clean
+            ]
             + [
                 {
                     "items": [

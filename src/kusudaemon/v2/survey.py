@@ -34,8 +34,18 @@ from ..v1.provider import OpenAICompatibleProvider
 from .run_dir import spine_path, spine_unit_path
 
 DEFAULT_MIN_CHUNK_TOKENS = 50
-DEFAULT_WINDOW_SIZE = 12
-DEFAULT_WINDOW_STRIDE = 8
+# A2-2 (IMPLEMENTATION-PLAN-COST-AND-LIVE.md): size the window to the
+# payload, not to a mental model of "12 big chunks". Each chunk contributes
+# only a ~25-word preview (~40 tokens), so a window of 12 was absurdly
+# small: 75% of every survey call was fixed overhead. 64/56 keeps an 8-chunk
+# overlap (so boundary votes aren't split) and cuts the call count 7× while
+# giving each call *more* context.
+DEFAULT_WINDOW_SIZE = 64
+DEFAULT_WINDOW_STRIDE = 56
+# A2-3: hard fence on model-mode survey calls — a pathological corpus
+# degrades to deterministic chunking for the remainder instead of issuing
+# thousands of requests (the only unbounded call loop in the harness).
+DEFAULT_MAX_SURVEY_CALLS = 60
 DEFAULT_MIN_UNIT_TOKENS = 800
 DEFAULT_CONFIDENCE_FLOOR = 0.5
 
@@ -101,6 +111,34 @@ def _merge_small_segments(segments: list[str], min_tokens: int) -> list[str]:
     return merged
 
 
+def prefold_chunks(
+    chunks: list[Chunk], *, max_tokens: int = DEFAULT_MIN_UNIT_TOKENS
+) -> list[Chunk]:
+    """A2-4 (IMPLEMENTATION-PLAN-COST-AND-LIVE.md): merge adjacent chunks up
+    to ~``max_tokens`` before model-mode surveying. ``assemble_spine`` folds
+    sub-``DEFAULT_MIN_UNIT_TOKENS`` units away afterward anyway, so surveying
+    the merged list loses no resolution while cutting the chunk count ~5–8×
+    on a long corpus.
+
+    Folding is greedy left-to-right, and a chunk that alone exceeds
+    ``max_tokens`` is kept as its own entry (never split) — it was already a
+    large structural block ``chunk_text`` chose not to split."""
+    if len(chunks) < 2:
+        return chunks
+    merged: list[Chunk] = []
+    for chunk in chunks:
+        if merged and merged[-1].tokens < max_tokens:
+            prev = merged[-1]
+            merged[-1] = Chunk(
+                index=prev.index,
+                text=prev.text + chunk.text,
+                tokens=prev.tokens + chunk.tokens,
+            )
+        else:
+            merged.append(chunk)
+    return merged
+
+
 @dataclass
 class BoundaryVote:
     boundary_after: int
@@ -144,7 +182,10 @@ _SURVEY_SYSTEM_PROMPT = (
 def _render_window(window: list[Chunk]) -> str:
     lines = []
     for local_index, chunk in enumerate(window):
-        preview = " ".join(chunk.text.split()[:15])
+        # A2-2: 25 words instead of 15 — still tiny, and boundary detection
+        # is mostly a lexical/structural judgment that benefits from a bit
+        # more text.
+        preview = " ".join(chunk.text.split()[:25])
         lines.append(f"{local_index}: {preview}")
     return "\n".join(lines)
 
@@ -155,25 +196,39 @@ def survey_chunks(
     *,
     window_size: int = DEFAULT_WINDOW_SIZE,
     stride: int = DEFAULT_WINDOW_STRIDE,
+    max_calls: int = DEFAULT_MAX_SURVEY_CALLS,
     on_reasoning: Callable[[str], None] | None = None,
+    streaming: bool = False,
 ) -> list[BoundaryVote]:
     """Walk ``chunks`` in overlapping windows of ``window_size`` (advancing
     by ``stride``), collecting one boundary-vote call per window. Each call's
     ``boundary_after`` is local to its window; this converts it back to a
-    global chunk index before returning."""
+    global chunk index before returning.
+
+    A2-3 (IMPLEMENTATION-PLAN-COST-AND-LIVE.md): ``max_calls`` fences the
+    loop. A pathological corpus (tens of thousands of chunks) degrades to
+    deterministic chunking for the remainder instead of issuing thousands of
+    requests — the fence is code-side, per §A6's "cost fences are code-side".
+    """
     votes: list[BoundaryVote] = []
     if len(chunks) < 2:
         return votes
     start = 0
+    calls = 0
     while start < len(chunks):
         window = chunks[start : start + window_size]
         if len(window) < 2:
             break
+        if calls >= max_calls:
+            break
+        calls += 1
         messages = [
             {"role": "system", "content": _SURVEY_SYSTEM_PROMPT},
             {"role": "user", "content": _render_window(window)},
         ]
-        payload = provider.complete_json(messages, SURVEY_SCHEMA, on_reasoning=on_reasoning)
+        payload = provider.complete_json(
+            messages, SURVEY_SCHEMA, on_reasoning=on_reasoning, streaming=streaming
+        )
         for boundary in payload.get("boundaries", []):
             global_index = start + int(boundary["boundary_after"])
             if 0 <= global_index < len(chunks) - 1:

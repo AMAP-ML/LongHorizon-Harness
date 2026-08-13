@@ -147,9 +147,12 @@ def extract_term_index(entries: list[IndexEntry]) -> dict[str, list[str]]:
 
 @dataclass
 class ReviewPass:
-    """One fixed pass: an id, its system prompt, and a context renderer over
-    a window of index entries. Stateless — the renderer produces the entire
-    user message."""
+    """One pre-A5-4 pass: an id, its system prompt, and a context renderer
+    over a window of index entries. Stateless — the renderer produces the
+    entire user message. Superseded by the merged per-window call
+    (``_MERGED_SYSTEM_PROMPT``/``_merged_render``); retained so the
+    original per-pass spec stays readable and callers that construct
+    their own passes keep working."""
 
     id: str
     system_prompt: str
@@ -236,6 +239,89 @@ PASSES: tuple[ReviewPass, ...] = (
 )
 
 
+# A5-4 (IMPLEMENTATION-PLAN-COST-AND-LIVE.md): PASSES above are the
+# pre-merge spec, kept for history; run_document_review no longer loops
+# them. The three checks now share one call per window — same verdict
+# shape plus a ``check`` discriminator on each item naming which of the
+# three checks found it. (The plan's name for the discriminator was
+# "pass", but ``pass`` already means the boolean fail-flag on every
+# verdict item in v1/reviewer.py's VERDICT_SCHEMA — reusing the name
+# would corrupt the schema's existing meaning, so the field is
+# ``check``.) A separate depth pass still runs per shape-median node —
+# it sends different content (full artifacts), which is exactly why the
+# merge excludes it.
+DOC_REVIEW_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "required": ["items", "verdict"],
+    "additionalProperties": False,
+    "properties": {
+        "items": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "required": ["id", "pass"],
+                "additionalProperties": False,
+                "properties": {
+                    "id": {"type": "string"},
+                    "pass": {"type": "boolean"},
+                    "defect": {"type": "string", "maxLength": 300},
+                    "class": {"type": "string", "enum": ["patchable", "regenerate"]},
+                    "node_ids": {"type": "array", "items": {"type": "string"}},
+                    # Which of the three merged checks produced this item.
+                    "check": {"type": "string", "maxLength": 24},
+                },
+            },
+        },
+        "verdict": {"type": "string", "enum": ["pass", "fail"]},
+    },
+}
+
+_MERGED_SYSTEM_PROMPT = (
+    "You are reviewing a whole decomposed document in one pass, covering "
+    "three checks: (1) coverage and gaps — the spine's expected section "
+    "labels, and each node's id, shape, brief, and writer-authored capped "
+    "summary; report material the spine implies that no node claims, and "
+    "gaps between adjacent sections' summaries; (2) duplication and "
+    "contradiction — two nodes covering the same ground, or conflicting "
+    "claims between sections; (3) contract compliance — sections whose own "
+    "summary already violates a frozen contract rule, and orphan "
+    "definitions (a concept defined in exactly one section) where the "
+    "contract demands consistent terminology. For every failing item set "
+    "its check field to the check that found it: 'coverage', "
+    "'duplication', or 'contract_compliance'. Judge a section by its own "
+    "summary, never the artifact. Name the node ids involved (node_ids "
+    "field); a boundary gap is attributable to at least one adjacent node. "
+    "Never invent items outside what the summaries and contract show. "
+    "Respond with a single JSON object only."
+)
+
+
+def _merged_render(entries: list[IndexEntry], extra: dict[str, Any]) -> str:
+    """The union of the three per-pass contexts, sent once per window:
+    contract text + spine labels + term index + per-node rows carrying
+    shape, brief, and summary. All three checks can read what they need
+    from one send, so a window costs one call instead of three."""
+    contract = extra.get("contract_text", "")
+    labels = extra.get("spine_labels", [])
+    parts = []
+    if contract:
+        parts.append(f"Frozen contract:\n{contract}")
+    if labels:
+        parts.append(f"Expected sections (from the spine): {', '.join(labels)}")
+    term_index = extract_term_index(entries)
+    top_terms = sorted(term_index.items(), key=lambda kv: len(kv[1]))[:_TERM_INDEX_CAP]
+    term_lines = [f"{term}: {', '.join(node_ids)}" for term, node_ids in top_terms]
+    if term_lines:
+        parts.append("Term index (term -> nodes that use it):\n" + "\n".join(term_lines))
+    parts.append(
+        _render_window(
+            _render_entries(entries, with_shape=True),
+            "Document index window (node, shape, brief, writer summary):",
+        )
+    )
+    return "\n\n".join(parts)
+
+
 @dataclass
 class DocumentReviewResult:
     triage: dict[str, Triage] = field(default_factory=dict)
@@ -255,12 +341,14 @@ def run_document_review(
     keep_depth_pass: bool = True,
     log: EventLog | None = None,
     on_reasoning: Callable[[str], None] | None = None,
+    streaming: bool = False,
 ) -> DocumentReviewResult:
-    """Read-only document review (§8.7): 3 passes over windowed index
-    contexts plus (by default) the depth pass over shape-median artifacts.
-    No writer is dispatched here — the triage feeds the existing §10
-    approval-then-apply path, by way of ``serialize_triage`` + the driver's
-    ``apply_triage``."""
+    """Read-only document review (§8.7): one merged check per windowed
+    index context (coverage + duplication + contract compliance in a
+    single call, A5-4) plus (by default) the depth pass over shape-median
+    artifacts. No writer is dispatched here — the triage feeds the
+    existing §10 approval-then-apply path, by way of ``serialize_triage``
+    + the driver's ``apply_triage``."""
     run_dir = Path(run_dir)
     entries = build_document_index(run_dir, tree)
     contract_text = ""
@@ -310,26 +398,33 @@ def run_document_review(
 
     extra: dict[str, Any] = {"contract_text": contract_text, "spine_labels": spine_labels}
     windows = window_indices(len(entries), window=window, stride=stride)
-    for _pass in PASSES:
-        for start, end in windows:
-            context = _pass.render(entries[start:end], extra)
-            payload = provider.complete_json(
-                [
-                    {"role": "system", "content": _pass.system_prompt},
-                    {"role": "user", "content": context},
-                ],
-                VERDICT_SCHEMA,
-            )
-            result.calls += 1
-            for item in payload.get("items", []):
-                if item.get("pass", True) is not False:
-                    continue
-                absorb(_pass.id, item)
-            # §11.10.1: an unattributable defect escalated inside absorb —
-            # every remaining window, pass, and the depth pass would spend
-            # ~50 calls whose output the caller already discards.
-            if result.escalated:
-                break
+    # A5-4: one call per window covers all three checks (coverage,
+    # duplication, contract compliance) — the union context ships once
+    # instead of three overlapping sends. The check field on each item
+    # names its originating check; a missing/unknown check is logged
+    # under "coverage" (the default reading), never dropped.
+    for start, end in windows:
+        context = _merged_render(entries[start:end], extra)
+        payload = provider.complete_json(
+            [
+                {"role": "system", "content": _MERGED_SYSTEM_PROMPT},
+                {"role": "user", "content": context},
+            ],
+            DOC_REVIEW_SCHEMA,
+            on_reasoning=on_reasoning,
+            streaming=streaming,
+        )
+        result.calls += 1
+        for item in payload.get("items", []):
+            if item.get("pass", True) is not False:
+                continue
+            check = str(item.get("check") or "")
+            if check not in ("coverage", "duplication", "contract_compliance"):
+                check = "coverage"
+            absorb(check, item)
+        # §11.10.1: an unattributable defect escalated inside absorb —
+        # every remaining window and the depth pass would spend ~50 calls
+        # whose output the caller already discards.
         if result.escalated:
             break
 
@@ -381,6 +476,8 @@ def run_document_review(
                     {"role": "user", "content": context},
                 ],
                 VERDICT_SCHEMA,
+                on_reasoning=on_reasoning,
+                streaming=streaming,
             )
             result.calls += 1
             for item in payload.get("items", []):

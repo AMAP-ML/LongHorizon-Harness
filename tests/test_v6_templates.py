@@ -74,6 +74,18 @@ class TemplateResolverTest(unittest.TestCase):
         finally:
             templates_mod._BUILTIN_TEMPLATES = original
 
+    def test_per_shape_tool_allowlists(self) -> None:
+        # PLAN-AUDIT-COST §A6-3: prose/reference leaves never execute, so
+        # their allowlists drop gptme's shell (the largest tool-doc block)
+        # and patch; derivation/problem-set keep shell (verification and
+        # answer-computation are plausibly the point), generic keeps no
+        # opinion (adapter's DEFAULT_TOOL_ALLOWLIST fallback).
+        self.assertEqual(template_for("prose-dominant").tools, ("read", "save"))
+        self.assertEqual(template_for("reference-dominant").tools, ("read", "save"))
+        self.assertEqual(template_for("derivation-dominant").tools, ("read", "save", "shell"))
+        self.assertEqual(template_for("problem-set-dominant").tools, ("read", "save", "shell"))
+        self.assertEqual(template_for("no-such-shape").tools, ())
+
 
 class ApplyTemplateTest(unittest.TestCase):
     def test_problem_set_template_lands_warn_gates_and_judgment(self) -> None:
@@ -123,6 +135,21 @@ class ApplyTemplateTest(unittest.TestCase):
         self.assertEqual(node.warn_gates, ["headers:std", "problems>=5"])
         self.assertEqual(node.gates, ["nonempty", "max_tokens:24000"])
         self.assertEqual(node.judgment, ["worked_examples_reachable"])
+        self.assertEqual(node.tools, ["read", "save", "shell"])
+
+    def test_apply_sets_per_shape_tools_only_when_node_has_none(self) -> None:
+        # §A6-3: a tool-less prose leaf takes the template's narrow
+        # allowlist; a node with its own tools keeps them.
+        plain = _node("p1", shape="prose-dominant")
+        apply_template_to_node(plain)
+        self.assertEqual(plain.tools, ["read", "save"])
+        tooled = _node("p2", shape="prose-dominant", tools=["shell", "read", "save", "patch"])
+        apply_template_to_node(tooled)
+        self.assertEqual(tooled.tools, ["shell", "read", "save", "patch"])
+        # The generic template (unknown shape) has no tool opinion.
+        generic = _node("g1", shape="mystery-shape")
+        apply_template_to_node(generic)
+        self.assertEqual(generic.tools, [])
 
     def test_explicit_template_param_wins_over_resolution(self) -> None:
         node = _node("p1", shape="prose-dominant")

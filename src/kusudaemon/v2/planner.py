@@ -63,7 +63,29 @@ PARTITION_SCHEMA: dict[str, Any] = {
                     "shape": {"type": "string", "enum": _SHAPES},
                 },
             },
-        }
+        },
+        # A5-3 (IMPLEMENTATION-PLAN-COST-AND-LIVE.md): the probe-planning
+        # decision folded into the plan call — up to 2 probes per call,
+        # each naming a child of this very call by its id. The item shape
+        # mirrors v4/probe_planner.py's PROBE_SUGGESTIONS_SCHEMA (kind
+        # optional; normalized post-hoc with "web" fallback), so a
+        # suggestion is interchangeable with the probe planner's output —
+        # the research phase consumes one or the other, never both.
+        "probes": {
+            "type": "array",
+            "maxItems": 2,
+            "items": {
+                "type": "object",
+                "required": ["node_id", "slug", "question"],
+                "additionalProperties": False,
+                "properties": {
+                    "node_id": {"type": "string", "minLength": 1, "maxLength": 64},
+                    "slug": {"type": "string", "minLength": 1, "maxLength": 64},
+                    "question": {"type": "string", "minLength": 1, "maxLength": 400},
+                    "kind": {"type": "string", "maxLength": 32},
+                },
+            },
+        },
     },
 }
 
@@ -122,7 +144,17 @@ def plan_level(
     top_level: bool,
     unit_summary_for: Callable[[SpineUnit], str] | None = None,
     on_reasoning: Callable[[str], None] | None = None,
+    probe_sink: list[dict[str, Any]] | None = None,
+    streaming: bool = False,
 ) -> list[Candidate]:
+    """A5-3 (IMPLEMENTATION-PLAN-COST-AND-LIVE.md): when ``probe_sink`` is
+    given, any ``probes`` the model returns are normalized and appended to
+    it — folded into this call instead of a later separate
+    ``plan_probes`` windowed call. Normalization mirrors
+    ``v4/probe_planner.py:_ask_one_window`` (kind validated post-hoc with
+    ``"web"`` fallback), so a sink entry is interchangeable with that
+    module's ``ProbeSuggestion`` dicts. The returned list is unchanged —
+    the sink is a pure out-parameter, never read here."""
     hint = (
         f"{DEFAULT_TOP_LEVEL_MIN_CHILDREN}-{DEFAULT_TOP_LEVEL_MAX_CHILDREN} children"
         if top_level
@@ -138,7 +170,24 @@ def plan_level(
             ),
         },
     ]
-    payload = provider.complete_json(messages, PARTITION_SCHEMA, on_reasoning=on_reasoning)
+    payload = provider.complete_json(messages, PARTITION_SCHEMA, on_reasoning=on_reasoning, streaming=streaming)
+    if probe_sink is not None:
+        raw_probes = payload.get("probes")
+        if isinstance(raw_probes, list):
+            for raw in raw_probes:
+                if not isinstance(raw, dict):
+                    continue
+                node_id = str(raw.get("node_id") or "").strip()
+                slug = str(raw.get("slug") or "").strip()
+                question = str(raw.get("question") or "").strip()
+                if not node_id or not slug or not question:
+                    continue
+                kind = str(raw.get("kind") or "web").strip() or "web"
+                if kind not in ("web", "workspace", "corpus"):
+                    kind = "web"
+                probe_sink.append(
+                    {"node_id": node_id, "slug": slug, "question": question, "kind": kind}
+                )
     candidates = []
     for child in payload["children"]:
         unit_start = max(0, min(int(child["unit_start"]), len(units) - 1))
@@ -284,6 +333,8 @@ def build_tree(
     log: EventLog | None = None,
     unit_summary_for: Callable[[SpineUnit], str] | None = None,
     on_reasoning: Callable[[str], None] | None = None,
+    probe_sink: list[dict[str, Any]] | None = None,
+    streaming: bool = False,
 ) -> TaskTree:
     """Recurse level-at-a-time from the full spine to a flat set of leaf
     TaskNodes. Depth cap, node cap, and a size floor (a one-unit slice
@@ -393,7 +444,18 @@ def build_tree(
             return
 
         candidates = plan_level(
-            slice_units, provider, top_level=(depth == 0), unit_summary_for=unit_summary_for, on_reasoning=on_reasoning
+            slice_units,
+            provider,
+            top_level=(depth == 0),
+            unit_summary_for=unit_summary_for,
+            on_reasoning=on_reasoning,
+            streaming=streaming,
+            # A5-3: probes are collected only from the top-level call —
+            # only there does a model-provided node id equal the final
+            # tree id. Deeper calls' children become ``path.child`` ids
+            # the model never saw, so their suggestions could never
+            # resolve; collecting-and-dropping would be fake confidence.
+            probe_sink=probe_sink if depth == 0 else None,
         )
         if not candidates:
             forced_leaf(slice_units, path or f"depth{depth}", "planner returned no children")

@@ -20,6 +20,7 @@ from kusudaemon.v1.provider import (  # noqa: E402
     ProviderError,
     ProviderHTTPError,
     RATE_LIMIT_BACKOFFS,
+    _consume_sse_lines,
 )
 from kusudaemon.v1.reviewer import cap_artifact_text, review_node  # noqa: E402
 from kusudaemon.v1.tree import TaskNode, TaskTree, TreeValidationError  # noqa: E402
@@ -564,6 +565,116 @@ class ProviderStructuredOutputTest(unittest.TestCase):
         provider = OpenAICompatibleProvider(transport=transport, api_key="unused")
         provider.complete_json([{"role": "user", "content": "hi"}], self.SCHEMA, on_reasoning=captured.append)
         self.assertEqual(captured, [])
+
+    # B3-1 (IMPLEMENTATION-PLAN-COST-AND-LIVE.md): the streaming
+    # complete_json. The stream transport is a separate swappable seam
+    # (tests inject `stream_transport`, never a socket); the SSE parsing
+    # itself is the pure `_consume_sse_lines`, exercised directly here.
+
+    def test_streaming_routes_through_the_stream_transport_and_asks_for_stream(self) -> None:
+        calls = []
+
+        def stream_transport(url, payload, headers, on_reasoning):
+            calls.append(payload)
+            return {"choices": [{"message": {"content": '{"action": "go"}'}}]}
+
+        provider = OpenAICompatibleProvider(
+            transport=lambda *args: self.fail("non-streaming transport used"),
+            stream_transport=stream_transport,
+            api_key="unused",
+        )
+        result = provider.complete_json([{"role": "user", "content": "hi"}], self.SCHEMA, streaming=True)
+        self.assertEqual(result, {"action": "go"})
+        self.assertTrue(calls[0]["stream"])
+
+    def test_streaming_validation_and_reprompt_operate_on_assembled_content(self) -> None:
+        # Same semantics as the non-streaming path: invalid first assembly
+        # reprompts with the validator's error and only the assembled
+        # content lands in the assistant turn.
+        calls = []
+
+        def stream_transport(url, payload, headers, on_reasoning):
+            calls.append(payload)
+            if len(calls) == 1:
+                return {"choices": [{"message": {"content": '{"action": "nope"}'}}]}
+            return {"choices": [{"message": {"content": '{"action": "stop"}'}}]}
+
+        provider = OpenAICompatibleProvider(stream_transport=stream_transport, api_key="unused")
+        result = provider.complete_json([{"role": "user", "content": "hi"}], self.SCHEMA, streaming=True)
+        self.assertEqual(result, {"action": "stop"})
+        self.assertEqual(len(calls), 2)
+        self.assertTrue(all(call["stream"] for call in calls))
+
+    def test_sse_parser_accumulates_deltas_and_streams_reasoning(self) -> None:
+        lines = [
+            'data: {"choices":[{"delta":{"reasoning_content":"weighing"}}]}',
+            "",
+            'data: {"choices":[{"delta":{"reasoning_content":" go vs stop"}}]}',
+            "",
+            'data: {"choices":[{"delta":{"content":"{\\"ac"}}]}',
+            "",
+            'data: {"choices":[{"delta":{"content":"tion\\": \\"go\\"}"}}]}',
+            "",
+            "data: [DONE]",
+            "",
+        ]
+        captured: list[str] = []
+        body = _consume_sse_lines(lines, captured.append)
+        message = body["choices"][0]["message"]
+        self.assertEqual(message["content"], '{"action": "go"}')
+        self.assertEqual(message["reasoning_content"], "weighing go vs stop")
+        self.assertEqual(captured, ["weighing", " go vs stop"])
+
+    def test_sse_parser_falls_back_to_a_plain_json_body(self) -> None:
+        # An endpoint that ignores `stream: true` returns a normal JSON
+        # body with no `data:` lines — parse it whole instead of failing
+        # validation on an empty content buffer.
+        body = _consume_sse_lines(
+            ['{"choices": [{"message": {"content": "{\\"action\\": \\"go\\"}"}}]}'], None
+        )
+        self.assertEqual(body["choices"][0]["message"]["content"], '{"action": "go"}')
+
+    # A3-2: once response_format has proven itself with a schema-valid
+    # parse, later calls drop the 170-240-token prose schema copy.
+
+    def test_prose_schema_copy_is_dropped_after_response_format_is_proven(self) -> None:
+        from kusudaemon.v1.json_schema import describe_schema
+
+        calls = []
+
+        def transport(url, payload, headers):
+            calls.append(payload)
+            return {"choices": [{"message": {"content": '{"action": "go"}'}}]}
+
+        provider = OpenAICompatibleProvider(transport=transport, api_key="unused")
+        provider.complete_json([{"role": "user", "content": "hi"}], self.SCHEMA)
+        self.assertIn(describe_schema(self.SCHEMA), calls[0]["messages"][0]["content"])
+
+        provider.complete_json([{"role": "user", "content": "hi again"}], self.SCHEMA)
+        self.assertEqual(len(calls), 2)
+        self.assertNotIn(
+            describe_schema(self.SCHEMA), calls[1]["messages"][0]["content"],
+            "once proven, the prose copy is redundant — response_format carries the schema",
+        )
+        # The caller's own messages go straight through with no system
+        # preamble at all — the schema lives in response_format.
+        self.assertEqual(calls[1]["messages"], [{"role": "user", "content": "hi again"}])
+
+    def test_prose_copy_stays_on_the_formatless_400_fallback(self) -> None:
+        from kusudaemon.v1.json_schema import describe_schema
+
+        calls = []
+
+        def transport(url, payload, headers):
+            calls.append(payload)
+            if "response_format" in payload:
+                raise ProviderHTTPError(400, "HTTP 400 from provider: response_format not supported")
+            return {"choices": [{"message": {"content": '{"action": "go"}'}}]}
+
+        provider = OpenAICompatibleProvider(transport=transport, api_key="unused")
+        provider.complete_json([{"role": "user", "content": "hi"}], self.SCHEMA)
+        self.assertEqual(len(calls), 2)
+        self.assertIn(describe_schema(self.SCHEMA), calls[1]["messages"][0]["content"])
 
     def test_gives_up_after_exhausting_retries(self) -> None:
         def transport(url, payload, headers):

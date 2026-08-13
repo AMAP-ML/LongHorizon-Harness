@@ -15,7 +15,7 @@ sys.path.insert(0, str(_REPO_ROOT / "src"))
 sys.path.insert(0, str(_REPO_ROOT / "tests" / "fixtures"))
 
 from fake_provider import FakeProvider  # noqa: E402
-from kusudaemon.v2.planner import Candidate, build_tree, leaf_gate  # noqa: E402
+from kusudaemon.v2.planner import Candidate, build_tree, leaf_gate, plan_level  # noqa: E402
 from kusudaemon.v2.survey import SpineUnit  # noqa: E402
 
 
@@ -62,6 +62,148 @@ class LeafGateTest(unittest.TestCase):
         is_leaf, reasons = leaf_gate(candidate)
         self.assertFalse(is_leaf)
         self.assertTrue(any("done-condition" in reason for reason in reasons))
+
+
+class ProbeSinkTest(unittest.TestCase):
+    """A5-3 (IMPLEMENTATION-PLAN-COST-AND-LIVE.md): the plan call's
+    optional probes array folds probe planning into planning itself —
+    normalized into a caller-provided sink, with the same kind
+    normalization posture as v4/probe_planner.py."""
+
+    def test_plan_level_collects_probes_into_the_sink(self) -> None:
+        units = _units(2)
+        provider = FakeProvider(
+            [
+                {
+                    "children": [
+                        {
+                            "id": "c0",
+                            "brief": "write unit 0",
+                            "unit_start": 0,
+                            "unit_end": 0,
+                            "estimated_calls": 3,
+                            "shape": "prose-dominant",
+                        },
+                        {
+                            "id": "c1",
+                            "brief": "write unit 1",
+                            "unit_start": 1,
+                            "unit_end": 1,
+                            "estimated_calls": 3,
+                            "shape": "problem-set-dominant",
+                        },
+                    ],
+                    "probes": [
+                        {"node_id": "c1", "slug": "ctx", "question": "what is the convention?"},
+                        {"node_id": "c1", "slug": "api", "question": "which API?", "kind": "workspace"},
+                        {"node_id": "c1", "slug": "x", "question": "bogus?", "kind": "doc_retrieval"},
+                    ],
+                }
+            ]
+        )
+        sink: list[dict] = []
+        candidates = plan_level(units, provider, top_level=True, probe_sink=sink)
+        self.assertEqual(len(candidates), 2)
+        self.assertEqual(len(sink), 3)
+        self.assertEqual(sink[0]["node_id"], "c1")
+        self.assertEqual(sink[1]["kind"], "workspace")
+        # Unsupported kind falls back to "web" (mirrors probe_planner).
+        self.assertEqual(sink[2]["kind"], "web")
+
+    def test_plan_level_drops_blank_suggestions_and_ignores_sink_by_default(self) -> None:
+        units = _units(1)
+        provider = FakeProvider(
+            [
+                {
+                    "children": [
+                        {
+                            "id": "c0",
+                            "brief": "write unit 0",
+                            "unit_start": 0,
+                            "unit_end": 0,
+                            "estimated_calls": 3,
+                            "shape": "prose-dominant",
+                        }
+                    ],
+                    "probes": [
+                        {"node_id": "  ", "slug": "x", "question": "q?"},
+                        {"node_id": "c0", "slug": "  ", "question": "q?"},
+                        {"node_id": "c0", "slug": "ok", "question": "  "},
+                        {"node_id": "c0", "slug": "ok", "question": "valid?"},
+                    ],
+                }
+            ]
+        )
+        sink: list[dict] = []
+        plan_level(units, provider, top_level=True, probe_sink=sink)
+        # Only the fully-populated entry survives stripping.
+        self.assertEqual([s["slug"] for s in sink], ["ok"])
+
+        # Without a sink the same response is a no-op.
+        provider2 = FakeProvider(
+            [
+                {
+                    "children": [
+                        {
+                            "id": "c0",
+                            "brief": "write unit 0",
+                            "unit_start": 0,
+                            "unit_end": 0,
+                            "estimated_calls": 3,
+                            "shape": "prose-dominant",
+                        }
+                    ],
+                    "probes": [{"node_id": "c0", "slug": "ok", "question": "valid?"}],
+                }
+            ]
+        )
+        plan_level(units, provider2, top_level=True)
+        self.assertEqual(len(provider2.calls), 1)
+
+    def test_build_tree_collects_only_from_the_top_level_call(self) -> None:
+        # The second (recursive) call returns probes too, but its children
+        # become path-prefixed ids the model never saw — collected-and-
+        # dropped would be fake confidence, so only top-level probes land.
+        units = _units(6, tokens=1000)
+        top_level = {
+            "children": [
+                {
+                    "id": "big",
+                    "brief": "write a huge section",
+                    "unit_start": 0,
+                    "unit_end": 5,
+                    "estimated_calls": 99,  # forces a recursive call
+                    "shape": "prose-dominant",
+                },
+            ],
+            "probes": [{"node_id": "big", "slug": "ctx", "question": "what is big?"}],
+        }
+        second_level = {
+            "children": [
+                {
+                    "id": "small1",
+                    "brief": "write part 1",
+                    "unit_start": 0,
+                    "unit_end": 2,
+                    "estimated_calls": 3,
+                    "shape": "prose-dominant",
+                },
+                {
+                    "id": "small2",
+                    "brief": "write part 2",
+                    "unit_start": 3,
+                    "unit_end": 5,
+                    "estimated_calls": 3,
+                    "shape": "prose-dominant",
+                },
+            ],
+            "probes": [{"node_id": "small1", "slug": "deep", "question": "deep question?"}],
+        }
+        provider = FakeProvider([top_level, second_level])
+        sink: list[dict] = []
+        tree = build_tree(units, provider, depth_cap=4, node_cap=100, tool_call_cap=15, probe_sink=sink)
+        self.assertEqual(len(provider.calls), 2)
+        self.assertEqual([s["node_id"] for s in sink], ["big"])
 
 
 class BuildTreeTest(unittest.TestCase):
