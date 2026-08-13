@@ -332,17 +332,39 @@ def _get_node_thinking(handler: "DashboardRequestHandler", match: Any, body: dic
     cache rather than ``rendering.parse_trace`` on the raw text — this
     route is polled every ~1.5s (after every SSE snapshot push) for as
     long as an episode runs, so re-parsing the whole trace from scratch on
-    every call got slower every tick as the trace grew."""
+    every call got slower every tick as the trace grew.
+
+    §F1 (2026-08-12 audit): an optional ``?since=<n>`` cursor lets a caller
+    fetch only ``parsed_entries[n:]`` instead of the whole (tail-capped)
+    trace every tick — the live-thinking-in-the-main-feed UI polls this
+    continuously while an episode runs, and re-rendering the full payload
+    every ~1.5s is the exact cost this cap already exists to avoid.
+    ``since`` omitted or ``0`` preserves today's exact response (the
+    tail-capped full fetch, unchanged field-for-field); a positive
+    ``since`` instead returns everything from that index onward,
+    uncapped — the client is expected to already hold the earlier entries.
+    ``next`` is always the cursor to pass on the following call, and
+    ``truncated`` reuses the same cap semantics either way (whether the
+    *total* trace exceeds ``MAX_THINKING_ENTRIES``, not just this
+    response's slice)."""
+    since_raw = (handler.query.get("since") or ["0"])[0]
+    try:
+        since = int(since_raw)
+    except (TypeError, ValueError):
+        since = 0
+    since = max(0, since)
     entries = handler.state.trace_entries(unquote(match.group(1))) or []
     serialized = [{"role": e.role, "text": e.text} for e in entries]
-    # §PERF: this route is polled every ~1.5s for as long as an episode
-    # runs; an unbounded payload grows with the episode and the client then
-    # JSON.parses megabytes per tick. Cap at the tail — live episodes only
-    # need the recent turns (the client bounds its own DOM render at
+    total = len(serialized)
+    truncated = total > MAX_THINKING_ENTRIES
+    if since > 0:
+        return 200, {"entries": serialized[since:], "total": total, "next": total, "truncated": truncated}
+    # Unchanged from before §F1: cap at the tail — live episodes only need
+    # the recent turns (the client bounds its own DOM render at
     # CHAT_RENDER_CAP) — and report ``total`` so the UI can say how much
     # history was omitted.
-    trimmed = serialized[-MAX_THINKING_ENTRIES:] if len(serialized) > MAX_THINKING_ENTRIES else serialized
-    return 200, {"entries": trimmed, "total": len(serialized), "truncated": len(trimmed) < len(serialized)}
+    trimmed = serialized[-MAX_THINKING_ENTRIES:] if truncated else serialized
+    return 200, {"entries": trimmed, "total": total, "next": total, "truncated": truncated}
 
 
 @_route("GET", r"^/api/node/([^/]+)/version/([^/]+)$")

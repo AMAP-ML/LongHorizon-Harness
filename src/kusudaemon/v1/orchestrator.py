@@ -29,7 +29,7 @@ from .manifest import read_manifest_tail
 from .provider import OpenAICompatibleProvider
 from .tree import TaskTree
 
-DispatchPolicy = Literal["model", "document_order"]
+DispatchPolicy = Literal["model", "document_order", "deterministic"]
 
 DISPATCH_SCHEMA: dict[str, Any] = {
     "type": "object",
@@ -158,11 +158,20 @@ def decide_next_action_with_policy(
     ``"document_order"`` path spends zero tokens, the ``"model"`` path is
     today's call unchanged. Any other spelling is a real error (the old
     fallback silently spent the per-round calls ``document_order`` exists
-    to avoid), so it raises instead of dispatching (§11.11)."""
-    if policy == "document_order":
+    to avoid), so it raises instead of dispatching (§11.11).
+
+    PLAN-AUDIT.md §E5: the dashboard's new-run modal offers ``"deterministic"``
+    as a dispatch-policy choice (readable label for the zero-token path), and
+    an already-on-disk ``run.spec.json`` may carry that spelling from before
+    this was noticed. Treated as a backward-compatible alias for
+    ``"document_order"`` — identical zero-call code path, not just a
+    string-coercion that happens to avoid the ``ValueError``."""
+    if policy in ("document_order", "deterministic"):
         return decide_next_action_deterministic(tree, round_index=round_index)
     if policy != "model":
-        raise ValueError(f"unrecognized dispatch policy {policy!r} (model | document_order)")
+        raise ValueError(
+            f"unrecognized dispatch policy {policy!r} (model | document_order | deterministic)"
+        )
     if provider is None:
         raise ValueError("policy='model' requires a provider")
     return decide_next_action(tree, manifest_path, provider, round_index=round_index)

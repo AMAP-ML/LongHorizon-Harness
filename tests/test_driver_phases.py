@@ -146,6 +146,111 @@ class PhaseDetailPreservationTest(unittest.TestCase):
         asyncio.run(scenario())
 
 
+class PhaseRetryPolicyTest(unittest.TestCase):
+    """PLAN-AUDIT.md §E10: ``_run_phase``'s retry logic used to be exactly
+    backwards — a deterministic error (``ValueError``, a schema-validation
+    ``ProviderError``, a ``KeyError``) got retried 3x, one second apart,
+    **re-executing the whole phase body** (and re-spending its provider
+    calls) each time, while a 429/501-class error failed this level
+    immediately. Fixed: only a genuinely transient error (a 5xx
+    ``ProviderHTTPError``, ``URLError``, ``TimeoutError``) is retried here,
+    capped at 2 total attempts with backoff; everything else — including
+    rate-limit/busy errors, unchanged — is reported on the first
+    occurrence."""
+
+    def _driver(self, root: Path) -> tuple[_ScriptedDriver, Path]:
+        run_dir = root / "run"
+        return _ScriptedDriver(run_dir), run_dir
+
+    def test_deterministic_error_reported_after_one_attempt(self) -> None:
+        import asyncio
+
+        async def scenario() -> None:
+            with tempfile.TemporaryDirectory() as root_str:
+                driver, _ = self._driver(Path(root_str))
+                calls = {"n": 0}
+
+                async def fake_classify() -> None:
+                    calls["n"] += 1
+                    raise ValueError("deterministic failure — retrying will not help")
+
+                driver._phase_classify = fake_classify  # type: ignore[method-assign]
+                report = await driver._run_phase("classify", round_index=0)
+                self.assertEqual(report.status, "error")
+                self.assertEqual(calls["n"], 1)
+
+        asyncio.run(scenario())
+
+    def test_transient_5xx_error_is_retried_and_capped_at_two_attempts(self) -> None:
+        import asyncio
+
+        from kusudaemon.v1.provider import ProviderHTTPError
+
+        async def scenario() -> None:
+            with tempfile.TemporaryDirectory() as root_str:
+                driver, _ = self._driver(Path(root_str))
+                calls = {"n": 0}
+
+                async def fake_classify() -> None:
+                    calls["n"] += 1
+                    raise ProviderHTTPError(503, "upstream unavailable")
+
+                driver._phase_classify = fake_classify  # type: ignore[method-assign]
+                report = await driver._run_phase("classify", round_index=0)
+                self.assertEqual(report.status, "error")
+                # Capped at 2 total attempts (the old code allowed 3) —
+                # a transient error that never clears still fails, just
+                # not after wasting a third call.
+                self.assertEqual(calls["n"], 2)
+
+        asyncio.run(scenario())
+
+    def test_transient_error_recovers_on_its_retry(self) -> None:
+        import asyncio
+
+        from kusudaemon.v1.provider import ProviderHTTPError
+
+        async def scenario() -> None:
+            with tempfile.TemporaryDirectory() as root_str:
+                driver, _ = self._driver(Path(root_str))
+                calls = {"n": 0}
+
+                async def fake_classify() -> None:
+                    calls["n"] += 1
+                    if calls["n"] == 1:
+                        raise ProviderHTTPError(500, "internal error")
+
+                driver._phase_classify = fake_classify  # type: ignore[method-assign]
+                report = await driver._run_phase("classify", round_index=0)
+                self.assertEqual(report.status, "done")
+                self.assertEqual(calls["n"], 2)
+
+        asyncio.run(scenario())
+
+    def test_rate_limit_error_still_fails_on_first_attempt(self) -> None:
+        """Unchanged behavior: a rate-limit/busy error is never retried at
+        this level — v1/provider.py's own ladder (§D11) already spent up to
+        five hours on it before one could even escape to here, so a second
+        retry layer on top of that would only double the wait."""
+        import asyncio
+
+        async def scenario() -> None:
+            with tempfile.TemporaryDirectory() as root_str:
+                driver, _ = self._driver(Path(root_str))
+                calls = {"n": 0}
+
+                async def fake_classify() -> None:
+                    calls["n"] += 1
+                    raise RuntimeError("simulated 429 rate limit")
+
+                driver._phase_classify = fake_classify  # type: ignore[method-assign]
+                report = await driver._run_phase("classify", round_index=0)
+                self.assertEqual(report.status, "error")
+                self.assertEqual(calls["n"], 1)
+
+        asyncio.run(scenario())
+
+
 class CorpusLessSurveyRaisesTest(unittest.TestCase):
     """PLAN.md §D4: a run with no source text used to synthesize a single
     SpineUnit labeled "The goal", producing one forced leaf whose entire
@@ -162,6 +267,56 @@ class CorpusLessSurveyRaisesTest(unittest.TestCase):
                 driver = _ScriptedDriver(run_dir)
                 with self.assertRaises(ValueError):
                     await driver._phase_survey()
+
+        asyncio.run(scenario())
+
+
+class T1ExploreSkipsSpineTest(unittest.TestCase):
+    """PLAN-AUDIT.md §E8: T1 has no "plan" phase and builds its single node
+    from the goal in code (build_single_node_tree) -- it never reads
+    spine.json. _phase_explore used to unconditionally ensure spine.json
+    exists by delegating to _phase_survey, which raises loudly for a
+    corpus-less, workspace-less run (§D4) -- so the single most natural
+    "small task, no corpus, no workspace" goal died at explore with a
+    message about a corpus the operator never mentioned, even though the
+    identical goal classified T0 (no explore phase at all) completed fine.
+    _phase_explore must skip the spine-ensure entirely when the current
+    tier's phase list has no "plan" phase."""
+
+    def test_t1_explore_does_not_touch_survey_with_no_source_or_workspace(self) -> None:
+        import asyncio
+
+        async def scenario() -> None:
+            with tempfile.TemporaryDirectory() as root_str:
+                run_dir = Path(root_str) / "run"
+                driver = _ScriptedDriver(run_dir)
+                (run_dir / "source.txt").write_text("", encoding="utf-8")
+                tier_path(run_dir).write_text(
+                    json.dumps({"tier": "T1", "needs_intake": False, "needs_explore": True}),
+                    encoding="utf-8",
+                )
+                # Must not raise -- a real bug here raised ValueError from
+                # _phase_survey by way of _phase_explore's old unconditional
+                # spine-ensure.
+                await driver._phase_explore()
+                self.assertFalse((run_dir / "spine.json").exists())
+
+        asyncio.run(scenario())
+
+    def test_t2_explore_still_raises_loudly_with_no_source(self) -> None:
+        import asyncio
+
+        async def scenario() -> None:
+            with tempfile.TemporaryDirectory() as root_str:
+                run_dir = Path(root_str) / "run"
+                driver = _ScriptedDriver(run_dir)
+                (run_dir / "source.txt").write_text("", encoding="utf-8")
+                tier_path(run_dir).write_text(
+                    json.dumps({"tier": "T2", "needs_intake": False, "needs_explore": True}),
+                    encoding="utf-8",
+                )
+                with self.assertRaises(ValueError):
+                    await driver._phase_explore()
 
         asyncio.run(scenario())
 

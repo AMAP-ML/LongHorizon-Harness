@@ -19,6 +19,7 @@ import socket
 import subprocess
 import sys
 import tempfile
+import threading
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -470,6 +471,111 @@ class HostedCountTest(unittest.TestCase):
         run_id, error = self.state.start_run({"goal": "g"}, driver=_StubDriver())
         self.assertEqual(error, "")
         self.assertEqual(self.state.hosted_count(), 1)
+
+    def test_hosted_count_returns_to_zero_when_driver_finishes(self) -> None:
+        """§E9 (2026-08-12 audit): before this fix, only ``kill_run`` ever
+        popped a run out of ``self._hosts`` -- a driver that finished on
+        its own (the common case) left a permanent phantom entry, so
+        ``hosted_count()`` grew monotonically across every completed run
+        in a long-lived ``serve`` process and ``is_hosted()``/
+        ``snapshot()["hosted"]`` stayed true forever for a run that was
+        long done. ``_host_driver`` must remove its own entry in a
+        ``finally`` regardless of how the driver call resolves."""
+
+        class _StubDriver:
+            def run(self):  # noqa: ANN201
+                return None
+
+        run_id, error = self.state.start_run({"goal": "g"}, driver=_StubDriver())
+        self.assertEqual(error, "")
+        with self.state._lock:
+            thread = self.state._hosts[run_id]
+        thread.join(timeout=5)
+        self.assertFalse(thread.is_alive())
+        self.assertEqual(self.state.hosted_count(), 0)
+        self.assertFalse(self.state.is_hosted(run_id))
+
+    def test_is_hosted_prunes_a_dead_thread_defensively(self) -> None:
+        """Defense in depth: even a thread that ended up in ``_hosts``
+        without ever reaching ``_host_driver``'s own cleanup (shouldn't
+        happen, but the fix is deliberately layered) must not permanently
+        pin the hosted flag once it's no longer alive."""
+        dead = threading.Thread(target=lambda: None)
+        dead.start()
+        dead.join(timeout=5)
+        self.assertFalse(dead.is_alive())
+        with self.state._lock:
+            self.state._hosts["ghost-run"] = dead
+        self.assertFalse(self.state.is_hosted("ghost-run"))
+        with self.state._lock:
+            self.assertNotIn("ghost-run", self.state._hosts)
+
+    def test_hosted_count_prunes_dead_threads(self) -> None:
+        dead = threading.Thread(target=lambda: None)
+        dead.start()
+        dead.join(timeout=5)
+        with self.state._lock:
+            self.state._hosts["ghost-run"] = dead
+        self.assertEqual(self.state.hosted_count(), 0)
+
+
+class OptionsFromBodyTierOverrideTest(unittest.TestCase):
+    """§E7 (2026-08-12 audit): the new-run form's tier-floor field can
+    plausibly send a bare digit, a lowercase letter, or the canonical
+    form -- the server used to only accept the literal "T0".."T3"."""
+
+    def test_accepts_bare_digit(self) -> None:
+        options, _ = RunState._options_from_body({"tier_override": "2"}, "goal")
+        self.assertEqual(options.tier_override, "T2")
+
+    def test_accepts_lowercase(self) -> None:
+        options, _ = RunState._options_from_body({"tier_override": "t3"}, "goal")
+        self.assertEqual(options.tier_override, "T3")
+
+    def test_accepts_canonical_form(self) -> None:
+        options, _ = RunState._options_from_body({"tier_override": "T1"}, "goal")
+        self.assertEqual(options.tier_override, "T1")
+
+    def test_accepts_via_tier_floor_alias(self) -> None:
+        options, _ = RunState._options_from_body({"tier_floor": "0"}, "goal")
+        self.assertEqual(options.tier_override, "T0")
+
+    def test_blank_yields_none(self) -> None:
+        options, _ = RunState._options_from_body({"tier_override": ""}, "goal")
+        self.assertIsNone(options.tier_override)
+
+    def test_missing_yields_none(self) -> None:
+        options, _ = RunState._options_from_body({}, "goal")
+        self.assertIsNone(options.tier_override)
+
+    def test_rejects_out_of_range_digit(self) -> None:
+        with self.assertRaises(ValueError):
+            RunState._options_from_body({"tier_override": "9"}, "goal")
+
+    def test_rejects_garbage(self) -> None:
+        with self.assertRaises(ValueError):
+            RunState._options_from_body({"tier_override": "foo"}, "goal")
+
+
+class OptionsFromBodyFieldCoverageTest(unittest.TestCase):
+    """§E20k (2026-08-12 audit): the new-run modal is documented as the
+    full ``RunOptions`` surface -- confirm ``max_parallel``/
+    ``auto_probe_plan`` round-trip through ``_options_from_body`` with the
+    right types, matching the pattern every other field there already
+    follows (``dispatch_policy``, ``document_review``, ...)."""
+
+    def test_max_parallel_and_auto_probe_plan_accepted(self) -> None:
+        options, _ = RunState._options_from_body(
+            {"max_parallel": "3", "auto_probe_plan": False}, "goal"
+        )
+        self.assertEqual(options.max_parallel, 3)
+        self.assertIsInstance(options.max_parallel, int)
+        self.assertFalse(options.auto_probe_plan)
+
+    def test_max_parallel_and_auto_probe_plan_defaults(self) -> None:
+        options, _ = RunState._options_from_body({}, "goal")
+        self.assertEqual(options.max_parallel, 1)
+        self.assertTrue(options.auto_probe_plan)
 
 
 class ResumeDoubleDriverGuardTest(unittest.TestCase):

@@ -87,7 +87,7 @@ const state = {
   approvalDrafts: {},
   approvalAnswerDrafts: {},
   pilotDrafts: {},
-  newRun: { runId: "", goal: "", source: "", model: "", compile: "", workspace: "", tier: "", dispatch_policy: "model", survey_mode: "model", max_rounds: 100, max_attempts: 3, document_review: false, inline_spans: false },
+  newRun: { runId: "", goal: "", source: "", model: "", compile: "", workspace: "", tier: "", dispatch_policy: "model", survey_mode: "model", max_rounds: 100, max_attempts: 3, max_parallel: 1, document_review: false, inline_spans: false, auto_probe_plan: true },
   // §3/§6/§7/§10 additions
   sseLive: true,
   authRequired: false,
@@ -106,6 +106,12 @@ const state = {
   lastCliCommand: "",      // §5.5 copyable CLI equivalent of the last UI action
   escalationFlash: false,
   chatFeedPinned: true,    // the run stream pins to the newest entry until the operator scrolls up
+  // §F1 (PLAN-AUDIT.md, 2026-08-12): live thinking for the followed agent
+  // (mainAgentId()), appended into the main feed. Cursor-based — `next` is
+  // the index to resume fetching from, `entries` accumulate client-side so
+  // a tick only ever asks the server for what's new (?since=next) instead
+  // of re-fetching and re-rendering the whole trace every ~1.5s.
+  mainThinking: { agentId: null, entries: [], next: 0 },
 };
 
 const root = document.getElementById("app");
@@ -186,16 +192,21 @@ async function guarded(fn) {
 // on the Terminal tab — the escape-hatch-and-teaching-device line.
 function recordCli(kind, detail) {
   const runId = state.snapshot ? state.snapshot.run_id : "";
+  // §E20a: pipeline/cli.py's subparser set is exactly
+  // run|resume|status|approve|amend|escalate|serve — there is no
+  // reopen/redispatch/interject/halt subcommand. Actions with no CLI
+  // equivalent record a dashboard-only note instead of a fabricated
+  // command string.
   const forms = {
     approve: () => `kusudaemon approve ${runId}`,
     amend: () => `kusudaemon amend ${runId} --text "${(detail || "").slice(0, 60)}"`,
-    reopen: () => `kusudaemon reopen ${runId} --node ${detail} --defect "…"`,
-    redispatch: () => `kusudaemon reopen ${runId} --node ${detail}`,
     escalate: () => `kusudaemon escalate ${runId}`,
     resume: () => `kusudaemon resume ${runId}`,
-    halt: () => `kusudaemon run --run-id ${runId}  (set halt.flag)`,
     pilot: () => `kusudaemon approve ${runId} --file out/.versions/${detail}/pilot-original.md`,
-    interject: () => `kusudaemon pipeline interject ${runId} ${detail} "…"`,
+    reopen: () => `(dashboard-only — no CLI equivalent yet)`,
+    redispatch: () => `(dashboard-only — no CLI equivalent yet)`,
+    interject: () => `(dashboard-only — no CLI equivalent yet)`,
+    halt: () => `(dashboard-only — no CLI equivalent yet; sets halt.flag)`,
   };
   state.lastCliCommand = (forms[kind] || (() => ""))();
   render();
@@ -277,6 +288,45 @@ function mainAgentId() {
   return live ? live.id : (subs.length ? subs[subs.length - 1].id : "");
 }
 
+// §F1 (PLAN-AUDIT.md §F1, 2026-08-12): live thinking for the followed agent,
+// appended into the main run-stream feed — not just a header pill. Follows
+// the same target mainAgentId() already computes (live subagent, else most
+// recently dispatched), so no new "which agent" state is introduced. Each
+// tick asks only for what's new via the ?since= cursor server.py's §F1 fix
+// added; entries accumulate in state.mainThinking and are capped client-side
+// at CHAT_RENDER_CAP, same as the per-node Chat tab already does.
+function loadMainThinking() {
+  const id = mainAgentId();
+  if (!id) return;
+  if (state.mainThinking.agentId !== id) {
+    state.mainThinking = { agentId: id, entries: [], next: 0 };
+  }
+  const since = state.mainThinking.next;
+  apiGet(`/api/node/${encodeURIComponent(id)}/thinking?since=${since}`)
+    .then((d) => {
+      if (state.mainThinking.agentId !== id) return; // followed agent changed mid-flight
+      const fresh = d.entries || [];
+      if (fresh.length) {
+        // Entries have no timestamp of their own (server.py's thinking
+        // route only ever returned {role, text}) -- they're a live tail,
+        // so "now" (with a tiny per-entry increment to preserve arrival
+        // order) is the correct sort key for interleaving them into the
+        // feed's chronological array alongside real event/approval
+        // timestamps.
+        const base = Date.now() / 1000;
+        fresh.forEach((entry, i) => {
+          state.mainThinking.entries.push(Object.assign({}, entry, { sort: base + i * 0.001 }));
+        });
+        state.mainThinking.total = d.total;
+        state.mainThinking.next = d.next;
+        render();
+      } else if (d.next !== undefined) {
+        state.mainThinking.next = d.next;
+      }
+    })
+    .catch(() => {});
+}
+
 // Chat tab for the selected node: fetch its parsed trace on demand and
 // keep it current with a quiet re-fetch each tick while that node is live.
 // Plain GETs never touch state.busy, so background refreshes can never
@@ -332,6 +382,9 @@ function applySnapshot(snap) {
   updateChrome(nextPending.length > 0);
   if (state.selectedNode && isLive(state.selectedNode)) {
     loadThinkingIfNeeded(true);
+  }
+  if (snap && snap.attached) {
+    loadMainThinking();
   }
   if (!unchanged) {
     // §Responsive: never rebuild the command bar (and so drop the operator's
@@ -1095,6 +1148,22 @@ function renderCenterStream() {
   feedEntries.push(...allApprovals);
   const pendingMsgs = (state.pendingMessages || []).map((m) => ({ sort: m.ts || 0, node: renderPendingEntry(m) }));
   feedEntries.push(...pendingMsgs);
+  // §F1: the followed agent's live thinking, interleaved into the same
+  // chronological feed via renderAgentChatEntry (already styled per role —
+  // thinking/tool_call/diff/error all render distinctly). Capped at
+  // CHAT_RENDER_CAP client-side entries, same as the per-node Chat tab.
+  const mt = state.mainThinking;
+  if (mt && mt.entries && mt.entries.length) {
+    const shown = mt.entries.length > CHAT_RENDER_CAP ? mt.entries.slice(mt.entries.length - CHAT_RENDER_CAP) : mt.entries;
+    if (mt.entries.length > shown.length) {
+      feedEntries.push({
+        sort: shown[0].sort - 0.0001,
+        node: el("div", { class: "dim", style: "font-size:11px; padding:4px 10px;" },
+          `showing last ${shown.length} of ${mt.total || mt.entries.length} thinking entries for ${mt.agentId}`),
+      });
+    }
+    feedEntries.push(...shown.map((entry) => ({ sort: entry.sort, node: renderAgentChatEntry(entry) })));
+  }
   feedEntries.sort((a, b) => a.sort - b.sort);
 
   const pinnedHeader = el("div", { class: "pinned-hdr" }, [
@@ -1229,7 +1298,10 @@ async function handlePromptSubmit(e) {
   if (!text) return;
   if (mode === "command" && text.startsWith(">")) {
     const q = text.slice(1).trim();
-    const suggestions = commandSuggestions();
+    // §E1: match against the command *registry* (real objects with
+    // .key/.trigger/.pattern), not commandSuggestions() — that returns
+    // rendered DOM elements, which have none of those properties.
+    const suggestions = commandList();
     const exact = suggestions.find((s) => s.key === q || s.trigger === q);
     state.promptMode = "msg_agent"; state.promptText = ""; patchCmdbar();
     if (exact) { await guarded(exact.run); return; }
@@ -1351,7 +1423,13 @@ function flushPendingMessages() {
 
 /* ------------------------- commands / palette ------------------------- */
 function findCommand(key) {
-  return COMMANDS[key];
+  // §E2: must always go through _memo(buildCommands), never read the
+  // module-global COMMANDS directly — it stays null until something
+  // triggers the memoized build, and the only prior caller was
+  // commandSuggestions(), which only runs once the bar already holds a
+  // leading ">". The amend/reopen mode chips call this without ever
+  // typing ">", so a direct COMMANDS[key] read threw on a null global.
+  return _memo(buildCommands)[key];
 }
 
 let COMMANDS = null;
@@ -1424,15 +1502,16 @@ function buildCommands() {
     runs: { key: "runs", trigger: "runs", label: "Switch run", usage: "> runs", timeout: 20, run: cmdRuns },
     escalate: { key: "escalate", trigger: "esc", label: "Escalate tier", usage: "> escalate", timeout: 20, run: cmdEscalate },
     help: { key: "help", trigger: "help", label: "Keyboard shortcuts", usage: "> help", timeout: 20, run: cmdHelp },
-    amend: { key: "amend", trigger: "amend", label: "Amend contract", usage: "> amend <rule> [node]", timeout: 20, run: async (text) => {
+    amend: { key: "amend", trigger: "amend", label: "Amend contract", usage: "> amend <rule>", timeout: 20, run: async (text) => {
+      // §E4: the whole trailing text is the rule — no positional
+      // first-3-words/rest-is-a-node-arg split. There is no flag syntax
+      // for node-scoping an amendment today, so none is invented here;
+      // amendments stay whole-run, as the contract model already assumes.
       if (!state.snapshot.attached) { showToast("No run attached", true); return; }
       if (!text) { showToast("amend requires a rule text", true); return; }
-      const split = text.split(/\s+/);
-      const rule = split.slice(0, 3).join(" ");
-      const nodeArg = split[3] ? split.slice(3).join(" ") : "";
       const target = state.targetAgentManual ? state.targetAgentId : "main";
-      const resp = await apiPost("/api/amend", { text: rule + (nodeArg ? " " + nodeArg : ""), reason: "web amendment", target });
-      recordCli("amend", rule + (nodeArg ? " " + nodeArg : ""));
+      const resp = await apiPost("/api/amend", { text, reason: "web amendment", target });
+      recordCli("amend", text);
       showToast(resp.detail || "Contract amendment queued");
     } },
     reopen: { key: "reopen", trigger: "reopen", label: "Reopen node", usage: "> reopen <reason> <node>", timeout: 20, run: async (text) => {
@@ -1474,18 +1553,49 @@ async function runCommand(c) {
   await guarded(() => c.run());
 }
 
-function commandSuggestions() {
-  const cmds = _memo(buildCommands);
+// §E1: the command *registry* (plain objects with id/trigger/pattern/run),
+// separate from its rendering. handlePromptSubmit matches against this —
+// never against commandSuggestions(), which returns rendered DOM rows.
+function commandList() {
+  return Object.values(_memo(buildCommands));
+}
+
+// Same filtering commandList() always had, now just mapped to rows.
+function matchingCommands() {
   const q = state.promptText.replace(/^\s*>/, "").trim();
-  const list = Object.values(cmds);
-  if (!q) return list.map((c) => suggestionRow(c));
+  const list = commandList();
+  if (!q) return list;
   const matches = list.filter((c) => c.usage.includes(q) || (c.label || "").toLowerCase().includes(q.toLowerCase()) || (c.trigger || "").startsWith(q));
-  const out = matches.length ? matches : list;
-  return out.slice(0, 8).map((c) => suggestionRow(c));
+  return matches.length ? matches : list;
+}
+
+function commandSuggestions() {
+  return matchingCommands().slice(0, 8).map((c) => suggestionRow(c));
 }
 
 function suggestionRow(c) {
-  return el("div", { class: "cmd-suggestion", onclick: () => { state.promptMode = "msg_agent"; state.promptText = c.usage.replace(/^>/, "").trim(); patchCmdbar(); focusCmdbar(); } }, [
+  // §E3: a no-arg command (usage has no "<...>" placeholder) runs
+  // immediately on click. An arg-taking command instead fills
+  // "> <trigger> " into the bar and stays in command mode, so the
+  // operator can type the argument — it must never drop into msg_agent
+  // mode holding the bare trigger word as if it were a chat message.
+  const takesArgs = /<[^>]+>/.test(c.usage);
+  return el("div", {
+    class: "cmd-suggestion",
+    onclick: () => {
+      if (takesArgs) {
+        state.promptMode = "command";
+        state.promptText = "> " + (c.trigger || c.key) + " ";
+        patchCmdbar();
+        focusCmdbar();
+      } else {
+        state.promptMode = "msg_agent";
+        state.promptText = "";
+        patchCmdbar();
+        runCommand(c);
+      }
+    },
+  }, [
     el("span", { class: "sug-usage" }, c.usage),
     el("span", { class: "sug-timeout" }, `timeout ${c.timeout}s`),
   ]);
@@ -1513,6 +1623,7 @@ function attachRun(runId) {
       state.workbenchTab = "tree";
       state.treeFilter = "";
       state.chatFeedPinned = true;
+      state.mainThinking = { agentId: null, entries: [], next: 0 };
       apiGet("/api/snapshot").then(applySnapshot).catch(() => {});
     })
     .catch((err) => showToast(String(err.message || err), true));
@@ -2171,15 +2282,30 @@ function renderNewRunModal() {
       el("select", { onchange: (e) => set("model", e.target.value) },
         modelOptions.map((v) => el("option", { value: v, selected: selectedModel === v ? "selected" : null }, v)))),
     f("compile", "compile command", input("compile", "text", "e.g. python3 -m unittest")),
-    f("tier", "tier floor (0-3)", input("tier", "text", "")),
+    // §E7: the server requires exactly T0..T3 or blank (dashboard/state.py's
+    // _options_from_body raises on anything else, uppercased and matched
+    // against ("T0","T1","T2","T3")) — a free-text field let the operator
+    // type "2" and always 400. A select can't produce an invalid value.
+    f("tier", "tier floor",
+      el("select", { onchange: (e) => set("tier", e.target.value) },
+        [["", "auto"], ["T0", "T0"], ["T1", "T1"], ["T2", "T2"], ["T3", "T3"]].map(([v, label]) =>
+          el("option", { value: v, selected: state.newRun.tier === v ? "selected" : null }, label)))),
+    // §E5: the orchestrator only accepts "model" / "document_order" —
+    // "deterministic" was never a real value here.
     f("dispatch", "dispatch policy",
       el("select", { onchange: (e) => set("dispatch_policy", e.target.value) },
-        ["model", "deterministic"].map((v) => el("option", { value: v, selected: state.newRun.dispatch_policy === v ? "selected" : null }, v)))),
+        [["model", "model"], ["document_order", "document order (0 tokens)"]].map(([v, label]) =>
+          el("option", { value: v, selected: state.newRun.dispatch_policy === v ? "selected" : null }, label)))),
+    // §E6: the backend checks survey_mode == "embedding"; "deterministic"
+    // was a no-op that silently fell back to the model survey.
     f("survey", "survey mode",
       el("select", { onchange: (e) => set("survey_mode", e.target.value) },
-        ["model", "deterministic"].map((v) => el("option", { value: v, selected: state.newRun.survey_mode === v ? "selected" : null }, v)))),
+        ["model", "embedding"].map((v) => el("option", { value: v, selected: state.newRun.survey_mode === v ? "selected" : null }, v)))),
     f("max_rounds", "max rounds", input("max_rounds", "number", "100")),
     f("max_attempts", "max attempts", input("max_attempts", "number", "3")),
+    // §E20k: RunOptions.max_parallel (pipeline/driver.py) was missing from
+    // the modal despite it being documented as "the full RunOptions surface".
+    f("max_parallel", "max parallel (concurrent writer episodes/round)", input("max_parallel", "number", "1")),
   ]);
   const flag = (key, label) => el("label", { class: "form-flag" }, [
     el("input", { type: "checkbox", name: `flag-${key}`, checked: state.newRun[key] ? "checked" : null, onchange: (e) => set(key, e.target.checked) }),
@@ -2190,7 +2316,12 @@ function renderNewRunModal() {
       el("div", { class: "panel-hdr" }, "＋ New run"),
       el("div", { class: "panel-body" }, [
         form,
-        el("div", { class: "form-flags" }, [flag("document_review", "document review"), flag("inline_spans", "inline spans")]),
+        el("div", { class: "form-flags" }, [
+          flag("document_review", "document review"),
+          flag("inline_spans", "inline spans"),
+          // §E20k: RunOptions.auto_probe_plan (default True) was missing.
+          flag("auto_probe_plan", "auto probe plan"),
+        ]),
       ]),
       el("div", { class: "panel-foot" }, [
         el("button", { class: "primary", disabled: state.busy ? "" : null, onclick: () => guarded(async () => {
@@ -2210,8 +2341,10 @@ function renderNewRunModal() {
             survey_mode: state.newRun.survey_mode,
             max_rounds: parseInt(state.newRun.max_rounds, 10) || undefined,
             max_attempts: parseInt(state.newRun.max_attempts, 10) || undefined,
+            max_parallel: parseInt(state.newRun.max_parallel, 10) || undefined,
             document_review: state.newRun.document_review,
             inline_spans: state.newRun.inline_spans,
+            auto_probe_plan: state.newRun.auto_probe_plan,
           });
           state.newRun = Object.assign({}, state.newRun, { runId: "", goal: "", source: "", compile: "", workspace: "", model: "", tier: "" });
           state.newRunOpen = false;

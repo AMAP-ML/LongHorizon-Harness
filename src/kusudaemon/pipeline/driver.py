@@ -32,7 +32,9 @@ from __future__ import annotations
 
 import asyncio
 import json
+import random
 import time
+import urllib.error
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, Callable
@@ -63,7 +65,7 @@ from ..v7.split import handle_split_proposal, maybe_derive_split_parent
 from ..v0.events import EventLog
 from ..v0.run_dir import write_text_atomic
 from ..v0.run_dir import create_run_dir, ensure_node_trace_path, events_path, glossary_path, manifest_path, node_artifact_path, spec_path
-from ..v1.provider import OpenAICompatibleProvider
+from ..v1.provider import OpenAICompatibleProvider, ProviderHTTPError
 from ..v1.reviewer import ReviewVerdict
 from ..v1.round_loop import run_round_loop
 from ..v1.tree import TaskNode, TaskTree
@@ -298,6 +300,41 @@ def is_rate_limit_or_busy_error(exc: Exception | str) -> bool:
     return any(ind in msg for ind in indicators)
 
 
+# PLAN-AUDIT.md §E10: `_run_phase`'s retry policy used to be backwards — a
+# 429/501 (already handled by its own patient ladder inside
+# ``v1/provider.py``'s ``_call``, §D11) failed this level immediately, while
+# a deterministic error (``ValueError``, a schema-validation
+# ``ProviderError``, a ``KeyError``) got retried 3x, one second apart,
+# **re-executing the whole phase body each time** — a ``classify`` phase
+# that raises deterministically burned 3 provider calls instead of 1 before
+# ever reporting the error. Fixed: only genuinely transient error classes
+# (a 5xx that escaped provider.py's own short retry ladder, or a raw
+# connection-level failure that never made it through ``_http_transport``'s
+# wrapping) are retried here, capped at 2 attempts total with exponential
+# backoff and jitter; everything else — including rate-limit/busy errors,
+# which stay exactly as they were: reported immediately, never
+# double-retried on top of the provider layer's own ladder — is reported on
+# the first occurrence.
+_PHASE_TRANSIENT_MAX_ATTEMPTS = 2
+_PHASE_TRANSIENT_BASE_DELAY = 1.0
+_PHASE_TRANSIENT_MAX_DELAY = 30.0
+
+
+def is_transient_phase_error(exc: Exception) -> bool:
+    """5xx ``ProviderHTTPError`` (provider.py already exhausted its own
+    short exponential retry for these before letting one escape), or a raw
+    ``URLError``/``TimeoutError`` that reached this level directly (e.g. a
+    call site or test transport that doesn't route through
+    ``_http_transport``'s wrapping into ``ProviderError``). A 4xx
+    ``ProviderHTTPError`` other than 429/501 (handled separately by
+    ``is_rate_limit_or_busy_error``, checked first at the call site so the
+    two never double-classify the same exception) is a caller/schema bug,
+    not a transient condition, and must not be retried."""
+    if isinstance(exc, ProviderHTTPError):
+        return 500 <= exc.status < 600
+    return isinstance(exc, (urllib.error.URLError, TimeoutError))
+
+
 class RecursiveDriver:
     """One pipeline run. Construction never touches the network; only
     :meth:`run` does, and each phase is individually resumable."""
@@ -412,7 +449,6 @@ class RecursiveDriver:
         self._set_phase(phase, _IN_PROGRESS)
         self._log({"node_id": "-", "role": "harness", "round": round_index, "type": "phase_started", "phase": phase})
         
-        max_auto_attempts = 3
         attempt = 0
         while True:
             attempt += 1
@@ -423,15 +459,39 @@ class RecursiveDriver:
                 outcome: Any = await getattr(self, f"_phase_{phase}")()
                 break
             except Exception as exc:  # noqa: BLE001 — the phase boundary is the reporter
-                if is_rate_limit_or_busy_error(exc) or attempt >= max_auto_attempts:
+                # §E10: rate-limit/busy errors are never retried at this
+                # level — v1/provider.py's own ladder (§D11) already spent
+                # up to five hours on them before one could even reach here,
+                # so a second retry layer on top would only double that
+                # wait. Checked first so it can never also match
+                # ``is_transient_phase_error`` (a 429/501's own message can
+                # overlap "server busy"-style wording).
+                if is_rate_limit_or_busy_error(exc):
                     self._set_phase(phase, "error", detail=str(exc))
                     self._log(
                         {"node_id": "-", "role": "harness", "round": round_index, "type": "phase_failed", "phase": phase, "error": str(exc)}
                     )
                     return RunReport(status="error", phase=phase, detail=str(exc))
-                # Auto-resume non-429/501 error automatically
+                if not is_transient_phase_error(exc) or attempt >= _PHASE_TRANSIENT_MAX_ATTEMPTS:
+                    # Deterministic error (ValueError, schema-validation
+                    # ProviderError, KeyError, ...) — reported on the first
+                    # occurrence; retrying would just fail identically. A
+                    # transient error that has already used up its retry
+                    # budget falls through the same way.
+                    self._set_phase(phase, "error", detail=str(exc))
+                    self._log(
+                        {"node_id": "-", "role": "harness", "round": round_index, "type": "phase_failed", "phase": phase, "error": str(exc)}
+                    )
+                    return RunReport(status="error", phase=phase, detail=str(exc))
+                # Transient (5xx / URLError / TimeoutError) with retry
+                # budget remaining — exponential backoff with jitter,
+                # capped at _PHASE_TRANSIENT_MAX_ATTEMPTS total attempts.
                 err_msg = str(exc)
-                self._set_phase(phase, _IN_PROGRESS, detail=f"Auto-resuming (attempt {attempt}/{max_auto_attempts}) after error: {err_msg}")
+                self._set_phase(
+                    phase,
+                    _IN_PROGRESS,
+                    detail=f"Auto-resuming (attempt {attempt}/{_PHASE_TRANSIENT_MAX_ATTEMPTS}) after transient error: {err_msg}",
+                )
                 self._log(
                     {
                         "node_id": "-",
@@ -443,7 +503,11 @@ class RecursiveDriver:
                         "error": err_msg,
                     }
                 )
-                await asyncio.sleep(1.0)
+                delay = min(
+                    _PHASE_TRANSIENT_BASE_DELAY * (2 ** (attempt - 1)),
+                    _PHASE_TRANSIENT_MAX_DELAY,
+                )
+                await asyncio.sleep(delay * random.uniform(0.8, 1.2))
         status = "done" if outcome is not False else "escalated"
         # Preserve a detail the phase body already wrote (e.g.
         # _phase_research's "skipped: ...") instead of clobbering it with a
@@ -797,6 +861,28 @@ class RecursiveDriver:
         uses for the "targeted, post-intake" pattern, §A6's second bullet,
         still carried unchanged from before this workstream).
         """
+        tier = self._current_tier()
+        if "plan" not in phases_for(tier):
+            # PLAN.md §A4.3: T1 has no "plan" phase and builds its single
+            # node from the goal in code (build_single_node_tree) — it
+            # never reads spine.json, so ensuring one exists here (which,
+            # for a corpus-less/workspace-less run, means _phase_survey
+            # raising per §D4) turned "small task, no corpus, no
+            # workspace" into a hard failure at explore for a tier that
+            # never needed a spine in the first place. T0 never reaches
+            # this method at all (no "explore" phase), so only T1 hits
+            # this branch in practice.
+            self._log(
+                {
+                    "node_id": "-",
+                    "role": "harness",
+                    "round": 0,
+                    "type": "phase_skipped",
+                    "phase": "explore_spine",
+                    "reason": "tier has no plan phase",
+                }
+            )
+            return
         if not (self.run_dir / "spine.json").exists():
             await self._phase_survey()
         needs_explore = bool(self._read_tier_record().get("needs_explore", True))
@@ -812,7 +898,6 @@ class RecursiveDriver:
                 }
             )
             return
-        tier = self._current_tier()
         if tier in ("T2", "T3"):
             await self._run_structural_exploration(tier)
         if self.options.research_plan:

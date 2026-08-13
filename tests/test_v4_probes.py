@@ -447,11 +447,17 @@ class PhaseExploreRoutingTest(unittest.TestCase):
                 driver = self._driver(run_dir, work, factory)
                 self._seed_tier(driver.run_dir, "T1")
                 await driver._phase_explore()
-                # Structural exploration was skipped, but spine.json still
-                # gets produced -- "plan" needs it unconditionally at every
-                # tier that has a plan phase (T1 doesn't, but the method's
-                # own contract is tier-independent on this point).
-                self.assertTrue((driver.run_dir / "spine.json").exists())
+                # PLAN-AUDIT.md §E8: T1 has no "plan" phase at all, so
+                # _phase_explore must skip ensuring spine.json entirely --
+                # doing so unconditionally used to make a corpus-less,
+                # workspace-less T1 goal die at explore (_phase_survey
+                # raises loudly per §D4 when there's no source and no
+                # workspace). Ensuring a spine is now gated on "plan" being
+                # in the tier's own phase list, so a workspace-mode T1 run
+                # like this one no longer gets one either -- it was never
+                # needed here, only produced as a side effect of the old
+                # unconditional ensure.
+                self.assertFalse((driver.run_dir / "spine.json").exists())
 
         asyncio.run(scenario())
 

@@ -325,6 +325,61 @@ class SubagentsInterjectDiffThinkingTest(_ServerTestCase):
         self.assertEqual(status, 404)
 
 
+class ThinkingCursorTest(_ServerTestCase):
+    """§F1 (2026-08-12 audit): ``GET /api/node/<id>/thinking?since=<n>``
+    supports a cheap incremental fetch -- ``entries`` from index ``n``
+    onward plus a ``next`` cursor -- so a live-thinking poll doesn't have
+    to re-fetch (and re-render) the whole trace every ~1.5s tick.
+    ``since`` omitted/0 must be byte-for-byte the pre-§F1 response."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        self._post("/api/attach", {"run_id": "run-a"})
+        scratch = node_scratch_dir(self.run_dir, "1")
+        scratch.mkdir(parents=True, exist_ok=True)
+        lines = [
+            json.dumps({"type": "message", "role": "assistant", "content": f"turn {i}"})
+            for i in range(5)
+        ]
+        (scratch / "trace.jsonl").write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+    def test_since_omitted_returns_full_capped_fetch(self) -> None:
+        status, payload = self._get("/api/node/1/thinking")
+        self.assertEqual(status, 200)
+        self.assertEqual(len(payload["entries"]), 5)
+        self.assertEqual(payload["total"], 5)
+        self.assertEqual(payload["next"], 5)
+        self.assertFalse(payload["truncated"])
+
+    def test_since_zero_matches_since_omitted(self) -> None:
+        _, without = self._get("/api/node/1/thinking")
+        _, with_zero = self._get("/api/node/1/thinking?since=0")
+        self.assertEqual(without["entries"], with_zero["entries"])
+        self.assertEqual(without["total"], with_zero["total"])
+        self.assertEqual(without["truncated"], with_zero["truncated"])
+
+    def test_since_returns_only_entries_from_cursor_onward(self) -> None:
+        status, payload = self._get("/api/node/1/thinking?since=3")
+        self.assertEqual(status, 200)
+        self.assertEqual([e["text"] for e in payload["entries"]], ["turn 3", "turn 4"])
+        self.assertEqual(payload["total"], 5)
+        self.assertEqual(payload["next"], 5)
+
+    def test_since_past_end_returns_empty_entries(self) -> None:
+        status, payload = self._get("/api/node/1/thinking?since=99")
+        self.assertEqual(status, 200)
+        self.assertEqual(payload["entries"], [])
+        self.assertEqual(payload["total"], 5)
+        self.assertEqual(payload["next"], 5)
+
+    def test_polling_since_next_covers_every_entry_exactly_once(self) -> None:
+        _, first = self._get("/api/node/1/thinking?since=0")
+        cursor = first["next"]
+        self.assertEqual(len(first["entries"]), 5)
+        _, second = self._get(f"/api/node/1/thinking?since={cursor}")
+        self.assertEqual(second["entries"], [])
+
+
 class OperatorActionRoutesTest(_ServerTestCase):
     """§DASHBOARD-UX §6.2/§6.3/§11: the pilot editor route, the intake
     answers passthrough, the tier escalate action, node redispatch,
@@ -718,17 +773,46 @@ class MaxConcurrentRunsTest(_ServerTestCase):
         def run(self):  # noqa: ANN201
             return None
 
-    def test_second_concurrent_run_is_429(self) -> None:
-        run_id, error = self.state.start_run({"goal": "g"}, driver=self._StubDriver())
-        self.assertEqual(error, "")
-        self.assertIsNotNone(run_id)
-        self.assertEqual(self.state.hosted_count(), 1)
+    class _BlockingStubDriver:
+        """§E9 (2026-08-12 audit): a driver whose ``run()`` doesn't return
+        until released. Needed here specifically because ``_host_driver``
+        now correctly removes its hosted-registry entry the moment the
+        driver call finishes (§E9's own fix) — a driver that finished
+        near-instantly, as ``_StubDriver`` above does, would race the
+        assertions below and make ``hosted_count()`` read back 0 before the
+        second POST fires, silently no longer exercising the 429 path this
+        test exists to check."""
 
-        status, payload = self._post("/api/runs", {"goal": "another"})
-        self.assertEqual(status, 429)
-        self.assertIn("max_concurrent_runs", payload["error"])
-        self.assertEqual(payload["hosted"], 1)
-        self.assertEqual(payload["max_concurrent_runs"], 1)
+        def __init__(self) -> None:
+            self._release = threading.Event()
+
+        async def run(self):  # noqa: ANN201
+            import asyncio
+
+            while not self._release.is_set():
+                await asyncio.sleep(0.01)
+            from types import SimpleNamespace
+
+            return SimpleNamespace(phase="done", status="done", detail="")
+
+        def release(self) -> None:
+            self._release.set()
+
+    def test_second_concurrent_run_is_429(self) -> None:
+        driver = self._BlockingStubDriver()
+        try:
+            run_id, error = self.state.start_run({"goal": "g"}, driver=driver)
+            self.assertEqual(error, "")
+            self.assertIsNotNone(run_id)
+            self.assertEqual(self.state.hosted_count(), 1)
+
+            status, payload = self._post("/api/runs", {"goal": "another"})
+            self.assertEqual(status, 429)
+            self.assertIn("max_concurrent_runs", payload["error"])
+            self.assertEqual(payload["hosted"], 1)
+            self.assertEqual(payload["max_concurrent_runs"], 1)
+        finally:
+            driver.release()
 
     def test_below_cap_starts_normally(self) -> None:
         # Stub the driver factory so the hosted run never touches the

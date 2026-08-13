@@ -116,7 +116,7 @@ class PolicyDispatcherTest(unittest.TestCase):
 
     def test_policy_unknown_spelling_raises_not_model_fallback(self) -> None:
         """§11.11: every unrecognized policy used to fall through to the
-        ``"model"`` path — a doc-following ``policy="deterministic"`` would
+        ``"model"`` path — a doc-following ``policy="some_typo"`` would
         silently spend the very per-round calls ``document_order`` exists to
         avoid. Unknown policies now raise instead of silently dispatching."""
         provider = FakeProvider(
@@ -125,9 +125,27 @@ class PolicyDispatcherTest(unittest.TestCase):
         with self.assertRaises(ValueError):
             decide_next_action_with_policy(
                 _ready_tree(), "/nonexistent/manifest.jsonl", provider,
-                round_index=0, policy="deterministic",
+                round_index=0, policy="some_typo",
             )
         self.assertEqual(len(provider.calls), 0)
+
+    def test_policy_deterministic_is_a_document_order_alias(self) -> None:
+        """PLAN-AUDIT.md §E5: the dashboard's new-run modal used to offer
+        ``"deterministic"`` as a dispatch-policy choice, and any
+        already-on-disk ``run.spec.json`` may still carry that spelling —
+        ``decide_next_action_with_policy`` used to raise for it
+        (``unrecognized dispatch policy 'deterministic'``), turning the
+        first execute round of such a run into a phase error. It must now
+        behave identically to ``"document_order"``: zero provider calls,
+        same document-order pick."""
+        provider = FakeProvider([])  # empty queue: any pop raises AssertionError
+        decision = decide_next_action_with_policy(
+            _ready_tree(), "/nonexistent/manifest.jsonl", provider,
+            round_index=0, policy="deterministic",
+        )
+        self.assertEqual(len(provider.calls), 0)
+        self.assertEqual(decision.action, "dispatch")
+        self.assertEqual(decision.node_id, "a")
 
 
 class HaltCoercionTest(unittest.TestCase):

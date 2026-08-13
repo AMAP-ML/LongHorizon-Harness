@@ -539,13 +539,22 @@ class RunState:
         from ..v0.run_dir import create_run_dir
 
         create_run_dir(self.runs_root, run_id)
+        # §E9 (2026-08-12 audit): _host_driver must remove this run's entry
+        # from self._hosts when the driver thread finishes, regardless of
+        # success/failure — otherwise hosted_count() grows monotonically
+        # across every completed run in a long-lived `serve` process, and
+        # snapshot()["hosted"] stays permanently true, which is what made
+        # the dashboard's Resume button branch into "un-halt" (a no-op for
+        # a genuinely finished/dead run) instead of "re-host". `on_done`
+        # is called from _host_driver's own finally block.
+        on_done = lambda: self._remove_host(run_id)  # noqa: E731
         if driver is None:
             if workspace_root is not None:
-                def _build_and_host(run_dir=run_dir, options=options, workspace_root=workspace_root) -> None:
+                def _build_and_host(run_dir=run_dir, options=options, workspace_root=workspace_root, on_done=on_done) -> None:
                     from ..v6.work_object import measure_workspace
 
                     options.work_object = measure_workspace(workspace_root)
-                    _host_driver(run_dir, self._default_driver(run_dir, options))
+                    _host_driver(run_dir, self._default_driver(run_dir, options), on_done=on_done)
 
                 thread = threading.Thread(
                     target=_build_and_host, name=f"kusudaemon-dashboard-{run_id}", daemon=True
@@ -553,11 +562,15 @@ class RunState:
             else:
                 driver = self._default_driver(run_dir, options)
                 thread = threading.Thread(
-                    target=_host_driver, args=(run_dir, driver), name=f"kusudaemon-dashboard-{run_id}", daemon=True
+                    target=_host_driver, args=(run_dir, driver),
+                    kwargs={"on_done": on_done},
+                    name=f"kusudaemon-dashboard-{run_id}", daemon=True,
                 )
         else:
             thread = threading.Thread(
-                target=_host_driver, args=(run_dir, driver), name=f"kusudaemon-dashboard-{run_id}", daemon=True
+                target=_host_driver, args=(run_dir, driver),
+                kwargs={"on_done": on_done},
+                name=f"kusudaemon-dashboard-{run_id}", daemon=True,
             )
         with self._lock:
             self._hosts[run_id] = thread
@@ -594,9 +607,20 @@ class RunState:
                 from ..v6.work_object import measure_workspace
 
                 work_object = measure_workspace(root)
-        tier_override = str(body.get("tier_override") or body.get("tier_floor") or "").strip().upper() or None
-        if tier_override not in (None, "T0", "T1", "T2", "T3"):
-            raise ValueError(f"invalid tier_override: {tier_override!r} (want T0-T3 or blank)")
+        # §E7 (2026-08-12 audit): the new-run form's tier-floor select can
+        # plausibly send a bare digit ("2"), lowercase ("t2"), or the
+        # canonical form ("T2") -- normalize all three to canonical "T<n>"
+        # before validating/storing, rather than requiring the literal
+        # "T0".."T3" the server used to accept as the only valid spelling.
+        raw_tier = str(body.get("tier_override") or body.get("tier_floor") or "").strip()
+        tier_override: str | None = None
+        if raw_tier:
+            normalized_tier = raw_tier.upper()
+            if normalized_tier in ("0", "1", "2", "3"):
+                normalized_tier = f"T{normalized_tier}"
+            if normalized_tier not in ("T0", "T1", "T2", "T3"):
+                raise ValueError(f"invalid tier_override: {raw_tier!r} (want T0-T3 or blank)")
+            tier_override = normalized_tier
 
         options = RunOptions(
             goal=_read_text_arg(goal),
@@ -647,17 +671,43 @@ class RunState:
             options=options,
         )
 
+    def _remove_host(self, run_id: str) -> None:
+        """§E9: called from ``_host_driver``'s ``finally`` block once the
+        driver thread finishes (success, failure, or an exception raised
+        before ``driver.run()`` was even awaitable) — the counterpart to
+        ``start_run``'s ``self._hosts[run_id] = thread``. Without this,
+        ``hosted_count()`` only ever grows and ``is_hosted()`` stays True
+        forever for a run whose driver has long since exited."""
+        with self._lock:
+            self._hosts.pop(run_id, None)
+
     def is_hosted(self, run_id: str | None = None) -> bool:
         with self._lock:
-            return (run_id or self._attached) in self._hosts
+            rid = run_id or self._attached
+            thread = self._hosts.get(rid) if rid else None
+            if thread is not None and not thread.is_alive():
+                # Defense in depth: a thread that died without reaching
+                # _host_driver's finally (shouldn't happen) can't
+                # permanently pin the hosted flag either.
+                del self._hosts[rid]
+                thread = None
+            return thread is not None
 
     def hosted_count(self) -> int:
         """§C4: the number of currently in-flight hosted runs. _post_runs
         checks this against ``max_concurrent_runs`` and returns 429 when
         the cap is reached. Held under the same _lock that mutate-hosts
         operations use, so a concurrent _post_runs sees a consistent
-        count rather than reading mid-add."""
+        count rather than reading mid-add.
+
+        §E9: also prunes any entry whose thread has already finished but
+        wasn't cleaned up (defense in depth, same rationale as
+        ``is_hosted``) so a stray dead entry can't inflate the count
+        against ``max_concurrent_runs``."""
         with self._lock:
+            dead = [rid for rid, thread in self._hosts.items() if not thread.is_alive()]
+            for rid in dead:
+                del self._hosts[rid]
             return len(self._hosts)
 
     def halt(self, value: bool) -> bool:
@@ -1216,14 +1266,30 @@ def _other_driver_pid(run_dir: Path) -> str | None:
     return f"driver already running (pid={job['pid']}) — the run is not dead; un-halt it instead of re-hosting"
 
 
-def _host_driver(run_dir: Path, driver: RecursiveDriver) -> None:
-    try:
-        import asyncio
+def _host_driver(run_dir: Path, driver: RecursiveDriver, *, on_done: Callable[[], None] | None = None) -> None:
+    """Runs a driver to completion in this (background) thread.
 
-        report = asyncio.run(driver.run())
-        _set_phase(run_dir, report.phase, report.status, report.detail)
-    except Exception as exc:  # noqa: BLE001 — surface into phase.json, not the thread
-        _set_phase(run_dir, "error", "error", str(exc))
+    §E9 (2026-08-12 audit): ``on_done`` is called in ``finally`` regardless
+    of how this returns — success, a caught exception, or (as
+    ``HostedCountTest``'s stub driver exercises) ``asyncio.run`` raising
+    immediately because ``driver.run()`` wasn't even a coroutine. Before
+    this, only ``kill_run`` ever popped ``RunState._hosts``, so a run that
+    finished on its own left a permanent phantom entry: ``hosted_count()``
+    grew across every completed run in a long-lived ``serve`` process, and
+    ``snapshot()["hosted"]`` stayed true forever, which is what made the
+    dashboard's Resume button branch into a no-op "un-halt" instead of
+    re-hosting a truly finished/dead run."""
+    try:
+        try:
+            import asyncio
+
+            report = asyncio.run(driver.run())
+            _set_phase(run_dir, report.phase, report.status, report.detail)
+        except Exception as exc:  # noqa: BLE001 — surface into phase.json, not the thread
+            _set_phase(run_dir, "error", "error", str(exc))
+    finally:
+        if on_done is not None:
+            on_done()
 
 
 def _set_phase(run_dir: Path, phase: str, status: str, detail: str = "") -> None:
