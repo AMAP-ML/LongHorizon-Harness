@@ -503,8 +503,8 @@ def _read_text_field(raw: Any) -> str:
         try:
             if not path.is_file():
                 return ""
-            return path.read_text(encoding="utf-8").strip()
-        except OSError:
+            return path.read_text(encoding="utf-8", errors="replace").strip()
+        except (OSError, UnicodeError):
             return ""
     return s
 

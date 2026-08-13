@@ -28,6 +28,7 @@ from kusudaemon.dashboard.server import (  # noqa: E402
     DEFAULT_MAX_CONCURRENT_RUNS,
     _AUTH_COOKIE_NAME,
     _assert_safe_host,
+    _read_text_field,
     make_server,
 )
 from kusudaemon.dashboard.state import RunState  # noqa: E402
@@ -821,6 +822,13 @@ class MaxConcurrentRunsTest(_ServerTestCase):
         status, payload = self._post("/api/runs", {"goal": "g"})
         self.assertEqual(status, 200)
         self.assertIn("run_id", payload)
+
+    def test_read_text_field_non_utf8(self) -> None:
+        non_utf8_file = self.tmp / "binary.txt"
+        non_utf8_file.write_bytes(b"hello \xa1 world")
+        res = _read_text_field(f"@{non_utf8_file}")
+        self.assertIn("hello", res)
+        self.assertIn("world", res)
 
 
 if __name__ == "__main__":
