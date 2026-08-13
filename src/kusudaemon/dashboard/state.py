@@ -59,7 +59,7 @@ from ..pipeline.driver import (
     apply_triage,
     reopen_node,
 )
-from ..pipeline.liveness import run_liveness
+from ..pipeline.liveness import HEARTBEAT_STALL_AFTER_SECONDS, run_liveness
 from ..pipeline.run_dir import (
     approvals_path,
     driver_pid_path,
@@ -1469,13 +1469,33 @@ def _other_driver_pid(run_dir: Path) -> str | None:
     re-hosting) has a dead pid and passes; a live driver (CLI-launched, or
     hosted by another dashboard instance) refuses with a message the
     operator can act on instead of racing two drivers over one run
-    directory. Pid reuse is the one false-positive mode, and it only ever
-    produces a visible refusal, never a silent double-run."""
+    directory.
+
+    B2-3 amendment (2026-08-13): the *heartbeat* is the primary liveness
+    signal, exactly as in ``run_liveness`` — a driver thread that has
+    stopped refreshing ``heartbeat_ts`` is dead regardless of pid. A bare
+    ``os.kill(pid, 0)`` check has a real false-positive mode: a dead
+    driver's pid is frequently recycled by an unrelated process within
+    seconds, so Resume on a run whose driver died of an error refused with
+    "driver already running", and the frontend's un-halt fallback had no
+    live driver to un-halt — the resume dead-end. Records written before
+    B2-3 (no ``heartbeat_ts`` field) fall back to the pid check."""
     try:
         job = json.loads(driver_pid_path(run_dir).read_text(encoding="utf-8"))
     except (OSError, ValueError):
         return None
-    if job.get("host") != socket.gethostname() or not isinstance(job.get("pid"), int):
+    if job.get("host") != socket.gethostname():
+        return None
+    heartbeat_ts = job.get("heartbeat_ts")
+    if isinstance(heartbeat_ts, (int, float)):
+        age = time.time() - heartbeat_ts
+        if age > HEARTBEAT_STALL_AFTER_SECONDS:
+            return None
+        return (
+            f"driver already running (pid={job.get('pid')}, heartbeat {age:.0f}s ago)"
+            f" — the run is not dead; un-halt it instead of re-hosting"
+        )
+    if not isinstance(job.get("pid"), int):
         return None
     try:
         os.kill(job["pid"], 0)

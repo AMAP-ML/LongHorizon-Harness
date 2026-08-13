@@ -244,7 +244,7 @@ Stdlib `unittest`. No pytest, no network, no agent binary, no API key.
 python3 -m unittest discover -s tests -p "test_*.py" -v
 ```
 
-**798 tests, all passing.**
+**803 tests, all passing.**
 
 **Every test file starts with `sys.path.insert(0, str(_REPO_ROOT / "src"))`.** This is load-bearing to prevent stale editable install imports.
 
@@ -267,7 +267,7 @@ python3 -m unittest discover -s tests -p "test_*.py" -v
 | `test_v4_research.py` / `_mcp_research.py` / `_research_loop.py` | 9 | Probe execution, SearXNG tool, research findings |
 | `test_v4_probes.py` / `_probe_planner.py` | 43 | Structural exploration probes, windowed probe suggestions, plan-call probe folding |
 | `test_workspace_read_tool.py` | 9 | Sandboxed directory listing and grep within root |
-| `test_dashboard_state.py` / `_server.py` | 119 | `RunState` caching, HTTP server, auth, concurrency caps, action routes, hosted-run lifecycle |
+| `test_dashboard_state.py` / `_server.py` | 121 | `RunState` caching, HTTP server, auth, concurrency caps, action routes, hosted-run lifecycle |
 | `test_dashboard_rendering.py` | 17 | Log parsing, ` thinking` tag extraction, inline diff generation |
 | `test_pipeline_prompts.py` / `_backends.py` / `test_driver_phases.py` | 100 | Writer prompt assembly (segment ordering, goal/rubric block), adapter path isolation, tier-based driver execution, retry artifact inlining, CLI defaults |
 | `test_pipeline_approvals.py` / `_liveness.py` | 13 | Incremental approval parsing, process liveness checks, heartbeat staleness |
@@ -653,6 +653,7 @@ Produced by tracing one run end to end — `kusudaemon run` → classify → int
 | **§E20j** | `_emit_assistant_content`'s dedupe heuristic (`any(role=="thinking" for e in entries[-50:])`) dropped a message's own thinking when live thinking existed anywhere in the last 50 entries, and duplicated it once >50 entries intervened | Deleted outright — the source of the dup is gone (§E20l strips tags at the source) |
 | **§E20k** | New-run modal documented as "the full RunOptions surface" but omitted `max_parallel` and `auto_probe_plan` | Modal is the full `_options_from_body` surface; both round-trip |
 | **§E20l** | `_gptme_worker.py` re-yielded the raw ` thinking`/` response` tags downstream, so they also landed in stored message content and were re-extracted by `parse_trace` — the source of §E20j's dedupe hack | Tags stripped at the source; exactly one producer of thinking |
+| **§E21** | Resume dead-ends on a driver killed by an error — `_other_driver_pid`'s bare `os.kill(pid, 0)` check has a false-positive mode the old docstring even admitted: a dead driver's pid is routinely recycled by another process, so Resume refused "driver already running (pid=…)", and app.js's `resumeRun` fallback un-halts — a no-op when no driver exists. "Nothing happens" was the frontend doing exactly what the backend told it | `_other_driver_pid` now mirrors B2-3/`run_liveness`: the **heartbeat** is the primary signal — a `heartbeat_ts` stale beyond `HEARTBEAT_STALL_AFTER_SECONDS` (30 s) means the driver thread is dead regardless of pid, and re-hosting is safe; records without a heartbeat (pre-B2-3) fall back to the pid check. Failing-first: `ResumeDoubleDriverGuardTest`'s stale-heartbeat-alive-pid case refused before the fix, resumes after |
 
 ## §F — thinking actually displays — SHIPPED
 

@@ -20,6 +20,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -663,6 +664,42 @@ class ResumeDoubleDriverGuardTest(unittest.TestCase):
         self.assertIsNotNone(run_id)
 
     def test_resume_allowed_without_pid_record(self) -> None:
+        run_id, error = self.state.start_run({"run_id": "run-a"}, driver=self._StubDriver())
+        self.assertEqual(error, "")
+        self.assertIsNotNone(run_id)
+
+    def test_resume_refused_while_heartbeat_fresh(self) -> None:
+        driver_pid_path(self.run_dir).write_text(
+            json.dumps({
+                "pid": subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"]).pid,
+                "started_at": 0,
+                "host": socket.gethostname(),
+                "heartbeat_ts": time.time(),
+            }) + "\n",
+            encoding="utf-8",
+        )
+        run_id, error = self.state.start_run({"run_id": "run-a"}, driver=self._StubDriver())
+        self.assertIsNone(run_id)
+        self.assertIn("already running", error)
+
+    def test_resume_allowed_when_heartbeat_stale_even_if_pid_reused(self) -> None:
+        # The 2026-08-13 resume dead-end: a run whose driver died of an
+        # error left a driver.pid.json whose pid was then recycled by an
+        # unrelated process. A bare os.kill(pid, 0) liveness check sees
+        # "alive" and Resume refuses with "driver already running" -- and
+        # the frontend's un-halt fallback (app.js resumeRun) has no live
+        # driver to un-halt, so clicking Resume does nothing. The stale
+        # heartbeat is the ground truth (B2-3, liveness.py): the driver
+        # thread is gone, so re-hosting is safe.
+        driver_pid_path(self.run_dir).write_text(
+            json.dumps({
+                "pid": subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"]).pid,
+                "started_at": 0,
+                "host": socket.gethostname(),
+                "heartbeat_ts": time.time() - 3600,
+            }) + "\n",
+            encoding="utf-8",
+        )
         run_id, error = self.state.start_run({"run_id": "run-a"}, driver=self._StubDriver())
         self.assertEqual(error, "")
         self.assertIsNotNone(run_id)
