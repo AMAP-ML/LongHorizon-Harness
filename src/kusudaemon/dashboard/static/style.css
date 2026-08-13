@@ -2293,3 +2293,21 @@ input:focus, textarea:focus, select:focus {
   padding: 40px 20px; color: var(--text-muted); font-size: 13px;
   border: 1px dashed var(--border-color); border-radius: 8px;
 }
+
+/* ==========================================================================
+   Accessibility & Motion Safety (WCAG AA & Prefers-Reduced-Motion)
+   ========================================================================== */
+:focus-visible {
+  outline: 2px solid var(--accent-cyan) !important;
+  outline-offset: 2px !important;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *, ::before, ::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+    scroll-behavior: auto !important;
+  }
+}
+
