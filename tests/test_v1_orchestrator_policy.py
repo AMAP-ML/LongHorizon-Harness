@@ -87,6 +87,29 @@ class DocumentOrderPolicyTest(unittest.TestCase):
         self.assertEqual(decision.reason, "nodes in flight; nothing new to dispatch")
 
 
+class SingleReadyNodeShortCircuitTest(unittest.TestCase):
+    """PLAN-AUDIT.md §E18: with dispatch_policy="model" (the default), a
+    round whose ready set has exactly one member has an already-determined
+    outcome -- the model call ``decide_next_action`` makes is pure waste.
+    An empty FakeProvider queue raises if anything pops it, the strictest
+    proof of zero calls."""
+
+    def test_single_ready_node_dispatches_with_zero_provider_calls(self) -> None:
+        tree = _tree(_node("only"))
+        provider = FakeProvider([])  # type: ignore[arg-type]
+        decision = decide_next_action(tree, "/nonexistent/manifest.jsonl", provider, round_index=0)
+        self.assertEqual(decision.action, "dispatch")
+        self.assertEqual(decision.node_id, "only")
+        self.assertIn("code-decided", decision.reason)
+
+    def test_multi_ready_path_is_unchanged(self) -> None:
+        tree = _ready_tree()
+        provider = FakeProvider([{"action": "dispatch", "node_id": "b", "reason": "picked b"}])  # type: ignore[arg-type]
+        decision = decide_next_action(tree, "/nonexistent/manifest.jsonl", provider, round_index=0)
+        self.assertEqual(decision.action, "dispatch")
+        self.assertEqual(decision.node_id, "b")
+
+
 class PolicyDispatcherTest(unittest.TestCase):
     def test_policy_model_still_calls_provider(self) -> None:
         provider = FakeProvider(

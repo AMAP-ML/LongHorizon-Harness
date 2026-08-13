@@ -81,12 +81,11 @@ class LinearChainRoundLoopTest(unittest.TestCase):
                 ],
             )
 
-            provider = FakeProvider(
-                [
-                    {"action": "dispatch", "node_id": "a", "reason": "a has no deps"},
-                    {"action": "dispatch", "node_id": "b", "reason": "a passed"},
-                ]
-            )
+            # PLAN-AUDIT.md §E18: "b depends_on a" means each round's ready
+            # set has exactly one member (round 1: {a}; round 2: {b}) — the
+            # dispatch decision is code-decided both times, zero provider
+            # calls, not the two this test used to queue and consume.
+            provider = FakeProvider([])
 
             tree = asyncio.run(
                 run_round_loop(
@@ -102,9 +101,7 @@ class LinearChainRoundLoopTest(unittest.TestCase):
 
             self.assertEqual(tree.nodes["a"].status, "passed")
             self.assertEqual(tree.nodes["b"].status, "passed")
-            # Both canned decisions were consumed and none left unused —
-            # the loop halted on tree.is_complete() without a third call.
-            self.assertEqual(len(provider.calls), 2)
+            self.assertEqual(len(provider.calls), 0)
 
             manifest_lines = manifest_path(run_dir).read_text(encoding="utf-8").splitlines()
             self.assertEqual(len(manifest_lines), 2)
@@ -337,7 +334,12 @@ class ResumeInFlightWriterNodeTest(unittest.TestCase):
                 }
             )
 
-            provider = FakeProvider([{"action": "dispatch", "node_id": "b", "reason": "only b"}])
+            # PLAN-AUDIT.md §E18: node a's recovery bypasses the
+            # orchestrator entirely (unchanged, as documented in
+            # round_loop.py), and node b is subsequently the sole ready
+            # node in its own round, so its dispatch decision is now also
+            # code-decided — zero orchestrator calls total, not one.
+            provider = FakeProvider([])
 
             tree = asyncio.run(
                 run_round_loop(
@@ -353,10 +355,7 @@ class ResumeInFlightWriterNodeTest(unittest.TestCase):
 
             self.assertEqual(tree.nodes["a"].status, "passed")
             self.assertEqual(tree.nodes["b"].status, "passed")
-
-            # The orchestrator was only ever asked about node b — node a's
-            # recovery bypassed it entirely, as documented in round_loop.py.
-            self.assertEqual(len(provider.calls), 1)
+            self.assertEqual(len(provider.calls), 0)
 
             all_events = [e for e in log.read_all() if e.get("node_id") == "a"]
             completed = [e for e in all_events if e["type"] == "episode_completed"]
@@ -391,12 +390,12 @@ class InPlaceRedispatchTest(unittest.TestCase):
                     }
                 ],
             )
-            # Exactly ONE orchestrator decision: the harness already knows
-            # it wants "a" for attempts 2 and 3. FakeProvider raises if a
-            # second dispatch decision is ever requested.
-            provider = FakeProvider(
-                [{"action": "dispatch", "node_id": "a", "reason": "attempt 1"}]
-            )
+            # PLAN-AUDIT.md §E18: a single-node tree's ready set is always
+            # exactly one node, so the harness now code-decides every
+            # attempt's dispatch too (not just attempts 2 and 3's in-place
+            # retry) -- zero orchestrator calls, not one. FakeProvider
+            # raises if anything is ever popped.
+            provider = FakeProvider([])
             tree = asyncio.run(
                 run_round_loop(
                     run_dir,
@@ -409,7 +408,7 @@ class InPlaceRedispatchTest(unittest.TestCase):
                     max_attempts=3,
                 )
             )
-            self.assertEqual(len(provider.calls), 1)
+            self.assertEqual(len(provider.calls), 0)
             self.assertEqual(tree.nodes["a"].status, "blocked")
             self.assertEqual(tree.nodes["a"].attempts, 3)
             self.assertIn("len:9999-99999", tree.nodes["a"].last_defect)
@@ -475,9 +474,14 @@ class FeedbackCarryingRetryTest(unittest.TestCase):
                     }
                 ],
             )
+            # PLAN-AUDIT.md §E18: with exactly one node in the tree, every
+            # round's ready set has exactly one member, so the orchestrator
+            # dispatch decision is now code-decided and never reaches the
+            # provider (a queued "dispatch" response here would otherwise
+            # get popped by the *reviewer* call instead and fail schema
+            # validation).
             provider = FakeProvider(
                 [
-                    {"action": "dispatch", "node_id": "a", "reason": "attempt 1"},
                     {
                         "items": [
                             {"id": "R1", "pass": False, "defect": "no mention of widgets"}
@@ -522,9 +526,12 @@ class FeedbackCarryingRetryTest(unittest.TestCase):
                     }
                 ],
             )
+            # PLAN-AUDIT.md §E18: single-node tree -> the dispatch decision
+            # is code-decided every round, so only reviewer responses are
+            # queued (see the sibling test above for why a stray "dispatch"
+            # entry here would break the reviewer's schema validation).
             provider = FakeProvider(
                 [
-                    {"action": "dispatch", "node_id": "a", "reason": "attempt 1"},
                     {
                         "items": [
                             {"id": "R1", "pass": False, "defect": "no mention of widgets"}
@@ -649,9 +656,10 @@ class WarnGatesNeverBlockTest(unittest.TestCase):
                 ],
             )
 
-            provider = FakeProvider(
-                [{"action": "dispatch", "node_id": "a", "reason": "only node"}]
-            )
+            # PLAN-AUDIT.md §E18: single-node tree -> dispatch is
+            # code-decided, zero calls (and no review call either: no
+            # judgment items).
+            provider = FakeProvider([])
 
             tree = asyncio.run(
                 run_round_loop(
@@ -667,7 +675,7 @@ class WarnGatesNeverBlockTest(unittest.TestCase):
 
             # ...and the node passes anyway.
             self.assertEqual(tree.nodes["a"].status, "passed")
-            self.assertEqual(len(provider.calls), 1)  # no review call: no judgment
+            self.assertEqual(len(provider.calls), 0)
 
             (line,) = (
                 json.loads(l)

@@ -90,6 +90,19 @@ def decide_next_action(
     ready = tree.ready_nodes()
     if not ready:
         return _arbitrate_empty_ready(tree)
+    if len(ready) == 1:
+        # PLAN-AUDIT.md §E18: with exactly one ready node, dispatch is the
+        # only legal outcome (§11.5, enforced below for the multi-ready
+        # case too) and there is only one node id it could legally name —
+        # the model call's answer is already fully determined by code, so
+        # spending it is pure waste. For a serial T2/T3 tree that's one
+        # provider call per leaf whose outcome was never in question.
+        # Purely additive: the multi-ready path below is unchanged.
+        return DispatchDecision(
+            action="dispatch",
+            node_id=ready[0],
+            reason="code-decided: single ready node, no model call needed",
+        )
 
     messages = [
         {"role": "system", "content": _SYSTEM_PROMPT},

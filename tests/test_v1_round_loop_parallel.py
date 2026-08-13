@@ -69,10 +69,14 @@ class MaxParallelOneByteIdentityTest(unittest.TestCase):
             prompt_dir.mkdir(parents=True, exist_ok=True)
             _independent_tree(run_dir, ["a", "b"])
 
+            # PLAN-AUDIT.md §E18: round 1's ready set is {a, b} (both
+            # independent, no depends_on) -> a real model call, still
+            # needed to pick between them. Round 2's ready set is {b}
+            # alone (a has since passed) -> code-decided, zero calls — so
+            # only one canned response is queued now, not two.
             provider = FakeProvider(
                 [
                     {"action": "dispatch", "node_id": "a", "reason": "a first"},
-                    {"action": "dispatch", "node_id": "b", "reason": "b second"},
                 ]
             )
             tree = asyncio_run(
@@ -80,8 +84,7 @@ class MaxParallelOneByteIdentityTest(unittest.TestCase):
             )
             self.assertEqual(tree.nodes["a"].status, "passed")
             self.assertEqual(tree.nodes["b"].status, "passed")
-            # One orchestrator call per round, exactly like pre-§C2.
-            self.assertEqual(len(provider.calls), 2)
+            self.assertEqual(len(provider.calls), 1)
 
             # Byte-identity: a's whole lifecycle (dispatch decision ...
             # episode completed) precedes b's dispatch decision — no
