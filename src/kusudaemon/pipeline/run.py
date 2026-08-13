@@ -23,7 +23,7 @@ from ..v0.events import EventLog
 from ..v1.provider import OpenAICompatibleProvider, RATE_LIMIT_BACKOFFS
 from .backends import parse_research_plan
 from .driver import RunOptions, RecursiveDriver
-from .run_dir import resolve_runs_root, run_spec_path, events_path
+from .run_dir import resolve_runs_root, run_spec_path, events_path, halt_path
 
 _RUNS_ROOT_DEFAULT = "./.kusudaemon/runs"
 

@@ -348,9 +348,11 @@ function loadThinkingIfNeeded(force = false) {
       const changed = prev === null || prev === "loading" || prev.sig !== sig;
       state.nodeThinking = { id, entries, total, sig };
       // §PERF: force refreshes fire every tick while a live node is
-      // selected; re-render only when the trace actually moved, or a full
-      // 9-region render pass happens each ~1.5s even when nothing arrived.
-      if (force && changed) render();
+      // selected; re-render only when the trace actually moved.
+      // §F5 fix: also render on first load for non-live (blocked) nodes
+      // — `changed` is always true on the initial load since prev was
+      // "loading", so this never fires a spurious extra render.
+      if (changed) render();
     })
     .catch(() => {
       if (state.selectedNode === id && state.nodeThinking === "loading") {
@@ -380,8 +382,12 @@ function applySnapshot(snap) {
   }
   state.sseLive = true;
   updateChrome(nextPending.length > 0);
-  if (state.selectedNode && isLive(state.selectedNode)) {
-    loadThinkingIfNeeded(true);
+  if (state.selectedNode) {
+    // §F5: always poll thinking for the selected node, not just when live.
+    // Blocked/completed nodes need their historical trace loaded too.
+    // `force=true` only when the node is actually live (avoids unnecessary
+    // re-renders on every tick for static completed traces).
+    loadThinkingIfNeeded(isLive(state.selectedNode));
   }
   if (snap && snap.attached) {
     loadMainThinking();
@@ -645,7 +651,7 @@ function renderPendingEntry(m) {
   ]);
   const body = (editing)
     ? (() => {
-        const ta = el("textarea", { class: "pending-edit-ta", rows: "3", "aria-label": "edit queued message" });
+        const ta = el("textarea", { class: "pending-edit-ta", rows: "3", "aria-label": "edit queued message", "data-key": "pending-edit-ta-" + m.ts });
         ta.value = state.editingPending[m.ts];
         ta.oninput = (e) => { state.editingPending[m.ts] = e.target.value; };
         ta.onkeydown = (e) => {
@@ -660,6 +666,10 @@ function renderPendingEntry(m) {
             patchCenter();
           }
         };
+        // §F5 (queued-edit): morphdom may replace the textarea element on
+        // patchCenter() even with a data-key match, losing focus. Re-focus
+        // asynchronously so the operator can keep typing without clicking.
+        setTimeout(() => { if (document.activeElement !== ta) ta.focus(); }, 0);
         return ta;
       })()
     : el("div", { class: "msg-body", style: "font-size:12px;" }, m.text);
@@ -782,7 +792,19 @@ function renderApprovalEntry(a, snap) {
           el("button", {
             class: opt.style === "primary" ? "primary" : "",
             disabled: state.busy ? "" : null,
-            onclick: () => guarded(() => apiPost(`/api/approvals/${encodeURIComponent(a.approval_id)}/resolve`, { action: opt.value }).then(() => { recordCli("approve"); showToast("Approval resolved"); })),
+            onclick: () => guarded(() => apiPost(`/api/approvals/${encodeURIComponent(a.approval_id)}/resolve`, { action: opt.value }).then(() => {
+              recordCli("approve");
+              // §F5 (blocked-recovery): after a redispatch approval is
+              // applied, the node is reset to pending but no driver is
+              // running to pick it up. Auto-resume (re-host) the run so
+              // the driver sees the newly-pending node.
+              if (a.kind === "redispatch" && opt.value === "apply" && snap && !snap.hosted) {
+                showToast("Node reset — resuming run…");
+                resumeRun();
+              } else {
+                showToast("Approval resolved");
+              }
+            })),
           }, `[${i + 1}] ${opt.label}`)
         );
       });

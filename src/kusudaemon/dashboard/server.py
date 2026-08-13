@@ -271,8 +271,8 @@ def _post_redispatch(handler: "DashboardRequestHandler", match: Any, body: dict)
     confirm approval whose apply half resets the node to pending with a
     fresh attempt budget."""
     handler.require_control()
-    approval = handler.state.request_redispatch(unquote(match.group(1)), str(body.get("reason", "")))
-    return (200, approval) if approval else (400, {"error": "not a redispatchable node, or no attached run"})
+    approval, reason = handler.state.request_redispatch(unquote(match.group(1)), str(body.get("reason", "")))
+    return (200, approval) if approval else (400, {"error": reason or "not a redispatchable node, or no attached run"})
 
 
 @_route("GET", r"^/api/node/([^/]+)/split$")

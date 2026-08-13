@@ -1073,21 +1073,25 @@ class RunState:
         approval_store.append(run_dir, resolved)
         return True
 
-    def request_redispatch(self, node_id: str, reason: str = "") -> dict[str, Any] | None:
+    def request_redispatch(self, node_id: str, reason: str = "") -> tuple[dict[str, Any] | None, str]:
         """§DASHBOARD-UX §11: re-dispatch a single node that never made it —
         failed/blocked/stale. Approval-gated (a redispatch costs a Writer
         episode, same as reopen); on apply the tree is reset so the round
         loop picks the node up again with a fresh attempt budget. Passed
-        nodes go through reopen instead (a redispatch can't touch them)."""
+        nodes go through reopen instead (a redispatch can't touch them).
+
+        Returns (approval_dict, "") on success or (None, reason) on failure."""
         run_dir = self._attached_dir()
-        if run_dir is None or not _safe_node_id(node_id):
-            return None
+        if run_dir is None:
+            return None, "no run attached to dashboard"
+        if not _safe_node_id(node_id):
+            return None, f"invalid node id: {node_id!r}"
         tree = _load_tree(run_dir)
         node = tree.nodes.get(node_id)
         if node is None:
-            return None
+            return None, f"node {node_id!r} not found in tree (may be a synthetic/derived dispatch — use reopen instead)"
         if node.status in ("passed", "split", "dispatched", "awaiting_review"):
-            return None
+            return None, f"node {node_id!r} is {node.status!r} — not redispatchable (use reopen for passed nodes)"
         approval = approval_store.Approval.create(
             "redispatch",
             title=f"Redispatch {node_id}",
@@ -1103,7 +1107,7 @@ class RunState:
             context={"node_id": node_id, "reason": reason.strip()},
         )
         approval_store.append(run_dir, approval)
-        return approval.to_dict()
+        return approval.to_dict(), ""
 
     # ------------------------------------------------------------------
     # Per-node view
@@ -1259,16 +1263,32 @@ class RunState:
                 phase_text = _read_text(phase_trace_path)
                 if phase_text and phase_text.strip():
                     return phase_trace_path
-            for sub in self.subagents(events=self._cached_events(run_dir)):
-                if sub.get("live"):
-                    sub_id = sub.get("id")
-                    if sub_id:
-                        sub_path = node_trace_path(run_dir, sub_id)
-                        sub_text = _read_text(sub_path)
-                        if sub_text and sub_text.strip():
-                            return sub_path
-            traces_dir = run_dir / "traces"
-            if traces_dir.exists():
+        # §F5 (2026-08-12): for any node whose own trace is empty or missing,
+        # check whether a live subagent matching this node_id wrote to a
+        # logdir-backed trace path instead (the AGY/gptme adapters write
+        # their trace via a logdir path, not directly to traces/<id>.jsonl).
+        # For non-main nodes this is the same walk the "main" branch already
+        # does for live subagents — we just don't restrict it to the
+        # {main, root, harness} guard any more.
+        for sub in self.subagents(events=self._cached_events(run_dir)):
+            sub_id = sub.get("id")
+            if not sub_id:
+                continue
+            # Prefer the subagent that matches the requested node_id; fall
+            # back to any live subagent for "main"-like pseudo-ids.
+            if sub_id != node_id and node_id not in {"main", "root", "harness"}:
+                continue
+            # For a non-pseudo node_id, include non-live (completed/blocked)
+            # subagents too — so historical trace is shown after a node stops.
+            sub_path = node_trace_path(run_dir, sub_id)
+            sub_text = _read_text(sub_path)
+            if sub_text and sub_text.strip():
+                return sub_path
+        traces_dir = run_dir / "traces"
+        if traces_dir.exists():
+            # For "main"-like ids, use the most recently written trace.
+            # For specific node ids, only use their own file from traces/.
+            if node_id in {"main", "root", "harness"}:
                 trace_files = sorted(traces_dir.glob("*.jsonl"), key=lambda p: p.stat().st_mtime, reverse=True)
                 for tf in trace_files:
                     txt = _read_text(tf)
