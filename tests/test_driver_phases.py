@@ -1897,6 +1897,26 @@ class PhaseReviewT2DocumentReviewCacheTest(unittest.TestCase):
 
         asyncio.run(scenario())
 
+    def test_halted_phase_recording(self) -> None:
+        """Verify that when a run is halted, _set_phase is called with phase, status ('halted'), and detail."""
+        import asyncio
+        from kusudaemon.pipeline.run_dir import halt_path, phase_path
+
+        async def scenario() -> None:
+            with tempfile.TemporaryDirectory() as root_str:
+                run_dir = Path(root_str) / "run"
+                driver = _ScriptedDriver(run_dir)
+                _write_tier(run_dir, "T0")
+                halt_path(run_dir).write_text("halted", encoding="utf-8")
+
+                report = await driver.run()
+                self.assertEqual(report.status, "halted")
+                phase_data = json.loads(phase_path(run_dir).read_text(encoding="utf-8"))
+                self.assertEqual(phase_data["status"], "halted")
+                self.assertIn("halted", phase_data["detail"])
+
+        asyncio.run(scenario())
+
 
 if __name__ == "__main__":
     unittest.main()

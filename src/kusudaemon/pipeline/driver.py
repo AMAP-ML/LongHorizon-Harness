@@ -460,7 +460,7 @@ class RecursiveDriver:
                 if next_phase is None:
                     break
                 if self._halted():
-                    self._set_phase(_HALTED, detail=f"halted before {next_phase}")
+                    self._set_phase(next_phase, _HALTED, detail=f"halted before {next_phase}")
                     self._log({"node_id": "-", "role": "harness", "round": round_index, "type": "halting"})
                     report = RunReport(status="halted", phase=next_phase, detail="halted by operator")
                     break
@@ -502,7 +502,7 @@ class RecursiveDriver:
         while True:
             attempt += 1
             if self._halted():
-                self._set_phase(_HALTED, detail=f"halted in {phase}")
+                self._set_phase(phase, _HALTED, detail=f"halted in {phase}")
                 return RunReport(status="halted", phase=phase, detail="halted by operator")
             try:
                 outcome: Any = await getattr(self, f"_phase_{phase}")()
