@@ -823,12 +823,101 @@ class ResumeAfterEscalationTest(unittest.TestCase):
         asyncio.run(scenario())
 
 
-# ----------------------------------------------------------------------
-# PLAN.md §A4.4 row 4 / §B5: a node's accepted split proposal promotes
-# T2 -> T3. `escalate(tier, "split_accepted")` was already correct and
-# unit-tested in isolation above (EscalateTest); this drives the actual
-# call site (`pipeline/driver.py:_phase_execute`) end to end.
-# ----------------------------------------------------------------------
+class BlockedNonSizeDefectParksRunTest(unittest.TestCase):
+    """PLAN.md §A4.4 + §2026-08-13: a T1 node that failed gates twice with a
+    NON-size defect (e.g. ``"nonempty: artifact is empty"`` after a provider
+    429 storm — the observed live-run failure) does NOT promote the tier:
+    the round loop's escalate signal has no auto-recovery for it, the run
+    parks with phase status "escalated" while ``tier.json`` stays T1, and
+    only the operator can recover (reopen with a defect / escalate /
+    amend). The driver logs one ``node_blocked`` event naming the node and
+    its last defect so the dashboard can say what is wrong instead of just
+    "escalated"; a resume against the same parked tree must not append a
+    duplicate (the phase re-parks identically on every resume)."""
+
+    def test_t1_non_size_defect_parks_and_logs_node_blocked_once(self) -> None:
+        async def scenario() -> None:
+            with tempfile.TemporaryDirectory() as root_str:
+                run_dir = Path(root_str) / "run"
+                create_run_dir(run_dir.parent, run_dir.name)
+
+                # Pre-seed every phase T1 needs as already-done, plus a
+                # single node already "blocked" with a NON-size defect --
+                # the mirror image of ResumeAfterEscalationTest's
+                # size-defect setup: same wiring, opposite outcome.
+                tier_path(run_dir).write_text(
+                    json.dumps(
+                        {
+                            "tier": "T1", "measured_tier": "T1", "override": None,
+                            "needs_intake": False, "needs_explore": False,
+                            "signals": {}, "estimate": {}, "ts": 0,
+                        }
+                    ),
+                    encoding="utf-8",
+                )
+                from kusudaemon.v0.run_dir import spec_path
+
+                spec_path(run_dir).write_text("# Spec\n\n## Goal\ndo the thing\n", encoding="utf-8")
+                from kusudaemon.v6.direct import build_direct_node
+
+                blocked_node = build_direct_node("do the thing", node_id=SINGLE_NODE_ID)
+                blocked_node.status = "blocked"
+                blocked_node.attempts = 2
+                blocked_node.last_defect = "nonempty: artifact is empty"
+                TaskTree(nodes={blocked_node.id: blocked_node}).save(tree_path(run_dir))
+
+                provider = FakeProvider([])
+                driver = RecursiveDriver(
+                    run_dir,
+                    provider=provider,  # type: ignore[arg-type]
+                    options=RunOptions(goal="do the thing", dispatch_policy="document_order"),
+                    writer_adapter_factory=_RateLimitedWriterFactory(),
+                    research_adapter_factory=lambda node, query: (_ for _ in ()).throw(
+                        AssertionError("no research dispatch expected")
+                    ),
+                )
+                report1 = await driver.run()
+                self.assertEqual(report1.status, "escalated")
+                self.assertEqual(report1.phase, "execute")
+                # No size defect -> no promotion: the tier is untouched and
+                # the replan machinery never ran.
+                tier_record = json.loads(tier_path(run_dir).read_text(encoding="utf-8"))
+                self.assertEqual(tier_record["tier"], "T1")
+                self.assertEqual(list(run_dir.glob("tree.json.pre-t1-escalation-*")), [])
+                events = [
+                    json.loads(line)
+                    for line in events_path(run_dir).read_text(encoding="utf-8").splitlines()
+                    if line.strip()
+                ]
+                blocked_events = [e for e in events if e.get("type") == "node_blocked"]
+                self.assertEqual(len(blocked_events), 1)
+                self.assertEqual(
+                    blocked_events[0]["nodes"],
+                    [{"node_id": SINGLE_NODE_ID, "defect": "nonempty: artifact is empty"}],
+                )
+
+                # Resume: a second, fresh RecursiveDriver against the same
+                # parked tree re-parks identically, but the identical
+                # node_blocked payload is not re-appended.
+                driver2 = RecursiveDriver(
+                    run_dir,
+                    provider=FakeProvider([]),  # type: ignore[arg-type]
+                    options=RunOptions(goal="do the thing", dispatch_policy="document_order"),
+                    writer_adapter_factory=_RateLimitedWriterFactory(),
+                    research_adapter_factory=lambda node, query: (_ for _ in ()).throw(
+                        AssertionError("no research dispatch expected")
+                    ),
+                )
+                report2 = await driver2.run()
+                self.assertEqual(report2.status, "escalated")
+                events2 = [
+                    json.loads(line)
+                    for line in events_path(run_dir).read_text(encoding="utf-8").splitlines()
+                    if line.strip()
+                ]
+                self.assertEqual(len([e for e in events2 if e.get("type") == "node_blocked"]), 1)
+
+        asyncio.run(scenario())
 class _SplitProposingWriterAdapter:
     has_file_tools = True
     supports_session_resume = False
@@ -856,6 +945,12 @@ class _SplitProposingWriterAdapter:
         return EpisodeResult(status="done", actions_log="", duration_ms=1, metadata={})
 
 
+# ----------------------------------------------------------------------
+# PLAN.md §A4.4 row 4 / §B5: a node's accepted split proposal promotes
+# T2 -> T3. `escalate(tier, "split_accepted")` was already correct and
+# unit-tested in isolation above (EscalateTest); this drives the actual
+# call site (`pipeline/driver.py:_phase_execute`) end to end.
+# ----------------------------------------------------------------------
 class SplitAcceptedEscalationDriverTest(unittest.TestCase):
     """PLAN.md §A4.4: "any node's accepted split proposal -> promote T2 ->
     T3." Only for T2 -- majority_regenerate's own driver-side check gates

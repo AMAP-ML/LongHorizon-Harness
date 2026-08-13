@@ -1585,7 +1585,56 @@ class RecursiveDriver:
                 self._archive_t2_contract_before_pilot()
                 self._escalate_tier("split_accepted", node_id=split_parents[0])
                 return None
-        return None if not tree.is_blocked() else False
+        if tree.is_blocked():
+            # §2026-08-13: parked (no auto-recovery applies — non-size
+            # defect at T1, or a T2/T3 tree whose blocked nodes aren't a
+            # promotion trigger). Log the actionable summary before the
+            # phase reports "escalated".
+            self._log_blocked_tree(tree)
+            return False
+        return None
+
+    def _log_blocked_tree(self, tree: TaskTree) -> None:
+        """§2026-08-13: a blocked tree parks the run — ``_phase_execute``
+        reports phase "escalated" with *no* tier change (only size-class
+        defects promote T1, PLAN.md §A4.4; T2/T3 are ceilings for this
+        signal), and the operator is the only one who can recover (reopen
+        with a defect, escalate, amend). Log one ``node_blocked`` event
+        naming the blocked nodes and their last defects so the dashboard
+        can say what is actually wrong instead of just "escalated".
+
+        Deduped across resumes: every resume re-enters execute against the
+        same parked tree, and appending the same fact on every attempt is
+        feed noise. The last ``node_blocked`` event's payload is compared;
+        identical → skip."""
+        blocked = sorted(
+            (
+                {"node_id": n.id, "defect": n.last_defect or ""}
+                for n in tree.nodes.values()
+                if n.status == "blocked"
+            ),
+            key=lambda rec: rec["node_id"],
+        )
+        if not blocked:
+            return
+        try:
+            last = None
+            for ev in self.log.read_all():
+                if ev.get("type") == "node_blocked":
+                    last = ev
+            if last is not None and last.get("nodes") == blocked:
+                return
+        except OSError:
+            pass
+        self.log.append(
+            {
+                "node_id": "-",
+                "role": "harness",
+                "type": "node_blocked",
+                "nodes": blocked,
+                "ts": time.time(),
+            }
+        )
 
     def _archive_tree_before_replan(self) -> None:
         """PLAN.md §A4.4: "T0/T1 node fails gates twice with a size defect

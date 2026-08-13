@@ -346,7 +346,18 @@ def _get_node_thinking(handler: "DashboardRequestHandler", match: Any, body: dic
     ``next`` is always the cursor to pass on the following call, and
     ``truncated`` reuses the same cap semantics either way (whether the
     *total* trace exceeds ``MAX_THINKING_ENTRIES``, not just this
-    response's slice)."""
+    response's slice).
+
+    Re-anchor (2026-08-13): entries are **not append-only** — consecutive
+    thinking deltas merge into one entry whose text grows while ``total``
+    stays put (and the tail cap can shift indices), so a cursor of
+    ``since == total`` must still deliver the boundary entry
+    (``entries[since-1:]``) for the client to replace in place. Without
+    this, a long continuous reasoning stream froze: the client polled
+    ``since=total`` forever and got ``[]`` while the one merged entry grew.
+    A ``since`` past the end means the trace shrank (rewritten/reparsed) —
+    return the full list with ``"reset": true`` so the client replaces
+    everything it holds instead of stitching onto a mismatched base."""
     since_raw = (handler.query.get("since") or ["0"])[0]
     try:
         since = int(since_raw)
@@ -362,8 +373,12 @@ def _get_node_thinking(handler: "DashboardRequestHandler", match: Any, body: dic
     serialized = [{"role": e.role, "text": e.text, "ts": i} for i, e in enumerate(entries)]
     total = len(serialized)
     truncated = total > MAX_THINKING_ENTRIES
+    if since > total:
+        return 200, {"entries": serialized, "total": total, "next": total, "truncated": truncated, "reset": True}
     if since > 0:
-        return 200, {"entries": serialized[since:], "total": total, "next": total, "truncated": truncated}
+        # Re-anchor: one boundary entry (which may have grown/merged since
+        # the client last held it) plus everything after it.
+        return 200, {"entries": serialized[max(0, since - 1):], "total": total, "next": total, "truncated": truncated}
     # Unchanged from before §F1: cap at the tail — live episodes only need
     # the recent turns (the client bounds its own DOM render at
     # CHAT_RENDER_CAP) — and report ``total`` so the UI can say how much

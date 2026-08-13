@@ -331,7 +331,14 @@ class ThinkingCursorTest(_ServerTestCase):
     supports a cheap incremental fetch -- ``entries`` from index ``n``
     onward plus a ``next`` cursor -- so a live-thinking poll doesn't have
     to re-fetch (and re-render) the whole trace every ~1.5s tick.
-    ``since`` omitted/0 must be byte-for-byte the pre-§F1 response."""
+    ``since`` omitted/0 must be byte-for-byte the pre-§F1 response.
+
+    Re-anchor (2026-08-13): trace entries are NOT append-only -- a
+    continuous reasoning stream merges deltas into one growing entry while
+    ``total`` stays put -- so ``since == total`` must still deliver the
+    boundary entry (``entries[since-1:]``) for the client to replace in
+    place, and ``since > total`` (trace shrank / was rewritten) delivers
+    the full list with ``"reset": true``."""
 
     def setUp(self) -> None:
         super().setUp()
@@ -359,26 +366,72 @@ class ThinkingCursorTest(_ServerTestCase):
         self.assertEqual(without["total"], with_zero["total"])
         self.assertEqual(without["truncated"], with_zero["truncated"])
 
-    def test_since_returns_only_entries_from_cursor_onward(self) -> None:
+    def test_since_reanchors_one_boundary_entry_plus_the_rest(self) -> None:
+        # §2026-08-13: since=N returns entries[N-1:] — the boundary entry is
+        # re-sent because it may have grown/merged since the client last
+        # held it (the old serialized[since:] contract froze the feed when
+        # total stayed put).
         status, payload = self._get("/api/node/1/thinking?since=3")
         self.assertEqual(status, 200)
-        self.assertEqual([e["text"] for e in payload["entries"]], ["turn 3", "turn 4"])
+        self.assertEqual([e["text"] for e in payload["entries"]], ["turn 2", "turn 3", "turn 4"])
         self.assertEqual(payload["total"], 5)
         self.assertEqual(payload["next"], 5)
 
-    def test_since_past_end_returns_empty_entries(self) -> None:
+    def test_since_past_end_returns_full_list_with_reset(self) -> None:
+        # §2026-08-13: since > total means the trace shrank (rewritten /
+        # reparsed) — the client must replace everything, not stitch onto a
+        # mismatched base.
         status, payload = self._get("/api/node/1/thinking?since=99")
         self.assertEqual(status, 200)
-        self.assertEqual(payload["entries"], [])
+        self.assertEqual(len(payload["entries"]), 5)
+        self.assertTrue(payload["reset"])
         self.assertEqual(payload["total"], 5)
-        self.assertEqual(payload["next"], 5)
 
-    def test_polling_since_next_covers_every_entry_exactly_once(self) -> None:
+    def test_polling_since_next_replaces_the_boundary_not_duplicates(self) -> None:
         _, first = self._get("/api/node/1/thinking?since=0")
         cursor = first["next"]
         self.assertEqual(len(first["entries"]), 5)
         _, second = self._get(f"/api/node/1/thinking?since={cursor}")
-        self.assertEqual(second["entries"], [])
+        # The boundary (turn 4) comes back for in-place replacement — the
+        # client's contract is "replace last with entries[0], append the
+        # rest", so exactly one entry is the correct response.
+        self.assertEqual([e["text"] for e in second["entries"]], ["turn 4"])
+
+    def test_growing_boundary_entry_is_delivered_when_since_equals_total(self) -> None:
+        # §2026-08-13 freeze regression: total stays put while the boundary
+        # entry GROWS (consecutive thinking deltas merge into one entry in
+        # the incremental parse). The old cursor returned serialized[since:]
+        # = [] for since == total, so a live reasoning stream froze the
+        # feed for minutes while the merged entry kept growing (the exact
+        # observed trace: 22 parsed entries, one merged thinking entry
+        # growing across 15:14:11-15:20:14, polls pinned at since=3).
+        #
+        # The trace must GROW by appending a line that merges into the last
+        # thinking entry — rewriting the file with a longer last line would
+        # break _parse_trace_incremental, which only parses bytes appended
+        # since its cached offset (a rewrite reads from mid-line and
+        # fabricates a partial entry).
+        first_lines = [
+            json.dumps({"type": "message", "role": "assistant", "content": f"turn {i}"})
+            for i in range(4)
+        ]
+        first_lines.append(json.dumps({"type": "thinking", "content": "initial"}))
+        (self.run_dir / "scratch" / "1" / "trace.jsonl").write_text(
+            "\n".join(first_lines) + "\n", encoding="utf-8"
+        )
+        _, first = self._get("/api/node/1/thinking?since=0")
+        self.assertEqual(first["next"], 5)
+        self.assertEqual(first["entries"][4]["text"], "initial")
+        self.assertEqual(first["entries"][4]["ts"], 4)
+
+        with (self.run_dir / "scratch" / "1" / "trace.jsonl").open("a", encoding="utf-8") as fh:
+            fh.write(json.dumps({"type": "thinking", "content": " grows"}) + "\n")
+
+        _, second = self._get("/api/node/1/thinking?since=5")
+        self.assertEqual(len(second["entries"]), 1)
+        self.assertEqual(second["entries"][0]["text"], "initial grows")
+        self.assertEqual(second["entries"][0]["ts"], 4)
+        self.assertEqual(second["next"], 5)
 
 
 class OperatorActionRoutesTest(_ServerTestCase):

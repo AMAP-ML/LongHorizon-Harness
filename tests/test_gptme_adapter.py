@@ -285,6 +285,46 @@ class ThinkingStreamWrapperTest(unittest.TestCase):
         stream_obj = wrapped()
         self.assertEqual(list(stream_obj.gen), ["plain content, no tags"])
 
+    def test_whitespace_only_tag_framing_is_not_emitted_as_thinking(self) -> None:
+        # 2026-08-13: real gptme 0.32.1 emits its (truncated) open tag as its
+        # own chunk and the close as another, with the tag-adjacent
+        # whitespace as framing: `OPEN + "\n"` then text chunks then
+        # `"\n" + CLOSE + "\n\n"`. The tags are NOT the canonical
+        # "<thinking>"/"</thinking>" spellings — gptme streams
+        # chr(60)+"think"+chr(62) and chr(60)+"/"+"think"+chr(62) — so they
+        # are built from chr() here to pin the exact bytes. Whitespace-only
+        # thinking lines were being emitted as "\n" entries that merged into
+        # the trace's thinking entry as noise; they must be dropped.
+        open_tag = chr(60) + "think" + chr(62)
+        close_tag = chr(60) + "/" + "think" + chr(62)
+
+        def fake_gen():
+            yield open_tag + "\n"
+            yield "reasoning "
+            yield "continues"
+            yield "\n" + close_tag + "\n\n"
+            return None
+
+        class _FakeStream:
+            def __init__(self) -> None:
+                self.gen = fake_gen()
+
+        wrapped = _wrap_thinking_stream(lambda *a, **kw: _FakeStream())
+        stream_obj = wrapped()
+
+        captured = io.StringIO()
+        with contextlib.redirect_stdout(captured):
+            chunks = list(stream_obj.gen)
+
+        thinking_lines = [json.loads(line) for line in captured.getvalue().splitlines() if line.strip()]
+        self.assertTrue(thinking_lines)
+        self.assertTrue(all(e["type"] == "thinking" for e in thinking_lines))
+        self.assertTrue(all(e["content"].strip() for e in thinking_lines), "no whitespace-only thinking entries")
+        self.assertEqual("".join(e["content"] for e in thinking_lines), "reasoning continues")
+        for chunk in chunks:
+            self.assertNotIn(" thinking", chunk)
+            self.assertNotIn(" response", chunk)
+
 
 if __name__ == "__main__":
     unittest.main()

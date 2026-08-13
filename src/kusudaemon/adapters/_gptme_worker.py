@@ -132,21 +132,29 @@ def _wrap_thinking_stream(orig_stream):
                         if "</think>" in after_open or "</thinking>" in after_open:
                             end_tag = "</think>" if "</think>" in after_open else "</thinking>"
                             t_text, _, after_close = after_open.partition(end_tag)
-                            if t_text:
+                            # 2026-08-13: gptme yields the open tag as its own
+                            # chunk (" thinking\n") and the close as another
+                            # ("\n response\n\n") — the tag-adjacent whitespace
+                            # is framing, not content. Whitespace-only thinking
+                            # lines are dropped so the trace's merged thinking
+                            # entry carries no "\n" noise.
+                            if t_text and t_text.strip():
                                 print(json.dumps({"type": "thinking", "content": t_text}), flush=True)
                             in_think = False
                             visible += after_close
                         else:
-                            print(json.dumps({"type": "thinking", "content": after_open}), flush=True)
+                            if after_open.strip():
+                                print(json.dumps({"type": "thinking", "content": after_open}), flush=True)
                 elif "</think>" in chunk or "</thinking>" in chunk:
                     end_tag = "</think>" if "</think>" in chunk else "</thinking>"
                     before, _, after = chunk.partition(end_tag)
-                    if before:
+                    if before and before.strip():
                         print(json.dumps({"type": "thinking", "content": before}), flush=True)
                     in_think = False
                     visible = after
                 elif in_think:
-                    print(json.dumps({"type": "thinking", "content": chunk}), flush=True)
+                    if chunk.strip():
+                        print(json.dumps({"type": "thinking", "content": chunk}), flush=True)
                     visible = ""
                 yield visible
             return metadata

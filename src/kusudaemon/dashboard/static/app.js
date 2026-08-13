@@ -110,6 +110,7 @@ const state = {
   lastCliCommand: "",      // §5.5 copyable CLI equivalent of the last UI action
   escalationFlash: false,
   chatFeedPinned: true,    // the run stream pins to the newest entry until the operator scrolls up
+  nodeChatPinned: true,    // the node Chat tab pins to the newest entry until the operator scrolls up
   // §F1 (PLAN-AUDIT.md, 2026-08-12): live thinking for the followed agent
   // (mainAgentId()), appended into the main feed. Cursor-based — `next` is
   // the index to resume fetching from, `entries` accumulate client-side so
@@ -329,9 +330,18 @@ function loadMainThinking() {
           state.mainThinking.sortAnchor = Date.now() / 1000;
         }
         const base = state.mainThinking.sortAnchor;
-        fresh.forEach((entry, i) => {
-          state.mainThinking.entries.push(Object.assign({}, entry, { sort: base + (entry.ts !== undefined ? entry.ts : i) * 0.001 }));
-        });
+        const stamped = fresh.map((entry, i) => Object.assign({}, entry, { sort: base + (entry.ts !== undefined ? entry.ts : i) * 0.001 }));
+        // Cursor re-anchor (2026-08-13): trace entries are NOT append-only —
+        // consecutive thinking deltas merge into one entry whose text grows
+        // while `total` stays put. The server therefore re-sends the
+        // boundary entry for `since=next`; replace the last held entry with
+        // it instead of appending a duplicate. `reset` (trace shrank /
+        // rewritten) replaces everything held.
+        if (d.reset || state.mainThinking.entries.length === 0) {
+          state.mainThinking.entries = stamped;
+        } else {
+          state.mainThinking.entries = state.mainThinking.entries.slice(0, -1).concat(stamped);
+        }
         state.mainThinking.total = d.total;
         state.mainThinking.next = d.next;
         render();
@@ -349,8 +359,18 @@ function loadMainThinking() {
 function loadThinkingIfNeeded(force = false) {
   const id = state.selectedNode;
   if (!id) return;
-  if (state.nodeThinking !== null && state.nodeThinking !== "loading" && state.nodeThinking.id === id && !force) return;
-  state.nodeThinking = "loading";
+  const cur = state.nodeThinking;
+  if (cur !== null && cur !== "loading" && cur.id === id && !force) return;
+  // §scroll fix (2026-08-13): a background refresh must NOT flip the tab
+  // back to the "loading chat…" placeholder. The snapshot's render lands
+  // synchronously right after this call (applySnapshot → render), swapping
+  // the tall chat-feed out for the tiny placeholder — the real scroll
+  // container (.agent-body) clamps to scrollTop 0 — and the fetch's
+  // resolution re-creates the feed at the top. Only the first load (no
+  // data yet) shows the placeholder; refreshes keep the old list visible
+  // until the new one replaces it in place.
+  const haveData = cur !== null && cur !== "loading" && cur.id === id;
+  if (!haveData) state.nodeThinking = "loading";
   apiGet(`/api/node/${encodeURIComponent(id)}/thinking`)
     .then((d) => {
       if (state.selectedNode !== id) return;
@@ -370,7 +390,7 @@ function loadThinkingIfNeeded(force = false) {
       if (changed) render();
     })
     .catch(() => {
-      if (state.selectedNode === id && state.nodeThinking === "loading") {
+      if (state.selectedNode === id && !haveData) {
         state.nodeThinking = { id, entries: [], total: 0, sig: "" };
       }
     });
@@ -726,6 +746,24 @@ function renderEventEntry(ev) {
         el("span", null, fmtTime(ev.ts)),
       ]),
       el("div", { class: "msg-body", style: "color:var(--accent-amber); font-weight:500;" }, `${from} → ${to}${tail ? " · " + tail : ""}`),
+    ]);
+  }
+  // §2026-08-13: a blocked tree parked the run (phase "escalated" with no
+  // tier change — the round loop's escalate signal with no auto-recovery).
+  // The driver logs the blocked nodes + last defects so this card says what
+  // is actually wrong and how to recover, instead of a bare red event.
+  if (ev.type === "node_blocked") {
+    const nodes = ev.nodes || [];
+    return el("div", { class: "stream-card", style: "border-left: 3px solid var(--accent-amber);" }, [
+      el("div", { class: "card-title" }, [
+        el("span", { style: "color:var(--accent-amber); font-weight:700;" }, `⛔ RUN PARKED — ${nodes.length} node${nodes.length === 1 ? "" : "s"} blocked, no ready work`),
+        el("span", null, fmtTime(ev.ts)),
+      ]),
+      el("div", { class: "card-text" }, nodes.map((n) => el("div", { style: "font-size:12px; margin:4px 0;" }, [
+        el("span", { class: "node-link", onclick: () => openNode(n.node_id) }, n.node_id),
+        el("span", null, ` — ${n.defect || "no defect recorded"}`),
+      ]))),
+      el("div", { class: "dim", style: "font-size:11px; margin-top:6px;" }, "recover: reopen the node with a defect, escalate the tier, or amend the contract"),
     ]);
   }
   if (isFailure) {
@@ -1784,6 +1822,7 @@ function openNode(id, subTab) {
   state.workbenchTab = "node";
   state.nodeDetailFailed = false;
   if (subTab) state.agentTab = subTab;
+  state.nodeChatPinned = true; // a newly opened node starts pinned to its newest entry
   loadNodeDetail(id);
   if (subTab === "chat" || state.agentTab === "chat") loadThinkingIfNeeded(true);
   render();
@@ -1998,7 +2037,10 @@ function renderAgentTab() {
   const tabBar = el("div", { class: "agent-tabs" }, tabs.map(([k, label]) =>
     el("button", { class: "agent-tab" + (state.agentTab === k ? " active" : ""), onclick: () => {
       state.agentTab = k;
-      if (k === "chat") loadThinkingIfNeeded(true);
+      if (k === "chat") {
+        state.nodeChatPinned = true;
+        loadThinkingIfNeeded(true);
+      }
       if (k === "artifact" || k === "versions") loadArtifactsIfNeeded();
       if (k === "diff") apiGet(`/api/node/${encodeURIComponent(id)}/diff/current`).then((r) => { state.nodeDiff = r; render(); }).catch(() => {});
       render();
@@ -2028,7 +2070,13 @@ function renderAgentTab() {
   else if (state.agentTab === "artifact") body = renderArtifactsTab();
   else if (state.agentTab === "versions") body = renderVersionsTab();
   else if (state.agentTab === "diff") body = renderDiffTab();
-  return el("div", { class: "agent-panel" }, [hdr, tabBar, el("div", { class: "agent-body" }, body)]);
+  return el("div", { class: "agent-panel" }, [hdr, tabBar, el("div", { class: "agent-body", onscroll: (e) => {
+    // §scroll: same pin contract as the main feed — the agent-body is the
+    // node Chat tab's real scroll container (the .chat-feed inside it is
+    // content-sized); patchInspector re-applies the pin after each morph.
+    const f = e.currentTarget;
+    state.nodeChatPinned = f.scrollHeight - f.scrollTop - f.clientHeight < 60;
+  } }, body)]);
 }
 
 /* ------------------------- pilot editor + takeover ------------------------- */
@@ -2528,7 +2576,19 @@ function patchCenter() {
   const feed = els.center.querySelector("#chat-feed");
   if (feed && state.chatFeedPinned) feed.scrollTop = feed.scrollHeight;
 }
-function patchInspector() { if (els.inspector) morphInto(els.inspector, renderRightWorkbench()); }
+function patchInspector() {
+  if (!els.inspector) return;
+  morphInto(els.inspector, renderRightWorkbench());
+  // §scroll: the node Chat tab's scroll container is .agent-body; re-apply
+  // the bottom pin after every morph (the feed grows every tick while the
+  // node is live). Only when the chat feed is actually shown — the other
+  // tabs scroll free.
+  if (state.agentTab === "chat") {
+    const scroller = els.inspector.querySelector(".agent-body");
+    const feed = els.inspector.querySelector(".chat-feed.node-chat");
+    if (scroller && feed && state.nodeChatPinned) scroller.scrollTop = scroller.scrollHeight;
+  }
+}
 function patchCmdbar() { if (els.cmdbar) morphInto(els.cmdbar, renderCommandBar()); }
 function patchJobs() {
   if (!els.jobs) return;
