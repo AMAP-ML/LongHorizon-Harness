@@ -111,6 +111,8 @@ class OpenAICompatibleProvider:
         concurrency: int = _DEFAULT_CONCURRENCY,
         sleep: Callable[[float], None] = time.sleep,
         on_backoff: Callable[[int, float], None] | None = None,
+        should_abort: Callable[[], bool] | None = None,
+        on_model_fallback: Callable[[str, str, str], None] | None = None,
     ) -> None:
         resolved = resolve(api_key=api_key or "", base_url=base_url or "", model=model or "")
         self.model = resolved.model
@@ -138,6 +140,8 @@ class OpenAICompatibleProvider:
         # otherwise; the ladder runs regardless of whether anyone's told about
         # it.
         self._on_backoff = on_backoff
+        self._should_abort = should_abort
+        self._on_model_fallback = on_model_fallback
         # §11.10.3: concurrent callers (parallel tests, the dashboard, two
         # drivers on one endpoint) share one throttle, so a 429 storm from
         # one run can't starve the endpoint for the other.
@@ -259,6 +263,27 @@ class OpenAICompatibleProvider:
                 if exc.status == 400 or (exc.status < 500 and exc.status != 429):
                     raise
                 if exc.status == 429:
+                    # §G4: on the second 429 rung (attempt == 1), try a model fallback if configured
+                    if attempt == 1:
+                        from ..provider_config import get_fallback_model, resolve as resolve_provider
+
+                        fallback_model = get_fallback_model(self.model)
+                        if fallback_model and fallback_model != self.model:
+                            old_model = self.model
+                            reason = f"429 rate limit on {old_model}"
+                            try:
+                                res = resolve_provider(model=fallback_model)
+                                self.model = res.model
+                                self.base_url = res.base_url.rstrip("/")
+                                self.api_key = res.api_key
+                                payload["model"] = self.model
+                                if self._on_model_fallback is not None:
+                                    self._on_model_fallback(old_model, self.model, reason)
+                                attempt = 0
+                                continue
+                            except Exception:
+                                pass
+
                     # ``attempt`` indexes the ladder rung we're about to
                     # sleep on (0-based); six rungs means seven HTTP attempts
                     # total when every one fails, and the rung-6 failure
@@ -271,7 +296,19 @@ class OpenAICompatibleProvider:
                         delay = max(delay, min(exc.retry_after, RATE_LIMIT_BACKOFFS[-1]))
                     if self._on_backoff is not None:
                         self._on_backoff(attempt + 1, delay)
-                    self._sleep(delay * random.uniform(0.8, 1.2))
+
+                    # §E16: sliced interruptible sleep
+                    total_sleep = delay * random.uniform(0.8, 1.2)
+                    if self._should_abort is not None:
+                        elapsed = 0.0
+                        while elapsed < total_sleep:
+                            if self._should_abort():
+                                raise ProviderError("rate limit backoff aborted by halt signal")
+                            step = min(5.0, total_sleep - elapsed)
+                            self._sleep(step)
+                            elapsed += step
+                    else:
+                        self._sleep(total_sleep)
                     attempt += 1
                     continue
                 if attempt >= self._max_http_retries:

@@ -195,15 +195,14 @@ def run_from_args(argv: list[str] | None = None, *, env: Environment | None = No
 
     spec = run_spec_path(run_dir)
     if spec.exists():
-        # Resume: the disk is authoritative — argv re-supplies nothing but
+        # Resume: disk is authoritative — argv re-supplies nothing but
         # the run id (§10: durable state wins over the caller's memory).
-        # work_object is the one exception: like source_text, it's a
-        # constructor input rather than a persisted spec field (comment on
-        # RunOptions.work_object) — a resumed workspace-mode run needs
-        # --workspace re-supplied, exactly as measured above, to pick its
-        # WorkObject back up.
+        # RunOptions.from_spec re-hydrates workspace_root and measures work_object.
+        # If --workspace is explicitly passed, it re-points workspace_root.
         options = RunOptions.from_spec(json.loads(spec.read_text(encoding="utf-8")))
-        options.work_object = work_object
+        if work_object is not None:
+            options.work_object = work_object
+            options.workspace_root = str(Path(args.workspace).expanduser().resolve())
     else:
         goal = _read_text_arg(args.goal).strip()
         if not goal:

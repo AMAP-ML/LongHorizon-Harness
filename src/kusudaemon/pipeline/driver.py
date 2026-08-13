@@ -65,7 +65,7 @@ from ..v6.work_object import WorkObject, survey_workspace, work_object_from_text
 from ..v7.split import handle_split_proposal, maybe_derive_split_parent
 from ..v0.events import EventLog
 from ..v0.run_dir import write_text_atomic
-from ..v0.run_dir import create_run_dir, ensure_node_trace_path, events_path, glossary_path, manifest_path, node_artifact_path, spec_path
+from ..v0.run_dir import create_run_dir, ensure_node_trace_path, node_trace_path, events_path, glossary_path, manifest_path, node_artifact_path, spec_path
 from ..v1.provider import OpenAICompatibleProvider, ProviderHTTPError
 from ..v1.reviewer import ReviewVerdict
 from ..v1.round_loop import run_round_loop
@@ -208,8 +208,18 @@ class RunOptions:
     # research_plan still wins when present — explicit targeting overrides
     # auto-targeting the same way --tier overrides the classifier.
     auto_probe_plan: bool = True
+    workspace_root: str | None = None
+
+    def __post_init__(self) -> None:
+        if not self.workspace_root and self.work_object is not None and self.work_object.root is not None:
+            self.workspace_root = str(self.work_object.root.resolve())
 
     def to_spec(self) -> dict[str, Any]:
+        ws_root = self.workspace_root or (
+            str(self.work_object.root.resolve())
+            if self.work_object is not None and self.work_object.root is not None
+            else None
+        )
         spec = {
             "goal": self.goal,
             "backend": self.backend,
@@ -230,6 +240,8 @@ class RunOptions:
             "tier_override": self.tier_override,
             "auto_probe_plan": self.auto_probe_plan,
         }
+        if ws_root:
+            spec["workspace_root"] = ws_root
         # §11.10.7: the corpus lives once, in source.txt. Embedding
         # source_text here duplicated the run's largest file into a JSON
         # every resume re-parses (*and* into the --detach argv, see
@@ -240,6 +252,15 @@ class RunOptions:
 
     @staticmethod
     def from_spec(data: dict[str, Any]) -> "RunOptions":
+        workspace_root = data.get("workspace_root")
+        work_object = None
+        if workspace_root:
+            try:
+                from ..v6.work_object import measure_workspace
+
+                work_object = measure_workspace(workspace_root)
+            except Exception:
+                work_object = None
         return RunOptions(
             goal=str(data.get("goal", "")),
             backend=str(data.get("backend", "gptme")),
@@ -248,6 +269,8 @@ class RunOptions:
             # the file in the run dir, which resume never needs to re-read —
             # source.txt already exists (driver only writes it when missing).
             source_text=str(data.get("source_text", "")),
+            work_object=work_object,
+            workspace_root=workspace_root,
             compile_command=data.get("compile_command"),
             research_plan=parse_research_plan(data.get("research_plan")),
             max_rounds=int(data.get("max_rounds", 100)),
@@ -380,6 +403,21 @@ class RecursiveDriver:
         create_run_dir(self.run_dir.parent, self.run_dir.name)
         self._write_source_and_spec()
         self.log = EventLog(events_path(self.run_dir))
+        if self.provider is not None:
+            if getattr(self.provider, "_should_abort", None) is None:
+                self.provider._should_abort = self._halted
+            if getattr(self.provider, "_on_model_fallback", None) is None:
+                def _on_fallback(from_model: str, to_model: str, reason: str) -> None:
+                    self._log({
+                        "node_id": "-",
+                        "role": "harness",
+                        "round": 0,
+                        "type": "model_fell_back",
+                        "from": from_model,
+                        "to": to_model,
+                        "reason": reason,
+                    })
+                self.provider._on_model_fallback = _on_fallback
         # §D0c: record who is (supposed to be) making progress, so a
         # phase.json frozen on "in_progress" by a dead process can be told
         # apart from one genuinely mid-call.
@@ -424,11 +462,12 @@ class RecursiveDriver:
                     report = RunReport(status="halted", phase=next_phase, detail="halted by operator")
                     break
                 report = await self._run_phase(next_phase, round_index=round_index)
-                round_index += 1
-                ran.add(next_key)
                 if report.status != "done":
                     break
-        report = report or RunReport(status="done", phase=phases_for(self._current_tier())[-1])
+                round_index += 1
+                ran.add(next_key)
+        if report.status == "done" and next_phase is None:
+            report = RunReport(status="done", phase=phases_for(self._current_tier())[-1])
         report.tree_counts = _count_statuses(self._load_tree())
         # §11.9: run_completed is a claim about the run's outcome — logging
         # it after a halt/escalate/error made the event log disagree with
@@ -534,6 +573,16 @@ class RecursiveDriver:
         )
         return RunReport(status=status, phase=phase)
 
+    def _reasoning_sink(self, pseudo_node_id: str) -> Callable[[str], None]:
+        trace_path = node_trace_path(self.run_dir, pseudo_node_id)
+        def _sink(text: str) -> None:
+            if not text:
+                return
+            trace_path.parent.mkdir(parents=True, exist_ok=True)
+            with trace_path.open("a", encoding="utf-8") as f:
+                f.write(json.dumps({"role": "thinking", "text": text}) + "\n")
+        return _sink
+
     # ------------------------------------------------------------------
     # Phases
     # ------------------------------------------------------------------
@@ -563,7 +612,9 @@ class RecursiveDriver:
             estimate = ScopeEstimate()
             measured: Tier = "T3"
         else:
-            estimate = estimate_scope(goal, work, self.provider)
+            estimate = estimate_scope(
+                goal, work, self.provider, on_reasoning=self._reasoning_sink("phase-classify")
+            )
             measured = classify(signals, estimate)
         tier: Tier = tier_max(measured, override) if override else measured
         payload = {
@@ -684,7 +735,15 @@ class RecursiveDriver:
         estimate = self._read_tier_record().get("estimate") or {}
         ambiguities = [str(item) for item in (estimate.get("ambiguities") or [])]
         objections = [str(item) for item in (estimate.get("objections") or [])]
-        run_intake(self.run_dir, goal, ambiguities, objections, self.provider, self._ask_intake_round)
+        run_intake(
+            self.run_dir,
+            goal,
+            ambiguities,
+            objections,
+            self.provider,
+            self._ask_intake_round,
+            on_reasoning=self._reasoning_sink("phase-intake"),
+        )
 
     def _write_minimal_spec(self, goal: str) -> None:
         rubric = GlobalRubric(
@@ -1004,6 +1063,7 @@ class RecursiveDriver:
             input_path_for=lambda unit: unit_input_path(self.run_dir, unit),
             log=self.log,
             unit_summary_for=self._explore_summary_for,
+            on_reasoning=self._reasoning_sink("phase-plan"),
         )
         # PLAN.md §C1: the planner's per-leaf ``apply_template_to_node``
         # cannot know run_dir, so re-apply with the absolute glossary path
@@ -1167,7 +1227,7 @@ class RecursiveDriver:
             tree = TaskTree.load(tree_path(self.run_dir))
         except Exception:
             return {}
-        plan = plan_probes(tree, self.provider)
+        plan = plan_probes(tree, self.provider, on_reasoning=self._reasoning_sink("phase-research"))
         total_probes = sum(len(qs) for qs in plan.values())
         self._log(
             {
@@ -1509,7 +1569,12 @@ class RecursiveDriver:
             )
             return DocumentReviewResult()
         review = run_document_review(
-            self.run_dir, tree, self.provider, keep_depth_pass=keep_depth_pass, log=self.log
+            self.run_dir,
+            tree,
+            self.provider,
+            keep_depth_pass=keep_depth_pass,
+            log=self.log,
+            on_reasoning=self._reasoning_sink("phase-review"),
         )
         self._write_document_review_cache(digest, review)
         return review

@@ -121,6 +121,7 @@ def plan_level(
     *,
     top_level: bool,
     unit_summary_for: Callable[[SpineUnit], str] | None = None,
+    on_reasoning: Callable[[str], None] | None = None,
 ) -> list[Candidate]:
     hint = (
         f"{DEFAULT_TOP_LEVEL_MIN_CHILDREN}-{DEFAULT_TOP_LEVEL_MAX_CHILDREN} children"
@@ -137,7 +138,7 @@ def plan_level(
             ),
         },
     ]
-    payload = provider.complete_json(messages, PARTITION_SCHEMA)
+    payload = provider.complete_json(messages, PARTITION_SCHEMA, on_reasoning=on_reasoning)
     candidates = []
     for child in payload["children"]:
         unit_start = max(0, min(int(child["unit_start"]), len(units) - 1))
@@ -282,6 +283,7 @@ def build_tree(
     input_path_for: Callable[[SpineUnit], str] | None = None,
     log: EventLog | None = None,
     unit_summary_for: Callable[[SpineUnit], str] | None = None,
+    on_reasoning: Callable[[str], None] | None = None,
 ) -> TaskTree:
     """Recurse level-at-a-time from the full spine to a flat set of leaf
     TaskNodes. Depth cap, node cap, and a size floor (a one-unit slice
@@ -391,7 +393,7 @@ def build_tree(
             return
 
         candidates = plan_level(
-            slice_units, provider, top_level=(depth == 0), unit_summary_for=unit_summary_for
+            slice_units, provider, top_level=(depth == 0), unit_summary_for=unit_summary_for, on_reasoning=on_reasoning
         )
         if not candidates:
             forced_leaf(slice_units, path or f"depth{depth}", "planner returned no children")

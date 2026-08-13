@@ -152,6 +152,30 @@ def build_pipeline_parser() -> argparse.ArgumentParser:
     serve_parser.add_argument("--no-control", action="store_true", help="Read-only view: disable start/attach/halt/approve/amend/reopen/interject.")
     serve_parser.add_argument("--auth-token", default=None, help="PLAN.md §C4: token required for dashboard access when bound to a non-loopback host. Issued as a cookie at /api/attach; sent as Bearer by API clients.")
     serve_parser.add_argument("--max-concurrent-runs", type=int, default=None, help="PLAN.md §C4: cap on concurrently-hosted dashboard runs (429 past this).")
+
+    pause_parser = sub.add_parser("pause", help="Pause a run (write halt.flag).")
+    pause_parser.add_argument("run_id")
+    pause_parser.add_argument("--runs-root", default=_RUNS_ROOT_DEFAULT)
+
+    kill_parser = sub.add_parser("kill", help="Kill a run process.")
+    kill_parser.add_argument("run_id")
+    kill_parser.add_argument("--runs-root", default=_RUNS_ROOT_DEFAULT)
+
+    reopen_parser = sub.add_parser("reopen", help="Reopen a node for repair.")
+    reopen_parser.add_argument("run_id")
+    reopen_parser.add_argument("node_id")
+    reopen_parser.add_argument("--defect", default="")
+    reopen_parser.add_argument("--runs-root", default=_RUNS_ROOT_DEFAULT)
+
+    tier_parser = sub.add_parser("tier", help="Set tier override.")
+    tier_parser.add_argument("run_id")
+    tier_parser.add_argument("tier", choices=("T0", "T1", "T2", "T3"))
+    tier_parser.add_argument("--runs-root", default=_RUNS_ROOT_DEFAULT)
+
+    model_parser = sub.add_parser("model", help="Set model override.")
+    model_parser.add_argument("run_id")
+    model_parser.add_argument("model")
+    model_parser.add_argument("--runs-root", default=_RUNS_ROOT_DEFAULT)
     return parser
 
 
@@ -410,6 +434,85 @@ def cmd_resume(argv: argparse.Namespace) -> int:
     return run_from_args(["--runs-root", argv.runs_root, "--run-id", argv.run_id])
 
 
+def cmd_pause(argv: argparse.Namespace) -> int:
+    run_dir = _require_existing_run(argv.runs_root, argv.run_id)
+    if run_dir is None:
+        return 1
+    halt_path(run_dir).touch()
+    print(f"paused run {argv.run_id} (wrote halt.flag)")
+    return 0
+
+
+def cmd_kill(argv: argparse.Namespace) -> int:
+    run_dir = _require_existing_run(argv.runs_root, argv.run_id)
+    if run_dir is None:
+        return 1
+    halt_path(run_dir).touch()
+    pid_file = run_dir / "driver.pid.json"
+    if not pid_file.is_file():
+        print(f"no driver PID found for run {argv.run_id}", file=sys.stderr)
+        return 1
+    try:
+        data = json.loads(pid_file.read_text(encoding="utf-8"))
+        pid = int(data["pid"])
+        import os, signal
+        os.kill(pid, signal.SIGTERM)
+        print(f"killed process {pid} for run {argv.run_id}")
+        return 0
+    except Exception as exc:
+        print(f"failed to kill process: {exc}", file=sys.stderr)
+        return 1
+
+
+def cmd_reopen(argv: argparse.Namespace) -> int:
+    run_dir = _require_existing_run(argv.runs_root, argv.run_id)
+    if run_dir is None:
+        return 1
+    tree_file = tree_path(run_dir)
+    if not tree_file.is_file():
+        print(f"no tree.json at {tree_file}", file=sys.stderr)
+        return 1
+    tree = TaskTree.load(tree_file)
+    node = tree.nodes.get(argv.node_id)
+    if node is None:
+        print(f"no node {argv.node_id} in tree", file=sys.stderr)
+        return 1
+    node.status = "pending"
+    node.last_defect = argv.defect or ""
+    tree.save(tree_file)
+    print(f"reopened node {argv.node_id} in run {argv.run_id}")
+    return 0
+
+
+def cmd_tier(argv: argparse.Namespace) -> int:
+    run_dir = _require_existing_run(argv.runs_root, argv.run_id)
+    if run_dir is None:
+        return 1
+    t_file = tier_path(run_dir)
+    rec = json.loads(t_file.read_text(encoding="utf-8")) if t_file.is_file() else {}
+    rec["override"] = argv.tier.upper()
+    write_text_atomic(t_file, json.dumps(rec, indent=2) + "\n")
+    print(f"set tier override for run {argv.run_id} to {argv.tier.upper()}")
+    return 0
+
+
+def cmd_model(argv: argparse.Namespace) -> int:
+    run_dir = _require_existing_run(argv.runs_root, argv.run_id)
+    if run_dir is None:
+        return 1
+    ov_file = run_dir / "model_override.json"
+    if argv.model.lower() in ("none", "default"):
+        try:
+            ov_file.unlink()
+        except OSError:
+            pass
+        print(f"cleared model override for run {argv.run_id}")
+    else:
+        write_text_atomic(ov_file, json.dumps({"model": argv.model.strip(), "ts": time.time()}, indent=2) + "\n")
+        print(f"set model override for run {argv.run_id} to {argv.model}")
+    return 0
+
+
 def dispatch(args: argparse.Namespace) -> int:
     """Route a parsed pipeline group to its handler."""
     command = args.pipeline_command
@@ -427,6 +530,16 @@ def dispatch(args: argparse.Namespace) -> int:
         return cmd_escalate(args)
     if command == "serve":
         return cmd_serve(args)
+    if command == "pause":
+        return cmd_pause(args)
+    if command == "kill":
+        return cmd_kill(args)
+    if command == "reopen":
+        return cmd_reopen(args)
+    if command == "tier":
+        return cmd_tier(args)
+    if command == "model":
+        return cmd_model(args)
     raise ValueError(f"unknown pipeline command: {command!r}")
 
 

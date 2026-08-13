@@ -548,6 +548,45 @@ class OptionsFromBodyTierOverrideTest(unittest.TestCase):
         options, _ = RunState._options_from_body({}, "goal")
         self.assertIsNone(options.tier_override)
 
+
+class WorkspaceModeRuntimeTest(unittest.TestCase):
+    def test_workspace_root_round_trips_in_to_spec_from_spec(self) -> None:
+        import tempfile
+        from kusudaemon.pipeline.driver import RunOptions
+        from kusudaemon.v6.work_object import measure_workspace
+
+        with tempfile.TemporaryDirectory() as td:
+            work = measure_workspace(td)
+            opts = RunOptions(goal="test", work_object=work)
+            self.assertEqual(opts.workspace_root, str(Path(td).resolve()))
+
+            spec = opts.to_spec()
+            self.assertEqual(spec.get("workspace_root"), str(Path(td).resolve()))
+
+            restored = RunOptions.from_spec(spec)
+            self.assertEqual(restored.workspace_root, str(Path(td).resolve()))
+
+    def test_runtime_for_reconstructs_workspace_path(self) -> None:
+        import tempfile
+        import json
+        from pathlib import Path
+        from kusudaemon.dashboard.state import _runtime_for
+        from kusudaemon.pipeline.driver import RunOptions
+        from kusudaemon.v6.work_object import measure_workspace
+
+        with tempfile.TemporaryDirectory() as td:
+            run_dir = Path(td) / "run_123"
+            run_dir.mkdir()
+            repo_dir = Path(td) / "my_repo"
+            repo_dir.mkdir()
+
+            work = measure_workspace(repo_dir)
+            opts = RunOptions(goal="repair test", work_object=work)
+            (run_dir / "run.spec.json").write_text(json.dumps(opts.to_spec()), encoding="utf-8")
+
+            res_opts, _, _, factory = _runtime_for(run_dir)
+            self.assertEqual(res_opts.workspace_root, str(repo_dir.resolve()))
+
     def test_rejects_out_of_range_digit(self) -> None:
         with self.assertRaises(ValueError):
             RunState._options_from_body({"tier_override": "9"}, "goal")

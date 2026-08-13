@@ -231,6 +231,7 @@ def plan_probes(
     window: int = PROBE_PLANNER_WINDOW,
     stride: int = PROBE_PLANNER_STRIDE,
     max_per_window: int = MAX_PROBES_PER_WINDOW,
+    on_reasoning: Callable[[str], None] | None = None,
 ) -> dict[str, list[ResearchQuery]]:
     """Build a ``ResearchPlan`` (the shape ``run_research_loop`` expects) by
     windowing the candidate set and making one ``complete_json`` call per
@@ -254,7 +255,7 @@ def plan_probes(
     for start, end in window_indices(len(candidates), window=window, stride=stride):
         window_nodes = candidates[start:end]
         window_ids = {node.id for node in window_nodes}
-        suggestions = _ask_one_window(provider, window_nodes)
+        suggestions = _ask_one_window(provider, window_nodes, on_reasoning=on_reasoning)
         accepted = _validate_and_cap(suggestions, window_ids, max_per_window)
         _merge_into_plan(plan, accepted)
     return plan
@@ -263,6 +264,7 @@ def plan_probes(
 def _ask_one_window(
     provider: OpenAICompatibleProvider,
     window_nodes: list[TaskNode],
+    on_reasoning: Callable[[str], None] | None = None,
 ) -> list[ProbeSuggestion]:
     """One complete_json call over one window. The schema's
     ``additionalProperties: False`` plus the harness-side validation below

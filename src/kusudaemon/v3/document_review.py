@@ -254,6 +254,7 @@ def run_document_review(
     stride: int = DEFAULT_REVIEW_STRIDE,
     keep_depth_pass: bool = True,
     log: EventLog | None = None,
+    on_reasoning: Callable[[str], None] | None = None,
 ) -> DocumentReviewResult:
     """Read-only document review (§8.7): 3 passes over windowed index
     contexts plus (by default) the depth pass over shape-median artifacts.

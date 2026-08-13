@@ -174,7 +174,8 @@ def _group_sections(sections: list[str], max_groups: int) -> list[str]:
 
 
 def _call_reviewer(
-    rubric_lines: str, artifact_text: str, provider: OpenAICompatibleProvider
+    rubric_lines: str, artifact_text: str, provider: OpenAICompatibleProvider,
+    on_reasoning: Callable[[str], None] | None = None,
 ) -> dict[str, Any]:
     messages = [
         {"role": "system", "content": _SYSTEM_PROMPT},
@@ -183,7 +184,7 @@ def _call_reviewer(
             "content": f"Rubric:\n{rubric_lines}\n\nArtifact:\n{artifact_text}",
         },
     ]
-    return provider.complete_json(messages, VERDICT_SCHEMA)
+    return provider.complete_json(messages, VERDICT_SCHEMA, on_reasoning=on_reasoning)
 
 
 def review_node(
@@ -192,6 +193,7 @@ def review_node(
     provider: OpenAICompatibleProvider,
     *,
     artifact_cap_tokens: int = DEFAULT_ARTIFACT_CAP_TOKENS,
+    on_reasoning: Callable[[str], None] | None = None,
 ) -> ReviewVerdict:
     """PLAN.md §A9/§B6: fan-out replaces whole-artifact truncation.
 
@@ -234,7 +236,7 @@ def review_node(
 
     capped_artifact = cap_artifact_text(artifact_text, artifact_cap_tokens)
     if capped_artifact == artifact_text:
-        payload = _call_reviewer(rubric_lines, artifact_text, provider)
+        payload = _call_reviewer(rubric_lines, artifact_text, provider, on_reasoning=on_reasoning)
         return ReviewVerdict(
             node_id=node.id,
             items=list(payload.get("items", [])),
@@ -244,7 +246,7 @@ def review_node(
 
     sections = _group_sections(_sections_by_heading(artifact_text), MAX_FANOUT_SECTIONS)
     if not sections:
-        payload = _call_reviewer(rubric_lines, capped_artifact, provider)
+        payload = _call_reviewer(rubric_lines, capped_artifact, provider, on_reasoning=on_reasoning)
         return ReviewVerdict(
             node_id=node.id,
             items=list(payload.get("items", [])),
@@ -260,7 +262,7 @@ def review_node(
         if capped_section != section_text:
             truncated = True
             section_text = capped_section
-        payload = _call_reviewer(rubric_lines, section_text, provider)
+        payload = _call_reviewer(rubric_lines, section_text, provider, on_reasoning=on_reasoning)
         items.extend(payload.get("items", []))
         if str(payload.get("verdict", "fail")) != "pass":
             verdict = "fail"

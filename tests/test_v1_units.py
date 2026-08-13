@@ -775,6 +775,62 @@ class ProviderStructuredOutputTest(unittest.TestCase):
             provider.complete_json([{"role": "user", "content": "hi"}], self.SCHEMA)
         self.assertEqual(ctx.exception.status, 400)
 
+    def test_should_abort_interrupts_rate_limit_backoff(self) -> None:
+        def transport(url, payload, headers):
+            raise ProviderHTTPError(429, "rate limit")
+
+        aborted = False
+        def should_abort():
+            nonlocal aborted
+            return aborted
+
+        def custom_sleep(d):
+            nonlocal aborted
+            aborted = True
+
+        provider = OpenAICompatibleProvider(
+            transport=transport,
+            api_key="unused",
+            sleep=custom_sleep,
+            should_abort=should_abort,
+        )
+        with self.assertRaises(ProviderError) as ctx:
+            provider.complete_json([{"role": "user", "content": "hi"}], self.SCHEMA)
+        self.assertIn("aborted", str(ctx.exception))
+
+    def test_model_fallback_switches_on_second_429_rung(self) -> None:
+        calls: list[str] = []
+        fallbacks_logged: list[tuple[str, str, str]] = []
+
+        def transport(url, payload, headers):
+            calls.append(payload["model"])
+            raise ProviderHTTPError(429, "rate limit")
+
+        def on_fallback(from_m, to_m, reason):
+            fallbacks_logged.append((from_m, to_m, reason))
+
+        from kusudaemon.provider_config import get_fallback_model
+        import kusudaemon.provider_config as pc
+        old_get_fallback = pc.get_fallback_model
+        pc.get_fallback_model = lambda m: "fallback-model" if m == "primary-model" else None
+        try:
+            provider = OpenAICompatibleProvider(
+                model="primary-model",
+                transport=transport,
+                api_key="unused",
+                sleep=lambda _: None,
+                on_model_fallback=on_fallback,
+            )
+            with self.assertRaises(ProviderHTTPError):
+                provider.complete_json([{"role": "user", "content": "hi"}], self.SCHEMA)
+
+            self.assertIn("fallback-model", calls)
+            self.assertEqual(len(fallbacks_logged), 1)
+            self.assertEqual(fallbacks_logged[0][0], "primary-model")
+            self.assertEqual(fallbacks_logged[0][1], "fallback-model")
+        finally:
+            pc.get_fallback_model = old_get_fallback
+
 
 class ReviewerInputCapTest(unittest.TestCase):
     """§11.10.13: the Reviewer (and the re-validation reviewer, which shares

@@ -184,6 +184,7 @@ def build_question_set(
     provider: OpenAICompatibleProvider,
     *,
     prior_qa: Sequence[str] = (),
+    on_reasoning: Callable[[str], None] | None = None,
 ) -> QuestionSet:
     """PLAN.md §A5.2: exactly one `complete_json` call. `prior_qa` is only
     non-empty on a round-2 call — lines like `"Q: ... A: ..."` from round 1,
@@ -204,7 +205,7 @@ def build_question_set(
         {"role": "system", "content": _QUESTION_SET_SYSTEM_PROMPT},
         {"role": "user", "content": "\n\n".join(sections)},
     ]
-    payload = provider.complete_json(messages, QUESTION_SET_SCHEMA)
+    payload = provider.complete_json(messages, QUESTION_SET_SCHEMA, on_reasoning=on_reasoning)
     questions = tuple(
         IntakeQuestion(
             id=str(item.get("id") or f"q{index + 1}"),
@@ -258,6 +259,7 @@ def run_intake(
     objections: Sequence[str],
     provider: OpenAICompatibleProvider,
     ask_fn: AskFn,
+    on_reasoning: Callable[[str], None] | None = None,
 ) -> GlobalRubric:
     """PLAN.md §A5/§B3: bounded, adaptive intake, and freezes the result
     into `spec.md` (§5: "frozen: goal, global rubric, approved
@@ -302,7 +304,7 @@ def run_intake(
     while keep_going and round_index < MAX_INTAKE_ROUNDS:
         round_index += 1
         question_set = build_question_set(
-            goal, pending_ambiguities, pending_objections, provider, prior_qa=prior_qa
+            goal, pending_ambiguities, pending_objections, provider, prior_qa=prior_qa, on_reasoning=on_reasoning
         )
         if round_index == 1:
             unresolved_objections = [_objection_line(o) for o in question_set.objections]

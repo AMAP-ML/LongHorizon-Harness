@@ -39,7 +39,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 from ..v0.events import EventLog
-from ..v0.run_dir import events_path, manifest_path, node_artifact_path, node_scratch_dir, node_trace_path, spec_path
+from ..v0.run_dir import events_path, manifest_path, node_artifact_path, node_scratch_dir, node_trace_path, spec_path, write_text_atomic
 from ..v1.gates import estimate_tokens
 from ..v1.tree import TaskTree
 from ..v2.contract import load_contract
@@ -345,6 +345,59 @@ class RunState:
             return None
         return self.runs_root / run_id
 
+    def set_model_override(self, model: str | None) -> bool:
+        run_dir = self._attached_dir()
+        if run_dir is None:
+            return False
+        override_file = run_dir / "model_override.json"
+        if model is None or not model.strip():
+            try:
+                override_file.unlink()
+            except OSError:
+                pass
+        else:
+            write_text_atomic(
+                override_file,
+                json.dumps({"model": model.strip(), "ts": _now()}, indent=2) + "\n",
+            )
+        return True
+
+    def get_model_override(self) -> str | None:
+        run_dir = self._attached_dir()
+        if run_dir is None:
+            return None
+        override_file = run_dir / "model_override.json"
+        data = _read_json(override_file)
+        if isinstance(data, dict):
+            return data.get("model")
+        return None
+
+    def set_tier_override(self, tier: str | None) -> bool:
+        run_dir = self._attached_dir()
+        if run_dir is None:
+            return False
+        rec = _read_json(tier_path(run_dir)) or {}
+        rec["override"] = tier
+        write_text_atomic(tier_path(run_dir), json.dumps(rec, indent=2) + "\n")
+        return True
+
+    def reopen_node(self, node_id: str, defect: str = "") -> bool:
+        run_dir = self._attached_dir()
+        if run_dir is None:
+            return False
+        tree_file = tree_path(run_dir)
+        if not tree_file.is_file():
+            return False
+        tree = TaskTree.load(tree_file)
+        node = tree.nodes.get(node_id)
+        if node is None:
+            return False
+        node.status = "pending"
+        node.last_defect = defect
+        tree.save(tree_file)
+        EventLog(events_path(run_dir)).append({"type": "node_reopened", "node_id": node_id, "defect": defect, "ts": _now()})
+        return True
+
     # ------------------------------------------------------------------
     # Snapshots (always read fresh; the disk is authoritative)
     # ------------------------------------------------------------------
@@ -414,6 +467,7 @@ class RunState:
             "has_assembly": assembly_output_path(run_dir).exists(),
             "models": models,
             "default_model": default_model,
+            "model_override": self.get_model_override(),
             "server_time": _now(),
         }
 
@@ -1482,12 +1536,19 @@ def _runtime_for(run_dir: Path):
     options = RunOptions.from_spec(spec)
     provider = OpenAICompatibleProvider(model=options.model)
     env = LocalEnvironment(tmp_dir=str(run_dir / "tmp"))
+    work = options.work_object
+    workspace_path = (
+        work.root
+        if work is not None and work.kind == "workspace" and work.root is not None
+        else run_dir
+    )
     factory = lambda node: build_writer_adapter(  # noqa: E731
         options.backend,
-        workspace_path=run_dir,
+        workspace_path=workspace_path,
         prompt_dir=run_dir / "tmp" / "prompts",
         node=node,
         model=options.model,
+        run_dir=run_dir,
     )
     return options, provider, env, factory
 
@@ -1711,11 +1772,45 @@ def _summarize_subagent(
             error = event.get("error")
     logdir = logdir_for(node_trace_path(run_dir, node_id))
     live = bool(logdir) and not completed
+
+    # §F4: derived_status (idle|starting|thinking|tool|reviewing|done|failed)
+    if completed:
+        derived_status = "done" if status == "done" else "failed"
+    elif attempts > 0 or live or status == "running":
+        trace_text = _read_text(node_trace_path(run_dir, node_id))
+        if not trace_text or not trace_text.strip():
+            derived_status = "starting"
+        else:
+            last_role = ""
+            for line in reversed(trace_text.splitlines()):
+                line = line.strip()
+                if not line or not line.startswith("{"):
+                    continue
+                try:
+                    rec = json.loads(line)
+                    role_val = str(rec.get("role") or rec.get("type") or "")
+                    if role_val:
+                        last_role = role_val
+                        break
+                except json.JSONDecodeError:
+                    continue
+            if last_role in ("thinking", "think"):
+                derived_status = "thinking"
+            elif last_role in ("tool", "system", "shell"):
+                derived_status = "tool"
+            elif last_role in ("reviewer", "review"):
+                derived_status = "reviewing"
+            else:
+                derived_status = "thinking"
+    else:
+        derived_status = "idle"
+
     return {
         "id": node_id,
         "kind": _kind_of(node_id),
         "role": role,
         "status": status,
+        "derived_status": derived_status,
         "attempts": attempts,
         "duration_ms": duration_ms,
         "error": error,

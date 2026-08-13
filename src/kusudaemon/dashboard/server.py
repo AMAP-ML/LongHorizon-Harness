@@ -367,6 +367,58 @@ def _get_node_thinking(handler: "DashboardRequestHandler", match: Any, body: dic
     return 200, {"entries": trimmed, "total": total, "next": total, "truncated": truncated}
 
 
+@_route("POST", r"^/api/model/override$")
+def _post_model_override(handler: "DashboardRequestHandler", match: Any, body: dict) -> tuple[int, Any]:
+    model = body.get("model")
+    if model is not None and not isinstance(model, str):
+        return 400, {"error": "model must be string or null"}
+    ok = handler.state.set_model_override(model)
+    if not ok:
+        return 400, {"error": "no run attached"}
+    return 200, {"ok": True, "model": model}
+
+
+@_route("POST", r"^/api/command$")
+def _post_command(handler: "DashboardRequestHandler", match: Any, body: dict) -> tuple[int, Any]:
+    handler.require_control()
+    cmd = str(body.get("command", "")).strip()
+    if not cmd:
+        return 400, {"error": "command is required"}
+
+    parts = cmd.split(maxsplit=1)
+    slash_cmd = parts[0].lower()
+    arg = parts[1].strip() if len(parts) > 1 else ""
+
+    if slash_cmd == "/pause":
+        ok = handler.state.halt(True)
+        return (200, {"ok": ok, "message": "Run paused"}) if ok else (400, {"error": "no run attached"})
+    elif slash_cmd == "/resume":
+        ok = handler.state.halt(False)
+        return (200, {"ok": ok, "message": "Run resumed"}) if ok else (400, {"error": "no run attached"})
+    elif slash_cmd == "/kill":
+        ok = handler.state.kill_run()
+        return (200, {"ok": ok, "message": "Run killed"}) if ok else (409, {"error": "kill failed"})
+    elif slash_cmd == "/tier":
+        if arg.upper() not in {"T0", "T1", "T2", "T3"}:
+            return 400, {"error": "tier must be T0, T1, T2, or T3"}
+        ok = handler.state.set_tier_override(arg.upper())
+        return (200, {"ok": ok, "message": f"Tier set to {arg.upper()}"}) if ok else (400, {"error": "no run attached"})
+    elif slash_cmd == "/model":
+        val = None if arg.lower() in {"", "default", "none"} else arg
+        ok = handler.state.set_model_override(val)
+        return (200, {"ok": ok, "message": f"Model set to {val or 'default'}"}) if ok else (400, {"error": "no run attached"})
+    elif slash_cmd == "/reopen":
+        if not arg:
+            return 400, {"error": "node id required for /reopen"}
+        subparts = arg.split(maxsplit=1)
+        node_id = subparts[0]
+        defect = subparts[1] if len(subparts) > 1 else ""
+        ok = handler.state.reopen_node(node_id, defect)
+        return (200, {"ok": ok, "message": f"Reopened {node_id}"}) if ok else (400, {"error": f"could not reopen {node_id}"})
+    else:
+        return 400, {"error": f"unknown command: {slash_cmd}"}
+
+
 @_route("GET", r"^/api/node/([^/]+)/version/([^/]+)$")
 def _get_node_version(handler: "DashboardRequestHandler", match: Any, body: dict) -> tuple[int, Any]:
     text = handler.state.version_snapshot(unquote(match.group(1)), unquote(match.group(2)))

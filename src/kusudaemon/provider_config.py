@@ -172,6 +172,15 @@ def read_config_file(path: Path | None = None) -> dict[str, object]:
     if not isinstance(data, dict):
         raise ProviderConfigError(f"provider config {target} must be a JSON object")
 
+    raw_fallbacks = data.get("fallbacks")
+    fallbacks: dict[str, str] = {}
+    if isinstance(raw_fallbacks, dict):
+        for k, v in raw_fallbacks.items():
+            if isinstance(v, str) and v.strip():
+                fallbacks[str(k).strip()] = v.strip()
+            elif isinstance(v, (list, tuple)) and v:
+                fallbacks[str(k).strip()] = str(v[0]).strip()
+
     raw_providers = data.get("providers")
     if isinstance(raw_providers, dict):
         providers = {str(name): _normalize_entry(entry, target) for name, entry in raw_providers.items()}
@@ -181,10 +190,46 @@ def read_config_file(path: Path | None = None) -> dict[str, object]:
                 f"provider config {target}: default {default!r} is not a "
                 f"defined provider ({sorted(providers)})"
             )
-        return {"default": default, "providers": providers}
+        return {"default": default, "providers": providers, "fallbacks": fallbacks}
 
     # Legacy flat shape: one provider named after the built-in default.
-    return {"default": DEFAULT_PROVIDER, "providers": {DEFAULT_PROVIDER: _normalize_entry(data, target)}}
+    return {"default": DEFAULT_PROVIDER, "providers": {DEFAULT_PROVIDER: _normalize_entry(data, target)}, "fallbacks": fallbacks}
+
+
+def get_fallback_model(model: str, config_path: Path | None = None) -> str | None:
+    """Look up fallback model for a given model from provider.json."""
+    try:
+        file_data = read_config_file(config_path)
+        fallbacks = file_data.get("fallbacks")
+        if isinstance(fallbacks, dict):
+            target = fallbacks.get(model)
+            if target:
+                return str(target)
+    except Exception:
+        pass
+    return None
+
+
+def get_model_for_role(
+    role: str,
+    default_model: str,
+    run_dir: Path | None = None,
+    role_models: dict[str, str] | None = None,
+) -> str:
+    """PLAN.md §G2: runtime override > per-role mapping > default model."""
+    if run_dir is not None:
+        override_file = run_dir / "model_override.json"
+        if override_file.is_file():
+            try:
+                data = json.loads(override_file.read_text(encoding="utf-8"))
+                if isinstance(data, dict) and data.get("model"):
+                    return str(data["model"]).strip()
+            except (OSError, json.JSONDecodeError):
+                pass
+    if role_models and role in role_models and role_models[role]:
+        return str(role_models[role]).strip()
+    return default_model
+
 
 
 def _normalize_entry(entry: object, target: Path) -> dict[str, object]:

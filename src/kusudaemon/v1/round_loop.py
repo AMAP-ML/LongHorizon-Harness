@@ -419,7 +419,7 @@ async def run_round_loop(
 
         for node in wave:
             node.status = "dispatched"
-            tree.save(tree_path)
+            await _save_tree_locked(tree, tree_path, tree_lock)
             log.append(
                 {
                     "node_id": node.id,
