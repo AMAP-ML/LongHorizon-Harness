@@ -883,6 +883,8 @@ class RunState:
         if not isinstance(record.get("pid"), int):
             return False
         pid: int = record["pid"]
+        if pid == os.getpid():
+            return True
         from ..utils.process_group import kill_process_group
         kill_process_group(pid, grace_seconds=2.0)
         return True

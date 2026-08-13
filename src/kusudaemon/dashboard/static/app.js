@@ -1011,29 +1011,29 @@ function renderHeaderRow() {
     ]),
     el("div", { class: "hdr-goal", title: snap.goal }, snap.goal || "—"),
     el("div", { class: "hdr-status" }, [
-      badge(snap.phase_status || (snap.halted ? "halted" : "created")),
+      badge(snap.halted ? "halted" : (snap.phase_status || "created")),
       el("span", { class: "dim" }, snap.phase_detail || ""),
     ]),
     el("div", { class: "hdr-buttons" }, [
       snap.control_enabled && tier !== "T3" ? el("button", { class: "btn-tiny", onclick: () => { if (confirm("Escalate tier (+1, T3 max)?") ) guarded(() => apiPost("/api/escalate", {}).then(() => { recordCli("escalate"); showToast("Tier escalated"); })); } }, "⇡ escalate") : null,
       snap.stalled ? el("button", { class: "btn-tiny", style: "color:var(--accent-red);", onclick: () => guarded(resumeRun) }, "☠ Resume") : null,
-      snap.control_enabled && !snap.stalled && (snap.phase_status === "error" || snap.halted || snap.phase_status === "failed" || snap.phase_status === "escalated" || snap.phase_status === "blocked" || snap.phase_status === "paused")
+      snap.control_enabled && !snap.stalled && !snap.halted && (snap.phase_status === "error" || snap.phase_status === "failed" || snap.phase_status === "escalated" || snap.phase_status === "blocked" || snap.phase_status === "paused")
         ? el("button", { class: "btn-tiny", onclick: () => guarded(() => {
             if (snap.hosted) {
-              // Our own driver thread is alive in this server process: it
-              // just needs halt.flag cleared to continue at the phase
-              // boundary it is parked on.
               return apiPost("/api/halt", { value: false }).then(() => showToast("Resume requested"));
             }
-            // Not hosted here — a CLI-launched or dead driver. Un-halting
-            // would write a flag nobody is polling, i.e. "does nothing":
-            // re-host the run (POST /api/runs; run.spec.json on disk is
-            // authoritative). The server refuses if a driver is genuinely
-            // still alive on this host.
             resumeRun();
           }) }, "▶ Resume")
         : null,
-      snap.control_enabled ? el("button", { class: "btn-tiny", onclick: () => guarded(() => apiPost("/api/halt", { value: snap.halted ? false : true }).then(() => { recordCli("halt"); showToast(snap.halted ? "Resume requested" : "Halting after current phase"); })) }, snap.halted ? "▶" : "⏸") : null,
+      snap.control_enabled ? el("button", { class: "btn-tiny", onclick: () => guarded(() => {
+        if (snap.halted) {
+          if (snap.hosted) {
+            return apiPost("/api/halt", { value: false }).then(() => showToast("Resume requested"));
+          }
+          return resumeRun();
+        }
+        return apiPost("/api/halt", { value: true }).then(() => { recordCli("halt"); showToast("Halting after current phase"); });
+      }) }, snap.halted ? "▶ Resume" : "⏸") : null,
     ]),
   ]);
 }
@@ -1332,7 +1332,8 @@ async function handlePromptSubmit(e) {
     if (exact) { await guarded(exact.run); return; }
     const match = suggestions.find((s) => s.pattern.test(q));
     if (match && match.fromQuery) {
-      await guarded(() => match.fromQuery(q));
+      const args = q.replace(match.pattern, "").trim();
+      await guarded(() => match.fromQuery(args));
       return;
     }
     await guarded(cmdHelp);
@@ -1539,13 +1540,17 @@ function buildCommands() {
       recordCli("amend", text);
       showToast(resp.detail || "Contract amendment queued");
     } },
-    reopen: { key: "reopen", trigger: "reopen", label: "Reopen node", usage: "> reopen <reason> <node>", timeout: 20, run: async (text) => {
+    reopen: { key: "reopen", trigger: "reopen", label: "Reopen node", usage: "> reopen <reason> <node>", timeout: 20, run: async (text, targetNode) => {
       if (!state.snapshot.attached) { showToast("No run attached", true); return; }
-      const split = text.split(/\s+/);
-      const maybeNode = split[split.length - 1] || "";
-      const isTreeNode = maybeNode && (state.snapshot.tree || []).some((n) => n && n.id === maybeNode);
-      const nodeArg = isTreeNode ? maybeNode : state.selectedNode;
-      const reason = isTreeNode ? split.slice(0, -1).join(" ") : text;
+      let nodeArg = targetNode;
+      let reason = text;
+      if (!nodeArg) {
+        const split = text.split(/\s+/);
+        const maybeNode = split[split.length - 1] || "";
+        const isTreeNode = maybeNode && (state.snapshot.tree || []).some((n) => n && n.id === maybeNode);
+        nodeArg = isTreeNode ? maybeNode : state.selectedNode;
+        reason = isTreeNode ? split.slice(0, -1).join(" ") : text;
+      }
       if (!nodeArg) { showToast("reopen needs a node id (select a node first)", true); return; }
       await apiPost("/api/reopen", { node_id: nodeArg, defect: reason, is_manual: true });
       recordCli("reopen", nodeArg);
@@ -1988,7 +1993,7 @@ function renderPilotEditor() {
   const originalLines = d.pilot_original.split("\n");
   const editedLines = (state.pilotDrafts[draftKey] || "").split("\n");
   const saveBtn = el("button", { class: "primary", disabled: state.busy ? "" : null, onclick: () => guarded(async () => {
-    await apiPost(`/api/approvals/${encodeURIComponent(a.approval_id)}/pilot-save`, { text: state.pilotDrafts[draftKey] || "" });
+    await apiPost(`/api/approvals/${encodeURIComponent(a.approval_id)}/pilot-save`, { node_id: (a.context && a.context.node_id) || d.id, text: state.pilotDrafts[draftKey] || "" });
     recordCli("pilot", a.context && a.context.node_id || d.id);
     showToast("Pilot edit saved & approval resolved");
   }) }, "Save & approve edit");
@@ -2103,7 +2108,7 @@ function renderTreeBranch(key, depth, visible, index) {
   // Note: this is a *nested* array when `key` has descendants (`[row,
   // [childRow, ...grandchildren], ...]`), not a flat sibling list --
   // refreshList() below flattens it before handing it to morphChildrenInto.
-  return [row].concat(kids.map((c) => renderTreeBranch(c, depth + 1, visible)));
+  return [row].concat(kids.map((c) => renderTreeBranch(c, depth + 1, visible, index)));
 }
 
 function visibleTreeRows() {
