@@ -341,8 +341,9 @@ def parse_trace_lines(raw: str, entries: list[TraceEntry], file_state: dict[str,
         if rtype == "logdir":
             entries.append(TraceEntry("logdir", f"session started (logdir={record.get('logdir', '')})"))
             continue
-        if rtype in ("thinking", "thought", "reasoning"):
-            content = record.get("content") or record.get("text") or record.get("thinking") or record.get("reasoning")
+        role_val = record.get("role")
+        if rtype in ("thinking", "thought", "reasoning", "reasoning_content", "think") or role_val in ("thinking", "thought", "reasoning", "reasoning_content", "think"):
+            content = record.get("content") or record.get("text") or record.get("thinking") or record.get("reasoning") or record.get("reasoning_content")
             if content:
                 str_content = content if isinstance(content, str) else json.dumps(content)
                 if entries and entries[-1].role == "thinking":
@@ -352,7 +353,7 @@ def parse_trace_lines(raw: str, entries: list[TraceEntry], file_state: dict[str,
             continue
         if rtype == "message":
             role = str(record.get("role") or "raw")
-            thinking = record.get("thinking") or record.get("reasoning") or record.get("thought")
+            thinking = record.get("thinking") or record.get("reasoning") or record.get("reasoning_content") or record.get("thought")
             if thinking:
                 entries.append(TraceEntry("thinking", thinking if isinstance(thinking, str) else json.dumps(thinking)))
             content = record.get("content")

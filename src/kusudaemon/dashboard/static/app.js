@@ -415,19 +415,21 @@ function updateChrome(hasPending) {
   }
 }
 
+let pollingTimer = null;
+
 function startLive() {
-  let usedSSE = false;
   try {
     const es = new EventSource("/api/stream");
     es.addEventListener("snapshot", (ev) => {
-      usedSSE = true;
+      if (pollingTimer) {
+        clearInterval(pollingTimer);
+        pollingTimer = null;
+      }
       applySnapshot(JSON.parse(ev.data));
     });
     es.onerror = () => {
-      if (!usedSSE) {
-        es.close();
-        startPolling();
-      }
+      es.close();
+      startPolling();
     };
   } catch (e) {
     startPolling();
@@ -435,10 +437,11 @@ function startLive() {
 }
 
 function startPolling() {
+  if (pollingTimer) return;
   state.sseLive = false; // §10: rail shows ⟳ — stream dropped, polling
   const tick = () => apiGet("/api/snapshot").then(applySnapshot).catch(() => {});
   tick();
-  setInterval(tick, 2000);
+  pollingTimer = setInterval(tick, 2000);
 }
 
 /* --------------------------- DOM helpers --------------------------- */

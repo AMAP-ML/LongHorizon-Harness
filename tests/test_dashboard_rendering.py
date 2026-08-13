@@ -45,6 +45,15 @@ class ThinkingExtractionTest(unittest.TestCase):
         entries = rendering.parse_trace(_msg("assistant", "working on it"))
         self.assertEqual(entries, [rendering.TraceEntry("assistant", "working on it")])
 
+    def test_reasoning_content_record_becomes_thinking_entry(self) -> None:
+        raw1 = json.dumps({"type": "thinking", "reasoning_content": "DeepSeek reasoning step"})
+        entries1 = rendering.parse_trace(raw1)
+        self.assertEqual(entries1[0], rendering.TraceEntry("thinking", "DeepSeek reasoning step"))
+
+        raw2 = json.dumps({"type": "message", "role": "assistant", "reasoning_content": "NVIDIA NIM reasoning"})
+        entries2 = rendering.parse_trace(raw2)
+        self.assertEqual(entries2[0], rendering.TraceEntry("thinking", "NVIDIA NIM reasoning"))
+
 
 class ToolCallAndDiffExtractionTest(unittest.TestCase):
     def test_save_block_becomes_tool_call_plus_diff_of_a_new_file(self) -> None:

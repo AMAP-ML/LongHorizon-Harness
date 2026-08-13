@@ -628,6 +628,11 @@ class RunState:
             other = _other_driver_pid(run_dir)
             if other is not None:
                 return None, other
+            flag = halt_path(run_dir)
+            try:
+                flag.unlink()
+            except OSError:
+                pass
         else:
             goal = str(body.get("goal", "")).strip()
             if not goal:

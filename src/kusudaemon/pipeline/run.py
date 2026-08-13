@@ -203,6 +203,10 @@ def run_from_args(argv: list[str] | None = None, *, env: Environment | None = No
         if work_object is not None:
             options.work_object = work_object
             options.workspace_root = str(Path(args.workspace).expanduser().resolve())
+        try:
+            halt_path(run_dir).unlink()
+        except OSError:
+            pass
     else:
         goal = _read_text_arg(args.goal).strip()
         if not goal:
