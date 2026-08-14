@@ -252,6 +252,94 @@ class PhaseRetryPolicyTest(unittest.TestCase):
         asyncio.run(scenario())
 
 
+class T1TextWorkObjectGetsSourceInputTest(unittest.TestCase):
+    """§E28 (2026-08-13): a T1/T0 text run builds its node with
+    ``inputs == ("source.txt",)``. Before, ``build_direct_node`` took no
+    inputs at all -- the node's prompt had no Inputs section, so a corpus
+    run's writer never saw the corpus and degenerated into repetition
+    (observed live: 87x "textbook more broadly" in one trace against a
+    129.8 MB source.txt). Workspace/none runs stay input-free (the writer's
+    cwd is the workspace root; there is nothing to name)."""
+
+    def test_t1_text_run_node_inputs_name_the_corpus(self) -> None:
+        import asyncio
+
+        from kusudaemon.types import EpisodeResult
+
+        async def scenario() -> None:
+            with tempfile.TemporaryDirectory() as root_str:
+                run_dir = Path(root_str) / "run"
+                create_run_dir(run_dir.parent, run_dir.name)
+                (run_dir / "source.txt").write_text("the corpus", encoding="utf-8")
+                _write_tier(run_dir, "T1")
+                spec_path(run_dir).write_text("# Spec\n\n## Goal\ng\n", encoding="utf-8")
+                seen: dict[str, TaskNode] = {}
+
+                class _Writer:
+                    def __init__(self, node: TaskNode) -> None:
+                        seen["node"] = node
+
+                    async def run_episode(self, prompt, env, budget, live_trajectory_path=None, **kwargs):
+                        from kusudaemon.types import EpisodeResult
+
+                        return EpisodeResult(status="done", actions_log="", duration_ms=1, metadata={})
+
+                driver = RecursiveDriver(
+                    run_dir,
+                    provider=FakeProvider([]),  # type: ignore[arg-type]
+                    options=RunOptions(goal="g", source_text="the corpus", dispatch_policy="document_order"),
+                    writer_adapter_factory=lambda node: _Writer(node),
+                    research_adapter_factory=lambda node, query: (_ for _ in ()).throw(
+                        AssertionError("no research dispatch expected")
+                    ),
+                    poll_interval=0.02,
+                )
+                await driver._phase_execute()
+                self.assertEqual(list(seen["node"].inputs), ["source.txt"])
+
+        asyncio.run(scenario())
+
+    def test_t0_text_run_node_inputs_name_the_corpus(self) -> None:
+        import asyncio
+
+        async def scenario() -> None:
+            with tempfile.TemporaryDirectory() as root_str:
+                run_dir = Path(root_str) / "run"
+                create_run_dir(run_dir.parent, run_dir.name)
+                (run_dir / "source.txt").write_text("the corpus", encoding="utf-8")
+                _write_tier(run_dir, "T0")
+                spec_path(run_dir).write_text("# Spec\n\n## Goal\ng\n", encoding="utf-8")
+                from kusudaemon.v6.direct import DIRECT_NODE_ID, direct_node_path
+
+                seen: dict[str, TaskNode] = {}
+
+                class _Writer:
+                    def __init__(self, node: TaskNode) -> None:
+                        seen["node"] = node
+
+                    async def run_episode(self, prompt, env, budget, live_trajectory_path=None, **kwargs):
+                        from kusudaemon.types import EpisodeResult
+
+                        return EpisodeResult(status="done", actions_log="", duration_ms=1, metadata={})
+
+                driver = RecursiveDriver(
+                    run_dir,
+                    provider=FakeProvider([]),  # type: ignore[arg-type]
+                    options=RunOptions(goal="g", source_text="the corpus", dispatch_policy="document_order"),
+                    writer_adapter_factory=lambda node: _Writer(node),
+                    research_adapter_factory=lambda node, query: (_ for _ in ()).throw(
+                        AssertionError("no research dispatch expected")
+                    ),
+                    poll_interval=0.02,
+                )
+                await driver._phase_execute()
+                self.assertEqual(seen["node"].id, DIRECT_NODE_ID)
+                self.assertEqual(list(seen["node"].inputs), ["source.txt"])
+                self.assertTrue(direct_node_path(run_dir).exists())
+
+        asyncio.run(scenario())
+
+
 class CorpusLessSurveyRaisesTest(unittest.TestCase):
     """PLAN.md §D4: a run with no source text used to synthesize a single
     SpineUnit labeled "The goal", producing one forced leaf whose entire

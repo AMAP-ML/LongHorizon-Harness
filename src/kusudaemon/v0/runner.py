@@ -23,6 +23,38 @@ from .run_dir import ensure_node_trace_path, events_path, node_artifact_path
 _SESSION_POLL_INTERVAL_SECONDS = 0.05
 
 
+# §E24 (2026-08-13): events that consume a node's episode_completed,
+# invalidating the resume-after-complete replay. The replay exists for one
+# window only: the episode ended but the harness never processed the result
+# (kill -9 between the completion append and the tree save). Any of these
+# events AFTER the completion means the harness (or the operator) already
+# acted on it — the node was transitioned or deliberately reset — so a
+# later dispatch must run a FRESH episode. Before this check every gate
+# failure poisoned the node: retries and operator redispatches replayed the
+# old completion instead of running an episode (observed live: a T1 writer
+# that 429'd once then "failed" its remaining attempts in ~4 ms each).
+_REPLAY_INVALIDATING_TYPES = frozenset(
+    {
+        "node_gate_failed",           # round loop transitioned the node
+        "node_review_failed",         # review consumed the completion
+        "node_redispatch_requested",  # operator redispatch — new attempt series
+        "node_reopened",              # operator direct reset — new attempt series
+    }
+)
+
+
+def _completion_consumed(
+    events: list[dict[str, Any]], node_id: str, completed: dict[str, Any]
+) -> bool:
+    base = completed.get("ts") or 0
+    for event in events:
+        if event.get("node_id") != node_id:
+            continue
+        if event.get("type") in _REPLAY_INVALIDATING_TYPES and (event.get("ts") or 0) > base:
+            return True
+    return False
+
+
 async def run_node(
     run_dir: str | Path,
     node_id: str,
@@ -40,10 +72,13 @@ async def run_node(
     # consistent prefix of the durable log.
     events = log.read_all()
     completed = EventLog.scan(events, node_id, "episode_completed")
-    if completed is not None:
+    if completed is not None and not _completion_consumed(events, node_id, completed):
         # Resume-after-complete is a pure no-op: replay the recorded result
         # instead of re-dispatching, so calling run_node twice never produces
-        # two artifacts or two terminal events for the same node.
+        # two artifacts or two terminal events for the same node. §E24: only
+        # in the crash window — a completion that a gate failure, review
+        # failure, or operator reset already consumed must not be replayed
+        # (a retry or redispatch is a new attempt and needs a real episode).
         return _result_from_completed_event(completed)
 
     dispatched = EventLog.scan(events, node_id, "node_dispatched")

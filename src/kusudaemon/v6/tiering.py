@@ -337,19 +337,34 @@ def estimate_scope_full(
     return estimate, QuestionSet(questions=questions, objections=objections)
 
 
+# PLAN.md §A4.3's T2 row ("artifacts <= 8 or work_tokens < 150k") defines
+# the line between "cheap enough to fly without planning" and "needs a
+# spine". §E28 (2026-08-13): T0/T1 must sit on the same side of that line
+# -- before, a 4.4M-token corpus whose estimate said "1 artifact, few
+# files" classified T1 and its single node ran blind (no spine, no inputs,
+# the writer never saw the corpus). A corpus that big falls through to T2,
+# where survey builds a spine and the planner partitions it.
+_T2_WORK_TOKENS_CEILING = 150_000
+
+
 def _classify_raw(signals: Signals, estimate: ScopeEstimate) -> Tier:
     """PLAN.md §A4.3's table, first match wins."""
     if (
         estimate.artifacts == 1
         and estimate.files_touched == "1"
+        and signals.work_tokens < _T2_WORK_TOKENS_CEILING
         and signals.breadth_markers == 0
         and not estimate.ambiguities
         and not estimate.objections
     ):
         return "T0"
-    if estimate.artifacts == 1 and estimate.files_touched in ("1", "few"):
+    if (
+        estimate.artifacts == 1
+        and estimate.files_touched in ("1", "few")
+        and signals.work_tokens < _T2_WORK_TOKENS_CEILING
+    ):
         return "T1"
-    if estimate.artifacts <= 8 or signals.work_tokens < 150_000:
+    if estimate.artifacts <= 8 or signals.work_tokens < _T2_WORK_TOKENS_CEILING:
         return "T2"
     return "T3"
 

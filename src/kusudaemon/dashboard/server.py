@@ -303,8 +303,8 @@ def _post_amend(handler: "DashboardRequestHandler", match: Any, body: dict) -> t
 @_route("POST", r"^/api/reopen$")
 def _post_reopen(handler: "DashboardRequestHandler", match: Any, body: dict) -> tuple[int, Any]:
     handler.require_control()
-    approval = handler.state.request_reopen(str(body.get("node_id", "")), str(body.get("defect", "")))
-    return (200, approval) if approval else (400, {"error": "node_id and defect are required, or no attached run"})
+    approval, err = handler.state.request_reopen(str(body.get("node_id", "")), str(body.get("defect", "")))
+    return (200, approval) if approval else (400, {"error": err or "node_id and defect are required, or no attached run"})
 
 
 @_route("GET", r"^/api/node/([^/]+)$")

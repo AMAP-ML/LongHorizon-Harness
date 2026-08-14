@@ -31,7 +31,7 @@ sys.path.insert(0, str(_REPO_ROOT / "src"))
 from kusudaemon.pipeline import approvals as approval_store  # noqa: E402
 from kusudaemon.pipeline.run_dir import driver_pid_path, run_spec_path, tier_path  # noqa: E402
 from kusudaemon.dashboard import gptme_queue  # noqa: E402
-from kusudaemon.dashboard.state import RunState  # noqa: E402
+from kusudaemon.dashboard.state import RunState, _finish_job, _run_redispatch_job  # noqa: E402
 from kusudaemon.v0.events import EventLog  # noqa: E402
 from kusudaemon.v0.run_dir import create_run_dir, events_path, node_artifact_path, node_scratch_dir  # noqa: E402
 from kusudaemon.v1.run_dir import tree_path  # noqa: E402
@@ -315,6 +315,32 @@ class SubagentsAndInterjectTest(unittest.TestCase):
         subagents = {s["id"]: s for s in self.state.subagents()}
         self.assertTrue(subagents["2"]["live"])
 
+    def test_redispatched_node_is_live_again(self) -> None:
+        # §2026-08-13: _summarize_subagent never reset `completed` on a
+        # re-dispatch, so a node whose first episode failed and then got an
+        # operator redispatch was never "live" in the dashboard for the new
+        # episode: the Chat tab's only refresh trigger is live-ness, so it
+        # kept displaying the old episode's history while the fresh episode
+        # ran (observed live on the §E22/§E23/§E24 run — the operator
+        # watched the new attempt but the chat window showed the old one).
+        log = self._log()
+        log.append({"node_id": "3", "role": "writer", "round": 0, "type": "node_dispatched"})
+        log.append({"node_id": "3", "role": "writer", "round": 0, "type": "episode_completed", "status": "error", "duration_ms": 482000})
+        log.append({"node_id": "3", "role": "writer", "round": 1, "type": "node_redispatched"})
+        scratch = node_scratch_dir(self.run_dir, "3")
+        scratch.mkdir(parents=True, exist_ok=True)
+        logdir = self.tmp / "gptme-logdir-3"
+        logdir.mkdir()
+        trace = scratch / "trace.jsonl"
+        trace.write_text(
+            json.dumps({"type": "logdir", "logdir": str(logdir)}) + "\n"
+            + json.dumps({"type": "message", "role": "assistant", "content": "new attempt"}) + "\n",
+            encoding="utf-8",
+        )
+        subagents = {s["id"]: s for s in self.state.subagents()}
+        self.assertTrue(subagents["3"]["live"], "a re-dispatched node running a fresh episode must be live")
+        self.assertEqual(subagents["3"]["status"], "running")
+
     def test_node_gptme_logdir_none_before_dispatch_starts(self) -> None:
         self.assertIsNone(self.state.node_gptme_logdir("2"))
 
@@ -353,14 +379,85 @@ class RequestReopenTest(unittest.TestCase):
         shutil.rmtree(self.tmp, ignore_errors=True)
 
     def test_request_reopen_creates_pending_approval(self) -> None:
-        approval = self.state.request_reopen("1", "missing a citation")
-        self.assertIsNotNone(approval)
+        approval, err = self.state.request_reopen("1", "missing a citation")
+        self.assertEqual(err, "")
         self.assertEqual(approval["kind"], "reopen")
         pending_kinds = [a["kind"] for a in self.state.snapshot()["pending_approvals"]]
         self.assertIn("reopen", pending_kinds)
 
     def test_request_reopen_rejects_blank_defect(self) -> None:
-        self.assertIsNone(self.state.request_reopen("1", "   "))
+        approval, err = self.state.request_reopen("1", "   ")
+        self.assertIsNone(approval)
+        self.assertIn("defect", err)
+
+    def test_request_reopen_on_blocked_node_creates_redispatch_approval(self) -> None:
+        # §E23: reopening a node that never passed (blocked/failed/stale)
+        # must NOT create a repair approval whose job fails with "node X is
+        # 'blocked', not 'passed' — nothing to reopen" (the silent dead-end
+        # observed on a parked T1 run). It routes to a redispatch approval —
+        # reset + re-dispatch with a fresh attempt budget, the only recovery
+        # that can move a never-passed node.
+        tree = TaskTree.load(tree_path(self.run_dir))
+        tree.nodes["3"] = TaskNode(
+            id="3",
+            brief="blocked",
+            artifact="out/3.md",
+            gates=["nonempty"],
+            status="blocked",
+            attempts=2,
+            last_defect="nonempty: artifact is empty",
+        )
+        tree.save(tree_path(self.run_dir))
+        approval, err = self.state.request_reopen("3", "the writer 429'd twice")
+        self.assertEqual(err, "")
+        self.assertEqual(approval["kind"], "redispatch")
+        self.assertEqual(approval["context"]["node_id"], "3")
+        # applying the approval resets the node to pending with a fresh budget
+        _run_redispatch_job(self.run_dir, approval["approval_id"])
+        tree = TaskTree.load(tree_path(self.run_dir))
+        self.assertEqual(tree.nodes["3"].status, "pending")
+        self.assertEqual(tree.nodes["3"].attempts, 0)
+
+    def test_request_reopen_unknown_node_returns_error(self) -> None:
+        approval, err = self.state.request_reopen("nope", "reason")
+        self.assertIsNone(approval)
+        self.assertIn("not found", err)
+
+    def test_request_reopen_refuses_dispatched_node(self) -> None:
+        # a node mid-episode must not be reopened — wait for the episode
+        approval, err = self.state.request_reopen("2", "reason")
+        self.assertIsNone(approval)
+        self.assertIn("dispatched", err)
+
+
+class JobFailureEventTest(unittest.TestCase):
+    def setUp(self) -> None:
+        self.tmp = Path(tempfile.mkdtemp())
+        self.runs_root = self.tmp / "runs"
+        self.runs_root.mkdir()
+        self.run_dir = _write_scripted_run(self.runs_root, "run-jobs")
+        self.state = RunState(self.runs_root)
+        self.state.attach("run-jobs")
+
+    def tearDown(self) -> None:
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_finish_job_failure_appends_event(self) -> None:
+        # §E23: a failed background job must surface in the feed, not vanish
+        # into jobs.jsonl — the reopen job's "not 'passed'" failure was
+        # invisible to the operator.
+        _finish_job(self.run_dir, "job-fail", "reopen", "failed", "boom")
+        events = list(EventLog(events_path(self.run_dir)).read_all())
+        tail = [e for e in events if e["type"] == "job_failed"]
+        self.assertEqual(len(tail), 1)
+        self.assertEqual(tail[0]["kind"], "reopen")
+        self.assertEqual(tail[0]["detail"], "boom")
+
+    def test_finish_job_success_appends_no_event(self) -> None:
+        # successful jobs stay a jobs.jsonl-only record — no feed noise
+        _finish_job(self.run_dir, "job-ok", "redispatch", "done", "node 1 reset to pending")
+        events = list(EventLog(events_path(self.run_dir)).read_all())
+        self.assertFalse(any(e["type"] == "job_failed" for e in events))
 
 
 class DeleteRunTest(unittest.TestCase):

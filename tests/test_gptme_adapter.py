@@ -149,6 +149,29 @@ class CommandConstructionTest(unittest.TestCase):
             adapter = GptmeAdapter(api_key="k", context_length=128_000)
         self.assertIn("GPTME_CONTEXT_LENGTH=128000", adapter.command_template)
 
+    def test_path_include_disabled_for_harness_prompts(self) -> None:
+        # §E27: gptme's include_paths() auto-embeds the contents of every
+        # path-like token it finds in the harness prompt -- the hidden-paths
+        # notice names events.jsonl/approvals.jsonl/audit/scratch/out, and the
+        # artifact instruction carries an absolute out/<node>.md path, so
+        # gptme read and dumped the run's own logs into writer contexts
+        # (observed: 29461 -> 56095 chars, the full event log + approvals).
+        # GPTME_DISABLE_PATH_INCLUDE is gptme's documented lever for
+        # programmatically-constructed prompts.
+        with _EnvGuard():
+            adapter = GptmeAdapter(api_key="k")
+        self.assertIn("GPTME_DISABLE_PATH_INCLUDE=1", adapter.command_template)
+
+    def test_fresh_context_pinned_off(self) -> None:
+        # §E27: the active-context hook (gptme/hooks/active_context.py) is
+        # gated on use_fresh_context() and would inject the same run-state
+        # files as a system message if the operator's config ever enabled
+        # [context]. Pin it off so harness isolation never depends on user
+        # config.
+        with _EnvGuard():
+            adapter = GptmeAdapter(api_key="k")
+        self.assertIn("GPTME_FRESH=0", adapter.command_template)
+
     def test_no_session_resume_support(self) -> None:
         self.assertFalse(GptmeAdapter.supports_session_resume)
         self.assertTrue(GptmeAdapter.supports_tool_restriction)

@@ -412,6 +412,16 @@ class InPlaceRedispatchTest(unittest.TestCase):
             self.assertEqual(tree.nodes["a"].status, "blocked")
             self.assertEqual(tree.nodes["a"].attempts, 3)
             self.assertIn("len:9999-99999", tree.nodes["a"].last_defect)
+            # §E24 (2026-08-13): "re-dispatched in place" must mean three
+            # REAL episodes. Before the fix, run_node replayed the first
+            # attempt's episode_completed event for attempts 2 and 3 — the
+            # node "failed" three times off ONE episode (this assertion
+            # failed: only 1 completion event existed).
+            completed = [
+                e for e in EventLog(events_path(run_dir)).read_all()
+                if e.get("node_id") == "a" and e["type"] == "episode_completed"
+            ]
+            self.assertEqual(len(completed), 3, "every retry must run a real episode, not replay the first failure")
 
 
 class FeedbackCarryingRetryTest(unittest.TestCase):

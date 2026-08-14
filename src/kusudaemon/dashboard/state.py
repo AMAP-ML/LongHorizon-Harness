@@ -123,6 +123,13 @@ class _TraceCacheEntry:
     offset: int = 0
     entries: list[TraceEntry] = field(default_factory=list)
     file_state: dict[str, str] = field(default_factory=dict)
+    # §2026-08-13: the file's inode at last parse. A fresh episode unlinks
+    # and recreates the trace (new inode), so a rewritten trace can never
+    # stitch onto a stale parse — the size-only shrink check missed
+    # rewrites that landed LARGER than the old file (observed live: old
+    # trace 25042 bytes, new episode 28028 — the chat window showed the
+    # old attempt's entries plus a garbage tail).
+    inode: int | None = None
 
 
 def _now() -> float:
@@ -1076,26 +1083,66 @@ class RunState:
         approval_store.append(run_dir, approval)
         return approval.to_dict()
 
-    def request_reopen(self, node_id: str, defect: str) -> dict[str, Any] | None:
+    def request_reopen(self, node_id: str, defect: str) -> tuple[dict[str, Any] | None, str]:
+        """§DASHBOARD-UX §11 reopen action, fixed 2026-08-13 (§E23): the
+        operator-facing "reopen a node" affordance must never produce an
+        approval whose job then fails. ``reopen_node`` repairs a node *in
+        place* — it only applies to nodes that passed (a repair episode
+        patches the existing artifact). A node that never passed
+        (``blocked``/``failed``/``stale``) has nothing to repair in place;
+        the only recovery that moves it is a redispatch (reset to pending,
+        fresh attempt budget, re-dispatch) — so this routes to a
+        ``redispatch`` approval instead, which auto-resumes the run on
+        apply (§F5). Mid-flight nodes (``dispatched``/``awaiting_review``)
+        are refused — wait for the episode to end.
+
+        Returns (approval_dict, "") on success or (None, error) on failure."""
         run_dir = self._attached_dir()
         if run_dir is None:
-            return None
+            return None, "no run attached to dashboard"
+        if not _safe_node_id(node_id):
+            return None, f"invalid node id: {node_id!r}"
         defect = (defect or "").strip()
         if not defect:
-            return None
+            return None, "a defect/reason is required"
+        tree = _load_tree(run_dir)
+        node = tree.nodes.get(node_id)
+        if node is None:
+            return None, f"node {node_id!r} not found in tree"
+        if node.status in ("dispatched", "awaiting_review", "split"):
+            return None, f"node {node_id!r} is {node.status!r} — wait for the episode to end before reopening"
+        if node.status == "passed":
+            approval = approval_store.Approval.create(
+                "reopen",
+                title=f"Reopen {node_id} for a scoped repair",
+                message=f"Defect: {defect}",
+                options=[
+                    {"value": "apply", "label": "Dispatch repair", "style": "primary"},
+                    {"value": "cancel", "label": "Cancel"},
+                ],
+                allow_input=False,
+                context={"node_id": node_id, "defect": defect},
+            )
+            approval_store.append(run_dir, approval)
+            return approval.to_dict(), ""
+        # blocked / failed / stale: the node never passed — reopen's in-place
+        # repair cannot touch it. Route to redispatch (the working recovery).
         approval = approval_store.Approval.create(
-            "reopen",
-            title=f"Reopen {node_id} for a scoped repair",
-            message=f"Defect: {defect}",
+            "redispatch",
+            title=f"Redispatch {node_id}",
+            message=(
+                f"Status: {node.status} (attempts {node.attempts}). "
+                f"Reason: {defect}"
+            ),
             options=[
-                {"value": "apply", "label": "Dispatch repair", "style": "primary"},
+                {"value": "apply", "label": "Redispatch", "style": "primary"},
                 {"value": "cancel", "label": "Cancel"},
             ],
             allow_input=False,
-            context={"node_id": node_id, "defect": defect},
+            context={"node_id": node_id, "reason": defect},
         )
         approval_store.append(run_dir, approval)
-        return approval.to_dict()
+        return approval.to_dict(), ""
 
     def escalate(self) -> dict[str, Any]:
         """§DASHBOARD-UX §11: the rail tier chip's escalate action — §B2's
@@ -1372,7 +1419,9 @@ class RunState:
     def _parse_trace_incremental(self, path: Path) -> list[TraceEntry]:
         key = str(path)
         try:
-            size = path.stat().st_size
+            st = path.stat()
+            size = st.st_size
+            inode = st.st_ino
         except OSError:
             with self._cache_lock:
                 self._trace_cache.pop(key, None)
@@ -1383,9 +1432,14 @@ class RunState:
         # in place (not append-only after all, or a fresh episode reusing a
         # stale cache entry after eviction+recreation) -- reparse from
         # scratch rather than trust a file_state/entries prefix that no
-        # longer corresponds to what's on disk.
-        if cached is None or size < cached.offset:
+        # longer corresponds to what's on disk. A different inode means the
+        # file was unlinked and recreated (a fresh episode) even when the
+        # new file happens to be LARGER than the old one — the old
+        # size-only check stitched the new file's bytes from the old offset
+        # onto the previous attempt's entries (§2026-08-13).
+        if cached is None or cached.inode != inode or size < cached.offset:
             cached = _TraceCacheEntry()
+            cached.inode = inode
         if size > cached.offset:
             with path.open("rb") as fh:
                 fh.seek(cached.offset)
@@ -1725,6 +1779,23 @@ def _job_thread(
 
 def _finish_job(run_dir: Path, job_id: str, kind: str, status: str, detail: str) -> None:
     _append_job(run_dir, {"job_id": job_id, "kind": kind, "status": status, "ts": _now(), "detail": detail})
+    if status == "failed":
+        # §E23 (2026-08-13): a failed background job must surface in the
+        # operator's feed, not vanish into jobs.jsonl — the jobs strip only
+        # renders running/queued entries, so before this event a failed
+        # reopen/redispatch/triage job was invisible (observed: the reopen
+        # job's "not 'passed'" failure while the toast said "Node reopened").
+        EventLog(events_path(run_dir)).append(
+            {
+                "node_id": "-",
+                "role": "operator",
+                "round": 0,
+                "type": "job_failed",
+                "kind": kind,
+                "job_id": job_id,
+                "detail": detail,
+            }
+        )
 
 
 def _append_job(run_dir: Path, record: dict[str, Any]) -> None:
@@ -1891,9 +1962,16 @@ def _summarize_subagent(
     for event in events:
         etype = event.get("type")
         role = event.get("role", role)
-        if etype in ("node_dispatched", "node_redispatched"):
+        if etype in ("node_dispatched", "node_redispatched", "node_reopened"):
             attempts += 1
             status = "running"
+            # §2026-08-13: a re-dispatch/reopen starts a NEW attempt — the
+            # previous episode_completed must not keep the node "completed"
+            # forever, or `live` stays False for the whole fresh episode:
+            # the Chat tab's only refresh trigger is live-ness, the main
+            # feed stops polling, and the operator watches the new attempt
+            # while the window shows the old episode's history.
+            completed = False
         elif etype == "session_captured":
             status = "running"
         elif etype == "episode_completed":

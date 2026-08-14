@@ -108,6 +108,24 @@ class GptmeAdapter(CommandAgentAdapter):
             # sit in the block buffer until process exit -- bad for live
             # debugging, where the last few lines before a crash matter most.
             "PYTHONUNBUFFERED=1",
+            # §E27: gptme's include_paths() auto-embeds the contents of every
+            # path-like token in the prompt (chat.py, on every user message).
+            # The harness prompt names run-dir paths -- the hidden-paths
+            # notice lists events.jsonl/approvals.jsonl/audit/scratch/out and
+            # the artifact instruction carries the absolute out/<node>.md path
+            # -- so gptme read and dumped the run's own logs (full event log,
+            # approvals, dir listings) into writer contexts, bypassing the tool
+            # allowlist with plain open(). Observed on a live T1 run: writer
+            # prompt 29461 -> 56095 chars of injected harness state; the model
+            # looped on the repeated failure history in its own context.
+            # GPTME_DISABLE_PATH_INCLUDE is gptme's documented lever for
+            # programmatically-constructed prompts (autonomous mode).
+            "GPTME_DISABLE_PATH_INCLUDE=1",
+            # §E27: the active_context GENERATION_PRE hook is gated on
+            # use_fresh_context() and injects the same files as a system
+            # message; pin it off so isolation never depends on operator
+            # config ([context].enabled / GPTME_FRESH).
+            "GPTME_FRESH=0",
         ]
         if context_length:
             env_parts.append(f"GPTME_CONTEXT_LENGTH={int(context_length)}")

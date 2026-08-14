@@ -73,18 +73,27 @@ def build_direct_node(
     node_id: str = DIRECT_NODE_ID,
     token_budget: int = 24_000,
     tool_call_cap: int = 15,
+    inputs: tuple[str, ...] = (),
 ) -> TaskNode:
     """One node, built directly from the goal by code -- no Planner call.
     Matches v2/planner.py's leaf defaults (`nonempty` + `max_tokens:N`,
     empty judgment -- review auto-passes when there is nothing to ask an
     opinion about, v1/reviewer.py) so a T0/T1 node behaves exactly like any
-    other leaf everywhere except in how it got built."""
+    other leaf everywhere except in how it got built.
+
+    §E28 (2026-08-13): ``inputs`` names the corpus for kind="text" runs
+    (stored relative to run_dir per §D0b, e.g. ``("source.txt",)``). Before
+    this, T0/T1 nodes shipped ``inputs=[]`` -- the prompt builder's Inputs
+    section was empty, so a corpus run's writer never saw the corpus and
+    degenerated into repetition (observed live against a 129.8 MB
+    source.txt)."""
     return TaskNode(
         id=node_id,
         brief=goal,
         artifact=f"out/{node_id}.md",
         gates=["nonempty", f"max_tokens:{token_budget}"],
         budget=NodeBudget(tokens=token_budget, calls=tool_call_cap),
+        inputs=inputs,
     )
 
 
@@ -95,12 +104,12 @@ def build_single_node_tree(goal: str, **kwargs) -> TaskTree:
     return TaskTree(nodes={node.id: node})
 
 
-def _load_or_create_direct_node(run_dir: Path, goal: str) -> tuple[TaskNode, TaskTree]:
+def _load_or_create_direct_node(run_dir: Path, goal: str, inputs: tuple[str, ...] = ()) -> tuple[TaskNode, TaskTree]:
     path = direct_node_path(run_dir)
     if path.exists():
         tree = TaskTree.load(path)
         return tree.nodes[DIRECT_NODE_ID], tree
-    node = build_direct_node(goal)
+    node = build_direct_node(goal, inputs=inputs)
     tree = TaskTree(nodes={node.id: node})
     tree.save(path)
     return node, tree
@@ -117,6 +126,7 @@ async def run_direct_episode(
     budget: EpisodeBudget,
     log: EventLog,
     max_attempts: int = DIRECT_MAX_ATTEMPTS,
+    inputs: tuple[str, ...] = (),
 ) -> TaskNode:
     """T0's whole execute phase: one gated Writer episode, one Reviewer
     verdict (free when the node declares no judgment items, exactly like
@@ -127,7 +137,7 @@ async def run_direct_episode(
     exactly like a round-loop resume does from ``tree.json``.
     """
     run_dir = Path(run_dir)
-    node, tree = _load_or_create_direct_node(run_dir, goal)
+    node, tree = _load_or_create_direct_node(run_dir, goal, inputs=inputs)
     path = direct_node_path(run_dir)
     manifest = manifest_path(run_dir)
 

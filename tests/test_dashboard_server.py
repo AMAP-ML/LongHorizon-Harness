@@ -433,6 +433,32 @@ class ThinkingCursorTest(_ServerTestCase):
         self.assertEqual(second["entries"][0]["ts"], 4)
         self.assertEqual(second["next"], 5)
 
+    def test_rewritten_trace_never_stitches_onto_old_parse(self) -> None:
+        # §2026-08-13: _parse_trace_incremental only reset its cache when the
+        # file SHRANK (size < cached.offset), so a fresh episode's trace that
+        # landed larger than the previous attempt's was parsed from the old
+        # offset: the old entries stayed in the response and the new file's
+        # bytes from that offset onward were stitched on — the chat window
+        # showed the previous attempt's history plus a garbage tail.
+        # Observed live: old trace 25042 bytes, new episode 28028 bytes.
+        trace = self.run_dir / "scratch" / "1" / "trace.jsonl"
+        old_size = trace.stat().st_size
+        _, first = self._get("/api/node/1/thinking?since=0")
+        self.assertEqual(first["total"], 5)
+        # A fresh episode: the file is unlinked and recreated (new inode),
+        # and this time it ends up LARGER than the old one.
+        trace.unlink()
+        new_lines = [
+            json.dumps({"type": "message", "role": "assistant", "content": f"new turn {i} with substantially longer content than the old turns"})
+            for i in range(4)
+        ]
+        trace.write_text("\n".join(new_lines) + "\n", encoding="utf-8")
+        self.assertGreater(trace.stat().st_size, old_size, "test requires the new trace to be larger than the old one")
+        _, second = self._get("/api/node/1/thinking?since=0")
+        self.assertEqual(second["total"], 4)
+        texts = [e["text"] for e in second["entries"]]
+        self.assertTrue(all(t.startswith("new turn") for t in texts), f"stitched onto the old parse: {texts}")
+
 
 class OperatorActionRoutesTest(_ServerTestCase):
     """§DASHBOARD-UX §6.2/§6.3/§11: the pilot editor route, the intake

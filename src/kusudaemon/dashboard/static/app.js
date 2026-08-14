@@ -312,12 +312,22 @@ function loadMainThinking() {
   const id = mainAgentId();
   if (!id) return;
   if (state.mainThinking.agentId !== id) {
-    state.mainThinking = { agentId: id, entries: [], next: 0 };
+    state.mainThinking = { agentId: id, entries: [], next: 0, loaded: false };
   }
+  // §E23 (2026-08-13): poll only while the followed agent is actually
+  // live, or until its (static) history has been loaded once. The most
+  // recent subagent of a parked/blocked run is not running — keep showing
+  // its last trace in the feed, but stop issuing one `?since=` request per
+  // tick against a trace that cannot grow. Before: the feed polled a frozen
+  // trace forever, which read as "the agent is stuck thinking" while
+  // nothing was running.
+  const live = (state.snapshot.subagents || []).some((s) => s.id === id && s.live);
+  if (!live && state.mainThinking.loaded) return;
   const since = state.mainThinking.next;
   apiGet(`/api/node/${encodeURIComponent(id)}/thinking?since=${since}`)
     .then((d) => {
       if (state.mainThinking.agentId !== id) return; // followed agent changed mid-flight
+      state.mainThinking.loaded = true;
       const fresh = d.entries || [];
       if (fresh.length) {
         // B4-5 (IMPLEMENTATION-PLAN-COST-AND-LIVE.md): entries now carry a
@@ -734,7 +744,13 @@ function renderPendingEntry(m) {
 
 function renderEventEntry(ev) {
   const isAutoResume = ev.type === "phase_auto_resuming";
-  const isFailure = ev.type === "phase_failed" || ev.type === "run_escalated" || (ev.type === "phase_done" && ev.status === "escalated");
+  // §2026-08-13: only a genuine phase exception is a "phase failure".
+  // `run_escalated` and `phase_done {status: escalated}` are the round
+  // loop's *parked* signal (tree blocked: no ready nodes, nothing in
+  // flight — v1/tree.py is_blocked), rendered by their own cards below;
+  // calling them failures made the feed say "click Resume to retry" for
+  // a state Resume deterministically re-parks.
+  const isFailure = ev.type === "phase_failed";
   // §10: escalation fired → inline feed marker at its own timestamp:
   // `T2 → T3 · split_accepted · node-04`, amber, never re-pinned.
   if (ev.type === "run_tier_escalated") {
@@ -764,6 +780,35 @@ function renderEventEntry(ev) {
         el("span", null, ` — ${n.defect || "no defect recorded"}`),
       ]))),
       el("div", { class: "dim", style: "font-size:11px; margin-top:6px;" }, "recover: reopen the node with a defect, escalate the tier, or amend the contract"),
+    ]);
+  }
+  // §2026-08-13: `run_escalated` fires only from the round loop's escalate
+  // branch, which only happens when the tree is blocked (v1/tree.py
+  // is_blocked: not complete, nothing in flight, nothing ready). That is
+  // the run *parking*, not an exception — Resume re-hosts the driver,
+  // execute re-runs, and it parks again, deterministically. Render it as
+  // the parked card with the actual recovery actions, never as a phase
+  // failure. (`node_blocked` below names the blocked nodes + defects; this
+  // card carries the "why" and fires on every resume attempt.)
+  if (ev.type === "run_escalated") {
+    return el("div", { class: "stream-card", style: "border-left: 3px solid var(--accent-amber);" }, [
+      el("div", { class: "card-title" }, [
+        el("span", { style: "color:var(--accent-amber); font-weight:700;" }, `⛔ RUN PARKED — ${ev.reason || "no ready nodes and nothing in flight"}`),
+        el("span", null, fmtTime(ev.ts)),
+      ]),
+      el("div", { class: "dim", style: "font-size:11px; margin-top:6px;" }, "resume re-runs execute and parks again — recover: reopen the blocked node, escalate the tier, or amend the contract"),
+    ]);
+  }
+  // §E23 (2026-08-13): a background job (reopen/redispatch/triage repair)
+  // failed after its approval was resolved — surfaced here so a dead action
+  // is never invisible again. The detail carries the exception text.
+  if (ev.type === "job_failed") {
+    return el("div", { class: "stream-card", style: "border-left: 3px solid var(--accent-amber);" }, [
+      el("div", { class: "card-title" }, [
+        el("span", { style: "color:var(--accent-amber); font-weight:700;" }, `⚠ ${ev.kind || "job"} failed`),
+        el("span", null, fmtTime(ev.ts)),
+      ]),
+      el("div", { class: "error-body" }, ev.detail || ev.error || "background job failed"),
     ]);
   }
   if (isFailure) {
@@ -1077,7 +1122,10 @@ function renderHeaderRow() {
   // B2-4 (IMPLEMENTATION-PLAN-COST-AND-LIVE.md): a run whose phase.json is
   // live-ish but that no driver thread is hosting is a dead run — surface it
   // directly instead of waiting for the stalled detector.
-  const _TERMINAL_STATUSES = ["done", "error", "failed"];
+  // §2026-08-13: "escalated" is terminal — a parked run (blocked tree) has
+  // no driver and resume deterministically re-parks it, so the badge must
+  // not advertise Resume as the way forward for it.
+  const _TERMINAL_STATUSES = ["done", "error", "failed", "escalated"];
   const noDriver = snap.attached && snap.hosted === false && !_TERMINAL_STATUSES.includes(snap.phase_status);
   const noDriverBadge = noDriver ? el("span", {
     class: "hdr-tier-badge hdr-nodriver-badge",
@@ -1636,9 +1684,16 @@ function buildCommands() {
         reason = isTreeNode ? split.slice(0, -1).join(" ") : text;
       }
       if (!nodeArg) { showToast("reopen needs a node id (select a node first)", true); return; }
-      await apiPost("/api/reopen", { node_id: nodeArg, defect: reason, is_manual: true });
+      // §E23 (2026-08-13): the server routes a never-passed node (blocked/
+      // failed/stale) to a redispatch approval — the response kind tells
+      // the toast the truth instead of the old unconditional "Node reopened"
+      // (which was a lie: an approval was only queued, and for a blocked
+      // node its job then failed invisibly).
+      const resp = await apiPost("/api/reopen", { node_id: nodeArg, defect: reason, is_manual: true });
       recordCli("reopen", nodeArg);
-      showToast("Node reopened");
+      showToast(resp && resp.kind === "redispatch"
+        ? "Node never passed — redispatch approval queued (resume happens on apply)"
+        : "Reopen approval queued");
       await refreshSnapshot();
     } },
     interject: { key: "interject", trigger: "interject", label: "Message agent", usage: "> interject <text> or just type below", timeout: 20, run: async (text) => {

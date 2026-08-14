@@ -1511,6 +1511,14 @@ class RecursiveDriver:
         same way).
         """
         tier = self._current_tier()
+        # §E28: a kind="text" T0/T1 run's node must name the corpus so the
+        # Writer prompt's Inputs section is non-empty and the artifact
+        # instruction resolves. Stored relative to run_dir (§D0b);
+        # workspace runs leave inputs empty -- their writers already live in
+        # the workspace root.
+        corpus_inputs = (
+            ("source.txt",) if self._effective_work_object().kind == "text" else ()
+        )
         if tier == "T0":
             await run_direct_episode(
                 self.run_dir,
@@ -1522,11 +1530,14 @@ class RecursiveDriver:
                 budget=EpisodeBudget(),
                 log=self.log,
                 max_attempts=DIRECT_MAX_ATTEMPTS,
+                inputs=corpus_inputs,
             )
             return None
 
         if tier == "T1" and not tree_path(self.run_dir).exists():
-            build_single_node_tree(self.options.goal.strip()).save(tree_path(self.run_dir))
+            build_single_node_tree(self.options.goal.strip(), inputs=corpus_inputs).save(
+                tree_path(self.run_dir)
+            )
 
         max_attempts = DIRECT_MAX_ATTEMPTS if tier == "T1" else self.options.max_attempts
         # PLAN.md §A8/§B5: runtime split only makes sense against a real,

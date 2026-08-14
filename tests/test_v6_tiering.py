@@ -288,6 +288,18 @@ class ClassifyTest(unittest.TestCase):
         estimate = ScopeEstimate(files_touched="many", artifacts=20)
         self.assertEqual(classify(self._signals(work_tokens=1_000), estimate), "T2")
 
+    def test_t0_and_t1_require_small_work_tokens(self) -> None:
+        # §E28: T0/T1 rows had no work_tokens guard -- a 4.4M-token corpus
+        # whose estimate said "1 artifact, few files" classified T1, and the
+        # single node ran blind (no spine, no inputs, see §E28's driver
+        # fix). A corpus that big must fall to T2 where survey builds a
+        # spine and the planner partitions it.
+        big = self._signals(work_tokens=4_000_000)
+        estimate = ScopeEstimate(files_touched="1", artifacts=1, answerable_without_exploration=True)
+        self.assertEqual(classify(big, estimate), "T2")
+        estimate_few = ScopeEstimate(files_touched="few", artifacts=1)
+        self.assertEqual(classify(big, estimate_few), "T2")
+
     def test_t3_otherwise(self) -> None:
         estimate = ScopeEstimate(files_touched="many", artifacts=20)
         self.assertEqual(classify(self._signals(work_tokens=500_000), estimate), "T3")

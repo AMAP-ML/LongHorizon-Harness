@@ -343,6 +343,119 @@ class _CannedAdapter:
         return self._result
 
 
+class _CountingAdapter(_CannedAdapter):
+    """_CannedAdapter plus a dispatch counter — proves an episode actually
+    ran instead of being replayed from the event log."""
+
+    def __init__(self, result, *, artifact_path=None, artifact_text=None):
+        super().__init__(result, artifact_path=artifact_path, artifact_text=artifact_text)
+        self.dispatches = 0
+
+    async def run_episode(self, prompt, env, budget, live_trajectory_path=None, **kwargs):
+        self.dispatches += 1
+        return await super().run_episode(prompt, env, budget, live_trajectory_path=live_trajectory_path, **kwargs)
+
+
+class ConsumedCompletionReplayTest(unittest.TestCase):
+    """§E24 (2026-08-13): run_node's resume-after-complete replay is only
+    for the crash window — the episode ended but nothing consumed it yet
+    (kill -9 between episode_completed and the tree save). Once the harness
+    transitioned the node (a `node_gate_failed` / `node_review_failed` after
+    the completion) or the operator reset it (`node_redispatch_requested` /
+    `node_reopened`), a later dispatch must run a FRESH episode — replaying
+    the old completion poisons every retry and every operator redispatch
+    (observed live: a T1 writer episode that 429'd once then "failed" its
+    remaining attempts in ~4 ms each, no episode ever running again)."""
+
+    def _run(self, run_dir, node_id, adapter, env, budget):
+        return asyncio.run(run_node(run_dir, node_id, "do the task", adapter, env, budget))
+
+    def test_dispatch_after_gate_failure_runs_a_fresh_episode(self) -> None:
+        with tempfile.TemporaryDirectory() as root_str:
+            root = Path(root_str)
+            run_dir = create_run_dir(root, "run-poison-gate")
+            node_id = "a"
+            tmp = root / "tmp"
+            tmp.mkdir(parents=True, exist_ok=True)
+            env = LocalEnvironment(tmp_dir=str(tmp))
+            budget = EpisodeBudget(max_duration_seconds=30)
+            # attempt 1: the episode errors (e.g. provider 429) and nothing
+            # is written — the round loop's gate evaluation then fails and
+            # appends `node_gate_failed`, consuming the completion.
+            failing = _CountingAdapter(
+                EpisodeResult(status="error", actions_log="", error="FreeUsageLimitError: 429", duration_ms=1)
+            )
+            first = self._run(run_dir, node_id, failing, env, budget)
+            self.assertEqual(first.status, "error")
+            EventLog(events_path(run_dir)).append(
+                {"node_id": node_id, "role": "harness", "round": 0, "type": "node_gate_failed", "attempts": 1, "episode_ok": False, "unmet": ["nonempty"]}
+            )
+            # attempt 2 (the in-place retry): a DIFFERENT adapter that
+            # succeeds. If the old completion is replayed, the second
+            # dispatch never calls the adapter and reports error again.
+            ok_adapter = _CountingAdapter(
+                EpisodeResult(status="done", actions_log="real content", duration_ms=1)
+            )
+            second = self._run(run_dir, node_id, ok_adapter, env, budget)
+            self.assertEqual(second.status, "done")
+            self.assertEqual(ok_adapter.dispatches, 1, "the retry must run a real episode")
+            self.assertIsNone(second.metadata.get("replayed_from_event_log"))
+
+    def test_dispatch_after_operator_redispatch_runs_a_fresh_episode(self) -> None:
+        with tempfile.TemporaryDirectory() as root_str:
+            root = Path(root_str)
+            run_dir = create_run_dir(root, "run-poison-redispatch")
+            node_id = "a"
+            tmp = root / "tmp"
+            tmp.mkdir(parents=True, exist_ok=True)
+            env = LocalEnvironment(tmp_dir=str(tmp))
+            budget = EpisodeBudget(max_duration_seconds=30)
+            failing = _CountingAdapter(
+                EpisodeResult(status="error", actions_log="", error="FreeUsageLimitError: 429", duration_ms=1)
+            )
+            first = self._run(run_dir, node_id, failing, env, budget)
+            self.assertEqual(first.status, "error")
+            # the dashboard's redispatch approval: reset to pending +
+            # `node_redispatch_requested` — a new attempt series.
+            EventLog(events_path(run_dir)).append(
+                {"node_id": node_id, "role": "operator", "round": 0, "type": "node_redispatch_requested", "reason": "continue"}
+            )
+            ok_adapter = _CountingAdapter(
+                EpisodeResult(status="done", actions_log="real content", duration_ms=1)
+            )
+            second = self._run(run_dir, node_id, ok_adapter, env, budget)
+            self.assertEqual(second.status, "done")
+            self.assertEqual(ok_adapter.dispatches, 1, "a redispatch must run a real episode")
+
+    def test_dispatch_after_review_failure_runs_a_fresh_episode(self) -> None:
+        with tempfile.TemporaryDirectory() as root_str:
+            root = Path(root_str)
+            run_dir = create_run_dir(root, "run-poison-review")
+            node_id = "a"
+            tmp = root / "tmp"
+            tmp.mkdir(parents=True, exist_ok=True)
+            env = LocalEnvironment(tmp_dir=str(tmp))
+            budget = EpisodeBudget(max_duration_seconds=30)
+            done = _CountingAdapter(
+                EpisodeResult(status="done", actions_log="content", duration_ms=1),
+                artifact_path=node_artifact_path(run_dir, node_id),
+                artifact_text="# draft\n\nshort",
+            )
+            first = self._run(run_dir, node_id, done, env, budget)
+            self.assertEqual(first.status, "done")
+            EventLog(events_path(run_dir)).append(
+                {"node_id": node_id, "role": "harness", "round": 0, "type": "node_review_failed", "attempts": 1}
+            )
+            better = _CountingAdapter(
+                EpisodeResult(status="done", actions_log="content", duration_ms=1),
+                artifact_path=node_artifact_path(run_dir, node_id),
+                artifact_text="# rewritten\n\nmuch longer content that passes review",
+            )
+            second = self._run(run_dir, node_id, better, env, budget)
+            self.assertEqual(second.status, "done")
+            self.assertEqual(better.dispatches, 1, "a post-review-failure retry must run a real episode")
+
+
 class ArtifactNotClobberedTest(unittest.TestCase):
     """§11.10.17 regression: run_node used to unconditionally overwrite
     out/<node>.md with derived "visible output" after every episode, even
