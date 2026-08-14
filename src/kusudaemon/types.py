@@ -1,10 +1,5 @@
-"""Shared types for the recursive-decomposition harness (v0-v5, gptme backend).
+"""Shared types for the recursive-decomposition harness."""
 
-Everything classic (manager/executor/auditor roles, HarnessConfig, AuditReport,
-ManagedRound, prompt-language) was removed along with the Claude/Codex adapters
-in the gptme-only cut. What remains is the shared surface the pipeline layers
-actually touch.
-"""
 
 from __future__ import annotations
 

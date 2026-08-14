@@ -101,7 +101,40 @@ SAMPLE_SETTINGS = {
             "api_key_env": DEFAULT_API_KEY_ENV,
         }
     },
+    "backends": {
+        "claude": {
+            "model": None,
+            "api_key_env": "ANTHROPIC_API_KEY",
+            "base_url": None,
+        },
+        "codex": {
+            "model": None,
+            "api_key_env": "CODEX_API_KEY",
+            "base_url": None,
+            "wire_api": "responses",
+        },
+        "opencode": {
+            "provider": "zen",
+            "providers": {
+                "zen": {
+                    "base_url": "https://opencode.ai/zen/v1",
+                    "model": "opencode/deepseek-v4-flash-free",
+                    "models": [
+                        "opencode/deepseek-v4-flash-free",
+                        "opencode/qwen3-coder",
+                    ],
+                    "api_key_env": "OPENCODE_API_KEY",
+                }
+            },
+        },
+        "gptme": {
+            "provider": DEFAULT_PROVIDER,
+            "model": DEFAULT_MODEL,
+        },
+    },
 }
+
+SUPPORTED_BACKENDS = ("gptme", "claude", "codex", "opencode")
 
 
 class ProviderConfigError(ValueError):
@@ -113,6 +146,17 @@ class ProviderSettings:
     api_key: str
     base_url: str
     model: str
+    source: str = "unset"
+
+
+@dataclass(frozen=True)
+class BackendSettings:
+    backend: str
+    model: str | None          # None = omit the --model flag entirely
+    base_url: str | None
+    api_key: str               # resolved from api_key_env, may be ""
+    api_key_env: str
+    extra: dict[str, object]   # wire_api, permissions, ...
     source: str = "unset"
 
 
@@ -152,15 +196,15 @@ def read_config_file(path: Path | None = None) -> dict[str, object]:
     """Read and normalize the provider file.
 
     Returns ``{"default": name, "providers": {name: {base_url, model,
-    api_key_env}, ...}}``. A missing file yields an empty provider map, and
-    ``opencode`` (the built-in default) applies at resolve time. The legacy
-    flat shape ({"api_key", "base_url", "model"}) is normalized to a single
-    provider named ``opencode``; a legacy ``api_key`` value is treated as
-    the env var name the key lives in.
+    api_key_env}, ...}, "backends": {name: ...}}``. A missing file yields
+    an empty provider map, and ``opencode`` (the built-in default) applies
+    at resolve time. The legacy flat shape ({"api_key", "base_url", "model"})
+    is normalized to a single provider named ``opencode``; a legacy ``api_key``
+    value is treated as the env var name the key lives in.
     """
     target = path or config_file_path()
     if not target.is_file():
-        return {"default": DEFAULT_PROVIDER, "providers": {}}
+        return {"default": DEFAULT_PROVIDER, "providers": {}, "backends": {}}
     try:
         raw = target.read_text(encoding="utf-8")
     except OSError as exc:
@@ -181,6 +225,11 @@ def read_config_file(path: Path | None = None) -> dict[str, object]:
             elif isinstance(v, (list, tuple)) and v:
                 fallbacks[str(k).strip()] = str(v[0]).strip()
 
+    raw_backends = data.get("backends")
+    backends: dict[str, dict[str, object]] = {}
+    if isinstance(raw_backends, dict):
+        backends = raw_backends
+
     raw_providers = data.get("providers")
     if isinstance(raw_providers, dict):
         providers = {str(name): _normalize_entry(entry, target) for name, entry in raw_providers.items()}
@@ -190,10 +239,255 @@ def read_config_file(path: Path | None = None) -> dict[str, object]:
                 f"provider config {target}: default {default!r} is not a "
                 f"defined provider ({sorted(providers)})"
             )
-        return {"default": default, "providers": providers, "fallbacks": fallbacks}
+        return {"default": default, "providers": providers, "fallbacks": fallbacks, "backends": backends}
 
     # Legacy flat shape: one provider named after the built-in default.
-    return {"default": DEFAULT_PROVIDER, "providers": {DEFAULT_PROVIDER: _normalize_entry(data, target)}, "fallbacks": fallbacks}
+    return {
+        "default": DEFAULT_PROVIDER,
+        "providers": {DEFAULT_PROVIDER: _normalize_entry(data, target)},
+        "fallbacks": fallbacks,
+        "backends": backends,
+    }
+
+
+def list_models_for_backend(backend: str, config_path: Path | None = None) -> list[str]:
+    """Collect all declared model names for a specific agent backend."""
+    name = str(backend).strip().lower()
+    if name not in SUPPORTED_BACKENDS:
+        return []
+    file_data = read_config_file(config_path)
+    backends = file_data.get("backends") if isinstance(file_data.get("backends"), dict) else {}
+    models: list[str] = []
+
+    def _add(m: object) -> None:
+        if isinstance(m, str) and m.strip():
+            val = m.strip()
+            if val not in models:
+                models.append(val)
+        elif isinstance(m, (list, tuple)):
+            for item in m:
+                if isinstance(item, str) and item.strip():
+                    val = item.strip()
+                    if val not in models:
+                        models.append(val)
+
+    if name == "gptme":
+        block = backends.get("gptme") if isinstance(backends.get("gptme"), dict) else {}
+        prov_name = str(block.get("provider") or file_data.get("default") or DEFAULT_PROVIDER)
+        providers = file_data.get("providers") if isinstance(file_data.get("providers"), dict) else {}
+        p_info = providers.get(prov_name, {}) if isinstance(providers.get(prov_name), dict) else {}
+        _add(p_info.get("model"))
+        _add(p_info.get("models"))
+        _add(block.get("model"))
+        _add(block.get("models"))
+    elif name == "opencode":
+        block = backends.get("opencode") if isinstance(backends.get("opencode"), dict) else {}
+        sub_providers = block.get("providers") if isinstance(block.get("providers"), dict) else {}
+        p_name = str(block.get("provider") or "zen")
+        p_info = sub_providers.get(p_name, {}) if isinstance(sub_providers.get(p_name), dict) else {}
+        _add(p_info.get("model"))
+        _add(p_info.get("models"))
+        _add(block.get("model"))
+        _add(block.get("models"))
+    else:
+        block = backends.get(name) if isinstance(backends.get(name), dict) else {}
+        _add(block.get("model"))
+        _add(block.get("models"))
+
+    return models
+
+
+def read_backend_config(
+    backend: str,
+    config_path: Path | None = None,
+    *,
+    run_dir: Path | None = None,
+    model: str | None = None,
+    base_url: str | None = None,
+    api_key: str | None = None,
+    extra: dict[str, object] | None = None,
+) -> BackendSettings:
+    """Resolve configuration for an agent backend (claude, codex, opencode, gptme).
+
+    Precedence ladder (highest first):
+    1. Explicit arguments (model, base_url, api_key, extra)
+    2. KUSUDAEMON_<BACKEND>_MODEL / _BASE_URL / _API_KEY env vars
+    3. Run-level model_override.json, ONLY when it names a model in this backend's models list
+    4. backends.<name> block in provider.json
+    5. Omit (None / CLI's own defaults)
+    """
+    name = str(backend).strip().lower()
+    if name not in SUPPORTED_BACKENDS:
+        raise ProviderConfigError(f"unknown backend: {backend!r} (available: {list(SUPPORTED_BACKENDS)})")
+
+    target = config_path or config_file_path()
+    file_data = read_config_file(target)
+    backends_map = file_data.get("backends") if isinstance(file_data.get("backends"), dict) else {}
+    backend_block = backends_map.get(name)
+    if backend_block is not None and not isinstance(backend_block, dict):
+        raise ProviderConfigError(f"provider config {target}: backend {name!r} must be an object")
+    backend_block = backend_block or {}
+
+    cfg_model: str | None = None
+    cfg_base_url: str | None = None
+    cfg_api_key_env: str = ""
+    cfg_extra: dict[str, object] = {}
+    declared_models: list[str] = []
+
+    if name == "gptme":
+        prov_name = str(backend_block.get("provider") or file_data.get("default") or DEFAULT_PROVIDER)
+        providers = file_data.get("providers") if isinstance(file_data.get("providers"), dict) else {}
+        if prov_name not in providers:
+            if providers:
+                raise ProviderConfigError(
+                    f"provider config {target}: gptme provider {prov_name!r} is not defined in providers ({sorted(providers)})"
+                )
+            prov_entry: dict[str, object] = {}
+        else:
+            prov_entry = providers[prov_name]
+        raw_m = backend_block.get("model") or prov_entry.get("model")
+        cfg_model = str(raw_m).strip() if raw_m else None
+        raw_bu = backend_block.get("base_url") or prov_entry.get("base_url")
+        cfg_base_url = str(raw_bu).strip() if raw_bu else None
+        cfg_api_key_env = str(prov_entry.get("api_key_env") or backend_block.get("api_key_env") or DEFAULT_API_KEY_ENV)
+        cfg_extra = {
+            k: v for k, v in backend_block.items()
+            if k not in ("provider", "model", "base_url", "api_key_env")
+        }
+        declared_models = list_models_for_backend("gptme", target)
+
+    elif name == "opencode":
+        sub_providers = backend_block.get("providers") if isinstance(backend_block.get("providers"), dict) else None
+        if sub_providers:
+            p_name = str(backend_block.get("provider") or "zen")
+            if p_name not in sub_providers:
+                if len(sub_providers) == 1:
+                    p_name = next(iter(sub_providers.keys()))
+                else:
+                    raise ProviderConfigError(
+                        f"provider config {target}: opencode provider {p_name!r} is not defined in opencode.providers ({sorted(sub_providers)})"
+                    )
+            p_entry = sub_providers[p_name]
+            if not isinstance(p_entry, dict):
+                raise ProviderConfigError(f"provider config {target}: opencode provider {p_name!r} must be an object")
+            raw_m = backend_block.get("model") if backend_block.get("model") is not None else p_entry.get("model")
+            cfg_model = str(raw_m).strip() if raw_m else None
+            raw_bu = backend_block.get("base_url") if backend_block.get("base_url") is not None else p_entry.get("base_url")
+            cfg_base_url = str(raw_bu).strip() if raw_bu else None
+            cfg_api_key_env = str(p_entry.get("api_key_env") or backend_block.get("api_key_env") or "OPENCODE_API_KEY")
+            cfg_extra = {
+                k: v for k, v in backend_block.items()
+                if k not in ("provider", "providers", "model", "base_url", "api_key_env")
+            }
+        else:
+            raw_m = backend_block.get("model")
+            cfg_model = str(raw_m).strip() if raw_m else None
+            raw_bu = backend_block.get("base_url")
+            cfg_base_url = str(raw_bu).strip() if raw_bu else None
+            cfg_api_key_env = str(backend_block.get("api_key_env") or "OPENCODE_API_KEY")
+            cfg_extra = {
+                k: v for k, v in backend_block.items()
+                if k not in ("provider", "providers", "model", "base_url", "api_key_env", "models")
+            }
+        declared_models = list_models_for_backend("opencode", target)
+
+    elif name == "claude":
+        raw_m = backend_block.get("model")
+        cfg_model = str(raw_m).strip() if raw_m else None
+        raw_bu = backend_block.get("base_url")
+        cfg_base_url = str(raw_bu).strip() if raw_bu else None
+        cfg_api_key_env = str(backend_block.get("api_key_env") or "ANTHROPIC_API_KEY")
+        cfg_extra = {
+            k: v for k, v in backend_block.items()
+            if k not in ("model", "base_url", "api_key_env", "models")
+        }
+        declared_models = list_models_for_backend("claude", target)
+
+    elif name == "codex":
+        raw_m = backend_block.get("model")
+        cfg_model = str(raw_m).strip() if raw_m else None
+        raw_bu = backend_block.get("base_url")
+        cfg_base_url = str(raw_bu).strip() if raw_bu else None
+        cfg_api_key_env = str(backend_block.get("api_key_env") or "CODEX_API_KEY")
+        cfg_extra = {
+            k: v for k, v in backend_block.items()
+            if k not in ("model", "base_url", "api_key_env", "models")
+        }
+        declared_models = list_models_for_backend("codex", target)
+
+    # Precedence resolution
+    # 1. API key
+    resolved_api_key = ""
+    api_key_source = ""
+    env_api_key_var = f"KUSUDAEMON_{name.upper()}_API_KEY"
+    if api_key:
+        resolved_api_key = api_key
+        api_key_source = "argument"
+    elif os.getenv(env_api_key_var):
+        resolved_api_key = os.environ[env_api_key_var]
+        api_key_source = env_api_key_var
+    elif cfg_api_key_env and os.getenv(cfg_api_key_env):
+        resolved_api_key = os.environ[cfg_api_key_env]
+        api_key_source = f"{cfg_api_key_env} (.env / environment)"
+
+    # 2. Base URL
+    resolved_base_url: str | None = None
+    env_base_url_var = f"KUSUDAEMON_{name.upper()}_BASE_URL"
+    if base_url:
+        resolved_base_url = base_url
+    elif os.getenv(env_base_url_var):
+        resolved_base_url = os.environ[env_base_url_var]
+    elif cfg_base_url:
+        resolved_base_url = cfg_base_url
+
+    # 3. Model
+    resolved_model: str | None = None
+    model_source = "default"
+    env_model_var = f"KUSUDAEMON_{name.upper()}_MODEL"
+    if model:
+        resolved_model = model
+        model_source = "argument"
+    elif os.getenv(env_model_var):
+        resolved_model = os.environ[env_model_var]
+        model_source = env_model_var
+    elif run_dir is not None and (run_dir / "model_override.json").is_file():
+        try:
+            ov_data = json.loads((run_dir / "model_override.json").read_text(encoding="utf-8"))
+            if isinstance(ov_data, dict) and ov_data.get("model"):
+                cand_model = str(ov_data["model"]).strip()
+                if cand_model in declared_models:
+                    resolved_model = cand_model
+                    model_source = "model_override.json"
+        except (OSError, json.JSONDecodeError):
+            pass
+
+    if resolved_model is None:
+        if cfg_model:
+            # Check validation against declared_models if present
+            if declared_models and cfg_model not in declared_models:
+                raise ProviderConfigError(
+                    f"provider config {target}: backend {name!r} model {cfg_model!r} is not in declared models ({declared_models})"
+                )
+            resolved_model = cfg_model
+            model_source = f"backends.{name} (provider.json)"
+
+    # 4. Extra
+    final_extra = dict(cfg_extra)
+    if extra:
+        final_extra.update(extra)
+
+    source = model_source if model_source != "default" else (api_key_source or "default")
+
+    return BackendSettings(
+        backend=name,
+        model=resolved_model,
+        base_url=resolved_base_url,
+        api_key=resolved_api_key,
+        api_key_env=cfg_api_key_env,
+        extra=final_extra,
+        source=source,
+    )
+
 
 
 def get_fallback_model(model: str, config_path: Path | None = None) -> str | None:

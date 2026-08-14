@@ -241,8 +241,9 @@ class InlineSpansTest(unittest.TestCase):
         # instruction, then the brief, then inputs.
         expected = (
             f"Write your artifact to `{run_dir / 'out' / 'a.md'}` using your file "
-            "tools (e.g. gptme's save/patch). That file is the deliverable; "
+            "tools (e.g. save, patch, write, or edit). That file is the deliverable; "
             "nothing else you write or say is.\n\n"
+
             "Your brief: Write the intro.\n\n"
             "Inputs (read them with your tools before writing, and cite them "
             f"where relevant):\n- {run_dir / 'spine' / 'unit-01.md'}"

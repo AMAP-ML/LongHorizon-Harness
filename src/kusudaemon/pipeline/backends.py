@@ -1,57 +1,20 @@
 """Adapter factories for the pipeline (PLAN.md §11 control surface).
 
 One module deciding which real agent backend a run's Writers talk to, so
-the driver never constructs an adapter itself. The mapping is deliberately
-tiny — three backends:
+the driver never constructs an adapter itself. Four backends are supported:
 
-- ``gptme`` — ``GptmeAdapter``: no agent CLI at all (drives gptme's tool
-  loop against the user's configured OpenAI-compatible provider, see
-  ``..provider_config``). The default Writer backend.
+- ``gptme`` — ``GptmeAdapter``: drives gptme's tool loop against the
+  configured OpenAI-compatible provider (see ``..provider_config``).
 - ``claude`` — ``ClaudeCodeAdapter``: Anthropic's ``claude --print`` CLI
-  (port of the old LongHorizon-Harness adapter, re-added 2026-08-13;
-  session resume + per-node tool deny-lists via ``--disallowedTools``).
-  Uses the CLI's own auth — never the harness's provider credentials.
-- ``codex`` — ``CodexAdapter``: OpenAI's ``codex exec`` CLI (same port);
-  no session resume, ``codex``'s own config when no endpoint overrides
-  are given.
+  (session resume + per-node tool deny-lists via ``--disallowedTools``).
+- ``codex`` — ``CodexAdapter``: OpenAI's ``codex exec`` CLI (sandbox bypass,
+  config overrides).
+- ``opencode`` — ``OpenCodeAdapter``: OpenCode's ``opencode run`` CLI
+  (session resume + fine-grained tool permissions).
 
-All three run their stdout through the trace translator in
-``adapters/_agent_worker.py`` (``claude``/``codex``) or gptme's own JSON
-output, so the dashboard's consumers see one vocabulary either way.
-
-Research queries (v4): ``web_search`` is served by a ``GptmeAdapter``
-scoped to exactly one tool — ``adapters/tools/searxng_search.py``, a
-self-hosted SearXNG metasearch query, loaded via gptme's own
-file-path-allowlist mechanism (see that module's docstring). ``doc_retrieval``
-(Context7) still raises loudly rather than silently degrading: it would
-need Claude Code's Context7 MCP wiring, and ``build_research_adapter``
-remains gptme-only (the re-added ``claude``/``codex`` backends are Writer
-backends; nothing wires them to research probes yet).
-
-**Every Writer also gets the same ``websearch`` tool directly** (added
-2026-08-09, superseding v4's original "only an isolated research episode
-may search" rule): a Writer can now call it mid-episode, at will, without
-a caller having pre-planned a ``research_plan`` entry for that node. The
-isolated v4 research phase (``v4/research_loop.py``) still exists
-alongside this and is still useful — it *guarantees* a specific question
-gets answered and capped to 300 tokens *before* the writer episode even
-starts, which "the writer happened to think to search" doesn't — but it's
-no longer the only way a node can reach the web. The tradeoff v4's design
-note flagged (PLAN.md §8: raw search results are expensive, uncapped
-context) is now the Writer's own token budget to manage
-(``node.budget.tokens``, default 24k) rather than something the harness
-prevents structurally.
-
-In corpus mode (``kind="text"``, unchanged) the workspace is the run
-directory itself: the writer sees ``source.txt``, ``contract.md``, ``out/``,
-``scratch/``, and its own artifacts — the entire corpus a leaf needs — with
-every other run directory path already out of its sight by construction. In
-workspace mode (``kind="workspace"``, PLAN.md §A3/§B1) the workspace is the
-real repo (``work.root``) instead, and the run directory — by default
-    ``~/.kusudaemon/runs``, outside the repo entirely, and only nested when
-    a caller explicitly points ``--runs-root`` inside it — is hidden as
-    one subtree rather than by individual filename (see
-    ``_hidden_paths_and_exceptions_for``).
+All four run their stdout through the trace translator in
+``adapters/_agent_worker.py`` (``claude``/``codex``/``opencode``) or gptme's own
+JSON output, so the dashboard's consumers see one vocabulary either way.
 """
 
 from __future__ import annotations
@@ -61,16 +24,21 @@ from pathlib import Path
 from typing import Any
 
 from ..adapters.base import AgentAdapter
+from ..adapters.capabilities import (
+    emit_capability_event,
+    translate_tools_to_claude_disallowed,
+    translate_tools_to_opencode_permissions,
+)
 from ..adapters.claude_code import ClaudeCodeAdapter
 from ..adapters.codex import CodexAdapter
 from ..adapters.gptme_adapter import DEFAULT_TOOL_ALLOWLIST, GptmeAdapter
 from ..adapters.opencode import OpenCodeAdapter
+from ..provider_config import read_backend_config
 from ..v1.tree import TaskNode
 from ..v4.mcp_research import allowed_tools_for
-from ..v4.research import ResearchQuery, normalize_probe_kind
+from ..v4.research import ResearchQuery, normalize_probe_kind, research_raw_finding_path
 
 BACKENDS = WRITER_BACKENDS = ("gptme", "claude", "codex", "opencode")
-_RESEARCH_CAPABLE: tuple[str, ...] = ("gptme", "claude", "codex", "opencode")
 
 # PLAN.md §D2: the run's own bookkeeping, off limits to every Writer's
 # prompt — including "out/" and "scratch/" themselves, which hold every
@@ -82,48 +50,24 @@ _HIDDEN_RUN_PATHS: tuple[str, ...] = ("events.jsonl", "approvals.jsonl", "audit/
 
 
 def _hidden_paths_for(node: TaskNode) -> tuple[str, ...]:
-    """The full hidden list, unfiltered. §D2 (fixing §11.8's inversion): the
-    node's own carve-out is no longer expressed by dropping "out/"/"scratch/"
-    from this list — that hid the whole directory from every node, always,
-    since e.g. "out/a.md".startswith("out/") is trivially true for EVERY
-    node's own path, not just a coincidence for one. See
-    ``_hidden_path_exceptions_for`` for the actual carve-out."""
+    """The full hidden list, unfiltered."""
     return _HIDDEN_RUN_PATHS
 
 
 def _hidden_path_exceptions_for(node: TaskNode) -> tuple[str, ...]:
-    """The node's own two paths — its artifact and its scratch dir — which
-    it is *supposed* to touch (writing out/<node>.md is the entire point of
-    the episode). Rendered as an explicit exception alongside the hidden
-    list (``cli_agent.py:_hidden_paths_notice``) rather than by removing the
-    broader entry."""
+    """The node's own two paths — its artifact and its scratch dir."""
     return (f"out/{node.id}.md", f"scratch/{node.id}")
 
 
 def _hidden_run_dir_subtree_for_probe(run_dir: Path, workspace_root: Path) -> tuple[str, ...]:
     """PLAN.md §A6/§B4: the read-only-probe counterpart of
-    ``_hidden_paths_and_exceptions_for``, without an exceptions half.
-    ``workspace``/``corpus`` probes never get a write tool at all (see
-    ``v4/research.py``'s module docstring — the finding is captured via
-    the assistant-message fallback, same as today's web-kind probes), so
-    there is no "its own artifact/scratch dir" to carve back out the way a
-    Writer's does. This still has to hide the run directory's bookkeeping
-    from a ``workspace``-kind probe's read/list/grep tools, or a probe
-    reading "the whole repo" would also read every other node's finished
-    artifact and scratch notes (§2 invariant 6) the instant the run
-    directory happens to be nested inside the workspace (the default
-    ``--workspace`` ``runs_root``)."""
+    ``_hidden_paths_and_exceptions_for``."""
     try:
         run_dir_resolved = run_dir.resolve()
         workspace_resolved = workspace_root.resolve()
     except OSError:
         return ()
     if run_dir_resolved == workspace_resolved:
-        # Corpus-mode probes: workspace_path *is* run_dir (spine/ lives
-        # there), so the per-file names apply exactly as they do for a
-        # Writer. This is the "spine/ only" approximation the module
-        # docstring in v4/mcp_research.py documents: everything but this
-        # denylist stays readable, which includes spine/ itself.
         return _HIDDEN_RUN_PATHS
     try:
         run_dir_rel = run_dir_resolved.relative_to(workspace_resolved)
@@ -132,32 +76,29 @@ def _hidden_run_dir_subtree_for_probe(run_dir: Path, workspace_root: Path) -> tu
     return (f"{run_dir_rel.as_posix()}/",)
 
 
+def _hidden_paths_and_exceptions_for_probe(
+    run_dir: Path, workspace_root: Path, raw_finding_path: Path | None = None
+) -> tuple[tuple[str, ...], tuple[str, ...]]:
+    """Carve out the probe's own raw finding path from the hidden run directory subtree."""
+    hidden = _hidden_run_dir_subtree_for_probe(run_dir, workspace_root)
+    exceptions: tuple[str, ...] = ()
+    if raw_finding_path is not None:
+        try:
+            run_dir_resolved = run_dir.resolve()
+            workspace_resolved = workspace_root.resolve()
+            raw_resolved = raw_finding_path.resolve()
+            if run_dir_resolved == workspace_resolved:
+                exceptions = (raw_resolved.relative_to(run_dir_resolved).as_posix(),)
+            else:
+                exceptions = (raw_resolved.relative_to(workspace_resolved).as_posix(),)
+        except (ValueError, OSError):
+            pass
+    return hidden, exceptions
+
+
 def _hidden_paths_and_exceptions_for(
     node: TaskNode, run_dir: Path, workspace_root: Path
 ) -> tuple[tuple[str, ...], tuple[str, ...]]:
-    """PLAN.md §A3/§B1: in corpus mode ``workspace_path`` (the Writer's cwd)
-    *is* ``run_dir``, so ``_hidden_paths_for``'s relative names ("out/",
-    "scratch/", ...) already point at the right place — this branch
-    reproduces that exactly, byte-for-byte, so a caller that never mentions
-    workspace mode sees no behavior change.
-
-    In workspace mode ``workspace_path`` is ``work.root``, a real repo the
-    run dir may happen to be nested inside when a caller points
-    ``--runs-root`` there (the default ``~/.kusudaemon/runs`` is outside
-    the repo). The
-    corpus-mode per-file names would resolve to nonexistent paths relative
-    to that cwd ("out/" isn't a directory in the repo root); worse, doing
-    nothing would leave the ENTIRE run directory readable from the
-    Writer's cwd — every other node's artifact, scratch notes, and audit
-    verdicts, not just its own (§2 invariant 6). So this hides the run
-    directory as one subtree, relative to the Writer's actual cwd, with the
-    same two-path carve-out expressed the same way.
-
-    A ``run_dir`` outside ``workspace_root`` entirely (a custom
-    ``--runs-root`` that isn't nested in the workspace) needs no entry at
-    all: nothing of the harness's bookkeeping sits inside the Writer's cwd
-    to begin with.
-    """
     if node is None:
         return (), ()
     try:
@@ -182,14 +123,6 @@ def _hidden_paths_and_exceptions_for(
 def hidden_paths_for_node(
     node: TaskNode, run_dir: str | Path, workspace_root: str | Path
 ) -> tuple[tuple[str, ...], tuple[str, ...]]:
-    """The (hidden, exceptions) pair a Writer's prompt and its adapter must
-    agree on (PLAN-AUDIT-COST §A6-1): ``build_writer_adapter`` passes them
-    to the adapter as ``hidden_paths``/``hidden_path_exceptions``, and the
-    driver passes the same pair to ``build_node_prompt`` so the notice can
-    be rendered in the stable region instead of appended by
-    ``cli_agent.run_episode``. ``workspace_root`` is the Writer's cwd
-    (``work.root`` for ``kind="workspace"``, else ``run_dir`` itself) —
-    exactly the two arguments ``build_writer_adapter`` receives."""
     return _hidden_paths_and_exceptions_for(node, Path(run_dir), Path(workspace_root))
 
 
@@ -207,73 +140,133 @@ def build_writer_adapter(
     (the adapter's ``tool_allowlist``) the same way v1's round loop does —
     web search is layered on top of that narrowed (or default) set
     unconditionally, so even a node scoped down via ``node.tools`` keeps
-    search access; only ``node.tools`` itself can narrow shell/read/save/
-    patch.
-
-    ``run_dir`` defaults to ``workspace_path`` — today's corpus-mode
-    invariant, where the Writer's cwd *is* the run directory. A caller
-    dispatching ``kind="workspace"`` (PLAN.md §A3) passes ``workspace_path``
-    as ``work.root`` and ``run_dir`` as the actual run directory, which may
-    live nested inside it; see ``_hidden_paths_and_exceptions_for``.
+    search access.
     """
     workspace = str(workspace_path)
     prompts = str(prompt_dir)
     run_dir_path = Path(run_dir) if run_dir is not None else Path(workspace_path)
     workspace_root_path = Path(workspace_path)
-    if backend == "gptme":
-        kwargs: dict[str, Any] = dict(
-            model=model, workspace_path=workspace, prompt_dir=prompts
-        )
-        base_tools = tuple(node.tools) if node and node.tools else DEFAULT_TOOL_ALLOWLIST
-        web_search_tools = allowed_tools_for("web_search")
-        kwargs["tool_allowlist"] = base_tools + tuple(
-            tool for tool in web_search_tools if tool not in base_tools
-        )
-        if node is not None:
-            # PLAN-zeromem.md §5.2c: node.budget.tokens (set by the planner,
-            # validated by leaf_gate) becomes the episode's OpenAI-compatible
-            # context length instead of the adapter's own default.
-            kwargs["context_length"] = node.budget.tokens
-            # PLAN.md §D2/§A3: hide the run's own bookkeeping in the
-            # episode prompt, with an explicit carve-out for the node's own
-            # artifact/scratch paths (not a silent drop from the list).
-            hidden, exceptions = _hidden_paths_and_exceptions_for(node, run_dir_path, workspace_root_path)
-            kwargs["hidden_paths"] = hidden
-            kwargs["hidden_path_exceptions"] = exceptions
-        return GptmeAdapter(**kwargs)
-    hidden, exceptions = ((), ())
+
+    settings = read_backend_config(
+        backend,
+        run_dir=run_dir_path if run_dir is not None else None,
+        model=model,
+        extra={"mcp_config": mcp_config} if mcp_config else None,
+    )
+
+    base_tools = tuple(node.tools) if node and node.tools else DEFAULT_TOOL_ALLOWLIST
+    web_search_tools = allowed_tools_for("web_search")
+    all_writer_tools = base_tools + tuple(
+        tool for tool in web_search_tools if tool not in base_tools
+    )
+
+    hidden: tuple[str, ...] = ()
+    exceptions: tuple[str, ...] = ()
     if node is not None:
         hidden, exceptions = _hidden_paths_and_exceptions_for(node, run_dir_path, workspace_root_path)
+
+    node_id = node.id if node else "-"
+
+    if backend == "gptme":
+        kwargs: dict[str, Any] = dict(
+            model=settings.model,
+            api_key=settings.api_key or None,
+            base_url=settings.base_url or None,
+            workspace_path=workspace,
+            prompt_dir=prompts,
+            tool_allowlist=all_writer_tools,
+            hidden_paths=hidden,
+            hidden_path_exceptions=exceptions,
+        )
+        if node is not None:
+            kwargs["context_length"] = node.budget.tokens
+        return GptmeAdapter(**kwargs)
+
     if backend == "claude":
-        # 2026-08-13: re-added CLI backend (Claude Code). The harness's
-        # provider credentials are deliberately not threaded here — this
-        # CLI uses its own auth (ANTHROPIC_API_KEY / OAuth), and the
-        # harness's OpenAI-compatible key must never reach Anthropic's
-        # servers. ``mcp_config`` reuses the (currently unused-for-gptme)
-        # parameter: a strict MCP config file scoped to this run.
+        if node is not None and node.budget.tokens:
+            emit_capability_event(
+                run_dir,
+                node_id,
+                "claude",
+                "context_length",
+                "Claude Code does not support context window restriction",
+            )
+        resolved_mcp = mcp_config or (str(settings.extra.get("mcp_config")) if settings.extra.get("mcp_config") else None)
         return ClaudeCodeAdapter(
+            model=settings.model,
+            api_key=settings.api_key or None,
+            base_url=settings.base_url or None,
             workspace_path=workspace,
             prompt_dir=prompts,
-            mcp_config=mcp_config,
+            mcp_config=resolved_mcp,
             hidden_paths=hidden,
             hidden_path_exceptions=exceptions,
         )
+
     if backend == "codex":
+        if node is not None and node.budget.tokens:
+            emit_capability_event(
+                run_dir,
+                node_id,
+                "codex",
+                "context_length",
+                "Codex does not support context window restriction",
+            )
+        if node and node.tools and tuple(node.tools) != DEFAULT_TOOL_ALLOWLIST:
+            emit_capability_event(
+                run_dir,
+                node_id,
+                "codex",
+                "tool_allowlist",
+                "Codex does not support tool allowlists",
+            )
+        if hidden:
+            emit_capability_event(
+                run_dir,
+                node_id,
+                "codex",
+                "path_deny",
+                "Codex does not support filesystem path deny rules",
+            )
+        resolved_mcp = mcp_config or (str(settings.extra.get("mcp_config")) if settings.extra.get("mcp_config") else None)
+        wire_api = str(settings.extra.get("wire_api") or "responses")
         return CodexAdapter(
+            model=settings.model,
+            api_key=settings.api_key or None,
+            base_url=settings.base_url or None,
+            wire_api=wire_api,
             workspace_path=workspace,
             prompt_dir=prompts,
-            mcp_config=mcp_config,
+            mcp_config=resolved_mcp,
             hidden_paths=hidden,
             hidden_path_exceptions=exceptions,
         )
+
     if backend == "opencode":
+        if node is not None and node.budget.tokens:
+            emit_capability_event(
+                run_dir,
+                node_id,
+                "opencode",
+                "context_length",
+                "OpenCode does not support context window restriction",
+            )
+        resolved_mcp = mcp_config or (str(settings.extra.get("mcp_config")) if settings.extra.get("mcp_config") else None)
+        perms = translate_tools_to_opencode_permissions(all_writer_tools, include_web_search=True, hidden_paths=hidden)
+        if isinstance(settings.extra.get("permissions"), dict):
+            perms.update(settings.extra["permissions"])  # type: ignore[arg-type]
         return OpenCodeAdapter(
-            model=model,
+            model=settings.model,
+            api_key=settings.api_key or None,
+            base_url=settings.base_url or None,
             workspace_path=workspace,
             prompt_dir=prompts,
+            mcp_config=resolved_mcp,
+            permissions=perms,
             hidden_paths=hidden,
             hidden_path_exceptions=exceptions,
         )
+
     raise ValueError(f"unknown backend: {backend!r}")
 
 
@@ -285,81 +278,115 @@ def build_research_adapter(
     query: ResearchQuery,
     model: str | None = None,
     run_dir: str | Path | None = None,
+    node_id: str | None = None,
+    raw_finding_path: str | Path | None = None,
 ) -> AgentAdapter:
     """Adapter for one v4/§B4 probe.
 
     Supports all backends (gptme, claude, codex, opencode). ``doc_retrieval``
     raises loudly rather than silently degrading: it needed Claude Code's Context7
     MCP wiring, which is not available for generic probes.
-
-    ``workspace``/``corpus`` (PLAN.md §A6/§B4) additionally need
-    ``hidden_paths`` set, the same "hide the run directory's own
-    bookkeeping" guarantee ``build_writer_adapter`` already gives every
-    Writer (§2 invariant 6) — a read/list/grep-capable probe pointed at a
-    real repo must not incidentally read every other node's finished
-    artifact just because the run directory happens to be nested inside
-    the workspace it's exploring. ``run_dir`` is optional (``None`` skips
-    this — today's ``web``/``doc_retrieval`` callers never pass it, since
-    those kinds get no filesystem tools at all) so this stays a strict,
-    additive change to the signature.
     """
     workspace = str(workspace_path)
     prompts = str(prompt_dir)
     kind = normalize_probe_kind(query.kind)
     tools = allowed_tools_for(query.kind)
 
+    settings = read_backend_config(
+        backend,
+        run_dir=Path(run_dir) if run_dir is not None else None,
+        model=model,
+    )
+
     hidden: tuple[str, ...] = ()
+    exceptions: tuple[str, ...] = ()
     if kind in ("workspace", "corpus") and run_dir is not None:
-        hidden = _hidden_run_dir_subtree_for_probe(
-            Path(run_dir), Path(workspace_path)
+        target_raw = Path(raw_finding_path) if raw_finding_path is not None else research_raw_finding_path(
+            Path(run_dir), node_id or query.slug, query.slug
+        )
+        hidden, exceptions = _hidden_paths_and_exceptions_for_probe(
+            Path(run_dir), Path(workspace_path), target_raw
         )
 
     if backend == "gptme":
         kwargs: dict[str, Any] = dict(
-            model=model,
+            model=settings.model,
+            api_key=settings.api_key or None,
+            base_url=settings.base_url or None,
             workspace_path=workspace,
             prompt_dir=prompts,
             tool_allowlist=tools,
             hidden_paths=hidden,
+            hidden_path_exceptions=exceptions,
         )
         return GptmeAdapter(**kwargs)
+
     if backend == "claude":
+        disallowed = translate_tools_to_claude_disallowed(tools, include_web_search=(kind == "web"))
         return ClaudeCodeAdapter(
+            model=settings.model,
+            api_key=settings.api_key or None,
+            base_url=settings.base_url or None,
             workspace_path=workspace,
             prompt_dir=prompts,
+            disallowed_tools=disallowed,
             hidden_paths=hidden,
+            hidden_path_exceptions=exceptions,
         )
+
     if backend == "codex":
+        emit_capability_event(
+            run_dir,
+            query.slug,
+            "codex",
+            "tool_allowlist",
+            "Codex does not support tool restrictions for research probes",
+            role="research",
+        )
+        if hidden:
+            emit_capability_event(
+                run_dir,
+                query.slug,
+                "codex",
+                "path_deny",
+                "Codex does not support filesystem path deny rules",
+                role="research",
+            )
+        wire_api = str(settings.extra.get("wire_api") or "responses")
         return CodexAdapter(
+            model=settings.model,
+            api_key=settings.api_key or None,
+            base_url=settings.base_url or None,
+            wire_api=wire_api,
             workspace_path=workspace,
             prompt_dir=prompts,
             hidden_paths=hidden,
+            hidden_path_exceptions=exceptions,
         )
+
     if backend == "opencode":
+        perms = translate_tools_to_opencode_permissions(tools, include_web_search=(kind == "web"), hidden_paths=hidden)
+        if isinstance(settings.extra.get("permissions"), dict):
+            perms.update(settings.extra["permissions"])  # type: ignore[arg-type]
         return OpenCodeAdapter(
-            model=model,
+            model=settings.model,
+            api_key=settings.api_key or None,
+            base_url=settings.base_url or None,
             workspace_path=workspace,
             prompt_dir=prompts,
+            permissions=perms,
             hidden_paths=hidden,
+            hidden_path_exceptions=exceptions,
         )
+
     raise ValueError(f"unknown backend: {backend!r}")
 
 
-# PLAN.md §B4: research_plan JSON (CLI/web) still ships the legacy spelling
-# "web_search" (unchanged shipped contract); "web" is accepted directly too
-# so a caller that already generalized to Probe's vocabulary isn't forced
-# back to the old name. Both normalize to "web" inside Probe.__post_init__.
 _VALID_PLAN_KINDS = ("web", "web_search", "workspace", "corpus", "doc_retrieval")
 
 
 def parse_research_plan(raw: Any) -> dict[str, list[ResearchQuery]]:
-    """Turn the web/CLI's loose ``research_plan`` JSON into v4's typed plan.
-
-    Accepted shapes: a list of ``{node_id, slug, kind, question}`` objects,
-    or a dict mapping ``node_id -> [same objects]`` (without node_id). Kind
-    defaults to ``"web_search"`` (normalized to ``"web"`` by ``Probe``
-    construction — see ``v4/research.py``).
-    """
+    """Turn the web/CLI's loose ``research_plan`` JSON into v4's typed plan."""
     if isinstance(raw, str):
         raw = raw.strip()
         if not raw:

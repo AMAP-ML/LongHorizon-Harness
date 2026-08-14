@@ -271,6 +271,7 @@ async def _watch_for_session_id(
         await asyncio.sleep(_SESSION_POLL_INTERVAL_SECONDS)
 
     offset = 0
+    captured_logdirs: set[str] = set()
     while True:
         try:
             # Binary mode and byte offsets: text-mode seek only accepts
@@ -317,17 +318,20 @@ async def _watch_for_session_id(
             # support today) is captured the same way so a future
             # resume-capable adapter whose continuity token is a logdir
             # rather than a session id doesn't need a second watcher.
-            if record.get("type") == "logdir":
-                log.append(
-                    {
-                        "node_id": node_id,
-                        "role": "writer",
-                        "round": 0,
-                        "type": "session_captured",
-                        "logdir": record.get("logdir"),
-                    }
-                )
-                return
+            # Non-terminal update: keep polling for a real session_id.
+            if record.get("type") == "logdir" and record.get("logdir"):
+                ld = str(record.get("logdir"))
+                if ld not in captured_logdirs:
+                    captured_logdirs.add(ld)
+                    log.append(
+                        {
+                            "node_id": node_id,
+                            "role": "writer",
+                            "round": 0,
+                            "type": "session_captured",
+                            "logdir": ld,
+                        }
+                    )
         if stop.is_set():
             return
         await asyncio.sleep(_SESSION_POLL_INTERVAL_SECONDS)

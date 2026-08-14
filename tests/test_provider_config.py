@@ -488,6 +488,82 @@ class ConfigFilePathTest(_EnvIsolatedTest):
         finally:
             os.chdir(old)
 
+    def test_backend_settings_precedence_and_model_override(self) -> None:
+        from kusudaemon.provider_config import read_backend_config, list_models_for_backend, ProviderConfigError
+        config = {
+            "backends": {
+                "claude": {
+                    "model": "claude-3-5-sonnet-latest",
+                    "api_key_env": "ANTHROPIC_API_KEY",
+                },
+                "codex": {
+                    "model": None,
+                    "api_key_env": "CODEX_API_KEY",
+                    "wire_api": "responses",
+                },
+                "opencode": {
+                    "provider": "zen",
+                    "providers": {
+                        "zen": {
+                            "base_url": "https://opencode.ai/zen/v1",
+                            "model": "opencode/deepseek-v4-flash-free",
+                            "models": ["opencode/deepseek-v4-flash-free", "opencode/qwen3-coder"],
+                            "api_key_env": "OPENCODE_API_KEY",
+                        }
+                    },
+                },
+                "gptme": {
+                    "provider": "opencode",
+                    "model": "opencode/deepseek-v4-flash-free",
+                },
+            }
+        }
+        self._write_config(config)
+        old = Path.cwd()
+        try:
+            os.chdir(self._tmp.name)
+            # Test list_models_for_backend
+            self.assertEqual(list_models_for_backend("opencode"), ["opencode/deepseek-v4-flash-free", "opencode/qwen3-coder"])
+            self.assertEqual(list_models_for_backend("claude"), ["claude-3-5-sonnet-latest"])
+
+            # Test claude resolution
+            settings = read_backend_config("claude")
+            self.assertEqual(settings.model, "claude-3-5-sonnet-latest")
+            self.assertEqual(settings.api_key_env, "ANTHROPIC_API_KEY")
+
+            # Test codex resolution with wire_api
+            settings_codex = read_backend_config("codex")
+            self.assertIsNone(settings_codex.model)
+            self.assertEqual(settings_codex.extra.get("wire_api"), "responses")
+
+            # Test opencode resolution
+            settings_opencode = read_backend_config("opencode")
+            self.assertEqual(settings_opencode.model, "opencode/deepseek-v4-flash-free")
+            self.assertEqual(settings_opencode.base_url, "https://opencode.ai/zen/v1")
+
+            # Test model_override.json when candidate is in declared models
+            run_dir = Path(self._tmp.name) / "run1"
+            run_dir.mkdir()
+            (run_dir / "model_override.json").write_text('{"model": "opencode/qwen3-coder"}', encoding="utf-8")
+            settings_overridden = read_backend_config("opencode", run_dir=run_dir)
+            self.assertEqual(settings_overridden.model, "opencode/qwen3-coder")
+            self.assertEqual(settings_overridden.source, "model_override.json")
+
+            # Test model_override.json when candidate is NOT in declared models (ignored)
+            (run_dir / "model_override.json").write_text('{"model": "unknown-gpt-model"}', encoding="utf-8")
+            settings_ignored = read_backend_config("opencode", run_dir=run_dir)
+            self.assertEqual(settings_ignored.model, "opencode/deepseek-v4-flash-free")
+
+            # Test explicit argument beats all
+            settings_arg = read_backend_config("opencode", run_dir=run_dir, model="explicit-model")
+            self.assertEqual(settings_arg.model, "explicit-model")
+
+            # Test unknown backend raises
+            with self.assertRaises(ProviderConfigError):
+                read_backend_config("nonexistent_backend")
+        finally:
+            os.chdir(old)
+
 
 if __name__ == "__main__":
     unittest.main()

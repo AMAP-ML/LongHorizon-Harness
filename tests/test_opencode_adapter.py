@@ -138,7 +138,8 @@ class OpenCodeAdapterFlagsAndTemplateTest(unittest.TestCase):
         )
         cmd = adapter.command_template
         self.assertIn("OPENCODE_API_KEY=sk-opencode-secret", cmd)
-        self.assertIn("OPENAI_API_KEY=sk-opencode-secret", cmd)
+        self.assertNotIn("OPENAI_API_KEY=", cmd)
+
 
     def test_permissions_dict_and_str(self) -> None:
         adapter1 = OpenCodeAdapter(

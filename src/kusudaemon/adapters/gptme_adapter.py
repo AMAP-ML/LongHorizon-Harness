@@ -150,33 +150,11 @@ class GptmeAdapter(CommandAgentAdapter):
             command_template=f"{env_prefix}{' '.join(command_parts)} < {{prompt_path}}",
             prompt_dir=prompt_dir,
             workspace_path=workspace_path,
-            visible_output_parser=gptme_visible_output,
+            visible_output_parser=extract_visible_output,
             hidden_paths=hidden_paths,
             hidden_path_exceptions=hidden_path_exceptions,
         )
 
 
-def gptme_visible_output(raw: str) -> str:
-    """Extract the final assistant message from the worker's
-    ``--output-format json`` stdout: one JSON object per message,
-    ``{"type": "message", "role": ..., "content": ...}`` — gptme's own
-    documented structured-output mode (verified against a real
-    ``pip install gptme``; not guessed from docs), not something this
-    module invents. It exists because the worker script controls the output
-    shape — there is no external CLI whose format we'd have to tolerate.
-    """
-    last_assistant_text = ""
-    for line in raw.splitlines():
-        line = line.strip()
-        if not line.startswith("{"):
-            continue
-        try:
-            event = json.loads(line)
-        except json.JSONDecodeError:
-            continue
-        if event.get("type") != "message" or event.get("role") != "assistant":
-            continue
-        content = event.get("content")
-        if isinstance(content, str) and content.strip():
-            last_assistant_text = content
-    return last_assistant_text
+from .trace_output import extract_visible_output, gptme_visible_output
+

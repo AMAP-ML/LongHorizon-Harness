@@ -53,6 +53,21 @@ ClaudeRole = Literal[
 _WRITE_TOOLS = ("Write", "Edit", "NotebookEdit")
 _AUDITOR_ROLES = {"gui_auditor", "cli_auditor", "auditor_format_repair"}
 
+ALL_CLAUDE_TOOLS = (
+    "Agent",
+    "Bash",
+    "Edit",
+    "Glob",
+    "Grep",
+    "Read",
+    "Write",
+    "WebSearch",
+    "NotebookRead",
+    "NotebookEdit",
+    "KillProcess",
+)
+
+
 
 @dataclass(frozen=True)
 class ClaudeRolePolicy:

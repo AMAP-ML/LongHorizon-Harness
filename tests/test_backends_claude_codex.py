@@ -174,8 +174,9 @@ class CodexAdapterTest(unittest.TestCase):
     def test_api_key_becomes_env(self) -> None:
         adapter = CodexAdapter(workspace_path="/tmp/ws", api_key="sk-1")
         cmd = adapter.command_template
-        self.assertIn("OPENAI_API_KEY=sk-1", cmd)
+        self.assertNotIn("OPENAI_API_KEY=", cmd)
         self.assertIn("CODEX_API_KEY=sk-1", cmd)
+
 
     def test_base_url_builds_provider_overrides(self) -> None:
         adapter = CodexAdapter(workspace_path="/tmp/ws", base_url="https://zen.example.com")

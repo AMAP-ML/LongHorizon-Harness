@@ -27,6 +27,8 @@ from ..environment.base import Environment
 from ..types import DEFAULT_TMP_DIR, DEFAULT_WORKSPACE_PATH, EpisodeBudget, EpisodeResult
 from .cli_agent import CommandAgentAdapter
 
+from .trace_output import extract_visible_output
+
 _WORKER_SCRIPT = Path(__file__).with_name("_agent_worker.py")
 _PYTHON = sys.executable
 
@@ -63,6 +65,7 @@ class OpenCodeAdapter(CommandAgentAdapter):
         password: str | None = None,
         workspace_path: str = DEFAULT_WORKSPACE_PATH,
         prompt_dir: str = f"{DEFAULT_TMP_DIR}/prompts",
+        mcp_config: str | None = None,
         permissions: dict[str, Any] | str | None = None,
         config_content: dict[str, Any] | str | None = None,
         config_path: str | None = None,
@@ -89,11 +92,10 @@ class OpenCodeAdapter(CommandAgentAdapter):
             "OPENCODE_DISABLE_AUTOUPDATE=1",
         ]
 
-        key = api_key or os.getenv("OPENCODE_API_KEY") or os.getenv("OPENAI_API_KEY")
+        key = api_key or os.getenv("OPENCODE_API_KEY")
         if key:
             quoted_key = shlex.quote(key)
             env_parts.append(f"OPENCODE_API_KEY={quoted_key}")
-            env_parts.append(f"OPENAI_API_KEY={quoted_key}")
 
         if permissions is not None:
             perm_str = (
@@ -114,6 +116,11 @@ class OpenCodeAdapter(CommandAgentAdapter):
         if config_path:
             resolved_cfg = str(Path(config_path).expanduser().resolve())
             env_parts.append(f"OPENCODE_CONFIG={shlex.quote(resolved_cfg)}")
+
+        mcp_config = mcp_config or os.getenv("KUSUDAEMON_OPENCODE_MCP_CONFIG")
+        if mcp_config:
+            resolved_mcp = str(Path(mcp_config).expanduser().resolve())
+            env_parts.append(f"OPENCODE_MCP_CONFIG={shlex.quote(resolved_mcp)}")
 
         command_parts = ["opencode", "run"]
 
@@ -157,11 +164,13 @@ class OpenCodeAdapter(CommandAgentAdapter):
         self.model = model
         self.agent = agent
         self.attach_url = attach_url
+        self.mcp_config = mcp_config
 
         super().__init__(
             command_template=self._template(self._env_prefix, command_parts),
             prompt_dir=prompt_dir,
             workspace_path=workspace_path,
+            visible_output_parser=extract_visible_output,
             hidden_paths=hidden_paths,
             hidden_path_exceptions=hidden_path_exceptions,
         )

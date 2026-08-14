@@ -160,9 +160,10 @@ def _artifact_instruction(node: TaskNode, run_dir: Path) -> str:
     absolute_path = resolve_stored(run_dir, node.artifact)
     return (
         f"Write your artifact to `{absolute_path}` using your file tools "
-        "(e.g. gptme's save/patch). That file is the deliverable; nothing "
+        "(e.g. save, patch, write, or edit). That file is the deliverable; nothing "
         "else you write or say is."
     )
+
 
 
 def _promotions_of(node: TaskNode, run_dir: Path) -> str:

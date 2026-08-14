@@ -46,6 +46,8 @@ try:
 except ModuleNotFoundError:  # pragma: no cover — py<3.11
     tomllib = importlib.import_module("tomli")  # type: ignore[no-redef]
 
+from .trace_output import extract_visible_output
+
 _WORKER_SCRIPT = Path(__file__).with_name("_agent_worker.py")
 _PYTHON = sys.executable
 
@@ -75,10 +77,9 @@ class CodexAdapter(CommandAgentAdapter):
         hidden_path_exceptions: tuple[str, ...] = (),
     ) -> None:
         env_parts: list[str] = []
-        key = api_key or os.getenv("OPENAI_API_KEY") or os.getenv("CODEX_API_KEY")
+        key = api_key or os.getenv("CODEX_API_KEY")
         if key:
             quoted_key = shlex.quote(key)
-            env_parts.append(f"OPENAI_API_KEY={quoted_key}")
             env_parts.append(f"CODEX_API_KEY={quoted_key}")
 
         command_parts = [
@@ -135,6 +136,7 @@ class CodexAdapter(CommandAgentAdapter):
             command_template=command_template,
             prompt_dir=prompt_dir,
             workspace_path=workspace_path,
+            visible_output_parser=extract_visible_output,
             hidden_paths=hidden_paths,
             hidden_path_exceptions=hidden_path_exceptions,
         )

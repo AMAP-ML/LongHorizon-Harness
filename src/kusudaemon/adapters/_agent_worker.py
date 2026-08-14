@@ -320,11 +320,15 @@ def translate_codex(record: dict[str, Any], session_dir: str) -> list[str] | Non
 def translate_opencode(record: dict[str, Any], session_dir: str) -> list[str] | None:
     """One OpenCode json record → trace lines, or None to drop the line."""
     rtype = record.get("type")
+    part = record.get("part") if isinstance(record.get("part"), dict) else {}
     if rtype in ("step-start", "step_start"):
         session_id = str(
             record.get("sessionID")
             or record.get("sessionId")
             or record.get("session_id")
+            or part.get("sessionID")
+            or part.get("sessionId")
+            or part.get("session_id")
             or ""
         )
         return [
@@ -339,7 +343,7 @@ def translate_opencode(record: dict[str, Any], session_dir: str) -> list[str] | 
     if rtype in ("step-finish", "step_finish"):
         return None
     if rtype == "text":
-        text = str(record.get("text") or record.get("content") or "").strip()
+        text = str(record.get("text") or record.get("content") or part.get("text") or "").strip()
         if text:
             return [json.dumps({"type": "message", "role": "assistant", "content": text})]
         return None
@@ -349,16 +353,19 @@ def translate_opencode(record: dict[str, Any], session_dir: str) -> list[str] | 
             or record.get("reasoning")
             or record.get("content")
             or record.get("text")
+            or part.get("thinking")
+            or part.get("reasoning")
+            or part.get("text")
             or ""
         ).strip()
         if text:
             return [json.dumps({"type": "thinking", "content": text})]
         return None
     if rtype in ("tool", "tool_use"):
-        tool_name = str(record.get("tool") or record.get("name") or "tool")
+        tool_name = str(record.get("tool") or record.get("name") or part.get("tool") or part.get("name") or "tool")
         state = record.get("state") if isinstance(record.get("state"), dict) else {}
         out = []
-        inp = state.get("input") if "input" in state else record.get("input")
+        inp = state.get("input") if "input" in state else (record.get("input") if "input" in record else part.get("input"))
         if inp is not None:
             out.append(
                 json.dumps(
@@ -373,7 +380,7 @@ def translate_opencode(record: dict[str, Any], session_dir: str) -> list[str] | 
             out.append(
                 json.dumps({"type": "message", "role": "tool", "content": f"tool_use {tool_name}"})
             )
-        output = state.get("output") if "output" in state else record.get("output")
+        output = state.get("output") if "output" in state else (record.get("output") if "output" in record else part.get("output"))
         if output is not None:
             text_out = output if isinstance(output, str) else _compact(output)
             out.append(
@@ -383,7 +390,7 @@ def translate_opencode(record: dict[str, Any], session_dir: str) -> list[str] | 
             )
         return out or None
     if rtype == "tool_result":
-        output = record.get("output") or record.get("content") or record.get("result") or ""
+        output = record.get("output") or record.get("content") or record.get("result") or part.get("output") or part.get("result") or ""
         text = output if isinstance(output, str) else _compact(output)
         return [json.dumps({"type": "message", "role": "tool", "content": f"tool_result: {_cap(text)}"})]
     if rtype == "message":
@@ -407,7 +414,6 @@ def translate_opencode(record: dict[str, Any], session_dir: str) -> list[str] | 
             return out or None
         return None
     if rtype == "message.part.updated":
-        part = record.get("part")
         if isinstance(part, dict):
             ptype = part.get("type")
             if ptype in ("thinking", "reasoning"):
@@ -416,7 +422,7 @@ def translate_opencode(record: dict[str, Any], session_dir: str) -> list[str] | 
                     return [json.dumps({"type": "thinking", "content": t})]
         return None
     if rtype == "error":
-        msg = str(record.get("message") or record.get("error") or "")
+        msg = str(record.get("message") or record.get("error") or part.get("message") or part.get("error") or "")
         if msg:
             return [json.dumps({"type": "message", "role": "system", "content": f"Error: {msg}"})]
         return None

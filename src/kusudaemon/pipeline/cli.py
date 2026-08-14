@@ -596,16 +596,11 @@ def _load_options(run_dir: Path) -> RunOptions:
 
 
 def _writer_factory(options: RunOptions, run_dir: Path):
-    def factory(node):
-        return build_writer_adapter(
-            options.backend,
-            workspace_path=run_dir,
-            prompt_dir=run_dir / "tmp" / "prompts",
-            node=node,
-            model=options.model,
-        )
+    from .driver import PipelineDriver
 
-    return factory
+    driver = PipelineDriver(run_dir, options=options)
+    return driver._default_writer_factory()
+
 
 
 def _run_argv(argv: argparse.Namespace, *, run_id: str | None) -> list[str]:

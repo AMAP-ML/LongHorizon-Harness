@@ -60,6 +60,8 @@ from ..types import DEFAULT_TMP_DIR, DEFAULT_WORKSPACE_PATH, EpisodeBudget, Epis
 from .claude_permissions import ClaudeRole, path_deny_rules, policy_for_role
 from .cli_agent import CommandAgentAdapter
 
+from .trace_output import extract_visible_output
+
 _WORKER_SCRIPT = Path(__file__).with_name("_agent_worker.py")
 _PYTHON = sys.executable
 
@@ -80,6 +82,7 @@ class ClaudeCodeAdapter(CommandAgentAdapter):
         mcp_config: str | None = None,
         add_dirs: list[str] | None = None,
         role: ClaudeRole = "cli_executor",
+        disallowed_tools: list[str] | tuple[str, ...] | None = None,
         hidden_paths: tuple[str, ...] = (),
         hidden_path_exceptions: tuple[str, ...] = (),
     ) -> None:
@@ -138,7 +141,12 @@ class ClaudeCodeAdapter(CommandAgentAdapter):
             "stream-json",
             "--dangerously-skip-permissions",
         ]
-        deny_tools = [*policy.disallowed_tools, *path_deny_rules(hidden_paths, base=workspace_path)]
+        raw_deny = [
+            *policy.disallowed_tools,
+            *(disallowed_tools or ()),
+            *path_deny_rules(hidden_paths, base=workspace_path),
+        ]
+        deny_tools = list(dict.fromkeys(raw_deny))
         if deny_tools:
             command_parts.append("--disallowedTools")
             command_parts.extend(shlex.quote(tool) for tool in deny_tools)
@@ -155,6 +163,7 @@ class ClaudeCodeAdapter(CommandAgentAdapter):
             command_template=self._template(env_prefix, command_parts),
             prompt_dir=prompt_dir,
             workspace_path=workspace_path,
+            visible_output_parser=extract_visible_output,
             hidden_paths=hidden_paths,
             hidden_path_exceptions=hidden_path_exceptions,
         )
