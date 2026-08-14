@@ -18,6 +18,7 @@ from typing import Any, Iterator
 
 CLAUDE_STREAM_JSON = "claude_stream_json"
 CODEX_EXEC_JSON = "codex_exec_json"
+DEEPSEEK_HARNESS_JSONL = "deepseek_harness_jsonl"
 # Untyped chat transcripts (one `{"role": ..., "content": ...}` object per line,
 # optionally wrapped in `message`). Neither CLI emits this directly, but saved
 # chat.jsonl transcripts and older runs use it.
@@ -54,6 +55,8 @@ def detect_format(raw: str) -> str:
     saw_chat_role = False
     for record in _json_records(raw):
         record_type = record.get("type")
+        if record_type == "dsh.result":
+            return DEEPSEEK_HARNESS_JSONL
         if record_type in _CODEX_EVENTS:
             return CODEX_EXEC_JSON
         if record_type in _CLAUDE_EVENTS:
@@ -66,6 +69,9 @@ def detect_format(raw: str) -> str:
 def visible_output(raw: str) -> str:
     """Return the final assistant-visible text, or "" for an unknown format."""
     log_format = detect_format(raw)
+    if log_format == DEEPSEEK_HARNESS_JSONL:
+        texts = _deepseek_assistant_texts(raw)
+        return texts[-1].strip() if texts else ""
     if log_format == CODEX_EXEC_JSON:
         texts = _codex_assistant_texts(raw)
         return texts[-1].strip() if texts else ""
@@ -83,6 +89,8 @@ def visible_output(raw: str) -> str:
 def assistant_texts(raw: str) -> list[str]:
     """Return every assistant text block in order, oldest first."""
     log_format = detect_format(raw)
+    if log_format == DEEPSEEK_HARNESS_JSONL:
+        return _deepseek_assistant_texts(raw)
     if log_format == CODEX_EXEC_JSON:
         return _codex_assistant_texts(raw)
     if log_format == CLAUDE_STREAM_JSON:
@@ -113,7 +121,13 @@ def tool_output_view(raw: str) -> str:
             continue
         if not isinstance(record, dict):
             continue
-        if log_format == CODEX_EXEC_JSON:
+        if log_format == DEEPSEEK_HARNESS_JSONL:
+            if record.get("type") != "dsh.result" or not record.get("is_error"):
+                continue
+            text = record.get("error") or record.get("text")
+            if isinstance(text, str) and text.strip():
+                parts.append(text.strip())
+        elif log_format == CODEX_EXEC_JSON:
             parts.extend(_codex_tool_output(record))
         elif log_format == CLAUDE_STREAM_JSON:
             parts.extend(_claude_tool_output(record))
@@ -148,7 +162,12 @@ def runtime_event_view(raw: str) -> str:
         if not isinstance(record, dict):
             continue
         record_type = str(record.get("type") or "")
-        if log_format == CODEX_EXEC_JSON:
+        if log_format == DEEPSEEK_HARNESS_JSONL:
+            if record_type != "dsh.result" or not record.get("is_error"):
+                continue
+            detail = record.get("error") or record.get("text") or "DeepSeek Harness failed"
+            parts.append(f"response.failed: {detail}")
+        elif log_format == CODEX_EXEC_JSON:
             if record_type == "turn.failed":
                 error = record.get("error")
                 message = error.get("message") if isinstance(error, dict) else error
@@ -172,11 +191,53 @@ def parse_trajectory(raw: str, *, max_steps: int | None = None) -> list[dict[str
     """
     bounded_steps = None if max_steps is None else max(1, int(max_steps))
     log_format = detect_format(raw)
+    if log_format == DEEPSEEK_HARNESS_JSONL:
+        return _deepseek_trajectory(raw, max_steps=bounded_steps)
     if log_format == CODEX_EXEC_JSON:
         return _codex_trajectory(raw, max_steps=bounded_steps)
     if log_format == CLAUDE_STREAM_JSON:
         return _claude_trajectory(raw, max_steps=bounded_steps)
     return []
+
+
+# ----------------------------------------------------------------------------
+# DeepSeek Harness (`dsh --profile headless` through deepseek_runner)
+# ----------------------------------------------------------------------------
+
+
+def _deepseek_assistant_texts(raw: str) -> list[str]:
+    texts: list[str] = []
+    for record in _json_records(raw):
+        if record.get("type") != "dsh.result":
+            continue
+        text = record.get("text")
+        if isinstance(text, str) and text.strip():
+            texts.append(text)
+    return texts
+
+
+def _deepseek_trajectory(
+    raw: str,
+    *,
+    max_steps: int | None = None,
+) -> list[dict[str, Any]]:
+    steps: deque[dict[str, Any]] = deque(maxlen=max_steps)
+    for record in _json_records(raw):
+        if record.get("type") != "dsh.result":
+            continue
+        text = record.get("text")
+        error = record.get("error")
+        step: dict[str, Any] = {
+            "kind": "result",
+            "text": text.strip() if isinstance(text, str) else "",
+            "is_error": bool(record.get("is_error")),
+        }
+        if isinstance(record.get("exit_code"), int):
+            step["exit_code"] = record["exit_code"]
+        if isinstance(error, str) and error.strip():
+            step["error"] = error.strip()
+        steps.append(step)
+    return list(steps)
 
 
 # ----------------------------------------------------------------------------
