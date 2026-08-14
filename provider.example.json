@@ -1,41 +1,26 @@
 {
-  "default": "opencode",
-  "providers": {
-    "opencode": {
-      "base_url": "https://opencode.ai/zen/v1",
-      "model": "opencode/deepseek-v4-flash-free",
-      "api_key_env": "OPENAI_API_KEY"
+  "gptme": {
+    "default": "opencode",
+    "providers": {
+      "opencode": {
+        "base_url": "https://opencode.ai/zen/v1",
+        "model": "opencode/deepseek-v4-flash-free",
+        "api_key_env": "OPENAI_API_KEY"
+      }
     }
   },
-  "backends": {
-    "claude": {
-      "model": null,
-      "api_key_env": "ANTHROPIC_API_KEY",
-      "base_url": null
-    },
-    "codex": {
-      "model": null,
-      "api_key_env": "CODEX_API_KEY",
-      "base_url": null,
-      "wire_api": "responses"
-    },
-    "opencode": {
-      "provider": "zen",
-      "providers": {
-        "zen": {
-          "base_url": "https://opencode.ai/zen/v1",
-          "model": "opencode/deepseek-v4-flash-free",
-          "models": [
-            "opencode/deepseek-v4-flash-free",
-            "opencode/qwen3-coder"
-          ],
-          "api_key_env": "OPENCODE_API_KEY"
-        }
-      }
-    },
-    "gptme": {
-      "provider": "opencode",
-      "model": "opencode/deepseek-v4-flash-free"
-    }
+  "claude": {
+    "model": null
+  },
+  "codex": {
+    "model": null,
+    "wire_api": "responses"
+  },
+  "opencode": {
+    "model": "opencode/deepseek-v4-flash-free",
+    "models": [
+      "opencode/deepseek-v4-flash-free",
+      "opencode/qwen3-coder"
+    ]
   }
 }

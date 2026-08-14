@@ -1,20 +1,24 @@
 """Provider config tests (src/kusudaemon/provider_config.py).
 
-The harness talks to the user's OpenAI-compatible endpoint. provider.json
-holds named providers (base_url/model + which env var holds the key); api
-keys themselves live in the environment/.env. Precedence per field:
-explicit argument > KUSUDAEMON_PROVIDER_* env > the selected provider entry
-> OPENAI_* env. There is no built-in fallback endpoint: resolve() raises
-ProviderConfigError when a field resolves to nothing from any of those.
+provider.json is a flat map of backend name -> that backend's own config:
+``gptme`` (the harness's own OpenAI-compatible endpoint, and the one the
+direct-call reasoning provider shares) requires a non-empty ``providers``
+map plus a ``default`` naming which one applies; ``claude``/``codex``/
+``opencode`` are CLI-driven backends with their own auth and take a single
+``model`` field -- a ``providers``/``provider`` key under any of them is a
+loud ProviderConfigError, not an alternate shape. Api keys themselves live
+in the environment/.env, referenced by name via ``api_key_env``.
 
 Coverage:
 - resolve() raises when nothing is configured, instead of silently
   substituting a hardcoded endpoint
 - each precedence level wins over the ones below it
-- provider selection: explicit arg > KUSUDAEMON_PROVIDER env > file default;
-  an unknown provider name raises
+- provider selection: explicit arg > KUSUDAEMON_PROVIDER env > gptme.default
 - a provider's api_key_env pulls its key from the env var it names
-- legacy flat config shape still normalizes to a single provider
+- legacy flat config shape still normalizes to a single gptme provider
+- gptme without a 'providers' section raises
+- claude/codex/opencode with a 'providers'/'provider' key raises
+- unknown top-level keys raise
 - malformed config raises a clear error
 - ensure_user_config materializes the sample once, never overwrites
 - require() passes when an api key is set and fails clearly when not
@@ -94,17 +98,19 @@ class _EnvIsolatedTest(unittest.TestCase):
 
     def _multi_provider_config(self) -> dict[str, object]:
         return {
-            "default": "opencode",
-            "providers": {
-                "opencode": {
-                    "base_url": "https://opencode.ai/zen/v1",
-                    "model": "opencode/deepseek-v4-flash-free",
-                    "api_key_env": "OPENAI_API_KEY",
-                },
-                "deepseek": {
-                    "base_url": "https://api.deepseek.com/v1",
-                    "model": "deepseek-chat",
-                    "api_key_env": "DEEPSEEK_API_KEY",
+            "gptme": {
+                "default": "opencode",
+                "providers": {
+                    "opencode": {
+                        "base_url": "https://opencode.ai/zen/v1",
+                        "model": "opencode/deepseek-v4-flash-free",
+                        "api_key_env": "OPENAI_API_KEY",
+                    },
+                    "deepseek": {
+                        "base_url": "https://api.deepseek.com/v1",
+                        "model": "deepseek-chat",
+                        "api_key_env": "DEEPSEEK_API_KEY",
+                    },
                 },
             },
         }
@@ -182,7 +188,7 @@ class ResolveTest(_EnvIsolatedTest):
 
     def test_selection_default_field_from_config(self) -> None:
         config = self._multi_provider_config()
-        config["default"] = "deepseek"
+        config["gptme"]["default"] = "deepseek"
         self._write_config(config)
         settings = resolve()
         self.assertEqual(settings.model, "deepseek-chat")
@@ -222,9 +228,12 @@ class ResolveTest(_EnvIsolatedTest):
     def test_read_config_file_normalization(self) -> None:
         self._write_config(self._multi_provider_config())
         data = read_config_file()
-        providers = data["providers"]
+        providers = data["gptme"]["providers"]
         self.assertIsInstance(providers, dict)
         self.assertEqual(providers["deepseek"]["api_key_env"], "DEEPSEEK_API_KEY")
+        self.assertEqual(data["claude"], {})
+        self.assertEqual(data["codex"], {})
+        self.assertEqual(data["opencode"], {})
 
     def test_malformed_config_json_raises(self) -> None:
         Path(self._tmp.name, "provider.json").write_text("{not json", encoding="utf-8")
@@ -236,6 +245,55 @@ class ResolveTest(_EnvIsolatedTest):
         with self.assertRaises(ProviderConfigError):
             resolve()
 
+    def test_gptme_without_providers_section_raises(self) -> None:
+        self._write_config({"gptme": {"model": "some-model"}})
+        with self.assertRaises(ProviderConfigError) as ctx:
+            resolve()
+        self.assertIn("providers", str(ctx.exception))
+
+    def test_gptme_with_empty_providers_raises(self) -> None:
+        self._write_config({"gptme": {"providers": {}}})
+        with self.assertRaises(ProviderConfigError):
+            resolve()
+
+    def test_claude_with_providers_key_raises(self) -> None:
+        self._write_config({"claude": {"model": "m", "providers": {"x": {"model": "m"}}}})
+        with self.assertRaises(ProviderConfigError) as ctx:
+            read_config_file()
+        self.assertIn("claude", str(ctx.exception))
+
+    def test_codex_with_provider_key_raises(self) -> None:
+        self._write_config({"codex": {"provider": "openai"}})
+        with self.assertRaises(ProviderConfigError):
+            read_config_file()
+
+    def test_opencode_with_providers_key_raises(self) -> None:
+        self._write_config(
+            {"opencode": {"provider": "zen", "providers": {"zen": {"model": "m"}}}}
+        )
+        with self.assertRaises(ProviderConfigError):
+            read_config_file()
+
+    def test_unknown_top_level_key_raises(self) -> None:
+        self._write_config({"bogus_backend": {"model": "m"}})
+        with self.assertRaises(ProviderConfigError) as ctx:
+            read_config_file()
+        self.assertIn("bogus_backend", str(ctx.exception))
+
+    def test_missing_backend_key_defaults_to_empty(self) -> None:
+        self._write_config(self._multi_provider_config())
+        data = read_config_file()
+        self.assertEqual(data["claude"], {})
+        self.assertEqual(data["codex"], {})
+        self.assertEqual(data["opencode"], {})
+
+    def test_stale_gptme_default_falls_back_to_first_provider(self) -> None:
+        config = self._multi_provider_config()
+        config["gptme"]["default"] = "nonexistent"
+        self._write_config(config)
+        data = read_config_file()
+        self.assertEqual(data["gptme"]["default"], "opencode")
+
 
 class EnsureUserConfigTest(_EnvIsolatedTest):
     def test_writes_sample_once_and_never_overwrites(self) -> None:
@@ -246,10 +304,18 @@ class EnsureUserConfigTest(_EnvIsolatedTest):
         self.assertTrue(path.exists())
 
         data = json.loads(path.read_text(encoding="utf-8"))
-        self.assertEqual(data["default"], DEFAULT_PROVIDER)
-        self.assertEqual(data["providers"][DEFAULT_PROVIDER]["base_url"], DEFAULT_BASE_URL)
-        self.assertEqual(data["providers"][DEFAULT_PROVIDER]["model"], DEFAULT_MODEL)
-        self.assertEqual(data["providers"][DEFAULT_PROVIDER]["api_key_env"], "OPENAI_API_KEY")
+        self.assertEqual(data["gptme"]["default"], DEFAULT_PROVIDER)
+        self.assertEqual(data["gptme"]["providers"][DEFAULT_PROVIDER]["base_url"], DEFAULT_BASE_URL)
+        self.assertEqual(data["gptme"]["providers"][DEFAULT_PROVIDER]["model"], DEFAULT_MODEL)
+        self.assertEqual(data["gptme"]["providers"][DEFAULT_PROVIDER]["api_key_env"], "OPENAI_API_KEY")
+        self.assertIsNone(data["claude"]["model"])
+        self.assertIsNone(data["codex"]["model"])
+        self.assertEqual(data["opencode"]["model"], DEFAULT_MODEL)
+        # The sample itself must satisfy the same validation rules a real
+        # user file does (round-trips through read_config_file cleanly).
+        path.write_text(json.dumps(data), encoding="utf-8")
+        read_config_file()
+
         path.write_text("{customized}", encoding="utf-8")
         self.assertIsNone(ensure_user_config())
         self.assertEqual(path.read_text(encoding="utf-8"), "{customized}")
@@ -445,7 +511,7 @@ class ConfigFilePathTest(_EnvIsolatedTest):
         # The exact reported scenario: an edited provider.json model only
         # takes effect if config_file_path() actually finds that file.
         config = self._multi_provider_config()
-        config["providers"]["opencode"]["model"] = "deepseek-v4-flash-free"
+        config["gptme"]["providers"]["opencode"]["model"] = "deepseek-v4-flash-free"
         self._write_config(config)
         old = Path.cwd()
         try:
@@ -458,18 +524,20 @@ class ConfigFilePathTest(_EnvIsolatedTest):
     def test_multiple_models_per_provider(self) -> None:
         from kusudaemon.provider_config import list_available_models
         config = {
-            "default": "nvidia",
-            "providers": {
-                "opencode": {
-                    "base_url": "https://opencode.ai/zen/v1",
-                    "model": "opencode/deepseek-v4-flash-free",
-                    "models": ["opencode/deepseek-v4-flash-free", "opencode/llama-3.3-70b-instruct"],
-                    "api_key_env": "OPENAI_API_KEY",
-                },
-                "nvidia": {
-                    "base_url": "https://integrate.api.nvidia.com/v1",
-                    "models": ["deepseek-ai/deepseek-v4-flash-0731", "meta/llama-3.3-70b-instruct"],
-                    "api_key_env": "NVIDIA_API_KEY",
+            "gptme": {
+                "default": "nvidia",
+                "providers": {
+                    "opencode": {
+                        "base_url": "https://opencode.ai/zen/v1",
+                        "model": "opencode/deepseek-v4-flash-free",
+                        "models": ["opencode/deepseek-v4-flash-free", "opencode/llama-3.3-70b-instruct"],
+                        "api_key_env": "OPENAI_API_KEY",
+                    },
+                    "nvidia": {
+                        "base_url": "https://integrate.api.nvidia.com/v1",
+                        "models": ["deepseek-ai/deepseek-v4-flash-0731", "meta/llama-3.3-70b-instruct"],
+                        "api_key_env": "NVIDIA_API_KEY",
+                    },
                 },
             },
         }
@@ -488,21 +556,42 @@ class ConfigFilePathTest(_EnvIsolatedTest):
         finally:
             os.chdir(old)
 
+    def test_list_available_models_includes_cli_backends(self) -> None:
+        from kusudaemon.provider_config import list_available_models
+        config = {
+            "gptme": self._multi_provider_config()["gptme"],
+            "claude": {"model": "claude-opus-5"},
+            "codex": {"model": "gpt-5-codex"},
+            "opencode": {"model": "opencode/qwen3-coder"},
+        }
+        self._write_config(config)
+        old = Path.cwd()
+        try:
+            os.chdir(self._tmp.name)
+            models = list_available_models()
+            self.assertIn("claude-opus-5", models)
+            self.assertIn("gpt-5-codex", models)
+            self.assertIn("opencode/qwen3-coder", models)
+        finally:
+            os.chdir(old)
+
     def test_list_providers_with_models(self) -> None:
         from kusudaemon.provider_config import list_providers_with_models
         config = {
-            "default": "nvidia",
-            "providers": {
-                "opencode": {
-                    "base_url": "https://opencode.ai/zen/v1",
-                    "model": "opencode/deepseek-v4-flash-free",
-                    "models": ["opencode/deepseek-v4-flash-free", "opencode/llama-3.3-70b-instruct"],
-                    "api_key_env": "OPENAI_API_KEY",
-                },
-                "nvidia": {
-                    "base_url": "https://integrate.api.nvidia.com/v1",
-                    "models": ["deepseek-ai/deepseek-v4-flash-0731", "meta/llama-3.3-70b-instruct"],
-                    "api_key_env": "NVIDIA_API_KEY",
+            "gptme": {
+                "default": "nvidia",
+                "providers": {
+                    "opencode": {
+                        "base_url": "https://opencode.ai/zen/v1",
+                        "model": "opencode/deepseek-v4-flash-free",
+                        "models": ["opencode/deepseek-v4-flash-free", "opencode/llama-3.3-70b-instruct"],
+                        "api_key_env": "OPENAI_API_KEY",
+                    },
+                    "nvidia": {
+                        "base_url": "https://integrate.api.nvidia.com/v1",
+                        "models": ["deepseek-ai/deepseek-v4-flash-0731", "meta/llama-3.3-70b-instruct"],
+                        "api_key_env": "NVIDIA_API_KEY",
+                    },
                 },
             },
         }
@@ -527,13 +616,15 @@ class ConfigFilePathTest(_EnvIsolatedTest):
     def test_list_providers_with_models_primary_model_first(self) -> None:
         from kusudaemon.provider_config import list_providers_with_models
         config = {
-            "default": "opencode",
-            "providers": {
-                "opencode": {
-                    "base_url": "https://opencode.ai/zen/v1",
-                    "model": "opencode/deepseek-v4-flash-free",
-                    "models": ["opencode/qwen3-coder"],
-                    "api_key_env": "OPENAI_API_KEY",
+            "gptme": {
+                "default": "opencode",
+                "providers": {
+                    "opencode": {
+                        "base_url": "https://opencode.ai/zen/v1",
+                        "model": "opencode/deepseek-v4-flash-free",
+                        "models": ["opencode/qwen3-coder"],
+                        "api_key_env": "OPENAI_API_KEY",
+                    },
                 },
             },
         }
@@ -553,12 +644,14 @@ class ConfigFilePathTest(_EnvIsolatedTest):
         provider that doesn't exist."""
         from kusudaemon.provider_config import list_providers_with_models
         config = {
-            "default": "opencode",
-            "providers": {
-                "nvidia": {
-                    "base_url": "https://integrate.api.nvidia.com/v1",
-                    "model": "deepseek-ai/deepseek-v4-flash-0731",
-                    "api_key_env": "NVIDIA_API_KEY",
+            "gptme": {
+                "default": "opencode",
+                "providers": {
+                    "nvidia": {
+                        "base_url": "https://integrate.api.nvidia.com/v1",
+                        "model": "deepseek-ai/deepseek-v4-flash-0731",
+                        "api_key_env": "NVIDIA_API_KEY",
+                    },
                 },
             },
         }
@@ -586,32 +679,30 @@ class ConfigFilePathTest(_EnvIsolatedTest):
     def test_backend_settings_precedence_and_model_override(self) -> None:
         from kusudaemon.provider_config import read_backend_config, list_models_for_backend, ProviderConfigError
         config = {
-            "backends": {
-                "claude": {
-                    "model": "claude-3-5-sonnet-latest",
-                    "api_key_env": "ANTHROPIC_API_KEY",
-                },
-                "codex": {
-                    "model": None,
-                    "api_key_env": "CODEX_API_KEY",
-                    "wire_api": "responses",
-                },
-                "opencode": {
-                    "provider": "zen",
-                    "providers": {
-                        "zen": {
-                            "base_url": "https://opencode.ai/zen/v1",
-                            "model": "opencode/deepseek-v4-flash-free",
-                            "models": ["opencode/deepseek-v4-flash-free", "opencode/qwen3-coder"],
-                            "api_key_env": "OPENCODE_API_KEY",
-                        }
+            "claude": {
+                "model": "claude-3-5-sonnet-latest",
+                "api_key_env": "ANTHROPIC_API_KEY",
+            },
+            "codex": {
+                "model": None,
+                "api_key_env": "CODEX_API_KEY",
+                "wire_api": "responses",
+            },
+            "opencode": {
+                "model": "opencode/deepseek-v4-flash-free",
+                "models": ["opencode/deepseek-v4-flash-free", "opencode/qwen3-coder"],
+                "api_key_env": "OPENCODE_API_KEY",
+            },
+            "gptme": {
+                "default": "opencode",
+                "providers": {
+                    "opencode": {
+                        "base_url": "https://opencode.ai/zen/v1",
+                        "model": "opencode/deepseek-v4-flash-free",
+                        "api_key_env": "OPENCODE_API_KEY",
                     },
                 },
-                "gptme": {
-                    "provider": "opencode",
-                    "model": "opencode/deepseek-v4-flash-free",
-                },
-            }
+            },
         }
         self._write_config(config)
         old = Path.cwd()
@@ -631,10 +722,10 @@ class ConfigFilePathTest(_EnvIsolatedTest):
             self.assertIsNone(settings_codex.model)
             self.assertEqual(settings_codex.extra.get("wire_api"), "responses")
 
-            # Test opencode resolution
+            # Test opencode resolution -- base_url is never read for opencode
             settings_opencode = read_backend_config("opencode")
             self.assertEqual(settings_opencode.model, "opencode/deepseek-v4-flash-free")
-            self.assertEqual(settings_opencode.base_url, "https://opencode.ai/zen/v1")
+            self.assertIsNone(settings_opencode.base_url)
 
             # Test model_override.json when candidate is in declared models
             run_dir = Path(self._tmp.name) / "run1"
@@ -656,6 +747,23 @@ class ConfigFilePathTest(_EnvIsolatedTest):
             # Test unknown backend raises
             with self.assertRaises(ProviderConfigError):
                 read_backend_config("nonexistent_backend")
+        finally:
+            os.chdir(old)
+
+    def test_claude_and_codex_optional_base_url_override(self) -> None:
+        """Unlike opencode, claude/codex may still declare an explicit
+        base_url override (e.g. routing through a proxy) -- only a
+        'providers'/'provider' key is disallowed for them."""
+        from kusudaemon.provider_config import read_backend_config
+        config = {
+            "claude": {"model": "claude-opus-5", "base_url": "https://proxy.example.com"},
+        }
+        self._write_config(config)
+        old = Path.cwd()
+        try:
+            os.chdir(self._tmp.name)
+            settings = read_backend_config("claude")
+            self.assertEqual(settings.base_url, "https://proxy.example.com")
         finally:
             os.chdir(old)
 

@@ -702,18 +702,20 @@ class ProviderSelectionTest(unittest.TestCase):
     server validates the name so a stale/malicious payload is a clean 400."""
 
     CONFIG = {
-        "default": "nvidia",
-        "providers": {
-            "nvidia": {
-                "base_url": "https://integrate.api.nvidia.com/v1",
-                "model": "deepseek-ai/deepseek-v4-flash-0731",
-                "models": ["deepseek-ai/deepseek-v4-flash-0731", "meta/llama-3.3-70b-instruct"],
-                "api_key_env": "NVIDIA_API_KEY",
-            },
-            "llama.cpp": {
-                "base_url": "http://localhost:8080/v1",
-                "model": "qwen",
-                "api_key_env": "OPENAI_API_KEY",
+        "gptme": {
+            "default": "nvidia",
+            "providers": {
+                "nvidia": {
+                    "base_url": "https://integrate.api.nvidia.com/v1",
+                    "model": "deepseek-ai/deepseek-v4-flash-0731",
+                    "models": ["deepseek-ai/deepseek-v4-flash-0731", "meta/llama-3.3-70b-instruct"],
+                    "api_key_env": "NVIDIA_API_KEY",
+                },
+                "llama.cpp": {
+                    "base_url": "http://localhost:8080/v1",
+                    "model": "qwen",
+                    "api_key_env": "OPENAI_API_KEY",
+                },
             },
         },
     }
