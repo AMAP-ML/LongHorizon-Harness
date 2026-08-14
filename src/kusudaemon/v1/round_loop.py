@@ -452,6 +452,8 @@ async def run_round_loop(
                     # just-failed attempt), not marked failed or blocked.
                     if should_halt is not None and should_halt():
                         break
+                    if node.attempts > 0:
+                        await asyncio.sleep(min(2 ** (node.attempts - 1), 5))
                     node.status = "dispatched"
                     tree.save(tree_path)
                     await dispatch(node)

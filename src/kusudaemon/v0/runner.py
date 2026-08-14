@@ -86,7 +86,7 @@ async def run_node(
     supports_resume = bool(getattr(adapter, "supports_session_resume", False))
 
     resume_session_id: str | None = None
-    if session is not None:
+    if session is not None and session.get("session_id"):
         if supports_resume:
             resume_session_id = session.get("session_id")
             log.append(
