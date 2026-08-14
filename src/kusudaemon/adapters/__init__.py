@@ -7,13 +7,15 @@ from typing import TYPE_CHECKING, Any
 if TYPE_CHECKING:
     from .base import AgentAdapter
     from .gptme_adapter import GptmeAdapter
+    from .opencode import OpenCodeAdapter
 
 _LAZY_EXPORTS = {
     "AgentAdapter": ".base",
     "GptmeAdapter": ".gptme_adapter",
+    "OpenCodeAdapter": ".opencode",
 }
 
-__all__ = ["AgentAdapter", "GptmeAdapter"]
+__all__ = ["AgentAdapter", "GptmeAdapter", "OpenCodeAdapter"]
 
 
 def __getattr__(name: str) -> Any:

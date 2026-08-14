@@ -1879,6 +1879,21 @@ input:focus, textarea:focus, select:focus {
 .hdr-esc-badge.flash { animation: esc-flash 1.8s; }
 @keyframes esc-flash { 0%, 100% { background: var(--bg-tertiary); } 30% { background: rgba(245, 158, 11, 0.35); } }
 .hdr-halt-badge { color: var(--accent-amber); border-color: rgba(245, 158, 11, 0.5); }
+/* §2026-08-13: writer-backend selector in the run header row — styled as
+   a tier badge so it reads as one chip among the other run chips. */
+.hdr-backend-sel {
+  font-size: 10px;
+  font-weight: 800;
+  font-family: var(--font-mono, monospace);
+  padding: 1px 4px;
+  border-radius: 8px;
+  background: var(--bg-tertiary);
+  border: 1px solid var(--border-color);
+  color: var(--text-bright);
+  cursor: pointer;
+  max-width: 84px;
+}
+.hdr-backend-sel:hover { background: var(--bg-hover); }
 
 /* pinned summary bar ------------------------------------------------- */
 .pinned-hdr {

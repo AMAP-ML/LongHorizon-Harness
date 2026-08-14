@@ -2,19 +2,31 @@
 
 One module deciding which real agent backend a run's Writers talk to, so
 the driver never constructs an adapter itself. The mapping is deliberately
-tiny — this harness has exactly one backend:
+tiny — three backends:
 
 - ``gptme`` — ``GptmeAdapter``: no agent CLI at all (drives gptme's tool
   loop against the user's configured OpenAI-compatible provider, see
-  ``..provider_config``). This is the only Writer backend.
+  ``..provider_config``). The default Writer backend.
+- ``claude`` — ``ClaudeCodeAdapter``: Anthropic's ``claude --print`` CLI
+  (port of the old LongHorizon-Harness adapter, re-added 2026-08-13;
+  session resume + per-node tool deny-lists via ``--disallowedTools``).
+  Uses the CLI's own auth — never the harness's provider credentials.
+- ``codex`` — ``CodexAdapter``: OpenAI's ``codex exec`` CLI (same port);
+  no session resume, ``codex``'s own config when no endpoint overrides
+  are given.
+
+All three run their stdout through the trace translator in
+``adapters/_agent_worker.py`` (``claude``/``codex``) or gptme's own JSON
+output, so the dashboard's consumers see one vocabulary either way.
 
 Research queries (v4): ``web_search`` is served by a ``GptmeAdapter``
 scoped to exactly one tool — ``adapters/tools/searxng_search.py``, a
 self-hosted SearXNG metasearch query, loaded via gptme's own
 file-path-allowlist mechanism (see that module's docstring). ``doc_retrieval``
-(Context7) has no gptme equivalent wired up yet — it needed Claude Code's
-MCP integration, which was removed along with that adapter — so it still
-raises loudly rather than silently degrading.
+(Context7) still raises loudly rather than silently degrading: it would
+need Claude Code's Context7 MCP wiring, and ``build_research_adapter``
+remains gptme-only (the re-added ``claude``/``codex`` backends are Writer
+backends; nothing wires them to research probes yet).
 
 **Every Writer also gets the same ``websearch`` tool directly** (added
 2026-08-09, superseding v4's original "only an isolated research episode
@@ -49,13 +61,16 @@ from pathlib import Path
 from typing import Any
 
 from ..adapters.base import AgentAdapter
+from ..adapters.claude_code import ClaudeCodeAdapter
+from ..adapters.codex import CodexAdapter
 from ..adapters.gptme_adapter import DEFAULT_TOOL_ALLOWLIST, GptmeAdapter
+from ..adapters.opencode import OpenCodeAdapter
 from ..v1.tree import TaskNode
 from ..v4.mcp_research import allowed_tools_for
 from ..v4.research import ResearchQuery, normalize_probe_kind
 
-WRITER_BACKENDS = ("gptme",)
-_RESEARCH_CAPABLE: tuple[str, ...] = ("gptme",)
+BACKENDS = WRITER_BACKENDS = ("gptme", "claude", "codex", "opencode")
+_RESEARCH_CAPABLE: tuple[str, ...] = ("gptme", "claude", "codex", "opencode")
 
 # PLAN.md §D2: the run's own bookkeeping, off limits to every Writer's
 # prompt — including "out/" and "scratch/" themselves, which hold every
@@ -226,6 +241,39 @@ def build_writer_adapter(
             kwargs["hidden_paths"] = hidden
             kwargs["hidden_path_exceptions"] = exceptions
         return GptmeAdapter(**kwargs)
+    hidden, exceptions = ((), ())
+    if node is not None:
+        hidden, exceptions = _hidden_paths_and_exceptions_for(node, run_dir_path, workspace_root_path)
+    if backend == "claude":
+        # 2026-08-13: re-added CLI backend (Claude Code). The harness's
+        # provider credentials are deliberately not threaded here — this
+        # CLI uses its own auth (ANTHROPIC_API_KEY / OAuth), and the
+        # harness's OpenAI-compatible key must never reach Anthropic's
+        # servers. ``mcp_config`` reuses the (currently unused-for-gptme)
+        # parameter: a strict MCP config file scoped to this run.
+        return ClaudeCodeAdapter(
+            workspace_path=workspace,
+            prompt_dir=prompts,
+            mcp_config=mcp_config,
+            hidden_paths=hidden,
+            hidden_path_exceptions=exceptions,
+        )
+    if backend == "codex":
+        return CodexAdapter(
+            workspace_path=workspace,
+            prompt_dir=prompts,
+            mcp_config=mcp_config,
+            hidden_paths=hidden,
+            hidden_path_exceptions=exceptions,
+        )
+    if backend == "opencode":
+        return OpenCodeAdapter(
+            model=model,
+            workspace_path=workspace,
+            prompt_dir=prompts,
+            hidden_paths=hidden,
+            hidden_path_exceptions=exceptions,
+        )
     raise ValueError(f"unknown backend: {backend!r}")
 
 
@@ -240,14 +288,9 @@ def build_research_adapter(
 ) -> AgentAdapter:
     """Adapter for one v4/§B4 probe.
 
-    ``web`` (legacy ``web_search``) gets a ``GptmeAdapter`` narrowed to
-    exactly the SearXNG tool (``v4/mcp_research.py``'s ``allowed_tools_for``)
-    — nothing else, so the episode can't drift into shell/file access it
-    has no reason to need. ``doc_retrieval`` still raises there: it needed
-    Claude Code's Context7 MCP wiring, which no longer exists in this
-    gptme-only harness. Raise instead of silently giving a query full tool
-    access: a research_plan that can't be honored should fail the run
-    loudly rather than degrade it.
+    Supports all backends (gptme, claude, codex, opencode). ``doc_retrieval``
+    raises loudly rather than silently degrading: it needed Claude Code's Context7
+    MCP wiring, which is not available for generic probes.
 
     ``workspace``/``corpus`` (PLAN.md §A6/§B4) additionally need
     ``hidden_paths`` set, the same "hide the run directory's own
@@ -260,24 +303,46 @@ def build_research_adapter(
     those kinds get no filesystem tools at all) so this stays a strict,
     additive change to the signature.
     """
-    if backend not in _RESEARCH_CAPABLE:
-        raise ValueError(
-            f"research queries need a backend that can serve them; "
-            f"backend {backend!r} cannot. Remove the research_plan or add "
-            f"support for this backend."
-        )
-    kwargs: dict[str, Any] = dict(
-        model=model,
-        workspace_path=str(workspace_path),
-        prompt_dir=str(prompt_dir),
-        tool_allowlist=allowed_tools_for(query.kind),
-    )
+    workspace = str(workspace_path)
+    prompts = str(prompt_dir)
     kind = normalize_probe_kind(query.kind)
+    tools = allowed_tools_for(query.kind)
+
+    hidden: tuple[str, ...] = ()
     if kind in ("workspace", "corpus") and run_dir is not None:
-        kwargs["hidden_paths"] = _hidden_run_dir_subtree_for_probe(
+        hidden = _hidden_run_dir_subtree_for_probe(
             Path(run_dir), Path(workspace_path)
         )
-    return GptmeAdapter(**kwargs)
+
+    if backend == "gptme":
+        kwargs: dict[str, Any] = dict(
+            model=model,
+            workspace_path=workspace,
+            prompt_dir=prompts,
+            tool_allowlist=tools,
+            hidden_paths=hidden,
+        )
+        return GptmeAdapter(**kwargs)
+    if backend == "claude":
+        return ClaudeCodeAdapter(
+            workspace_path=workspace,
+            prompt_dir=prompts,
+            hidden_paths=hidden,
+        )
+    if backend == "codex":
+        return CodexAdapter(
+            workspace_path=workspace,
+            prompt_dir=prompts,
+            hidden_paths=hidden,
+        )
+    if backend == "opencode":
+        return OpenCodeAdapter(
+            model=model,
+            workspace_path=workspace,
+            prompt_dir=prompts,
+            hidden_paths=hidden,
+        )
+    raise ValueError(f"unknown backend: {backend!r}")
 
 
 # PLAN.md §B4: research_plan JSON (CLI/web) still ships the legacy spelling

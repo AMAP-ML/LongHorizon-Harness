@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import json
 import subprocess
 import sys
 import time
@@ -22,6 +23,7 @@ from pathlib import Path
 
 from ..environment.local import LocalEnvironment
 from ..v0.events import EventLog
+from ..v0.run_dir import write_text_atomic
 from ..v1.provider import OpenAICompatibleProvider
 from ..v1.tree import TaskTree
 from . import approvals as approval_store
@@ -63,7 +65,9 @@ def build_pipeline_parser() -> argparse.ArgumentParser:
         help="Path to a real directory the Writer edits directly "
         "(PLAN.md §A3 kind=\"workspace\") instead of a materialized corpus.",
     )
-    run_parser.add_argument("--backend", default="gptme", choices=("gptme",))
+    run_parser.add_argument(
+        "--backend", default="gptme", choices=("gptme", "claude", "codex", "opencode")
+    )
     run_parser.add_argument("--model", default=None)
     run_parser.add_argument("--compile-command", default=None)
     run_parser.add_argument("--research-plan", default=None)
@@ -181,6 +185,16 @@ def build_pipeline_parser() -> argparse.ArgumentParser:
     model_parser.add_argument("run_id")
     model_parser.add_argument("model")
     model_parser.add_argument("--runs-root", default=_RUNS_ROOT_DEFAULT)
+
+    # 2026-08-13: choices restrict the CLI the same way the dashboard's
+    # POST /api/backend does — an invalid backend is a clean argparse
+    # exit-2 error here, never a crash later.
+    backend_parser = sub.add_parser(
+        "backend", help="Set subagent backend override (gptme|claude|codex|opencode)."
+    )
+    backend_parser.add_argument("run_id")
+    backend_parser.add_argument("backend", choices=("gptme", "claude", "codex", "opencode", "none", "default"))
+    backend_parser.add_argument("--runs-root", default=_RUNS_ROOT_DEFAULT)
     return parser
 
 
@@ -519,6 +533,27 @@ def cmd_model(argv: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_backend(argv: argparse.Namespace) -> int:
+    """§2026-08-13: CLI twin of the dashboard's backend override — writes
+    backend_override.json, read at every dispatch by driver._current_backend().
+    Invalid values can't reach this function (argparse choices); "none"/
+    "default" clear the override back to run.spec.json's backend."""
+    run_dir = _require_existing_run(argv.runs_root, argv.run_id)
+    if run_dir is None:
+        return 1
+    ov_file = run_dir / "backend_override.json"
+    if argv.backend.lower() in ("none", "default"):
+        try:
+            ov_file.unlink()
+        except OSError:
+            pass
+        print(f"cleared backend override for run {argv.run_id}")
+    else:
+        write_text_atomic(ov_file, json.dumps({"backend": argv.backend.strip(), "ts": time.time()}, indent=2) + "\n")
+        print(f"set backend override for run {argv.run_id} to {argv.backend}")
+    return 0
+
+
 def dispatch(args: argparse.Namespace) -> int:
     """Route a parsed pipeline group to its handler."""
     command = args.pipeline_command
@@ -546,6 +581,8 @@ def dispatch(args: argparse.Namespace) -> int:
         return cmd_tier(args)
     if command == "model":
         return cmd_model(args)
+    if command == "backend":
+        return cmd_backend(args)
     raise ValueError(f"unknown pipeline command: {command!r}")
 
 

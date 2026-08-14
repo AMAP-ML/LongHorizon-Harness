@@ -409,6 +409,47 @@ class RunState:
             return data.get("model")
         return None
 
+    # 2026-08-13: the writer-backend override is the same mechanism as the
+    # model override — a small JSON file in the run dir, read at every
+    # dispatch by driver._current_backend(), written by the dashboard
+    # header selector, the /backend command, and `kusudaemon pipeline
+    # backend`. Unlike set_model_override, the value is validated against
+    # WRITER_BACKENDS here so an invalid value is a clean 400/exit-1, not
+    # a mid-dispatch surprise.
+    def set_backend_override(self, backend: str | None) -> bool:
+        from ..pipeline.backends import WRITER_BACKENDS
+
+        run_dir = self._attached_dir()
+        if run_dir is None:
+            return False
+        value = (backend or "").strip()
+        if value and value not in WRITER_BACKENDS:
+            raise ValueError(
+                f"invalid backend {value!r} (want gptme, claude, or codex)"
+            )
+        override_file = run_dir / "backend_override.json"
+        if not value:
+            try:
+                override_file.unlink()
+            except OSError:
+                pass
+        else:
+            write_text_atomic(
+                override_file,
+                json.dumps({"backend": value, "ts": _now()}, indent=2) + "\n",
+            )
+        return True
+
+    def get_backend_override(self) -> str | None:
+        run_dir = self._attached_dir()
+        if run_dir is None:
+            return None
+        override_file = run_dir / "backend_override.json"
+        data = _read_json(override_file)
+        if isinstance(data, dict):
+            return data.get("backend")
+        return None
+
     def set_tier_override(self, tier: str | None) -> bool:
         run_dir = self._attached_dir()
         if run_dir is None:
@@ -505,6 +546,7 @@ class RunState:
             "models": models,
             "default_model": default_model,
             "model_override": self.get_model_override(),
+            "backend_override": self.get_backend_override(),
             "server_time": _now(),
         }
 
@@ -807,7 +849,7 @@ class RunState:
 
         options = RunOptions(
             goal=_read_text_arg(goal),
-            backend=str(body.get("backend") or _default_backend()),
+            backend=_validated_backend(str(body.get("backend") or _default_backend())),
             model=body.get("model") or None,
             source_text=_read_text_arg(str(body.get("source", ""))),
             work_object=work_object,
@@ -1514,6 +1556,19 @@ def _default_backend() -> str:
     import os
 
     return os.getenv("KUSUDAEMON_BACKEND", "gptme")
+
+
+def _validated_backend(value: str) -> str:
+    """§2026-08-13: the new-run form's backend field is validated against
+    WRITER_BACKENDS before it reaches RunOptions — a bogus value must be a
+    clean 400 from the route, not a ValueError thrown at first dispatch.
+    """
+    from ..pipeline.backends import WRITER_BACKENDS
+
+    value = value.strip()
+    if value not in WRITER_BACKENDS:
+        raise ValueError(f"invalid backend {value!r} (want gptme, claude, or codex)")
+    return value
 
 
 def _other_driver_pid(run_dir: Path) -> str | None:

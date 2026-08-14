@@ -21,7 +21,7 @@ During a run, Kusudaemon coordinates four specialized roles:
 |---|---|---|
 | **Orchestrator** | Decides which subtask to dispatch next based on dependencies and ready states. | Sees tree status and event log tail. Stateless per round. |
 | **Planner** | Recursively breaks down a larger goal into a flat tree of subtasks. | Sees structural unit labels and token budgets. Never sees raw source content. |
-| **Writer** | Executes a single subtask tool loop (driven by `gptme`). | Sees its brief, required inputs, and the quality contract. Writes one specific artifact file. |
+| **Writer** | Executes a single subtask tool loop (driven by `gptme`, Claude Code, or Codex). | Sees its brief, required inputs, and the quality contract. Writes one specific artifact file. |
 | **Reviewer** | Audits completed artifacts against the quality contract and rubric. | Sees the completed artifact, rubric, and contract. Never sees the Writer's scratchpad or reasoning. |
 
 ---
@@ -71,6 +71,28 @@ To update Kusudaemon in the future:
 ```bash
 uv tool upgrade kusudaemon  # or: pip install --upgrade "kusudaemon[gptme]"
 ```
+
+### Choosing an Agent Backend
+
+Subagent episodes (from structural explorers to leaf writers) can run under four agent backends, selected with `--backend` (or `KUSUDAEMON_BACKEND`):
+
+| Backend | CLI required | Notes |
+|---|---|---|
+| `gptme` *(default)* | `gptme` (installed via `kusudaemon[gptme]`) | Full harness integration: live thinking streaming, session resume, interjections, skills/plugins/MCP (`gptme-capabilities.toml`). |
+| `claude` | `claude` (Claude Code, authenticated on its own) | Tool-restricted (hidden run state denied), supports `--resume` after a crash. |
+| `codex` | `codex` (authenticated on its own) | No session resume; sandbox bypassed unless you set one. |
+| `opencode` | `opencode` (authenticated on its own or via provider) | Structured JSON output, session resume (`--session`), permission restrictions. |
+
+**Each CLI uses its own credentials — the harness never shares your provider key with them.** All subagents (explorers, research probes, writers) can utilize any of the supported backends. Mid-episode interjections are gptme-only.
+
+The backend can be switched for an already-running run — the change takes effect at the next dispatch:
+
+```bash
+kusudaemon pipeline backend <run-id> codex   # or: gptme | claude | opencode
+kusudaemon pipeline backend <run-id> default # clear the override
+```
+
+or from the dashboard: the backend selector in the run header, the new-run modal's "subagent backend" field, or the `/backend` command.
 
 ---
 
@@ -142,7 +164,9 @@ Kusudaemon subagents can search the web through a local, self-hosted [SearXNG](h
 
 ### Step 4: Connecting Agent Skills, Plugins, and MCP Servers
 
-Kusudaemon allows Writer nodes to extend their toolset using **Agent Skills**, **Plugins**, and **MCP (Model Context Protocol) Servers**. These are configured by placing a `gptme-capabilities.toml` file in your **project workspace root directory**:
+*(`gptme` backend only — Claude Code, Codex, and OpenCode use their own configuration.)*
+
+Kusudaemon allows subagent nodes to extend their toolset using **Agent Skills**, **Plugins**, and **MCP (Model Context Protocol) Servers**. These are configured by placing a `gptme-capabilities.toml` file in your **project workspace root directory**:
 
 #### A. Agent Skills (`SKILL.md`)
 Skills are auto-discovered from standard directories such as `~/.claude/skills`, `./skills`, or `./.gptme/skills`. You can also specify custom directories in `gptme-capabilities.toml`:
@@ -252,6 +276,7 @@ Type `/` or `>` in the bottom Command Bar (or press `⌘K` / `Ctrl+K`) to bring 
 | `/reopen [node]` | Reopen a completed or failed node for repair. |
 | `/redispatch [node]` | Reset a node back to pending status. |
 | `/model <role> <name>` | Change model routing mid-run (e.g. `/model writer claude-sonnet-5`). |
+| `/backend <gptme\|claude\|codex\|opencode\|default>` | Switch the subagent backend mid-run (takes effect at the next dispatch). |
 | `/escalate` | Escalate the execution tier by +1 (e.g. T2 → T3). |
 | `/halt` / `/resume` | Pause or resume the pipeline execution. |
 | `/approve` / `/deny` | Resolve the current pending approval. |

@@ -87,7 +87,7 @@ const state = {
   approvalDrafts: {},
   approvalAnswerDrafts: {},
   pilotDrafts: {},
-  newRun: { runId: "", goal: "", source: "", model: "", compile: "", workspace: "", tier: "", dispatch_policy: "model", survey_mode: "embedding", max_rounds: 100, max_attempts: 3, max_parallel: 1, document_review: false, inline_spans: false, auto_probe_plan: true },
+  newRun: { runId: "", goal: "", source: "", model: "", compile: "", workspace: "", tier: "", backend: "gptme", dispatch_policy: "model", survey_mode: "embedding", max_rounds: 100, max_attempts: 3, max_parallel: 1, document_review: false, inline_spans: false, auto_probe_plan: true },
   // §3/§6/§7/§10 additions
   // B1-3 (IMPLEMENTATION-PLAN-COST-AND-LIVE.md): honest sseLive — true only
   // while the EventSource is actually delivering; lastSnapshotAt feeds the
@@ -220,6 +220,7 @@ function recordCli(kind, detail) {
     redispatch: () => `(dashboard-only — no CLI equivalent yet)`,
     interject: () => `(dashboard-only — no CLI equivalent yet)`,
     halt: () => `(dashboard-only — no CLI equivalent yet; sets halt.flag)`,
+    backend: (b) => `kusudaemon pipeline backend ${runId} ${b || "default"}`,
   };
   state.lastCliCommand = (forms[kind] || (() => ""))();
   render();
@@ -1133,10 +1134,30 @@ function renderHeaderRow() {
     style: "color:var(--accent-red); cursor:pointer;",
     onclick: () => guarded(resumeRun),
   }, "⚠ no driver attached — Resume") : null;
+  // §2026-08-13: subagent backend selector. Effective backend =
+  // backend_override || run.spec.json's backend || gptme; changing it
+  // writes backend_override.json, which the driver re-reads at every
+  // dispatch (no resume needed). "default" clears the override.
+  const _BACKENDS = ["gptme", "claude", "codex", "opencode"];
+  const effectiveBackend = snap.backend_override || snap.backend || "gptme";
+  const backendSel = snap.control_enabled ? el("select", {
+    class: "hdr-backend-sel",
+    title: `Subagent backend (effective: ${effectiveBackend}) — applies at the next dispatch`,
+    onchange: (e) => guarded(async () => {
+      const v = e.target.value;
+      await apiPost("/api/backend", { backend: v === "default" ? null : v });
+      recordCli("backend", v);
+      showToast(v === "default" ? "Backend set to default (run spec)" : `Backend set to ${v}`);
+      await refreshSnapshot();
+    }),
+  }, [
+    ..._BACKENDS.map((b) => el("option", { value: b, selected: effectiveBackend === b ? "selected" : null }, b)),
+    el("option", { value: "default", selected: !_BACKENDS.includes(effectiveBackend) ? "selected" : null }, "default"),
+  ]) : null;
   return el("div", { class: "hdr-run" }, [
     el("div", { class: "hdr-run-id" }, [
       el("span", { class: "runId", style: "cursor:pointer;", title: "switch run", onclick: () => { state.runSwitcherOpen = true; render(); } }, snap.run_id),
-      tierChip, escChip, liveSubBadge, noDriverBadge,
+      tierChip, escChip, liveSubBadge, noDriverBadge, backendSel,
       snap.halted ? el("span", { class: "hdr-tier-badge hdr-halt-badge" }, "⏸ halted") : null,
     ]),
     el("div", { class: "hdr-goal", title: snap.goal }, snap.goal || "—"),
@@ -1708,6 +1729,26 @@ function buildCommands() {
       const nodeArg = text || state.selectedNode;
       if (!nodeArg) { showToast("redispatch needs a node", true); return; }
       await _redispatchAction(nodeArg);
+    } },
+    // §2026-08-13: subagent backend override — the header selector's CLI/
+    // command-bar twin. Applies at the next dispatch (driver re-reads
+    // backend_override.json per dispatch, like the model override).
+    backend: { key: "backend", trigger: "backend", label: "Subagent backend", usage: "> backend <gptme|claude|codex|opencode|default>", timeout: 20, run: async (text) => {
+      const val = (text || "").trim().toLowerCase();
+      if (!val) { showToast("usage: > backend <gptme|claude|codex|opencode|default>", true); return; }
+      if (val === "default") {
+        await apiPost("/api/backend", { backend: null });
+        recordCli("backend", "default");
+        showToast("Backend set to default (run spec)");
+      } else if (["gptme", "claude", "codex", "opencode"].includes(val)) {
+        await apiPost("/api/backend", { backend: val });
+        recordCli("backend", val);
+        showToast(`Backend set to ${val}`);
+      } else {
+        showToast("backend must be gptme, claude, codex, opencode, or default", true);
+        return;
+      }
+      await refreshSnapshot();
     } },
   };
   // fromQuery: pattern-matching for `>` queries
@@ -2467,6 +2508,11 @@ function renderNewRunModal() {
     f("model", "model",
       el("select", { onchange: (e) => set("model", e.target.value) },
         modelOptions.map((v) => el("option", { value: v, selected: selectedModel === v ? "selected" : null }, v)))),
+    // §2026-08-13: subagent backend for this run. The server validates it
+    // (a select can't produce an invalid value anyway).
+    f("backend", "subagent backend",
+      el("select", { onchange: (e) => set("backend", e.target.value) },
+        ["gptme", "claude", "codex", "opencode"].map((v) => el("option", { value: v, selected: state.newRun.backend === v ? "selected" : null }, v)))),
     f("compile", "compile command", input("compile", "text", "e.g. python3 -m unittest")),
     // §E7: the server requires exactly T0..T3 or blank (dashboard/state.py's
     // _options_from_body raises on anything else, uppercased and matched
@@ -2523,6 +2569,7 @@ function renderNewRunModal() {
             model: state.newRun.model || undefined,
             tier_override: state.newRun.tier || undefined,
             tier_floor: state.newRun.tier || undefined,
+            backend: state.newRun.backend,
             dispatch_policy: state.newRun.dispatch_policy,
             survey_mode: state.newRun.survey_mode,
             max_rounds: parseInt(state.newRun.max_rounds, 10) || undefined,

@@ -398,6 +398,29 @@ def _post_model_override(handler: "DashboardRequestHandler", match: Any, body: d
     return 200, {"ok": True, "model": model}
 
 
+@_route("POST", r"^/api/backend$")
+def _post_backend(handler: "DashboardRequestHandler", match: Any, body: dict) -> tuple[int, Any]:
+    """§2026-08-13: writer-backend override for the attached run, read by
+    driver._current_backend() at every dispatch. Mirrors
+    /api/model/override — value is validated here so an invalid backend is
+    a clean 400, not a mid-dispatch surprise."""
+    from ..pipeline.backends import WRITER_BACKENDS
+
+    backend = body.get("backend")
+    if backend is not None and not isinstance(backend, str):
+        return 400, {"error": "backend must be string or null"}
+    value = (backend or "").strip()
+    if value and value not in WRITER_BACKENDS:
+        return 400, {"error": f"invalid backend {value!r} (want gptme, claude, or codex)"}
+    try:
+        ok = handler.state.set_backend_override(value or None)
+    except ValueError as exc:
+        return 400, {"error": str(exc)}
+    if not ok:
+        return 400, {"error": "no run attached"}
+    return 200, {"ok": True, "backend": value or None}
+
+
 @_route("POST", r"^/api/command$")
 def _post_command(handler: "DashboardRequestHandler", match: Any, body: dict) -> tuple[int, Any]:
     handler.require_control()
@@ -427,6 +450,17 @@ def _post_command(handler: "DashboardRequestHandler", match: Any, body: dict) ->
         val = None if arg.lower() in {"", "default", "none"} else arg
         ok = handler.state.set_model_override(val)
         return (200, {"ok": ok, "message": f"Model set to {val or 'default'}"}) if ok else (400, {"error": "no run attached"})
+    elif slash_cmd == "/backend":
+        from ..pipeline.backends import WRITER_BACKENDS
+
+        val = None if arg.lower() in {"", "default", "none"} else arg
+        if val and val not in WRITER_BACKENDS:
+            return 400, {"error": f"backend must be gptme, claude, or codex"}
+        try:
+            ok = handler.state.set_backend_override(val)
+        except ValueError as exc:
+            return 400, {"error": str(exc)}
+        return (200, {"ok": ok, "message": f"Backend set to {val or 'default'}"}) if ok else (400, {"error": "no run attached"})
     elif slash_cmd == "/reopen":
         if not arg:
             return 400, {"error": "node id required for /reopen"}

@@ -41,8 +41,10 @@ class CommandAgentAdapter:
     # Overridden True by adapters whose agent can write files itself mid-
     # episode (see GptmeAdapter) -- v0/runner.py's post-episode fallback
     # (visible_output / actions_log) is a "last message becomes the
-    # artifact" mechanism inherited from the deleted Claude Code/Codex
-    # adapters (PLAN.md §D0) and must never run for one of these: an empty
+    # artifact" mechanism inherited from the original Claude Code/Codex
+    # adapters (PLAN.md §D0; those backends were deleted 2026-08-09 and
+    # re-added 2026-08-13 with has_file_tools=True — see claude_code.py/
+    # codex.py) and must never run for one of these: an empty
     # out/<node>.md after a real file-writing episode is a genuine failure,
     # not raw log noise to paper over.
     has_file_tools = False

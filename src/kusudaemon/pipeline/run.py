@@ -53,7 +53,12 @@ def build_parser() -> argparse.ArgumentParser:
         "Mutually exclusive in spirit with --source, though both may be "
         "set; only one kind flows into the run.",
     )
-    parser.add_argument("--backend", default="gptme", choices=("gptme",), help="Writer agent backend (only gptme in this harness).")
+    parser.add_argument(
+        "--backend",
+        default="gptme",
+        choices=("gptme", "claude", "codex", "opencode"),
+        help="Subagent backend: gptme (default), claude (Claude Code CLI), codex (Codex CLI), opencode (OpenCode CLI). The CLI backends use their own auth, never the harness provider.",
+    )
     parser.add_argument("--model", default=None, help="Provider model; defaults to the provider config (default: opencode's DeepSeek V4 Flash Free).")
     parser.add_argument("--compile-command", default=None, help="Optional shell command run as the assembly compile gate (e.g. 'latexmk -pdf').")
     parser.add_argument(

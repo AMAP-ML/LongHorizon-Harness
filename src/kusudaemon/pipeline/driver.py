@@ -2175,6 +2175,42 @@ class RecursiveDriver:
                 json.dumps(self.options.to_spec(), ensure_ascii=False, indent=2) + "\n",
             )
 
+    def _current_backend(self) -> str:
+        """§2026-08-13: effective writer backend for the next dispatch —
+        ``backend_override.json`` (dashboard header selector / ``/backend``
+        command / ``kusudaemon pipeline backend``) wins over
+        ``run.spec.json``'s ``backend``, mirroring ``model_override.json``.
+
+        Read at every dispatch, not at driver construction: like the model
+        override, a backend change must reach the next episode without a
+        resume. An invalid or unreadable override is logged and *ignored*
+        (fall back to the spec's backend) rather than raised — a stale or
+        hand-edited override file must not kill a live run mid-phase.
+        """
+        from .backends import WRITER_BACKENDS
+
+        override_file = self.run_dir / "backend_override.json"
+        if override_file.is_file():
+            try:
+                data = json.loads(override_file.read_text(encoding="utf-8"))
+                value = str(data.get("backend") or "").strip()
+            except (OSError, json.JSONDecodeError):
+                value = ""
+            if value and value not in WRITER_BACKENDS:
+                self._log(
+                    {
+                        "node_id": "-",
+                        "role": "harness",
+                        "round": 0,
+                        "type": "backend_override_invalid",
+                        "backend": value,
+                    }
+                )
+                return self.options.backend
+            if value:
+                return value
+        return self.options.backend
+
     def _default_writer_factory(self) -> WriterAdapterFactory:
         def factory(node: TaskNode) -> AgentAdapter:
             from .backends import build_writer_adapter
@@ -2192,7 +2228,7 @@ class RecursiveDriver:
                 else self.run_dir
             )
             return build_writer_adapter(
-                self.options.backend,
+                self._current_backend(),
                 workspace_path=workspace_path,
                 prompt_dir=self.run_dir / "tmp" / "prompts",
                 node=node,
@@ -2238,7 +2274,7 @@ class RecursiveDriver:
             from .backends import build_research_adapter
 
             return build_research_adapter(
-                self.options.backend,
+                self._current_backend(),
                 workspace_path=self._probe_workspace_path(query),
                 prompt_dir=self.run_dir / "tmp" / "prompts",
                 query=query,
@@ -2264,7 +2300,7 @@ class RecursiveDriver:
             from .backends import build_research_adapter
 
             return build_research_adapter(
-                self.options.backend,
+                self._current_backend(),
                 workspace_path=self._probe_workspace_path(query),
                 prompt_dir=self.run_dir / "tmp" / "prompts",
                 query=query,
