@@ -79,19 +79,31 @@ from .rendering import TraceEntry
 _DEFAULT_RUN_ID_PREFIX = "rec"
 
 
-def _available_models_and_default() -> tuple[list[str], str]:
+def _providers_models_and_default() -> tuple[dict[str, list[str]], str, list[str], str]:
+    """Return ``(providers→models map, default_provider, flat models,
+    default_model)`` from ``provider.json``. The providers map is what lets
+    the new-run modal offer "pick a provider, then its models"; the flat
+    ``models`` list and ``default_model`` stay for the legacy single-select
+    path. The default provider's own first model is the strongest default
+    model; ``resolve()`` is the fallback (and the pre-provider behavior)."""
     try:
-        from ..provider_config import list_available_models, resolve
+        from ..provider_config import list_available_models, list_providers_with_models, resolve
+        providers, default_provider = list_providers_with_models()
         models = list_available_models()
         default_m = ""
-        try:
-            default_m = resolve().model
-        except Exception:
-            if models:
-                default_m = models[0]
-        return models, default_m
+        p_models = providers.get(default_provider)
+        if p_models:
+            default_m = p_models[0]
+        if not default_m:
+            try:
+                default_m = resolve().model
+            except Exception:
+                pass
+        if not default_m and models:
+            default_m = models[0]
+        return providers, default_provider, models, default_m
     except Exception:
-        return [], ""
+        return {}, "", [], ""
 
 
 def _provider_config_stat_path() -> Path | None:
@@ -282,21 +294,21 @@ class RunState:
             )
         return self._cached_read(run_dir, lambda: _dir_mtime(run_dir))
 
-    def _cached_models_and_default(self) -> tuple[list[str], str]:
-        """§E20e (2026-08-12 audit): ``list_available_models()``/``resolve()``
-        each independently call ``provider_config.read_config_file()``,
-        which re-reads and re-JSON-parses ``provider.json`` from scratch —
-        previously done on *every* ``snapshot()`` call, i.e. every
-        ``_STREAM_INTERVAL`` tick per connected SSE client, forever, even
-        though the file almost never changes mid-run. Cached via the same
-        stat-stamp ``_cached_read`` pattern every other per-snapshot disk
-        read in this file already uses, keyed on the resolved config path
-        itself so a config file that appears/changes/disappears is picked
-        up on the next tick."""
+    def _cached_providers_models_and_default(self) -> tuple[dict[str, list[str]], str, list[str], str]:
+        """§E20e (2026-08-12 audit): ``list_providers_with_models()``/
+        ``list_available_models()``/``resolve()`` each independently call
+        ``provider_config.read_config_file()``, which re-reads and
+        re-JSON-parses ``provider.json`` from scratch — previously done on
+        *every* ``snapshot()`` call, i.e. every ``_STREAM_INTERVAL`` tick
+        per connected SSE client, forever, even though the file almost
+        never changes mid-run. Cached via the same stat-stamp ``_cached_read``
+        pattern every other per-snapshot disk read in this file already
+        uses, keyed on the resolved config path itself so a config file
+        that appears/changes/disappears is picked up on the next tick."""
         path = _provider_config_stat_path()
         if path is None:
-            return _available_models_and_default()
-        return self._cached_read(path, _available_models_and_default)
+            return _providers_models_and_default()
+        return self._cached_read(path, _providers_models_and_default)
 
     # ------------------------------------------------------------------
     # Run scanning / attachment (read-only browsing across runs_root)
@@ -480,7 +492,7 @@ class RunState:
     # Snapshots (always read fresh; the disk is authoritative)
     # ------------------------------------------------------------------
     def snapshot(self) -> dict[str, Any]:
-        models, default_model = self._cached_models_and_default()
+        providers, default_provider, models, default_model = self._cached_providers_models_and_default()
         run_dir = self._attached_dir()
         if run_dir is None:
             return {
@@ -488,6 +500,8 @@ class RunState:
                 "runs": self.list_runs(),
                 "models": models,
                 "default_model": default_model,
+                "providers": providers,
+                "default_provider": default_provider,
                 "server_time": _now(),
             }
         spec = _read_json(run_spec_path(run_dir)) or {}
@@ -545,6 +559,8 @@ class RunState:
             "has_assembly": assembly_output_path(run_dir).exists(),
             "models": models,
             "default_model": default_model,
+            "providers": providers,
+            "default_provider": default_provider,
             "model_override": self.get_model_override(),
             "backend_override": self.get_backend_override(),
             "server_time": _now(),
@@ -847,10 +863,25 @@ class RunState:
                 raise ValueError(f"invalid tier_override: {raw_tier!r} (want T0-T3 or blank)")
             tier_override = normalized_tier
 
+        # The new-run modal's provider select: the chosen provider's
+        # base_url/key feed the direct-call provider. Validated here so an
+        # unknown provider name is a clean 400, not a mid-dispatch surprise.
+        provider = str(body.get("provider") or "").strip() or None
+        if provider:
+            from ..provider_config import list_providers_with_models
+
+            known_providers, _ = list_providers_with_models()
+            if provider not in known_providers:
+                raise ValueError(
+                    f"unknown provider: {provider!r} "
+                    f"(available: {sorted(known_providers)})"
+                )
+
         options = RunOptions(
             goal=_read_text_arg(goal),
             backend=_validated_backend(str(body.get("backend") or _default_backend())),
             model=body.get("model") or None,
+            provider=provider,
             source_text=_read_text_arg(str(body.get("source", ""))),
             work_object=work_object,
             compile_command=body.get("compile_command") or None,
@@ -892,7 +923,9 @@ class RunState:
 
         return RecursiveDriver(
             run_dir,
-            provider=OpenAICompatibleProvider(model=options.model, on_backoff=_on_backoff),
+            provider=OpenAICompatibleProvider(
+                model=options.model, provider=options.provider, on_backoff=_on_backoff
+            ),
             options=options,
         )
 
@@ -1774,7 +1807,7 @@ def _runtime_for(run_dir: Path):
 
     spec = _read_json(run_spec_path(run_dir)) or {}
     options = RunOptions.from_spec(spec)
-    provider = OpenAICompatibleProvider(model=options.model)
+    provider = OpenAICompatibleProvider(model=options.model, provider=options.provider)
     env = LocalEnvironment(tmp_dir=str(run_dir / "tmp"))
     work = options.work_object
     workspace_path = (

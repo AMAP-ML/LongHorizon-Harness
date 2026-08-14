@@ -69,6 +69,7 @@ def build_pipeline_parser() -> argparse.ArgumentParser:
         "--backend", default="gptme", choices=("gptme", "claude", "codex", "opencode")
     )
     run_parser.add_argument("--model", default=None)
+    run_parser.add_argument("--provider", default=None)
     run_parser.add_argument("--compile-command", default=None)
     run_parser.add_argument("--research-plan", default=None)
     run_parser.add_argument("--max-rounds", type=int, default=100)
@@ -305,6 +306,7 @@ def cmd_run_detach(argv: argparse.Namespace) -> int:
         command += ["--no-intake"]
     for flag, value in (
         ("--model", argv.model),
+        ("--provider", getattr(argv, "provider", None)),
         ("--compile-command", argv.compile_command),
         ("--research-plan", argv.research_plan),
     ):
@@ -629,6 +631,7 @@ def _run_argv(argv: argparse.Namespace, *, run_id: str | None) -> list[str]:
         parts += ["--inline-spans"]
     for flag, value in (
         ("--model", argv.model),
+        ("--provider", getattr(argv, "provider", None)),
         ("--compile-command", argv.compile_command),
         ("--research-plan", argv.research_plan),
     ):

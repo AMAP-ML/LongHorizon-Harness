@@ -179,6 +179,13 @@ class RunOptions:
     goal: str = ""
     backend: str = "gptme"
     model: str | None = None
+    # The named provider (provider.json's `providers` map) whose base_url
+    # and key the direct-call provider should use. None = let
+    # provider_config.resolve() infer it from the model (or the file's
+    # default) as before — selecting a provider explicitly pins the
+    # endpoint so a model name that appears in more than one provider can't
+    # resolve to the wrong one.
+    provider: str | None = None
     source_text: str = ""
     # PLAN.md §A3/§B1: the work object a run's Writers dispatch against.
     # Like source_text, a constructor input only — never round-tripped
@@ -253,6 +260,7 @@ class RunOptions:
             "goal": self.goal,
             "backend": self.backend,
             "model": self.model,
+            "provider": self.provider,
             "compile_command": self.compile_command,
             "research_plan": [
                 {"node_id": node_id, **asdict(query)}
@@ -295,6 +303,7 @@ class RunOptions:
             goal=str(data.get("goal", "")),
             backend=str(data.get("backend", "gptme")),
             model=data.get("model"),
+            provider=str(data["provider"]) if data.get("provider") else None,
             # Legacy specs embedded source_text; spec["source"] just names
             # the file in the run dir, which resume never needs to re-read —
             # source.txt already exists (driver only writes it when missing).

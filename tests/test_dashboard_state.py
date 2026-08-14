@@ -14,6 +14,7 @@ gptme-adapter tool file and never its gptme-importing half.
 from __future__ import annotations
 
 import json
+import os
 import shutil
 import socket
 import subprocess
@@ -694,6 +695,93 @@ class WorkspaceModeRuntimeTest(unittest.TestCase):
             RunState._options_from_body({"tier_override": "foo"}, "goal")
 
 
+class ProviderSelectionTest(unittest.TestCase):
+    """New-run modal provider selection: a named provider from
+    provider.json pins the endpoint for the run's direct-call provider.
+    The modal offers providers first, then that provider's models; the
+    server validates the name so a stale/malicious payload is a clean 400."""
+
+    CONFIG = {
+        "default": "nvidia",
+        "providers": {
+            "nvidia": {
+                "base_url": "https://integrate.api.nvidia.com/v1",
+                "model": "deepseek-ai/deepseek-v4-flash-0731",
+                "models": ["deepseek-ai/deepseek-v4-flash-0731", "meta/llama-3.3-70b-instruct"],
+                "api_key_env": "NVIDIA_API_KEY",
+            },
+            "llama.cpp": {
+                "base_url": "http://localhost:8080/v1",
+                "model": "qwen",
+                "api_key_env": "OPENAI_API_KEY",
+            },
+        },
+    }
+
+    def setUp(self) -> None:
+        self.tmp = Path(tempfile.mkdtemp())
+        self._old_env = dict(os.environ)
+        self._provider_cfg = self.tmp / "provider.json"
+        self._provider_cfg.write_text(json.dumps(self.CONFIG), encoding="utf-8")
+        os.environ["KUSUDAEMON_PROVIDER_CONFIG"] = str(self._provider_cfg)
+
+    def tearDown(self) -> None:
+        os.environ.clear()
+        os.environ.update(self._old_env)
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_options_from_body_accepts_valid_provider(self) -> None:
+        options, _ = RunState._options_from_body(
+            {"provider": "llama.cpp", "model": "qwen"}, "goal"
+        )
+        self.assertEqual(options.provider, "llama.cpp")
+        self.assertEqual(options.model, "qwen")
+
+    def test_options_from_body_rejects_unknown_provider(self) -> None:
+        with self.assertRaises(ValueError):
+            RunState._options_from_body({"provider": "bogus"}, "goal")
+
+    def test_options_from_body_blank_provider_yields_none(self) -> None:
+        options, _ = RunState._options_from_body({}, "goal")
+        self.assertIsNone(options.provider)
+
+    def test_snapshot_carries_providers_and_default(self) -> None:
+        state = RunState(self.tmp / "runs")
+        snap = state.snapshot()
+        self.assertEqual(snap["providers"]["nvidia"][0], "deepseek-ai/deepseek-v4-flash-0731")
+        self.assertEqual(snap["providers"]["llama.cpp"], ["qwen"])
+        self.assertEqual(snap["default_provider"], "nvidia")
+        self.assertIn("qwen", snap["models"])
+
+    def test_run_options_round_trips_provider(self) -> None:
+        from kusudaemon.pipeline.driver import RunOptions
+
+        opts = RunOptions(goal="g", model="qwen", provider="llama.cpp")
+        restored = RunOptions.from_spec(opts.to_spec())
+        self.assertEqual(restored.provider, "llama.cpp")
+        self.assertEqual(restored.model, "qwen")
+
+    def test_default_driver_passes_provider_to_provider_constructor(self) -> None:
+        from unittest import mock as _mock
+
+        state = RunState(self.tmp / "runs")
+        with _mock.patch(
+            "kusudaemon.v1.provider.OpenAICompatibleProvider",
+            return_value=_mock.MagicMock(),
+        ) as ctor:
+            state._default_driver(
+                self.tmp / "run", _options_with_provider()
+            )
+        self.assertEqual(ctor.call_args.kwargs.get("provider"), "nvidia")
+        self.assertEqual(ctor.call_args.kwargs.get("model"), "m")
+
+
+def _options_with_provider():
+    from kusudaemon.pipeline.driver import RunOptions
+
+    return RunOptions(goal="g", model="m", provider="nvidia")
+
+
 class OptionsFromBodyFieldCoverageTest(unittest.TestCase):
     """§E20k (2026-08-12 audit): the new-run modal is documented as the
     full ``RunOptions`` surface -- confirm ``max_parallel``/
@@ -921,13 +1009,13 @@ class ProviderConfigAndRunsRootCacheTest(unittest.TestCase):
         import kusudaemon.dashboard.state as state_mod
 
         calls = {"n": 0}
-        real = state_mod._available_models_and_default
+        real = state_mod._providers_models_and_default
 
         def counting(*a, **kw):  # noqa: ANN001, ANN002, ANN003
             calls["n"] += 1
             return real(*a, **kw)
 
-        with mock.patch.object(state_mod, "_available_models_and_default", counting):
+        with mock.patch.object(state_mod, "_providers_models_and_default", counting):
             self.state.snapshot()
             self.state.snapshot()
             self.state.snapshot()

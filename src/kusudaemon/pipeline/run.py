@@ -60,6 +60,13 @@ def build_parser() -> argparse.ArgumentParser:
         help="Subagent backend: gptme (default), claude (Claude Code CLI), codex (Codex CLI), opencode (OpenCode CLI). The CLI backends use their own auth, never the harness provider.",
     )
     parser.add_argument("--model", default=None, help="Provider model; defaults to the provider config (default: opencode's DeepSeek V4 Flash Free).")
+    parser.add_argument(
+        "--provider",
+        default=None,
+        help="Named provider from provider.json whose base_url and key the "
+        "direct-call provider uses; defaults to the config's default (or is "
+        "inferred from --model).",
+    )
     parser.add_argument("--compile-command", default=None, help="Optional shell command run as the assembly compile gate (e.g. 'latexmk -pdf').")
     parser.add_argument(
         "--research-plan",
@@ -226,6 +233,7 @@ def run_from_args(argv: list[str] | None = None, *, env: Environment | None = No
             goal=goal,
             backend=args.backend,
             model=args.model,
+            provider=args.provider,
             source_text=_read_text_arg(args.source),
             work_object=work_object,
             compile_command=args.compile_command,
@@ -254,6 +262,7 @@ def run_from_args(argv: list[str] | None = None, *, env: Environment | None = No
         # any provider call happens.)
         provider=OpenAICompatibleProvider(
             model=options.model,
+            provider=options.provider,
             on_backoff=_log_rate_limit_backoff_for(run_dir),
         ),
         options=options,

@@ -234,11 +234,17 @@ def read_config_file(path: Path | None = None) -> dict[str, object]:
     if isinstance(raw_providers, dict):
         providers = {str(name): _normalize_entry(entry, target) for name, entry in raw_providers.items()}
         default = str(data.get("default") or DEFAULT_PROVIDER)
-        if default not in providers:
-            raise ProviderConfigError(
-                f"provider config {target}: default {default!r} is not a "
-                f"defined provider ({sorted(providers)})"
-            )
+        if default not in providers and providers:
+            # 2026-08-14: a stale `default` name (e.g. an `opencode` default
+            # left over after its top-level provider entry was deleted)
+            # used to make the *whole file* unreadable — every resolve(),
+            # every model lookup, and the dashboard's new-run modal came
+            # back empty or raised. The declared providers are real and
+            # usable; fall back to the first one so the config still
+            # resolves, and surface the effective default in the returned
+            # map (callers like list_providers_with_models show it in the
+            # UI rather than failing).
+            default = next(iter(providers))
         return {"default": default, "providers": providers, "fallbacks": fallbacks, "backends": backends}
 
     # Legacy flat shape: one provider named after the built-in default.
@@ -250,7 +256,42 @@ def read_config_file(path: Path | None = None) -> dict[str, object]:
     }
 
 
-def list_models_for_backend(backend: str, config_path: Path | None = None) -> list[str]:
+def list_providers_with_models(config_path: Path | None = None) -> tuple[dict[str, list[str]], str]:
+    """Return ``({provider_name: [model, ...]}, default_provider_name)``.
+
+    Ordered as declared in the config file; each provider's list carries its
+    primary ``model`` first (``_normalize_entry`` guarantees this), so the
+    first entry of the default provider is the sensible default selection.
+    A missing/empty config yields an empty map with the built-in default
+    name. When the file's ``default`` names a provider that isn't defined
+    (e.g. an ``opencode`` default with only ``nvidia``/``llama.cpp`` in
+    ``providers``), the first defined provider becomes the default so
+    callers never hand the UI a provider that doesn't exist.
+    """
+    file_data = read_config_file(config_path)
+    providers: dict[str, list[str]] = {}
+    raw_providers = file_data.get("providers")
+    if isinstance(raw_providers, dict):
+        for name, entry in raw_providers.items():
+            if not isinstance(entry, dict):
+                continue
+            raw_models = entry.get("models")
+            models: list[str] = []
+            if isinstance(raw_models, (list, tuple)):
+                models = [str(m).strip() for m in raw_models if str(m).strip()]
+            elif isinstance(raw_models, str) and raw_models.strip():
+                models = [raw_models.strip()]
+            if models:
+                providers[str(name)] = models
+    default = str(file_data.get("default") or DEFAULT_PROVIDER)
+    if default not in providers and providers:
+        default = next(iter(providers))
+    return providers, default
+
+
+def list_models_for_backend(
+    backend: str, config_path: Path | None = None, provider: str | None = None
+) -> list[str]:
     """Collect all declared model names for a specific agent backend."""
     name = str(backend).strip().lower()
     if name not in SUPPORTED_BACKENDS:
@@ -273,7 +314,12 @@ def list_models_for_backend(backend: str, config_path: Path | None = None) -> li
 
     if name == "gptme":
         block = backends.get("gptme") if isinstance(backends.get("gptme"), dict) else {}
-        prov_name = str(block.get("provider") or file_data.get("default") or DEFAULT_PROVIDER)
+        # An explicit ``provider`` (the run's own selection) wins over the
+        # backend block's declaration, mirroring read_backend_config.
+        prov_name = (
+            provider
+            or str(block.get("provider") or file_data.get("default") or DEFAULT_PROVIDER)
+        )
         providers = file_data.get("providers") if isinstance(file_data.get("providers"), dict) else {}
         p_info = providers.get(prov_name, {}) if isinstance(providers.get(prov_name), dict) else {}
         _add(p_info.get("model"))
@@ -306,15 +352,21 @@ def read_backend_config(
     base_url: str | None = None,
     api_key: str | None = None,
     extra: dict[str, object] | None = None,
+    provider: str | None = None,
 ) -> BackendSettings:
     """Resolve configuration for an agent backend (claude, codex, opencode, gptme).
 
     Precedence ladder (highest first):
-    1. Explicit arguments (model, base_url, api_key, extra)
+    1. Explicit arguments (model, base_url, api_key, extra; ``provider``
+       selects which named provider the gptme backend talks to)
     2. KUSUDAEMON_<BACKEND>_MODEL / _BASE_URL / _API_KEY env vars
     3. Run-level model_override.json, ONLY when it names a model in this backend's models list
     4. backends.<name> block in provider.json
     5. Omit (None / CLI's own defaults)
+
+    ``provider`` only affects the ``gptme`` backend (the one backend that
+    uses the harness's OpenAI-compatible provider — claude/codex/opencode
+    bring their own auth and endpoints, per Part II's adapters section).
     """
     name = str(backend).strip().lower()
     if name not in SUPPORTED_BACKENDS:
@@ -335,7 +387,7 @@ def read_backend_config(
     declared_models: list[str] = []
 
     if name == "gptme":
-        prov_name = str(backend_block.get("provider") or file_data.get("default") or DEFAULT_PROVIDER)
+        prov_name = provider or str(backend_block.get("provider") or file_data.get("default") or DEFAULT_PROVIDER)
         providers = file_data.get("providers") if isinstance(file_data.get("providers"), dict) else {}
         if prov_name not in providers:
             if providers:
@@ -354,7 +406,7 @@ def read_backend_config(
             k: v for k, v in backend_block.items()
             if k not in ("provider", "model", "base_url", "api_key_env")
         }
-        declared_models = list_models_for_backend("gptme", target)
+        declared_models = list_models_for_backend("gptme", target, provider=prov_name)
 
     elif name == "opencode":
         sub_providers = backend_block.get("providers") if isinstance(backend_block.get("providers"), dict) else None

@@ -101,6 +101,7 @@ class OpenAICompatibleProvider:
     def __init__(
         self,
         *,
+        provider: str | None = None,
         model: str | None = None,
         base_url: str | None = None,
         api_key: str | None = None,
@@ -119,7 +120,7 @@ class OpenAICompatibleProvider:
         should_abort: Callable[[], bool] | None = None,
         on_model_fallback: Callable[[str, str, str], None] | None = None,
     ) -> None:
-        resolved = resolve(api_key=api_key or "", base_url=base_url or "", model=model or "")
+        resolved = resolve(provider=provider or "", api_key=api_key or "", base_url=base_url or "", model=model or "")
         self.model = resolved.model
         self.base_url = resolved.base_url.rstrip("/")
         self.api_key = resolved.api_key

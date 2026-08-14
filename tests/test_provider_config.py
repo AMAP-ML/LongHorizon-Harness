@@ -488,6 +488,101 @@ class ConfigFilePathTest(_EnvIsolatedTest):
         finally:
             os.chdir(old)
 
+    def test_list_providers_with_models(self) -> None:
+        from kusudaemon.provider_config import list_providers_with_models
+        config = {
+            "default": "nvidia",
+            "providers": {
+                "opencode": {
+                    "base_url": "https://opencode.ai/zen/v1",
+                    "model": "opencode/deepseek-v4-flash-free",
+                    "models": ["opencode/deepseek-v4-flash-free", "opencode/llama-3.3-70b-instruct"],
+                    "api_key_env": "OPENAI_API_KEY",
+                },
+                "nvidia": {
+                    "base_url": "https://integrate.api.nvidia.com/v1",
+                    "models": ["deepseek-ai/deepseek-v4-flash-0731", "meta/llama-3.3-70b-instruct"],
+                    "api_key_env": "NVIDIA_API_KEY",
+                },
+            },
+        }
+        self._write_config(config)
+        old = Path.cwd()
+        try:
+            os.chdir(self._tmp.name)
+            providers, default_provider = list_providers_with_models()
+            self.assertEqual(
+                providers["opencode"],
+                ["opencode/deepseek-v4-flash-free", "opencode/llama-3.3-70b-instruct"],
+            )
+            # no primary `model` key -> `models` list as declared
+            self.assertEqual(
+                providers["nvidia"],
+                ["deepseek-ai/deepseek-v4-flash-0731", "meta/llama-3.3-70b-instruct"],
+            )
+            self.assertEqual(default_provider, "nvidia")
+        finally:
+            os.chdir(old)
+
+    def test_list_providers_with_models_primary_model_first(self) -> None:
+        from kusudaemon.provider_config import list_providers_with_models
+        config = {
+            "default": "opencode",
+            "providers": {
+                "opencode": {
+                    "base_url": "https://opencode.ai/zen/v1",
+                    "model": "opencode/deepseek-v4-flash-free",
+                    "models": ["opencode/qwen3-coder"],
+                    "api_key_env": "OPENAI_API_KEY",
+                },
+            },
+        }
+        self._write_config(config)
+        old = Path.cwd()
+        try:
+            os.chdir(self._tmp.name)
+            providers, default_provider = list_providers_with_models()
+            self.assertEqual(providers["opencode"], ["opencode/deepseek-v4-flash-free", "opencode/qwen3-coder"])
+            self.assertEqual(default_provider, "opencode")
+        finally:
+            os.chdir(old)
+
+    def test_list_providers_with_models_default_falls_back_when_default_undefined(self) -> None:
+        """The user's real-world shape: default names ``opencode`` but only
+        ``nvidia``/``llama.cpp`` are defined — the UI must not hand back a
+        provider that doesn't exist."""
+        from kusudaemon.provider_config import list_providers_with_models
+        config = {
+            "default": "opencode",
+            "providers": {
+                "nvidia": {
+                    "base_url": "https://integrate.api.nvidia.com/v1",
+                    "model": "deepseek-ai/deepseek-v4-flash-0731",
+                    "api_key_env": "NVIDIA_API_KEY",
+                },
+            },
+        }
+        self._write_config(config)
+        old = Path.cwd()
+        try:
+            os.chdir(self._tmp.name)
+            providers, default_provider = list_providers_with_models()
+            self.assertEqual(default_provider, "nvidia")
+            self.assertEqual(list(providers), ["nvidia"])
+        finally:
+            os.chdir(old)
+
+    def test_list_providers_with_models_empty_config(self) -> None:
+        from kusudaemon.provider_config import DEFAULT_PROVIDER, list_providers_with_models
+        # Explicit config_path: ConfigFilePathTest deliberately pops
+        # KUSUDAEMON_PROVIDER_CONFIG, and the search would otherwise fall
+        # back to the installed repo root's real provider.json.
+        providers, default_provider = list_providers_with_models(
+            config_path=Path(self._tmp.name) / "no-such-config.json"
+        )
+        self.assertEqual(providers, {})
+        self.assertEqual(default_provider, DEFAULT_PROVIDER)
+
     def test_backend_settings_precedence_and_model_override(self) -> None:
         from kusudaemon.provider_config import read_backend_config, list_models_for_backend, ProviderConfigError
         config = {

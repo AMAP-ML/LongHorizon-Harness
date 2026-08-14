@@ -135,12 +135,17 @@ def build_writer_adapter(
     model: str | None = None,
     mcp_config: str | None = None,
     run_dir: str | Path | None = None,
+    provider: str | None = None,
 ) -> AgentAdapter:
     """A Writer adapter for one node. ``node.tools`` narrows the tool set
     (the adapter's ``tool_allowlist``) the same way v1's round loop does —
     web search is layered on top of that narrowed (or default) set
     unconditionally, so even a node scoped down via ``node.tools`` keeps
     search access.
+
+    ``provider`` names the provider.json provider the gptme writer backend
+    should use (the run's own selection from the new-run modal); the
+    claude/codex/opencode backends have their own auth and ignore it.
     """
     workspace = str(workspace_path)
     prompts = str(prompt_dir)
@@ -151,6 +156,7 @@ def build_writer_adapter(
         backend,
         run_dir=run_dir_path if run_dir is not None else None,
         model=model,
+        provider=provider,
         extra={"mcp_config": mcp_config} if mcp_config else None,
     )
 
