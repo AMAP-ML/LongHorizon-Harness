@@ -36,7 +36,13 @@ from .control_bus import (
     _read_jsonl,
 )
 from .lifecycle import ACTIVE_STATUSES, TERMINAL_STATUSES, canonical_lifecycle_status, is_terminal_status
-from ..types import DEFAULT_CLAUDE_MODEL, DEFAULT_CODEX_MODEL, DEFAULT_MAX_ROUNDS, MAX_ROUNDS
+from ..types import (
+    DEFAULT_CLAUDE_MODEL,
+    DEFAULT_CODEX_MODEL,
+    DEFAULT_DEEPSEEK_HARNESS_MODEL,
+    DEFAULT_MAX_ROUNDS,
+    MAX_ROUNDS,
+)
 from ..utils.run_boundary import safe_run_control, safe_run_dir, safe_run_logs, safe_run_role, safe_run_rounds
 
 
@@ -56,10 +62,15 @@ _MAX_SAVED_TASK_BYTES = 100_000
 _MAX_ROUND_DIR_SCAN = 10_000
 _MISSING_COMPLETION_EVIDENCE = "worker reported completion without explicit completion evidence"
 _ROLE_KEYS = ("manager", "executor", "auditor")
+_AGENT_CHOICES = frozenset({"codex", "claude_code", "deepseek_harness"})
 
 
 def _default_model_for_agent(agent: str) -> str:
-    return DEFAULT_CLAUDE_MODEL if agent == "claude_code" else DEFAULT_CODEX_MODEL
+    if agent == "claude_code":
+        return DEFAULT_CLAUDE_MODEL
+    if agent == "deepseek_harness":
+        return DEFAULT_DEEPSEEK_HARNESS_MODEL
+    return DEFAULT_CODEX_MODEL
 
 
 def _normalise_role_configs(
@@ -94,8 +105,10 @@ def _normalise_role_configs(
         if extra:
             raise ValueError(f"unknown roles.{role} field: {sorted(extra)[0]}")
         role_agent = str(raw.get("agent") or agent).strip()
-        if role_agent not in {"codex", "claude_code"}:
-            raise ValueError(f"roles.{role}.agent must be codex or claude_code")
+        if role_agent not in _AGENT_CHOICES:
+            raise ValueError(
+                f"roles.{role}.agent must be codex, claude_code, or deepseek_harness"
+            )
         raw_model = raw.get("model")
         if raw_model is None or (isinstance(raw_model, str) and not raw_model.strip()):
             role_model = model.strip() if role_agent == agent and isinstance(model, str) and model.strip() else _default_model_for_agent(role_agent)
@@ -1376,8 +1389,8 @@ class RunSupervisor:
             raise ValueError("task is required")
         if len(task) > 100_000 or "\x00" in task:
             raise ValueError("task is too large or contains a NUL byte")
-        if agent not in {"codex", "claude_code"}:
-            raise ValueError("agent must be codex or claude_code")
+        if agent not in _AGENT_CHOICES:
+            raise ValueError("agent must be codex, claude_code, or deepseek_harness")
         if isinstance(max_rounds, bool) or not isinstance(max_rounds, int) or not 1 <= max_rounds <= MAX_ROUNDS:
             raise ValueError(f"max_rounds must be an integer from 1 to {MAX_ROUNDS}")
         if prompt_language not in {"en", "zh"}:

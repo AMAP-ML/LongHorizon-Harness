@@ -4,7 +4,7 @@
 
 ### 面向 Computer-Use Agent 的 Loop Engineering
 
-**只需向 Claude Code 或 Codex 给出一次目标，即可让它跨桌面 App 与终端持续工作数十个小时。**
+**只需向 Claude Code、Codex 或 DeepSeek Harness 给出一次目标，即可让它跨桌面 App 与终端持续工作数十个小时。**
 
 **规划 → 执行 → 验证 → 保存或恢复 → 重复，直到任务真正完成。**
 
@@ -18,7 +18,7 @@
 </p>
 
 [![Python](https://img.shields.io/badge/python-≥3.10-blue?logo=python&logoColor=white)](https://www.python.org/)
-[![Agents](https://img.shields.io/badge/backends-Claude%20Code%20|%20Codex-8A2BE2)](#任意模型任意-agent-后端)
+[![Agents](https://img.shields.io/badge/backends-Claude%20Code%20|%20Codex%20|%20DeepSeek-8A2BE2)](#任意模型任意-agent-后端)
 [![Benchmarks](https://img.shields.io/badge/benchmarks-WeaveBench%20|%20OSWorld%202.0%20|%20Terminal--Bench%202.1-orange)](#数百个真实任务规模化验证)
 
 [Usage](#一条命令全程可见) · [The Loop](#面向真实电脑环境的-loop-engineering) · [Computer Use](#桌面-app-与命令行一个连续任务) · [Results](#数百个真实任务规模化验证) · [Project Website](https://lh-harness.pages.dev) · [English](README.md)
@@ -30,12 +30,13 @@
 
 > **模型决定 Agent 一轮能做什么。LongHorizon-Harness 负责工程化模型外部的执行闭环：下一步做什么、如何在真实电脑中验证、哪些进度可以保存，以及在失败或上下文刷新后如何继续。**
 
-**一套面向 Claude Code 和 Codex 的 Loop Engineering 系统。一条命令安装，开箱即用。**
+**一套面向 Claude Code、Codex 和 DeepSeek Harness 的 Loop Engineering 系统。一条命令安装，开箱即用。**
 
 LongHorizon-Harness 将现有 Agent 变成可长期运行的 computer-use 系统。它在桌面 App 与终端 CLI 之间持续恢复目标和已验证状态、选择下一项有明确边界的工作、用全新上下文执行、检查真实结果，再保存通过验收的进度，或把失败证据带入下一轮。它不训练新模型，也不替换现有 Agent，而是为现有 Agent 提供一套可持续运行的执行闭环。
 
 ## ✨ News
 
+- **[v0.1.5 · 2026-08-14]** 第一阶段已适配 [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness) CLI。LongHorizon-Harness 现在可以通过 `--agent deepseek_harness` 调用 `dsh --profile headless`，并提供隔离的 `DSH_HOME`、按角色划分的读写权限、DeepSeek API 端点覆盖、标准化 JSONL 结果以及 CLI/config/doctor 接入。Web 工作台支持为每个角色分别选择 DeepSeek Harness 及其模型；GUI computer-use 和 MCP 支持将在后续阶段补充。使用方式见 [CLI 配置说明](#5-也可以用命令行运行任务)。
 - **[v0.1.4 · 2026-08-11]** 新版 Dashboard 已上线：基于 React/FastAPI 的工作台，全部操作都能在浏览器里完成——发起任务、为每个角色分别选择后端和模型、处理审批、运行中追加指令、停止或重启任务。用 `lh-harness web` 启动，见[在网页上运行任务](#4-在网页上运行任务推荐)。
 - **[2026-08-10]** 补充了 Terminal-Bench 2.1 评测。
 - **[v0.1.3 · 2026-08-07]** 每次运行结束都会输出一份自然语言回复，只依据已验证状态回答你的任务；任务默认作用于你启动命令的目录，控制台也会实时打印每一轮进展。
@@ -103,7 +104,7 @@ LongHorizon-Harness 不绑定特定模型或 Agent 后端。现有模型和 Agen
 | | 层级 | 支持选项 |
 |---|---|---|
 | 🧠 | **模型** | Claude、GPT、Qwen，以及 Agent 后端提供的其他模型 |
-| 🤖 | **Agent 后端** | Claude Code、Codex CLI，以及自定义 `AgentAdapter` 实现 |
+| 🤖 | **Agent 后端** | Claude Code、Codex CLI、DeepSeek Harness（`dsh`，第一阶段仅 CLI），以及自定义 `AgentAdapter` 实现 |
 | 🎛️ | **角色分配** | Manager、Executor 和 Auditor 可以分别使用不同模型或后端 |
 | 🖥️ | **执行环境** | 本地，并提供可扩展的 `Environment` 协议 |
 
@@ -187,8 +188,8 @@ LongHorizon-Harness 不只展示了几个精心挑选的成功案例。
 |---|---|
 | [uv](https://docs.astral.sh/uv/getting-started/installation/) | 推荐的隔离安装方式。习惯用 pip 可以不装。 |
 | Python 3.10 或更高版本 | 运行 Harness。`uv tool install` 自带 Python；用 pip 安装则使用你当前的。 |
-| `PATH` 上有一个 Agent 运行时：[`codex`](https://github.com/openai/codex#installing-and-running-codex-cli) 或 [`claude`](https://docs.anthropic.com/en/docs/claude-code/getting-started) | 真正执行任务。想按角色混用两个后端就都装上。 |
-| [Node.js](https://nodejs.org) 20 或更高版本 | 只有 npm 分发的 computer-use 插件需要。用 `codex-computer-use` 或纯 CLI 任务时不需要。 |
+| `PATH` 上有一个 Agent 运行时：[`codex`](https://github.com/openai/codex#installing-and-running-codex-cli)、[`claude`](https://docs.anthropic.com/en/docs/claude-code/getting-started) 或 [`dsh`](https://github.com/deepseek-ai/deepseek-harness) | 真正执行任务。想按角色混用多个后端就安装多个。 |
+| [Node.js](https://nodejs.org) 20 或更高版本 | npm 分发的 computer-use 插件需要；DeepSeek Harness 本身目前要求 Node.js `^22.19.0` 或 `>=24.0.0`。 |
 
 > **平台状态：** 目前只在 macOS 上完成了测试；Windows 已支持，但尚未经过详细测试。
 
@@ -246,6 +247,48 @@ lh-harness run --task "${TASK}" --agent codex
 
 命令行上显式传入的参数（如 `--agent`）会覆盖 `./.lh-harness/config.toml` 中的对应配置，仅对本次运行生效；不传则沿用配置文件里的默认值。
 
+使用第一阶段的 DeepSeek Harness CLI 后端时，安装官方 npm 包、提供 DeepSeek API Key，并选择 `deepseek_harness`：
+
+```bash
+npm install -g @deepseek-ai/dsh
+# 如果当前 npm 镜像尚未同步该包：
+# npm install -g @deepseek-ai/dsh --registry=https://registry.npmjs.org
+
+dsh --version
+export DEEPSEEK_API_KEY="sk-..."
+# 使用私有或兼容端点时可选：
+# export DEEPSEEK_BASE_URL="https://your-endpoint.example.com"
+
+lh-harness doctor
+lh-harness run --task @task.md --agent deepseek_harness \
+  --model deepseek-v4-flash --no-dashboard
+```
+
+需要将 DeepSeek Harness 设为当前项目的默认后端时，在 `./.lh-harness/config.toml` 中写入：
+
+```toml
+[run]
+agent = "deepseek_harness"
+model = "deepseek-v4-flash"
+dashboard = false
+```
+
+之后就可以继续使用原来的 LongHorizon-Harness 命令：
+
+```bash
+lh-harness run --task @task.md
+```
+
+LongHorizon Web 工作台也会在每个角色的 Harness 下拉框中显示 **DeepSeek Harness (CLI)**，模型可选择 `deepseek-v4-flash` 或填写自定义模型 ID。启动 Web 服务前先导出 provider 环境变量，确保后续 worker 可以继承：
+
+```bash
+export DEEPSEEK_API_KEY="sk-..."
+# export DEEPSEEK_BASE_URL="https://your-endpoint.example.com"
+lh-harness web --workspace-root .
+```
+
+适配器通过 `dsh --profile headless` 运行，每次 run 使用隔离的 `DSH_HOME`；Executor 使用 `workspace-write`，Manager 和 Auditor 使用 `read-only`。`--api-key` 会映射到 `DEEPSEEK_API_KEY`，`--base-url` 会映射到 `DEEPSEEK_BASE_URL`，也可用 `LH_HARNESS_DSH_BINARY` 指定不在 `PATH` 上的二进制。DeepSeek Harness 仍处于 developer preview；第一阶段暂不接入它的 Web UI、computer-use 插件、MCP 配置或 `--mcp-add-dir`。目前 headless profile 只返回最终答案，因此 DeepSeek 的中间 tool event 不会实时进入 trajectory；上游任务接口采用位置参数，episode 运行期间任务文本也会出现在子进程参数列表中。
+
 Agent 直接在你启动命令的那个目录里工作，任务作用于你的真实项目。需要换到别处时设置 `workspace` 或 `--workspace`。`./.lh-harness/` 本身会被排除在外，本次运行自己的日志和状态不会被当成任务内容。
 
 Dashboard 会自动在浏览器中打开，控制台会逐行打印每个角色的进展。结束时会输出一份自然语言回复，只依据已验证状态回答你的原始任务，没跑完也会如实说明。
@@ -282,7 +325,7 @@ lh-harness check-update
 
 | 字段 | 默认值 | 说明 |
 |---|---|---|
-| `agent` | `"codex"` | 所有角色使用的后端（角色可单独覆盖）：`codex` 或 `claude_code`。 |
+| `agent` | `"codex"` | 所有角色使用的后端（角色可单独覆盖）：`codex`、`claude_code` 或 `deepseek_harness`。 |
 | `model` | `"gpt-5.6-sol"` | 所有角色使用的模型（角色可单独覆盖）。必须是所选后端支持的模型。 |
 | `env` | `"local"` | 执行环境，目前只有 `local`。 |
 | `runs_root` | `"./.lh-harness/runs"` | 运行目录的根路径，每次运行生成 `<runs_root>/<run-id>/`。 |
@@ -444,7 +487,7 @@ lh-harness web --workspace-root .               # 为指定目录启动工作台
 | 参数 | 说明 |
 |---|---|
 | `--task` | 任务文本或 `@task.md` |
-| `--agent` | `claude_code` 或 `codex` |
+| `--agent` | `claude_code`、`codex` 或 `deepseek_harness`（第一阶段仅 CLI） |
 | `--env` | `local` |
 | `--max-rounds` | Manage-Execute-Audit 循环的最大轮数；CLI 默认为 30 |
 | `--dashboard` | 启动实时监控和人工介入功能 |

@@ -219,6 +219,7 @@ interface ActivityStep {
 const MODEL_PRESETS: Record<string, { id: string; label: string }[]> = {
   codex: [{ id: 'gpt-5.6-sol', label: 'GPT-5.6 Sol · default' }],
   claude_code: [{ id: 'claude-opus-5', label: 'Claude Opus 5 · default' }],
+  deepseek_harness: [{ id: 'deepseek-v4-flash', label: 'DeepSeek V4 Flash · default' }],
 };
 
 type PublicRole = 'manager' | 'executor' | 'auditor';
@@ -1703,7 +1704,7 @@ function RoleRuntimePicker({ role, selection, meta, onChange }: { role: typeof P
   const { text } = useUiLanguage();
   const agentChoices = meta?.agents?.length
     ? meta.agents.map((item) => ({ id: item.id, label: item.label || item.id, available: item.available }))
-    : [{ id: 'codex', label: 'Codex', available: undefined }, { id: 'claude_code', label: 'Claude Code', available: undefined }];
+    : [{ id: 'codex', label: 'Codex', available: undefined }, { id: 'claude_code', label: 'Claude Code', available: undefined }, { id: 'deepseek_harness', label: 'DeepSeek Harness (CLI)', available: undefined }];
   const discovered = normalizedModelChoices(
     meta?.models?.[selection.agent] || meta?.agents?.find((item) => item.id === selection.agent)?.models,
   );
@@ -1719,6 +1720,9 @@ function RoleRuntimePicker({ role, selection, meta, onChange }: { role: typeof P
   const discoveryNote = discovery?.account_scoped
     ? text(`已从当前 ${selection.agent === 'codex' ? 'Codex 登录态' : '账号'}检测到 ${choices.length} 个模型。`, `Detected ${choices.length} models from the current ${selection.agent === 'codex' ? 'Codex session' : 'account'}.`)
     : discovery?.warning || text('模型可用性会在 worker 启动时由 provider 验证。', 'The provider will verify model availability when the worker starts.');
+  const backendScopeNote = selection.agent === 'deepseek_harness'
+    ? text('DeepSeek Harness 当前仅执行 CLI/代码任务，不包含 computer-use 或 MCP。', 'DeepSeek Harness currently runs CLI/code tasks only; computer-use and MCP are not included.')
+    : '';
   const roleDescription = role.id === 'manager'
     ? text('规划、路由与完成判定', 'Planning, routing, and completion decisions')
     : role.id === 'executor'
@@ -1731,7 +1735,7 @@ function RoleRuntimePicker({ role, selection, meta, onChange }: { role: typeof P
       <label className="drawer-field"><span>Model</span><select value={selectValue} onChange={(event) => { const value = event.target.value; onChange(value === '__custom__' ? { ...selection, model: '', custom: true } : { ...selection, model: value, custom: false }); }}><option value="">{text(`Provider 默认（${providerDefault}）`, `Provider default (${providerDefault})`)}</option>{choices.map((choice) => <option value={choice.id} key={choice.id}>{choice.label}</option>)}<option value="__custom__">{text('自定义模型…', 'Custom model…')}</option></select></label>
     </div>
     {selection.custom && <input className="role-runtime-custom" autoFocus value={selection.model || ''} onChange={(event) => onChange({ ...selection, model: event.target.value })} placeholder={text('输入 provider 暴露的模型名', 'Enter a model name exposed by the provider')} />}
-    <small className={`drawer-field-note ${discovery?.account_scoped ? 'model-detected' : ''}`}>{selection.custom ? text('自定义模型不在检测目录时仍允许尝试；若不存在、无权限或凭据错误，任务会立即失败并显示 provider 原因。', 'You may try a custom model that was not detected. If it is unavailable, unauthorized, or the credentials are invalid, the task will fail immediately with the provider reason.') : discoveryNote}</small>
+    <small className={`drawer-field-note ${discovery?.account_scoped ? 'model-detected' : ''}`}>{selection.custom ? text('自定义模型不在检测目录时仍允许尝试；若不存在、无权限或凭据错误，任务会立即失败并显示 provider 原因。', 'You may try a custom model that was not detected. If it is unavailable, unauthorized, or the credentials are invalid, the task will fail immediately with the provider reason.') : [backendScopeNote, discoveryNote].filter(Boolean).join(' ')}</small>
   </section>;
 }
 
@@ -1780,7 +1784,7 @@ function DetailsDrawer({ creating, runId, snapshot, meta, selectedRound, setSele
     {creating ? <>
       <p className="drawer-copy">{text('任务会由真实 worker 执行。右侧状态面板会持续显示进度，中间区域只保留可读的步骤结果。', 'A real worker will execute the task. The status panel tracks progress while the conversation shows readable step results.')}</p>
       <label className="drawer-field"><span>{text('任务', 'Task')}</span><textarea autoFocus value={task} onChange={(event) => setTask(event.target.value)} placeholder={text('请描述 LongHorizon 需要完成的任务', 'What should LongHorizon do?')} /></label>
-      <div className="role-runtime-head"><div><strong>{text('角色运行配置', 'Role runtime configuration')}</strong><small>{text('每个角色可独立选择 Codex / Claude Code 和模型', 'Choose Codex or Claude Code and a model independently for each role')}</small></div><button type="button" disabled={modelRefreshBusy} onClick={() => { setModelRefreshBusy(true); setModelRefreshError(''); void onRefreshModels().catch((reason) => setModelRefreshError(String(reason))).finally(() => setModelRefreshBusy(false)); }}>{modelRefreshBusy ? text('检测中…', 'Detecting…') : text('重新检测模型', 'Refresh models')}</button></div>
+      <div className="role-runtime-head"><div><strong>{text('角色运行配置', 'Role runtime configuration')}</strong><small>{text('每个角色可独立选择 Codex / Claude Code / DeepSeek Harness 和模型', 'Choose Codex, Claude Code, or DeepSeek Harness and a model independently for each role')}</small></div><button type="button" disabled={modelRefreshBusy} onClick={() => { setModelRefreshBusy(true); setModelRefreshError(''); void onRefreshModels().catch((reason) => setModelRefreshError(String(reason))).finally(() => setModelRefreshBusy(false)); }}>{modelRefreshBusy ? text('检测中…', 'Detecting…') : text('重新检测模型', 'Refresh models')}</button></div>
       {modelRefreshError && <div className="drawer-error-state"><span className="drawer-error">{text('模型检测失败：', 'Model detection failed: ')}{compactText(modelRefreshError, 240)}</span></div>}
       <div className="role-runtime-list">{PUBLIC_ROLES.map((role) => <RoleRuntimePicker key={role.id} role={role} selection={roleSelections[role.id]} meta={meta} onChange={(value) => setRoleSelections((current) => ({ ...current, [role.id]: value }))} />)}</div>
       <label className="drawer-field"><span>{text('最大轮次', 'Max rounds')} <small>1–{MAX_ROUNDS}</small></span><input inputMode="numeric" type="text" pattern="[0-9]*" value={maxRounds} onChange={(event) => setMaxRounds(event.target.value.replace(/\D+/gu, ''))} onBlur={() => setMaxRounds(String(normaliseMaxRounds(maxRounds)))} /></label>

@@ -26,6 +26,7 @@ from .config import (
 from .types import (
     DEFAULT_CLAUDE_MODEL,
     DEFAULT_CODEX_MODEL,
+    DEFAULT_DEEPSEEK_HARNESS_MODEL,
     DEFAULT_MAX_ROUNDS,
     DEFAULT_WORKSPACE_PATH,
     MAX_ROUNDS,
@@ -54,8 +55,10 @@ _MAX_TASK_FILE_BYTES = 100_000
 _AGENTS = (
     ("claude_code", "claude", DEFAULT_CLAUDE_MODEL),
     ("codex", "codex", DEFAULT_CODEX_MODEL),
+    ("deepseek_harness", "dsh", DEFAULT_DEEPSEEK_HARNESS_MODEL),
 )
 _AGENT_CHOICES = tuple(name for name, _, _ in _AGENTS)
+_MCP_AGENT_CHOICES = ("claude_code", "codex")
 # Each agent reads MCP config in its own format, so each gets its own flag.
 _MCP_CONFIG_DESTS = {"claude_code": "claude_mcp_config", "codex": "codex_mcp_config"}
 
@@ -459,15 +462,15 @@ def main(argv: list[str] | None = None) -> int:
     )
     # Credentials are handed to the agent CLI as its own env vars; each adapter
     # maps them to its backend (ANTHROPIC_* for claude_code, OPENAI_* plus a
-    # provider override for codex).
+    # provider override for codex, or DEEPSEEK_* for deepseek_harness).
     run_parser.add_argument(
         "--api-key",
-        help="LLM API key for the agent CLI. Omit to reuse the CLI's own login (`claude login` / `codex login`).",
+        help="LLM API key for the agent CLI. Omit to reuse its existing login or environment.",
     )
     run_parser.add_argument(
         "--base-url",
         default=run_default("base_url"),
-        help="OpenAI-compatible endpoint for the agent CLI. The trailing `/v1` is added or stripped per backend.",
+        help="Provider endpoint for the agent CLI. The trailing `/v1` is normalized when required by the backend.",
     )
     run_parser.add_argument(
         "--prompt-language",
@@ -617,7 +620,7 @@ def main(argv: list[str] | None = None) -> int:
             sub_parser.add_argument(
                 "--agent",
                 action="append",
-                choices=_AGENT_CHOICES,
+                choices=_MCP_AGENT_CHOICES,
                 default=None,
                 help="Agent to register the plugin with. May be repeated; defaults to every supported agent.",
             )
@@ -717,7 +720,11 @@ def _doctor_command() -> int:
         _doctor_line("OK", name, f"{cli.version} ({cli.path})")
 
     if not found_agents:
-        _doctor_line("FAIL", "Agent runtime", "install Claude Code or Codex CLI and add it to PATH")
+        _doctor_line(
+            "FAIL",
+            "Agent runtime",
+            "install Claude Code, Codex CLI, or DeepSeek Harness and add it to PATH",
+        )
         failures += 1
 
     warnings += _doctor_node_toolchain()
@@ -871,7 +878,7 @@ def _doctor_active_plugins() -> int:
     from .plugins import PluginError, active_plugin_for_agent
 
     warnings = 0
-    for agent in _AGENT_CHOICES:
+    for agent in _MCP_AGENT_CHOICES:
         try:
             active = active_plugin_for_agent(agent)
         except PluginError as exc:
@@ -936,7 +943,7 @@ def _plugin_list_command() -> int:
 
     print(f"Priority when several are installed: {' > '.join(PLUGIN_PRIORITY)}")
     print(f"Generated MCP configs live under {plugins_root()}")
-    for agent in _AGENT_CHOICES:
+    for agent in _MCP_AGENT_CHOICES:
         try:
             active = active_plugin_for_agent(agent)
         except PluginError as exc:
@@ -1588,6 +1595,8 @@ def _run_command(args: argparse.Namespace) -> int:
     def resolve_mcp_config(agent_name: str) -> str | None:
         # The agent's own --*-mcp-config wins; otherwise the installed
         # computer-use plugin with the highest priority is loaded for this agent.
+        if agent_name == "deepseek_harness":
+            return None
         override = getattr(args, _MCP_CONFIG_DESTS[agent_name], None)
         if override:
             return override
@@ -1844,6 +1853,7 @@ def _public_role_configs_from_args(
     defaults = {
         "codex": DEFAULT_CODEX_MODEL,
         "claude_code": DEFAULT_CLAUDE_MODEL,
+        "deepseek_harness": DEFAULT_DEEPSEEK_HARNESS_MODEL,
     }
     result: dict[str, dict[str, str | None]] = {}
     for role in public_roles:
@@ -1994,6 +2004,21 @@ def _build_agent(
         if model is not None:
             kwargs["model"] = model
         return ClaudeCodeAdapter(**kwargs)
+    if name == "deepseek_harness":
+        from .adapters.deepseek_harness import DeepSeekHarnessAdapter
+
+        kwargs = dict(
+            api_key=api_key,
+            base_url=base_url,
+            workspace_path=workspace_path,
+            prompt_dir=prompt_dir,
+            add_dirs=mcp_add_dirs,
+            role=role,
+            hidden_paths=hidden_paths,
+        )
+        if model is not None:
+            kwargs["model"] = model
+        return DeepSeekHarnessAdapter(**kwargs)
     raise ValueError(f"Unknown agent: {name}")
 
 

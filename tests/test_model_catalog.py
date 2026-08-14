@@ -3,7 +3,12 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-from lh_harness.model_catalog import _discover_codex_models, _normalise_codex_entries
+from lh_harness.model_catalog import (
+    _discover_codex_models,
+    _discover_deepseek_models,
+    _normalise_codex_entries,
+    discover_model_catalog,
+)
 from lh_harness.provider_errors import classify_agent_runtime_failure
 from lh_harness.types import EpisodeResult
 
@@ -51,6 +56,28 @@ def test_codex_catalog_keeps_reasoning_efforts_without_rejecting_new_values() ->
         source="account",
     )
     assert models[0]["reasoning_efforts"] == ["high", "max", "ultra"]
+
+
+def test_deepseek_catalog_exposes_default_model_and_cli_availability(tmp_path: Path) -> None:
+    binary = tmp_path / "dsh"
+    binary.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    binary.chmod(0o755)
+
+    models, discovery = _discover_deepseek_models(str(binary))
+    catalog = discover_model_catalog(codex_binary=None, dsh_binary=str(binary))
+    agent = next(item for item in catalog["agents"] if item["id"] == "deepseek_harness")
+
+    assert models == [
+        {
+            "id": "deepseek-v4-flash",
+            "label": "DeepSeek V4 Flash · default",
+            "availability": "suggested",
+        }
+    ]
+    assert discovery["status"] == "suggested"
+    assert agent["available"] is True
+    assert agent["default_model"] == "deepseek-v4-flash"
+    assert catalog["models"]["deepseek_harness"] == models
 
 
 def test_invalid_model_failure_keeps_provider_message() -> None:

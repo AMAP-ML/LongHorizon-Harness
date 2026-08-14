@@ -3,9 +3,9 @@
 The workbench must not present a documentation catalogue as proof that the
 currently logged-in user can run every model.  Codex exposes an account-aware
 ``model/list`` app-server method and also persists the last successful response
-in ``models_cache.json``.  Claude Code currently exposes no equivalent stable
-machine-readable command, so its entries are deliberately labelled as
-suggestions or recently used models rather than verified entitlements.
+in ``models_cache.json``.  Claude Code and DeepSeek Harness currently expose no
+equivalent stable account-scoped command, so their entries are deliberately
+labelled as suggestions rather than verified entitlements.
 """
 
 from __future__ import annotations
@@ -20,8 +20,8 @@ from pathlib import Path
 from threading import Lock
 from typing import Any
 
-from .types import DEFAULT_CLAUDE_MODEL, DEFAULT_CODEX_MODEL
-from .utils.agent_cli import is_agent_binary_available, resolve_codex_binary
+from .types import DEFAULT_CLAUDE_MODEL, DEFAULT_CODEX_MODEL, DEFAULT_DEEPSEEK_HARNESS_MODEL
+from .utils.agent_cli import is_agent_binary_available, resolve_codex_binary, resolve_dsh_binary
 
 _CACHE_TTL_SECONDS = 30.0
 _PROBE_TIMEOUT_SECONDS = 4.0
@@ -30,7 +30,7 @@ _MODEL_ID_LIMIT = 256
 _cache_lock = Lock()
 _cached_at = 0.0
 _cached_result: dict[str, Any] | None = None
-_cached_key: tuple[str, str] | None = None
+_cached_key: tuple[str, str, str] | None = None
 _UNSET = object()
 
 
@@ -38,6 +38,7 @@ def discover_model_catalog(
     *,
     force: bool = False,
     codex_binary: str | None | object = _UNSET,
+    dsh_binary: str | None | object = _UNSET,
 ) -> dict[str, Any]:
     """Return agent/model choices plus honest discovery provenance.
 
@@ -53,8 +54,11 @@ def discover_model_catalog(
     )
     if resolved_codex_binary is not None and not isinstance(resolved_codex_binary, str):
         raise TypeError("codex_binary must be a string or None")
+    resolved_dsh_binary = resolve_dsh_binary() if dsh_binary is _UNSET else dsh_binary
+    if resolved_dsh_binary is not None and not isinstance(resolved_dsh_binary, str):
+        raise TypeError("dsh_binary must be a string or None")
     claude_binary = shutil.which("claude")
-    cache_key = (resolved_codex_binary or "", claude_binary or "")
+    cache_key = (resolved_codex_binary or "", claude_binary or "", resolved_dsh_binary or "")
     with _cache_lock:
         if (
             not force
@@ -69,6 +73,7 @@ def discover_model_catalog(
             allow_probe=force,
         )
         claude_models, claude_discovery = _discover_claude_models(claude_binary)
+        deepseek_models, deepseek_discovery = _discover_deepseek_models(resolved_dsh_binary)
         result = {
             "agents": [
                 {
@@ -89,14 +94,25 @@ def discover_model_catalog(
                     "models": claude_models,
                     "discovery": claude_discovery,
                 },
+                {
+                    "id": "deepseek_harness",
+                    "label": "DeepSeek Harness (CLI)",
+                    "available": is_agent_binary_available(resolved_dsh_binary),
+                    "binary": resolved_dsh_binary,
+                    "default_model": DEFAULT_DEEPSEEK_HARNESS_MODEL,
+                    "models": deepseek_models,
+                    "discovery": deepseek_discovery,
+                },
             ],
             "models": {
                 "codex": codex_models,
                 "claude_code": claude_models,
+                "deepseek_harness": deepseek_models,
             },
             "model_discovery": {
                 "codex": codex_discovery,
                 "claude_code": claude_discovery,
+                "deepseek_harness": deepseek_discovery,
             },
         }
         _cached_at = time.monotonic()
@@ -182,6 +198,30 @@ def _discover_claude_models(binary: str | None) -> tuple[list[dict[str, Any]], d
             "Claude Code 未提供稳定的账号级模型列表命令；这些是 CLI 别名和本机近期使用记录，实际权限会在 worker 启动时验证。"
             if binary
             else "未找到 Claude Code CLI。"
+        ),
+    }
+
+
+def _discover_deepseek_models(
+    binary: str | None,
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    models = [
+        _model_entry(
+            DEFAULT_DEEPSEEK_HARNESS_MODEL,
+            "DeepSeek V4 Flash · default",
+            "suggested",
+        )
+    ]
+    available = is_agent_binary_available(binary)
+    return models, {
+        "status": "suggested" if available else "unavailable",
+        "source": "deepseek_harness_default",
+        "account_scoped": False,
+        "refreshed_at": None,
+        "warning": (
+            "DeepSeek Harness 暂未提供稳定的账号级模型列表；可使用默认模型或输入端点暴露的自定义模型 ID。"
+            if available
+            else "未找到 DeepSeek Harness CLI（dsh）。"
         ),
     }
 

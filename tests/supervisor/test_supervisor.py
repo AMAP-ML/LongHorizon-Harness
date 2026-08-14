@@ -57,6 +57,50 @@ def test_web_supervisor_exposes_create_and_lifecycle_routes(monkeypatch, tmp_pat
     assert snapshot.json()["controls"]["can_resume"] is True
 
 
+def test_web_supervisor_creates_deepseek_run_with_role_models(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    process = FakeProcess()
+    monkeypatch.setattr("lh_harness.supervisor.service.subprocess.Popen", lambda *args, **kwargs: process)
+    root = tmp_path / "runs"
+    supervisor = RunSupervisor(root, workspace_root=tmp_path / "workspace")
+    client = TestClient(create_app(runs_root=root, supervisor=supervisor))
+
+    created = client.post(
+        "/api/runs",
+        json={
+            "task": "run with DeepSeek Harness",
+            "agent": "deepseek_harness",
+            "model": "deepseek-v4-flash",
+            "roles": {
+                "manager": {"agent": "deepseek_harness", "model": "deepseek-v4-flash"},
+                "executor": {"agent": "deepseek_harness", "model": "deepseek-v4-flash"},
+                "auditor": {"agent": "deepseek_harness", "model": "deepseek-v4-flash"},
+            },
+            "max_rounds": 1,
+        },
+    )
+
+    assert created.status_code == 200
+    run_id = created.json()["run"]["id"]
+    owner = supervisor.owner(run_id)
+    command = owner["command"]
+    assert owner["agent"] == "deepseek_harness"
+    assert owner["model"] == "deepseek-v4-flash"
+    assert "--agent=deepseek_harness" in command
+    assert "--model=deepseek-v4-flash" in command
+    assert "--manager-agent=deepseek_harness" in command
+    assert "--executor-agent=deepseek_harness" in command
+    assert "--auditor-agent=deepseek_harness" in command
+
+    snapshot = client.get(f"/api/runs/{run_id}/snapshot").json()["run"]
+    assert snapshot["role_configs"]["manager"] == {
+        "agent": "deepseek_harness",
+        "model": "deepseek-v4-flash",
+    }
+
+
 def test_websocket_pushes_supervisor_lifecycle_without_role_events(monkeypatch, tmp_path: Path) -> None:
     process = FakeProcess()
     monkeypatch.setattr("lh_harness.supervisor.service.subprocess.Popen", lambda *args, **kwargs: process)
