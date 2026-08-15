@@ -150,7 +150,10 @@ def _unwrap_provider_message(value: object, *, depth: int = 0) -> str:
     if depth >= 5 or value is None:
         return ""
     if isinstance(value, dict):
-        for key in ("message", "detail", "error"):
+        # Providers wrap the readable sentence in different keys: OpenAI/Claude
+        # use {"error": {"message": ...}}, OpenCode uses {"name": ..., "data":
+        # {"message": ...}}, FastAPI uses {"detail": ...}.
+        for key in ("message", "detail", "data", "error"):
             if key in value:
                 message = _unwrap_provider_message(value.get(key), depth=depth + 1)
                 if message:

@@ -19,6 +19,7 @@ from typing import Any, Iterator
 CLAUDE_STREAM_JSON = "claude_stream_json"
 CODEX_EXEC_JSON = "codex_exec_json"
 DEEPSEEK_HARNESS_JSONL = "deepseek_harness_jsonl"
+OPENCODE_RUN_JSON = "opencode_run_json"
 # Untyped chat transcripts (one `{"role": ..., "content": ...}` object per line,
 # optionally wrapped in `message`). Neither CLI emits this directly, but saved
 # chat.jsonl transcripts and older runs use it.
@@ -39,6 +40,10 @@ _CODEX_EVENTS = {
     "item.completed",
 }
 _CLAUDE_EVENTS = {"system", "assistant", "user", "result"}
+# OpenCode `run --format json` emits one JSON event per line.  "error" is
+# shared with Codex's `--json` protocol, so it is only matched after the Codex
+# and Claude event families, which real logs open with before any error record.
+_OPENCODE_EVENTS = {"step_start", "step_finish", "tool_use", "text", "error"}
 # Codex items that record an action rather than assistant prose.
 _CODEX_TOOL_ITEMS = {
     "command_execution",
@@ -61,6 +66,8 @@ def detect_format(raw: str) -> str:
             return CODEX_EXEC_JSON
         if record_type in _CLAUDE_EVENTS:
             return CLAUDE_STREAM_JSON
+        if record_type in _OPENCODE_EVENTS:
+            return OPENCODE_RUN_JSON
         if _chat_message(record) is not None:
             saw_chat_role = True
     return CHAT_JSONL if saw_chat_role else UNKNOWN
@@ -80,6 +87,9 @@ def visible_output(raw: str) -> str:
         if result_text.strip():
             return result_text.strip()
         return "\n\n".join(assistant_texts).strip()
+    if log_format == OPENCODE_RUN_JSON:
+        texts = _opencode_texts(raw)
+        return texts[-1].strip() if texts else ""
     if log_format == CHAT_JSONL:
         texts = _chat_assistant_texts(raw)
         return texts[-1].strip() if texts else ""
@@ -98,6 +108,8 @@ def assistant_texts(raw: str) -> list[str]:
         if result_text.strip() and (not texts or texts[-1].strip() != result_text.strip()):
             texts.append(result_text)
         return texts
+    if log_format == OPENCODE_RUN_JSON:
+        return _opencode_texts(raw)
     if log_format == CHAT_JSONL:
         return _chat_assistant_texts(raw)
     return []
@@ -131,6 +143,8 @@ def tool_output_view(raw: str) -> str:
             parts.extend(_codex_tool_output(record))
         elif log_format == CLAUDE_STREAM_JSON:
             parts.extend(_claude_tool_output(record))
+        elif log_format == OPENCODE_RUN_JSON:
+            parts.extend(_opencode_tool_output(record))
     return "\n".join(part for part in parts if part)
 
 
@@ -179,6 +193,8 @@ def runtime_event_view(raw: str) -> str:
         elif log_format == CLAUDE_STREAM_JSON and record_type == "result" and record.get("is_error"):
             message = record.get("result") or record.get("error") or record.get("subtype") or "claude response failed"
             parts.append(f"response.failed: {message}")
+        elif log_format == OPENCODE_RUN_JSON and record_type == "error":
+            parts.append(f"response.failed: {_opencode_error_message(record)}")
     return "\n".join(parts)
 
 
@@ -197,6 +213,8 @@ def parse_trajectory(raw: str, *, max_steps: int | None = None) -> list[dict[str
         return _codex_trajectory(raw, max_steps=bounded_steps)
     if log_format == CLAUDE_STREAM_JSON:
         return _claude_trajectory(raw, max_steps=bounded_steps)
+    if log_format == OPENCODE_RUN_JSON:
+        return _opencode_trajectory(raw, max_steps=bounded_steps)
     return []
 
 
@@ -565,6 +583,139 @@ def _claude_trajectory(raw: str, *, max_steps: int | None = None) -> list[dict[s
                 }
             )
     return list(steps)
+
+
+# ----------------------------------------------------------------------------
+# OpenCode (`opencode run --format json`)
+# ----------------------------------------------------------------------------
+
+
+def _opencode_texts(raw: str) -> list[str]:
+    texts: list[str] = []
+    for record in _json_records(raw):
+        if record.get("type") != "text":
+            continue
+        part = record.get("part")
+        if not isinstance(part, dict) or part.get("type") != "text":
+            continue
+        text = part.get("text")
+        if isinstance(text, str) and text.strip():
+            texts.append(text)
+    return texts
+
+
+def _opencode_tool_output(record: dict[str, Any]) -> list[str]:
+    if record.get("type") != "tool_use":
+        return []
+    part = record.get("part")
+    if not isinstance(part, dict) or part.get("type") != "tool":
+        return []
+    state = part.get("state")
+    if not isinstance(state, dict) or str(state.get("status") or "") != "completed":
+        return []
+    output = state.get("output")
+    if isinstance(output, str) and output.strip():
+        return [output]
+    return []
+
+
+def _opencode_error_message(record: dict[str, Any]) -> str:
+    payload = record.get("error")
+    if isinstance(payload, dict):
+        data = payload.get("data") if isinstance(payload.get("data"), dict) else payload
+        if isinstance(data, dict):
+            message = data.get("message")
+            if isinstance(message, str) and message.strip():
+                return message.strip()
+        name = payload.get("name")
+        if isinstance(name, str) and name.strip():
+            return name.strip()
+    message = record.get("message")
+    if isinstance(message, str) and message.strip():
+        return message.strip()
+    return "opencode run failed"
+
+
+def _opencode_trajectory(raw: str, *, max_steps: int | None = None) -> list[dict[str, Any]]:
+    steps: deque[dict[str, Any]] = deque(maxlen=max_steps)
+    seen_ids: set[str] = set()
+    seen_order: deque[str] | None = deque() if max_steps is not None else None
+    seen_cap = max(32, (max_steps or 0) * 4) if max_steps is not None else None
+    for record in _json_records(raw):
+        record_type = record.get("type")
+        part = record.get("part") if isinstance(record.get("part"), dict) else {}
+        part_type = part.get("type")
+        if record_type == "text" and part_type == "text":
+            text = part.get("text")
+            if isinstance(text, str) and text.strip():
+                steps.append({"kind": "text", "text": text})
+            continue
+        if record_type == "tool_use" and part_type == "tool":
+            _opencode_tool_steps(record, part, steps, seen_ids, seen_order, seen_cap)
+            continue
+        if record_type == "step_finish" and str(part.get("reason") or "") == "stop":
+            steps.append(_opencode_result_step(record, part, steps))
+    return list(steps)
+
+
+def _opencode_tool_steps(
+    record: dict[str, Any],
+    part: dict[str, Any],
+    steps: deque[dict[str, Any]],
+    seen_ids: set[str],
+    seen_order: deque[str] | None,
+    seen_cap: int | None,
+) -> None:
+    part_id = str(part.get("id") or record.get("id") or "")
+    state = part.get("state") if isinstance(part.get("state"), dict) else {}
+    status = str(state.get("status") or "")
+    if part_id not in seen_ids:
+        seen_ids.add(part_id)
+        if seen_order is not None:
+            seen_order.append(part_id)
+            while len(seen_order) > (seen_cap or 0):
+                seen_ids.discard(seen_order.popleft())
+        input_value = state.get("input")
+        steps.append(
+            {
+                "kind": "tool_use",
+                "id": part_id,
+                "name": str(part.get("tool") or "tool"),
+                "input": input_value if isinstance(input_value, dict) else {"input": input_value},
+            }
+        )
+    if status in {"completed", "failed", "error"}:
+        output = state.get("output")
+        text = str(output) if output is not None else ""
+        steps.append(_tool_result_step(part_id, text, [], status != "completed", status=status))
+
+
+def _opencode_result_step(
+    record: dict[str, Any],
+    part: dict[str, Any],
+    steps: deque[dict[str, Any]],
+) -> dict[str, Any]:
+    final_text = ""
+    for step in reversed(steps):
+        if step.get("kind") == "text":
+            final_text = str(step.get("text") or "")
+            break
+    tokens = part.get("tokens") if isinstance(part.get("tokens"), dict) else {}
+    cache = tokens.get("cache") if isinstance(tokens.get("cache"), dict) else {}
+    result: dict[str, Any] = {
+        "kind": "result",
+        "text": final_text,
+        "is_error": False,
+        "num_turns": 1,
+        "input_tokens": tokens.get("input"),
+        "output_tokens": tokens.get("output"),
+        "reasoning_tokens": tokens.get("reasoning"),
+        "cached_input_tokens": cache.get("read"),
+    }
+    cost = part.get("cost")
+    if isinstance(cost, (int, float)):
+        result["cost_usd"] = cost
+    return result
 
 
 # ----------------------------------------------------------------------------

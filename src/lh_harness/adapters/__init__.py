@@ -9,15 +9,23 @@ if TYPE_CHECKING:
     from .claude_code import ClaudeCodeAdapter
     from .codex import CodexAdapter
     from .deepseek_harness import DeepSeekHarnessAdapter
+    from .opencode import OpenCodeAdapter
 
 _LAZY_EXPORTS = {
     "AgentAdapter": ".base",
     "ClaudeCodeAdapter": ".claude_code",
     "CodexAdapter": ".codex",
     "DeepSeekHarnessAdapter": ".deepseek_harness",
+    "OpenCodeAdapter": ".opencode",
 }
 
-__all__ = ["AgentAdapter", "ClaudeCodeAdapter", "CodexAdapter", "DeepSeekHarnessAdapter"]
+__all__ = [
+    "AgentAdapter",
+    "ClaudeCodeAdapter",
+    "CodexAdapter",
+    "DeepSeekHarnessAdapter",
+    "OpenCodeAdapter",
+]
 
 
 def __getattr__(name: str) -> Any:

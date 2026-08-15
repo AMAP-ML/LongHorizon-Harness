@@ -20,8 +20,18 @@ from pathlib import Path
 from threading import Lock
 from typing import Any
 
-from .types import DEFAULT_CLAUDE_MODEL, DEFAULT_CODEX_MODEL, DEFAULT_DEEPSEEK_HARNESS_MODEL
-from .utils.agent_cli import is_agent_binary_available, resolve_codex_binary, resolve_dsh_binary
+from .types import (
+    DEFAULT_CLAUDE_MODEL,
+    DEFAULT_CODEX_MODEL,
+    DEFAULT_DEEPSEEK_HARNESS_MODEL,
+    DEFAULT_OPENCODE_MODEL,
+)
+from .utils.agent_cli import (
+    is_agent_binary_available,
+    resolve_codex_binary,
+    resolve_dsh_binary,
+    resolve_opencode_binary,
+)
 
 _CACHE_TTL_SECONDS = 30.0
 _PROBE_TIMEOUT_SECONDS = 4.0
@@ -39,6 +49,7 @@ def discover_model_catalog(
     force: bool = False,
     codex_binary: str | None | object = _UNSET,
     dsh_binary: str | None | object = _UNSET,
+    opencode_binary: str | None | object = _UNSET,
 ) -> dict[str, Any]:
     """Return agent/model choices plus honest discovery provenance.
 
@@ -57,8 +68,18 @@ def discover_model_catalog(
     resolved_dsh_binary = resolve_dsh_binary() if dsh_binary is _UNSET else dsh_binary
     if resolved_dsh_binary is not None and not isinstance(resolved_dsh_binary, str):
         raise TypeError("dsh_binary must be a string or None")
+    resolved_opencode_binary = (
+        resolve_opencode_binary() if opencode_binary is _UNSET else opencode_binary
+    )
+    if resolved_opencode_binary is not None and not isinstance(resolved_opencode_binary, str):
+        raise TypeError("opencode_binary must be a string or None")
     claude_binary = shutil.which("claude")
-    cache_key = (resolved_codex_binary or "", claude_binary or "", resolved_dsh_binary or "")
+    cache_key = (
+        resolved_codex_binary or "",
+        claude_binary or "",
+        resolved_dsh_binary or "",
+        resolved_opencode_binary or "",
+    )
     with _cache_lock:
         if (
             not force
@@ -74,6 +95,9 @@ def discover_model_catalog(
         )
         claude_models, claude_discovery = _discover_claude_models(claude_binary)
         deepseek_models, deepseek_discovery = _discover_deepseek_models(resolved_dsh_binary)
+        opencode_models, opencode_discovery = _discover_opencode_models(
+            resolved_opencode_binary
+        )
         result = {
             "agents": [
                 {
@@ -103,16 +127,27 @@ def discover_model_catalog(
                     "models": deepseek_models,
                     "discovery": deepseek_discovery,
                 },
+                {
+                    "id": "opencode",
+                    "label": "OpenCode",
+                    "available": is_agent_binary_available(resolved_opencode_binary),
+                    "binary": resolved_opencode_binary,
+                    "default_model": DEFAULT_OPENCODE_MODEL,
+                    "models": opencode_models,
+                    "discovery": opencode_discovery,
+                },
             ],
             "models": {
                 "codex": codex_models,
                 "claude_code": claude_models,
                 "deepseek_harness": deepseek_models,
+                "opencode": opencode_models,
             },
             "model_discovery": {
                 "codex": codex_discovery,
                 "claude_code": claude_discovery,
                 "deepseek_harness": deepseek_discovery,
+                "opencode": opencode_discovery,
             },
         }
         _cached_at = time.monotonic()
@@ -222,6 +257,30 @@ def _discover_deepseek_models(
             "DeepSeek Harness 暂未提供稳定的账号级模型列表；可使用默认模型或输入端点暴露的自定义模型 ID。"
             if available
             else "未找到 DeepSeek Harness CLI（dsh）。"
+        ),
+    }
+
+
+def _discover_opencode_models(
+    binary: str | None,
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    models = [
+        _model_entry(
+            DEFAULT_OPENCODE_MODEL,
+            "DeepSeek V4 Flash Free · default",
+            "suggested",
+        )
+    ]
+    available = is_agent_binary_available(binary)
+    return models, {
+        "status": "suggested" if available else "unavailable",
+        "source": "opencode_default",
+        "account_scoped": False,
+        "refreshed_at": None,
+        "warning": (
+            "OpenCode 未提供稳定的账号级模型列表；可使用默认模型或输入端点暴露的自定义模型 ID。"
+            if available
+            else "未找到 OpenCode CLI（opencode）。"
         ),
     }
 
