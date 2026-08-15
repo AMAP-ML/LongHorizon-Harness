@@ -4,7 +4,7 @@
 
 ### Loop Engineering for Computer-Use Agents
 
-**Give Claude Code, Codex, or DeepSeek Harness a goal once. Keep it working across desktop apps and the terminal for dozens of hours.**
+**Give Claude Code, Codex, OpenCode, or DeepSeek Harness a goal once. Keep it working across desktop apps and the terminal for dozens of hours.**
 
 **Plan → act → verify → checkpoint or recover → repeat — until the work is actually done.**
 
@@ -18,7 +18,7 @@
 </p>
 
 [![Python](https://img.shields.io/badge/python-≥3.10-blue?logo=python&logoColor=white)](https://www.python.org/)
-[![Agents](https://img.shields.io/badge/backends-Claude%20Code%20|%20Codex%20|%20DeepSeek-8A2BE2)](#any-model-any-agent-backend)
+[![Agents](https://img.shields.io/badge/backends-Claude%20Code%20|%20Codex%20|%20OpenCode%20|%20DeepSeek-8A2BE2)](#any-model-any-agent-backend)
 [![Benchmarks](https://img.shields.io/badge/benchmarks-WeaveBench%20|%20OSWorld%202.0%20|%20Terminal--Bench%202.1-orange)](#hundreds-of-real-tasks-measured-gains)
 
 [Usage](#one-command-full-visibility) · [The Loop](#loop-engineering-for-real-computer-environments) · [Computer Use](#desktop-apps-and-cli-one-continuous-task) · [Results](#hundreds-of-real-tasks-measured-gains) · [Project Website](https://lh-harness.pages.dev) · [简体中文](README.zh-CN.md)
@@ -30,12 +30,13 @@
 
 > **The model determines what an agent can do in one round. LongHorizon-Harness engineers the loop around it: what to do next, how to verify the result in the real computer, what progress to preserve, and how to continue after failure or context refresh.**
 
-**A Loop Engineering system for Claude Code, Codex, and DeepSeek Harness. One-command install, ready to run.**
+**A Loop Engineering system for Claude Code, Codex, OpenCode, and DeepSeek Harness. One-command install, ready to run.**
 
 LongHorizon-Harness turns existing agents into long-running computer-use systems. Across desktop apps and the terminal CLI, it continuously recovers the goal and verified state, selects the next bounded step, executes it with a fresh context, checks the actual result, and then checkpoints accepted progress or feeds failure evidence into the next round. It does not train a new model or replace an existing agent; it provides the durable execution loop around one.
 
 ## ✨ News
 
+- **[v0.1.6 · 2026-08-15]** Added [OpenCode](https://github.com/anomalyco/opencode) CLI support. LongHorizon-Harness can now run `opencode run prompt` as `--agent opencode`, with role-scoped read/write permissions, OpenCode API endpoint overrides, normalized JSON results, and CLI/config/doctor integration. The Web workbench can select OpenCode Harness and its model independently for each role.
 - **[v0.1.5 · 2026-08-14]** Added phase-1 [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness) CLI support. LongHorizon-Harness can now run `dsh --profile headless` as `--agent deepseek_harness`, with an isolated `DSH_HOME`, role-scoped read/write permissions, DeepSeek API endpoint overrides, normalized JSONL results, and CLI/config/doctor integration. The Web workbench can select DeepSeek Harness and its model independently for each role. GUI computer-use and MCP support will follow in a later phase; see [the CLI setup](#5-or-run-a-task-from-the-command-line).
 - **[v0.1.4 · 2026-08-11]** The new Dashboard has landed: a React/FastAPI workbench you can drive entirely from the browser. Start a task, choose a backend and model per role, answer approvals, send an instruction mid-run, and stop or restart a run. Launch it with `lh-harness web`; see [Run a task in the browser](#4-run-a-task-in-the-browser-recommended).
 - **[2026-08-10]** Added the Terminal-Bench 2.1 evaluation.
@@ -103,7 +104,7 @@ LongHorizon-Harness is not tied to a specific model or agent backend. Existing m
 | | Layer | Supported choices |
 |---|---|---|
 | 🧠 | **Models** | Claude, GPT, Qwen, and other models exposed by an agent backend |
-| 🤖 | **Agent backends** | Claude Code, Codex CLI, DeepSeek Harness (`dsh`, CLI-only in phase 1), and custom `AgentAdapter` implementations |
+| 🤖 | **Agent backends** | Claude Code, Codex CLI, OpenCode, DeepSeek Harness (`dsh`, CLI-only in phase 1), and custom `AgentAdapter` implementations |
 | 🎛️ | **Role assignment** | The Manager, Executor, and Auditor can each use a different model or backend |
 | 🖥️ | **Execution environments** | Local, with a pluggable `Environment` protocol |
 
@@ -187,7 +188,7 @@ Steps 1–2 are once per machine; step 3 is once per project. Then run tasks fro
 |---|---|
 | [uv](https://docs.astral.sh/uv/getting-started/installation/) | The recommended isolated install. Skip it if you prefer pip. |
 | Python 3.10 or later | Running the harness. `uv tool install` brings its own; a pip install uses yours. |
-| One agent runtime on `PATH`: [`codex`](https://github.com/openai/codex#installing-and-running-codex-cli), [`claude`](https://docs.anthropic.com/en/docs/claude-code/getting-started), or [`dsh`](https://github.com/deepseek-ai/deepseek-harness) | Actually executing the work. Install more than one if you want to mix backends across roles. |
+| One agent runtime on `PATH`: [`codex`](https://github.com/openai/codex#installing-and-running-codex-cli), [`claude`](https://docs.anthropic.com/en/docs/claude-code/getting-started), [`opencode`](https://github.com/anomalyco/opencode), or [`dsh`](https://github.com/deepseek-ai/deepseek-harness) | Actually executing the work. Install more than one if you want to mix backends across roles. |
 | [Node.js](https://nodejs.org) 20 or later | The npm-distributed computer-use plugins. DeepSeek Harness itself currently requires Node.js `^22.19.0` or `>=24.0.0`. |
 
 > **Platform status:** Currently tested on macOS. Windows support is included but has not yet been thoroughly tested.
@@ -324,7 +325,7 @@ Task text, run IDs, and API keys are deliberately **not** configurable here; the
 
 | Field | Default | Description |
 |---|---|---|
-| `agent` | `"codex"` | Backend for every role unless a role overrides it: `codex`, `claude_code`, or `deepseek_harness`. |
+| `agent` | `"codex"` | Backend for every role unless a role overrides it: `codex`, `claude_code`, `opencode`, or `deepseek_harness`. |
 | `model` | `"gpt-5.6-sol"` | Model for every role unless a role overrides it. Must be a model the chosen backend exposes. |
 | `env` | `"local"` | Execution environment. Only `local` today. |
 | `runs_root` | `"./.lh-harness/runs"` | Where run directories are created. Each run gets `<runs_root>/<run-id>/`. |
@@ -486,7 +487,7 @@ lh-harness web --workspace-root .               # Serve the workbench for anothe
 | Option | Description |
 |---|---|
 | `--task` | Task text or `@task.md` |
-| `--agent` | `claude_code`, `codex`, or `deepseek_harness` (CLI-only in phase 1) |
+| `--agent` | `claude_code`, `codex`, `opencode`, or `deepseek_harness` (CLI-only in phase 1) |
 | `--env` | `local` |
 | `--max-rounds` | Maximum number of Manage-Execute-Audit rounds; the CLI default is 30 |
 | `--dashboard` | Start live monitoring and human intervention |

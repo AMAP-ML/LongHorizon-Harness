@@ -99,7 +99,7 @@ def _safe_role_configs(value: object) -> dict[str, dict[str, str]]:
             continue
         agent = raw.get("agent")
         model = raw.get("model")
-        if agent not in {"codex", "claude_code", "deepseek_harness"}:
+        if agent not in {"codex", "claude_code", "deepseek_harness", "opencode"}:
             continue
         if not isinstance(model, str) or not model.strip() or len(model.strip()) > 256 or "\x00" in model:
             continue

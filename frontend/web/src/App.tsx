@@ -220,6 +220,7 @@ const MODEL_PRESETS: Record<string, { id: string; label: string }[]> = {
   codex: [{ id: 'gpt-5.6-sol', label: 'GPT-5.6 Sol · default' }],
   claude_code: [{ id: 'claude-opus-5', label: 'Claude Opus 5 · default' }],
   deepseek_harness: [{ id: 'deepseek-v4-flash', label: 'DeepSeek V4 Flash · default' }],
+  opencode: [{ id: 'opencode/deepseek-v4-flash-free', label: 'DeepSeek V4 Flash Free · default' }],
 };
 
 type PublicRole = 'manager' | 'executor' | 'auditor';
@@ -1704,7 +1705,7 @@ function RoleRuntimePicker({ role, selection, meta, onChange }: { role: typeof P
   const { text } = useUiLanguage();
   const agentChoices = meta?.agents?.length
     ? meta.agents.map((item) => ({ id: item.id, label: item.label || item.id, available: item.available }))
-    : [{ id: 'codex', label: 'Codex', available: undefined }, { id: 'claude_code', label: 'Claude Code', available: undefined }, { id: 'deepseek_harness', label: 'DeepSeek Harness (CLI)', available: undefined }];
+    : [{ id: 'codex', label: 'Codex', available: undefined }, { id: 'claude_code', label: 'Claude Code', available: undefined }, { id: 'deepseek_harness', label: 'DeepSeek Harness (CLI)', available: undefined }, { id: 'opencode', label: 'OpenCode', available: undefined }];
   const discovered = normalizedModelChoices(
     meta?.models?.[selection.agent] || meta?.agents?.find((item) => item.id === selection.agent)?.models,
   );
@@ -1722,7 +1723,9 @@ function RoleRuntimePicker({ role, selection, meta, onChange }: { role: typeof P
     : discovery?.warning || text('模型可用性会在 worker 启动时由 provider 验证。', 'The provider will verify model availability when the worker starts.');
   const backendScopeNote = selection.agent === 'deepseek_harness'
     ? text('DeepSeek Harness 当前仅执行 CLI/代码任务，不包含 computer-use 或 MCP。', 'DeepSeek Harness currently runs CLI/code tasks only; computer-use and MCP are not included.')
-    : '';
+    : selection.agent === 'opencode'
+      ? text('OpenCode 当前仅执行 CLI/代码任务，不包含 computer-use 或 MCP。', 'OpenCode currently runs CLI/code tasks only; computer-use and MCP are not included.')
+      : '';
   const roleDescription = role.id === 'manager'
     ? text('规划、路由与完成判定', 'Planning, routing, and completion decisions')
     : role.id === 'executor'

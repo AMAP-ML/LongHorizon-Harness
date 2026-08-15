@@ -30,6 +30,7 @@ _VERSION_RE = re.compile(r"\d+(?:\.\d+)+\S*")
 # precedence in one place so adapters, doctor output, and the Web API agree.
 _CODEX_BINARY_ENV_VARS = ("LH_HARNESS_CODEX_BINARY", "CODEX_CLI_PATH")
 _DSH_BINARY_ENV_VAR = "LH_HARNESS_DSH_BINARY"
+_OPENCODE_BINARY_ENV_VAR = "LH_HARNESS_OPENCODE_BINARY"
 _CODEX_DESKTOP_BINARY = "/Applications/ChatGPT.app/Contents/Resources/codex"
 
 
@@ -72,6 +73,11 @@ def resolve_agent_binary(
         if value:
             return os.path.expanduser(value)
 
+    if binary == "opencode":
+        value = str(env.get(_OPENCODE_BINARY_ENV_VAR) or "").strip()
+        if value:
+            return os.path.expanduser(value)
+
     return shutil.which(binary)
 
 
@@ -93,6 +99,16 @@ def resolve_dsh_binary(
     """Resolve the DeepSeek Harness executable selected by the harness."""
 
     return resolve_agent_binary("dsh", environ=environ, platform_name=platform_name)
+
+
+def resolve_opencode_binary(
+    *,
+    environ: dict[str, str] | None = None,
+    platform_name: str | None = None,
+) -> str | None:
+    """Resolve the OpenCode executable selected by the harness."""
+
+    return resolve_agent_binary("opencode", environ=environ, platform_name=platform_name)
 
 
 def is_agent_binary_available(path: str | None) -> bool:
