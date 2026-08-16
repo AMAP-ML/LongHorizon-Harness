@@ -7,6 +7,7 @@ import base64
 import binascii
 import hmac
 import ipaddress
+import mimetypes
 import os
 import re
 import threading
@@ -35,6 +36,11 @@ from .snapshot import _provenance, build_run_summary, build_snapshot
 # installed wheel resolve the same path.  It is absent until the frontend is
 # built; the API then serves JSON only.
 _STATIC_DIR = Path(__file__).resolve().parents[1] / "_frontend" / "web" / "dist"
+_DASHBOARD_MIME_TYPES = {
+    ".js": "application/javascript",
+    ".mjs": "text/javascript",
+    ".css": "text/css",
+}
 
 _MAX_ARTIFACT_BYTES = 8 * 1024 * 1024
 
@@ -1033,6 +1039,11 @@ def create_app(
         return receipt
 
     if _STATIC_DIR.is_dir():
+        # Starlette's FileResponse delegates MIME detection to Python.  A
+        # Windows registry entry can incorrectly map JavaScript to text/plain,
+        # which browsers reject for module scripts when nosniff is enabled.
+        for suffix, media_type in _DASHBOARD_MIME_TYPES.items():
+            mimetypes.add_type(media_type, suffix)
         app.mount("/", StaticFiles(directory=str(_STATIC_DIR), html=True), name="dashboard-static")
     return app
 

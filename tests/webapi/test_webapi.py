@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import mimetypes
 import threading
 from pathlib import Path
 
@@ -257,6 +258,28 @@ def test_legacy_static_dashboard_routes_are_not_registered(tmp_path: Path) -> No
     assert "/api/round/{round_index}" not in paths
     assert "/api/round/{round_index}/{name}" not in paths
     assert "/api/inject" not in paths
+
+
+def test_dashboard_javascript_asset_has_valid_mime_type_on_bad_platform_mapping(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    static_dir = tmp_path / "dist"
+    assets_dir = static_dir / "assets"
+    assets_dir.mkdir(parents=True)
+    (assets_dir / "index.js").write_text("document.body.dataset.loaded = 'yes';", encoding="utf-8")
+    monkeypatch.setattr("lh_harness.webapi.server._STATIC_DIR", static_dir)
+
+    # Simulate the Windows registry mapping without depending on the host OS.
+    mimetypes.guess_type("index.js")
+    monkeypatch.setitem(mimetypes.types_map, ".js", "text/plain")
+    assert mimetypes.guess_type("index.js")[0] == "text/plain"
+
+    client = TestClient(create_app(state=DashboardState(tmp_path / "logs")))
+    response = client.get("/assets/index.js")
+
+    assert response.status_code == 200
+    assert response.headers["content-type"].split(";", 1)[0] == "application/javascript"
+    assert response.headers["x-content-type-options"] == "nosniff"
 
 
 def test_api_snapshot_replay_and_artifact(tmp_path: Path) -> None:
