@@ -12,6 +12,7 @@ import pytest
 pytest.importorskip("fastapi")
 from fastapi.testclient import TestClient
 
+import lh_harness.dashboard.state as dashboard_state
 from lh_harness.dashboard.state import DashboardState
 from lh_harness.webapi.events import EventTailer
 from lh_harness.webapi.server import create_app
@@ -33,6 +34,67 @@ def _run(tmp_path: Path) -> tuple[Path, DashboardState]:
 def _ws_auth_protocols(token: str) -> list[str]:
     encoded = base64.urlsafe_b64encode(token.encode("utf-8")).decode("ascii").rstrip("=")
     return ["lh-harness-auth.v1", f"lh-harness-token.{encoded}"]
+
+
+def test_dashboard_missing_file_does_not_close_a_reused_parent_fd(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A failed final open must close its parent descriptor exactly once.
+
+    Dashboard snapshots routinely probe files that do not exist yet.  Model
+    another thread reusing the parent descriptor between cleanup paths: the
+    replacement must remain open after the expected FileNotFoundError.
+    """
+
+    if not getattr(os, "O_NOFOLLOW", 0) or os.open not in getattr(os, "supports_dir_fd", set()):
+        pytest.skip("secure descriptor-relative opens are unavailable")
+
+    target = tmp_path.resolve() / "missing-final-response.txt"
+    real_open = os.open
+    real_close = os.close
+    source_fd = real_open(os.devnull, os.O_RDONLY)
+    final_parent_fd: dict[str, int] = {}
+    replacement_fd: dict[str, int] = {}
+
+    def tracking_open(path, flags, *args, **kwargs):
+        try:
+            return real_open(path, flags, *args, **kwargs)
+        except FileNotFoundError:
+            if path == target.name and isinstance(kwargs.get("dir_fd"), int):
+                final_parent_fd["fd"] = kwargs["dir_fd"]
+            raise
+
+    def reusing_close(fd: int) -> None:
+        if fd == final_parent_fd.get("fd") and "fd" not in replacement_fd:
+            real_close(fd)
+            os.dup2(source_fd, fd)
+            replacement_fd["fd"] = fd
+            return
+        real_close(fd)
+
+    monkeypatch.setattr(os, "open", tracking_open)
+    monkeypatch.setattr(os, "close", reusing_close)
+    os.supports_dir_fd.add(tracking_open)
+    try:
+        with pytest.raises(FileNotFoundError):
+            dashboard_state._open_nofollow(target, strict_parent=True)
+    finally:
+        os.supports_dir_fd.discard(tracking_open)
+        monkeypatch.undo()
+
+    replacement = replacement_fd.get("fd")
+    try:
+        assert replacement is not None
+        os.fstat(replacement)
+    finally:
+        for fd in {source_fd, replacement}:
+            if fd is None:
+                continue
+            try:
+                real_close(fd)
+            except OSError:
+                pass
 
 
 def test_event_tail_is_absolute_and_bad_records_are_diagnostic(tmp_path: Path) -> None:
