@@ -28,7 +28,7 @@ from typing import Any
 
 from ..types import DEFAULT_LOG_DIR
 from ..supervisor.control_bus import ControlBus, _ensure_dir_fd_nofollow, _open_private_regular_at
-from ..supervisor.lifecycle import TERMINAL_STATUSES, canonical_lifecycle_status
+from ..supervisor.lifecycle import ACTIVE_STATUSES, TERMINAL_STATUSES, canonical_lifecycle_status
 from ..utils.run_boundary import safe_run_dir, safe_run_logs, safe_run_role, safe_run_rounds
 
 from ..agent_logs import parse_trajectory as parse_agent_trajectory
@@ -964,6 +964,29 @@ class DashboardState:
                 approval.resolved_at = time.time()
                 snapshot = approval.to_dict()
             self._persist_approval(snapshot)
+            if action == "stop":
+                # Resolving an end-of-round gate with "stop" is an explicit
+                # operator cancellation, not a worker crash.  Persist that
+                # intent before the blocking Manager hook is released so a
+                # fast worker exit cannot race Supervisor reconciliation and
+                # be misclassified as ``failed`` solely because incomplete
+                # runs deliberately return a non-zero process status.
+                now = time.time()
+
+                def mark_operator_stop(current: dict[str, Any]) -> dict[str, Any]:
+                    lifecycle = canonical_lifecycle_status(current.get("status"), default="")
+                    if lifecycle in TERMINAL_STATUSES:
+                        return current
+                    updated = {
+                        **current,
+                        "requested_action": "cancel",
+                        "operator_stop_requested_at": current.get("operator_stop_requested_at") or now,
+                    }
+                    if lifecycle in ACTIVE_STATUSES:
+                        updated["status"] = "stopping"
+                    return updated
+
+                self.control_bus.update_status(mark_operator_stop)
             self.control_bus.receipt(command, "applied", result={"approval_id": approval_id})
 
     def update_approval_context(self, approval_id: str, **updates: Any) -> bool:

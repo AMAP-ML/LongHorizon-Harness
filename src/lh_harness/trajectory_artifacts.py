@@ -53,6 +53,7 @@ class StreamingTrajectoryArtifactWriter:
         self.step_count = 0
         self.total_bytes = 0
         self.screenshots: list[dict[str, Any]] = []
+        self.seen_tool_ids: set[str] = set()
         self.trajectory_path = round_dir / f"{role_name}_trajectory.jsonl"
         self.manifest_path = round_dir / f"{role_name}_screenshots.json"
         _remove_role_step_images(round_dir, role_name)
@@ -79,6 +80,18 @@ class StreamingTrajectoryArtifactWriter:
         for source_step in parse_trajectory(raw):
             if self.step_count >= _MAX_NORMALIZED_STEPS:
                 break
+            # Codex sends ``item.started`` and ``item.completed`` as separate
+            # JSONL records.  Parsing one streamed line at a time means the
+            # completion record defensively contains the tool call again, even
+            # though the earlier start record already materialised it.  Keep
+            # the first call and the later result so the live Dashboard shows
+            # one command card that transitions to completed.
+            if source_step.get("kind") == "tool_use":
+                tool_id = str(source_step.get("id") or "").strip()
+                if tool_id and tool_id in self.seen_tool_ids:
+                    continue
+                if tool_id:
+                    self.seen_tool_ids.add(tool_id)
             self.step_count += 1
             step, new_items, new_bytes = _materialize_step(
                 source_step,
