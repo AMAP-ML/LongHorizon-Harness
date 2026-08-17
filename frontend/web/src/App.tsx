@@ -807,14 +807,11 @@ export default function App() {
   function commitTrajectory(storageKey: string, requestKey: string, requestId: number, next: TrajectoryView, size?: number): void {
     if (trajectoryRequestSeq.current.get(requestKey) !== requestId) return;
     if (typeof size === 'number' && Number.isFinite(size)) trajectoryLoadedSizes.current.set(storageKey, size);
-    setTrajectories((current) => {
-      // A slower request can finish after a newer live poll. Keep the newer
-      // response unless the backend deliberately reports a reset/truncation.
-      const previous = current[storageKey];
-      if (previous && typeof next.raw_chars === 'number' && typeof previous.raw_chars === 'number'
-        && next.raw_chars < previous.raw_chars && !next.warning) return current;
-      return { ...current, [storageKey]: next };
-    });
+    // The request sequence above rejects responses that started before a newer
+    // poll.  Do not use payload length as a freshness signal: when a role ends,
+    // the backend rebuilds its live trajectory into a deduplicated normalized
+    // file, which can legitimately be shorter than the preceding live view.
+    setTrajectories((current) => ({ ...current, [storageKey]: next }));
   }
 
   useEffect(() => {

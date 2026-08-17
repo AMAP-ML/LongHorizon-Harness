@@ -11,6 +11,7 @@ import pytest
 
 import lh_harness.supervisor.control_bus as control_bus
 import lh_harness.supervisor.service as supervisor_service
+from lh_harness.dashboard.state import ApprovalOption, DashboardState
 from lh_harness.supervisor.control_bus import ControlBus, RevisionConflict, iter_run_control_dirs
 from lh_harness.supervisor.service import IdempotencyConflict, RunSupervisor
 
@@ -43,6 +44,54 @@ def test_nonzero_worker_exit_is_failed_and_persists_crash_report(monkeypatch, tm
     assert status["report_status"] == "completed"
     crash = json.loads((run_dir / "logs" / "crash_report.json").read_text(encoding="utf-8"))
     assert crash["status"] == "failed"
+
+
+def test_end_at_approval_gate_is_cancelled_not_failed(monkeypatch, tmp_path: Path) -> None:
+    process = _Process()
+    monkeypatch.setattr("lh_harness.supervisor.service.subprocess.Popen", lambda *args, **kwargs: process)
+    runs_root = tmp_path / "runs"
+    supervisor = RunSupervisor(runs_root, workspace_root=tmp_path / "workspace")
+    created = supervisor.create_run(task="finish at the round limit")
+    run_dir = runs_root / created["id"]
+    logs = run_dir / "logs"
+    (logs / "role_management" / "rounds").mkdir(parents=True)
+    state = DashboardState(logs, runs_root=runs_root, control_enabled=True)
+    approval = state.create_approval(
+        title="Round limit reached",
+        options=[
+            ApprovalOption("continue", "Continue run"),
+            ApprovalOption("stop", "End run"),
+        ],
+        context={"phase": "end_of_round", "trigger": "max_rounds"},
+    )
+
+    assert state.resolve_approval(approval.approval_id, action="stop")
+    assert state.get_approval(approval.approval_id).action == "stop"
+    durable = ControlBus(run_dir).read_status()
+    assert durable["status"] == "stopping"
+    assert durable["requested_action"] == "cancel"
+
+    (logs / "report.json").write_text(
+        json.dumps(
+            {
+                "status": "incomplete",
+                "completion_satisfied": False,
+                "abort_reason": "max_rounds_exhausted",
+                "rounds": [{"round_index": 1}],
+                "final_response": "Useful final answer",
+            }
+        ),
+        encoding="utf-8",
+    )
+    process.returncode = 1
+
+    status = supervisor.status(created["id"])
+
+    assert status["status"] == "cancelled"
+    assert status["report_status"] == "incomplete"
+    assert status["exit_code"] == 1
+    assert "failure_reason" not in status
+    assert not (logs / "crash_report.json").exists()
 
 
 @pytest.mark.parametrize("completion_satisfied", [False, None])

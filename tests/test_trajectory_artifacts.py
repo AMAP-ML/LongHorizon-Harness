@@ -93,3 +93,41 @@ def test_streaming_writer_persists_screenshot_before_role_finishes(tmp_path: Pat
     normalized = (round_dir / "executor_trajectory.jsonl").read_text(encoding="utf-8")
     assert "executor_step_0002_01.png" in normalized
     assert "data:image" not in normalized
+
+
+def test_streaming_writer_pairs_codex_tool_start_and_completion_once(tmp_path: Path) -> None:
+    round_dir = tmp_path / "round_001"
+    live_path = round_dir / "executor_raw_trajectory.jsonl"
+    writer = StreamingTrajectoryArtifactWriter.from_live_path(live_path)
+    assert writer is not None
+    started = {
+        "type": "item.started",
+        "item": {
+            "id": "command-1",
+            "type": "command_execution",
+            "command": "/bin/zsh -lc pwd",
+            "status": "in_progress",
+        },
+    }
+    completed = {
+        "type": "item.completed",
+        "item": {
+            "id": "command-1",
+            "type": "command_execution",
+            "command": "/bin/zsh -lc pwd",
+            "status": "completed",
+            "exit_code": 0,
+            "aggregated_output": "/tmp/workspace\n",
+        },
+    }
+
+    writer.consume_line(json.dumps(started))
+    writer.consume_line(json.dumps(completed))
+
+    records = [
+        json.loads(line)
+        for line in (round_dir / "executor_trajectory.jsonl").read_text(encoding="utf-8").splitlines()
+    ]
+    assert [record["kind"] for record in records] == ["tool_use", "tool_result"]
+    assert records[0]["id"] == records[1]["tool_use_id"] == "command-1"
+    assert records[1]["status"] == "completed"
