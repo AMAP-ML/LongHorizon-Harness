@@ -376,6 +376,8 @@ cli_auditor  → auditor  → [run].agent / [run].model
 
 Every field above also has a CLI flag (`--agent`, `--max-rounds`, `--gui-executor-model`, `--auditor-timeout`, and so on) that overrides it for a single run. Run `lh-harness run --help` for the full list.
 
+If a Manager, Executor, or Auditor reaches its local episode timeout, the run keeps the partial trajectory and recorded task state, then lets the next Manager round inspect the real workspace and recover. The timeout remains an agent execution timeout; it is not treated as proof of a provider network failure. Repeated timed-out rounds still trigger the Dashboard's human-review gate.
+
 #### Manage computer-use plugins
 
 Computer-use setup is intentionally separate from task execution: `doctor` only reports status, and `lh-harness run` never installs, removes, or changes plugins. All changes go through `lh-harness plugin`.

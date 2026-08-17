@@ -67,11 +67,13 @@ _CLASSIFIERS: tuple[tuple[str, re.Pattern[str], str], ...] = (
 
 
 def classify_agent_runtime_failure(result: EpisodeResult) -> AgentRuntimeFailure | None:
-    """Return a terminal failure only when the agent runtime itself failed.
+    """Return a failure only when the agent runtime itself failed.
 
     Tool commands run by an otherwise healthy Executor may fail as part of the
     task and must remain auditable task evidence.  We therefore require a
-    non-success episode status or a normalized hard runtime signal.
+    non-success episode status or a normalized hard runtime signal. Local
+    episode timeouts are classified separately so the manager can recover;
+    genuine provider failures remain terminal at the caller.
     """
 
     metadata = result.metadata if isinstance(result.metadata, dict) else {}
@@ -82,11 +84,17 @@ def classify_agent_runtime_failure(result: EpisodeResult) -> AgentRuntimeFailure
     combined = "\n".join(candidates)
     kind = "timeout" if result.status == "timeout" else "provider_error"
     label = "Agent 执行超时" if kind == "timeout" else "Agent provider 启动或运行失败"
-    for candidate_kind, pattern, candidate_label in _CLASSIFIERS:
-        if pattern.search(combined):
-            kind = candidate_kind
-            label = candidate_label
-            break
+    # A command episode that reaches its harness budget is a local timeout, not
+    # evidence that the provider connection failed. In particular, the
+    # adapter's own "Episode timed out after ..." message matches the generic
+    # network classifier below. Keep the explicit status authoritative so the
+    # manager can recover from the real workspace in a later round.
+    if result.status != "timeout":
+        for candidate_kind, pattern, candidate_label in _CLASSIFIERS:
+            if pattern.search(combined):
+                kind = candidate_kind
+                label = candidate_label
+                break
     message = next((item for item in candidates if _specific_message(item)), None)
     message = message or next(iter(candidates), "agent runtime failed")
     message = _clean(message, 1200)

@@ -375,14 +375,17 @@ async def _run_impl(
             break
         manager_failure = classify_agent_runtime_failure(manager_result)
         if manager_failure is not None:
+            recoverable_timeout = manager_failure.kind == "timeout"
             plan_text = (
-                "Next: blocked\n\nReason:\n" + manager_failure.user_message
+                ("Next: invalid\n\nReason:\n" if recoverable_timeout else "Next: blocked\n\nReason:\n")
+                + manager_failure.user_message
                 if config.prompt_language == "en"
-                else "下一步: 阻塞\n\n阻塞原因:\n" + manager_failure.user_message
+                else ("下一步: 无效\n\n原因:\n" if recoverable_timeout else "下一步: 阻塞\n\n阻塞原因:\n")
+                + manager_failure.user_message
             )
             record = ManagedRound(
                 round_index=round_index,
-                next_step=MANAGER_NEXT_BLOCKED,
+                next_step=MANAGER_NEXT_INVALID if recoverable_timeout else MANAGER_NEXT_BLOCKED,
                 plan_text=plan_text,
                 harness_feedback=manager_failure.user_message,
                 task_state=current_task_state,
@@ -390,13 +393,12 @@ async def _run_impl(
                 manager_status=_failed_episode_status(
                     manager_result, manager_failure.user_message
                 ),
+                auditor_status={"invalid_plan": True} if recoverable_timeout else {},
             )
             _write_local(round_dir / "manager_plan.txt", plan_text)
             _write_local(round_dir / "harness_feedback.txt", manager_failure.user_message)
             rounds.append(record)
             await _record_round(env, config, role_dir, events_path, record)
-            gate.abort_reason = manager_failure.abort_reason
-            gate.failure_reason = manager_failure.user_message
             _append_event(
                 events_path,
                 "agent_runtime_failed",
@@ -420,6 +422,12 @@ async def _run_impl(
                 duration_ms=manager_result.duration_ms,
                 error=manager_failure.user_message,
             )
+            if recoverable_timeout:
+                if await _human_gate(gate, "progress", round_index, current_task_state):
+                    break
+                continue
+            gate.abort_reason = manager_failure.abort_reason
+            gate.failure_reason = manager_failure.user_message
             break
         plan_text = extract_role_manager_plan_text(_visible_output(manager_result)).strip()
         if not plan_text:
@@ -648,11 +656,12 @@ async def _run_impl(
             break
         executor_failure = classify_agent_runtime_failure(executor_result)
         if executor_failure is not None:
+            recoverable_timeout = executor_failure.kind == "timeout"
             record = ManagedRound(
                 round_index=round_index,
                 next_step=next_step,
                 plan_text=plan_text,
-                executor_output="",
+                executor_output=executor_output if recoverable_timeout else "",
                 harness_feedback=executor_failure.user_message,
                 task_state=current_task_state,
                 task_contract=current_task_contract,
@@ -665,8 +674,6 @@ async def _run_impl(
             _write_local(round_dir / "harness_feedback.txt", executor_failure.user_message)
             rounds.append(record)
             await _record_round(env, config, role_dir, events_path, record)
-            gate.abort_reason = executor_failure.abort_reason
-            gate.failure_reason = executor_failure.user_message
             _append_event(
                 events_path,
                 "agent_runtime_failed",
@@ -690,6 +697,12 @@ async def _run_impl(
                 duration_ms=executor_result.duration_ms,
                 error=executor_failure.user_message,
             )
+            if recoverable_timeout:
+                if await _human_gate(gate, "progress", round_index, current_task_state):
+                    break
+                continue
+            gate.abort_reason = executor_failure.abort_reason
+            gate.failure_reason = executor_failure.user_message
             break
         await _write_remote_round_text(env, config, round_index, "executor_output.txt", executor_output)
         _append_event(
@@ -782,6 +795,7 @@ async def _run_impl(
             break
         auditor_failure = classify_agent_runtime_failure(auditor_result)
         if auditor_failure is not None:
+            recoverable_timeout = auditor_failure.kind == "timeout"
             record = ManagedRound(
                 round_index=round_index,
                 next_step=next_step,
@@ -800,8 +814,6 @@ async def _run_impl(
             _write_local(round_dir / "harness_feedback.txt", auditor_failure.user_message)
             rounds.append(record)
             await _record_round(env, config, role_dir, events_path, record)
-            gate.abort_reason = auditor_failure.abort_reason
-            gate.failure_reason = auditor_failure.user_message
             _append_event(
                 events_path,
                 "agent_runtime_failed",
@@ -825,6 +837,12 @@ async def _run_impl(
                 duration_ms=auditor_result.duration_ms,
                 error=auditor_failure.user_message,
             )
+            if recoverable_timeout:
+                if await _human_gate(gate, "progress", round_index, current_task_state):
+                    break
+                continue
+            gate.abort_reason = auditor_failure.abort_reason
+            gate.failure_reason = auditor_failure.user_message
             break
         auditor_report, auditor_status = await _auditor_report_with_format_repair(
             env=env,
@@ -1690,7 +1708,7 @@ def _episode_status(result: EpisodeResult) -> dict[str, Any]:
 
 def _failed_episode_status(result: EpisodeResult, user_message: str) -> dict[str, Any]:
     status = _episode_status(result)
-    status["status"] = "error"
+    status["status"] = "timeout" if result.status == "timeout" else "error"
     status["error"] = user_message
     return status
 

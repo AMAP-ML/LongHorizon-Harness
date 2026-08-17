@@ -377,6 +377,8 @@ cli_auditor  → auditor  → [run].agent / [run].model
 
 上述每个字段都有对应的 CLI 参数（`--agent`、`--max-rounds`、`--gui-executor-model`、`--auditor-timeout` 等）可以对单次运行覆盖。完整列表见 `lh-harness run --help`。
 
+当 Manager、Executor 或 Auditor 达到本地 episode 超时时限时，Harness 会保留已有轨迹和任务状态，并让下一轮 Manager 检查真实 workspace 后继续恢复。本地 episode 超时会显示为“Agent 执行超时”，不会再被误判为 provider 网络故障；连续超时仍会触发 Dashboard 的人工复核门禁。
+
 #### 管理 computer-use 插件
 
 插件的安装与任务执行相互独立：`doctor` 只检查状态，`lh-harness run` 不会安装、卸载或修改任何插件。所有变更都通过 `lh-harness plugin` 完成。

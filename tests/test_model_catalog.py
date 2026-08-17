@@ -121,6 +121,17 @@ def test_invalid_model_failure_unwraps_nested_provider_json() -> None:
     assert "{\"type\"" not in failure.user_message
 
 
+def test_runtime_failure_classifier_keeps_local_episode_timeout_authoritative() -> None:
+    failure = classify_agent_runtime_failure(
+        EpisodeResult(status="timeout", error="Episode timed out after 1800s.")
+    )
+
+    assert failure is not None
+    assert failure.kind == "timeout"
+    assert failure.abort_reason == "provider_timeout"
+    assert failure.user_message == "Agent 执行超时：Episode timed out after 1800s."
+
+
 def test_chinese_invalid_api_key_is_classified_as_authentication() -> None:
     message = "API Error: 400 无效的api key"
     result = EpisodeResult(
