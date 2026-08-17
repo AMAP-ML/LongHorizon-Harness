@@ -1124,22 +1124,23 @@ def _open_nofollow(path: Path, *, directory: bool = False, strict_parent: bool =
                 os.O_RDONLY | directory_flag | nofollow | cloexec,
                 dir_fd=current_fd,
             )
-            os.close(current_fd)
-            current_fd = next_fd
+            # Transfer ownership before closing the previous directory.  If
+            # close itself raises, the final cleanup must own ``next_fd`` and
+            # must never retry the same numeric descriptor after another
+            # thread may have reused it.
+            previous_fd, current_fd = current_fd, next_fd
+            os.close(previous_fd)
         final_component = components[-1]
         if final_component in {"", ".", ".."}:
             raise OSError("unsafe path component")
-        try:
-            result_fd = os.open(final_component, flags, dir_fd=current_fd)
-        finally:
-            os.close(current_fd)
-        return result_fd
-    except BaseException:
-        try:
-            os.close(current_fd)
-        except OSError:
-            pass
-        raise
+
+        return os.open(final_component, flags, dir_fd=current_fd)
+    finally:
+        # This is the sole cleanup path for the owned parent descriptor.  The
+        # old nested finally/except pair closed it twice when the final open
+        # failed, allowing a concurrent subprocess pipe that reused the number
+        # to be closed out from under Popen.
+        os.close(current_fd)
 
 
 def _read_file_bounded(
