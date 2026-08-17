@@ -613,7 +613,7 @@ def test_attached_api_rejects_foreign_run_paths(tmp_path: Path) -> None:
     client = TestClient(create_app(state=state, runs_root=root, run_id="run-1", supervisor=supervisor))
 
     assert client.get("/api/runs/run-2/snapshot").status_code == 404
-    assert client.post("/api/runs/run-2/stop").status_code == 404
+    assert client.post("/api/runs/run-2/stop", json={}).status_code == 404
 
 
 def test_loopback_host_header_rejects_dns_rebind(tmp_path: Path) -> None:
@@ -647,6 +647,10 @@ def test_control_posts_require_json_and_bound_body(tmp_path: Path) -> None:
         data={"instructions": "keep going"},
     ).status_code == 415
     assert client.post(
+        "/api/runs/run-1/stop",
+        content=b"",
+    ).status_code == 415
+    assert client.post(
         "/api/runs/run-1/instructions",
         content=b'{"instructions":"keep going"}',
         headers={"Content-Type": "application/json; charset=utf-8"},
@@ -660,6 +664,78 @@ def test_control_posts_require_json_and_bound_body(tmp_path: Path) -> None:
         },
     )
     assert oversized.status_code == 413
+
+
+async def _streaming_control_post(
+    app,
+    chunks: list[bytes],
+) -> tuple[int, int, int]:
+    pending = list(chunks)
+    receive_calls = 0
+    sent: list[dict] = []
+
+    async def receive() -> dict:
+        nonlocal receive_calls
+        receive_calls += 1
+        body = pending.pop(0)
+        return {"type": "http.request", "body": body, "more_body": bool(pending)}
+
+    async def send(message: dict) -> None:
+        sent.append(message)
+
+    scope = {
+        "type": "http",
+        "asgi": {"version": "3.0"},
+        "http_version": "1.1",
+        "method": "POST",
+        "scheme": "http",
+        "path": "/api/models/refresh",
+        "raw_path": b"/api/models/refresh",
+        "query_string": b"",
+        "headers": [(b"host", b"127.0.0.1"), (b"content-type", b"application/json")],
+        "client": ("127.0.0.1", 50000),
+        "server": ("127.0.0.1", 8799),
+        "root_path": "",
+    }
+    await app(scope, receive, send)
+    status = next(message["status"] for message in sent if message["type"] == "http.response.start")
+    return status, receive_calls, len(pending)
+
+
+@pytest.mark.asyncio
+async def test_control_body_limit_stops_chunked_stream_early(tmp_path: Path) -> None:
+    root, state = _run(tmp_path)
+    app = create_app(state=state, runs_root=root, run_id="run-1")
+
+    status, receive_calls, remaining = await _streaming_control_post(
+        app,
+        [b"x" * (256 * 1024) for _ in range(10)],
+    )
+
+    assert status == 413
+    assert receive_calls == 5
+    assert remaining == 5
+
+
+@pytest.mark.asyncio
+async def test_control_auth_rejects_before_reading_body(tmp_path: Path) -> None:
+    root, state = _run(tmp_path)
+    app = create_app(
+        state=state,
+        runs_root=root,
+        run_id="run-1",
+        auth_token="secret",
+        bind_host="0.0.0.0",
+    )
+
+    status, receive_calls, remaining = await _streaming_control_post(
+        app,
+        [b"x" * (256 * 1024) for _ in range(10)],
+    )
+
+    assert status == 401
+    assert receive_calls == 0
+    assert remaining == 10
 
 
 def test_bearer_and_non_loopback_host_behavior(tmp_path: Path) -> None:

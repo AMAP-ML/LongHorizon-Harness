@@ -136,6 +136,25 @@ def _is_json_content_type(value: str | None) -> bool:
     return media == "application/json"
 
 
+async def _cache_bounded_request_body(request: Request, limit: int) -> bool:
+    """Buffer at most ``limit`` bytes and replay them to the route handler.
+
+    ``Request.body()`` consumes the complete ASGI stream before its caller can
+    inspect the size.  Reading the documented streaming interface lets the
+    control plane reject an undeclared/chunked oversized body as soon as it
+    crosses the limit.  Starlette's middleware request wrapper replays the
+    cached body to ``call_next``.
+    """
+
+    body = bytearray()
+    async for chunk in request.stream():
+        if len(body) + len(chunk) > limit:
+            return False
+        body.extend(chunk)
+    request._body = bytes(body)
+    return True
+
+
 def _configured_token(explicit: str | None) -> str | None:
     value = explicit if explicit is not None else os.environ.get("LH_HARNESS_WEB_TOKEN")
     value = str(value or "").strip()
@@ -620,25 +639,6 @@ def create_app(
             request.headers.get("host", ""), bind_host
         ):
             return JSONResponse({"detail": "host is not allowed"}, status_code=403)
-        if request.method in {"POST", "PUT", "PATCH"} and request.url.path.startswith("/api/"):
-            content_type = request.headers.get("content-type")
-            content_length = request.headers.get("content-length")
-            if content_length is not None:
-                try:
-                    declared = int(content_length)
-                except ValueError:
-                    return JSONResponse({"detail": "invalid content-length"}, status_code=400)
-                if declared > _MAX_CONTROL_BODY_BYTES:
-                    return JSONResponse({"detail": "request body is too large"}, status_code=413)
-            body = await request.body()
-            if len(body) > _MAX_CONTROL_BODY_BYTES:
-                return JSONResponse({"detail": "request body is too large"}, status_code=413)
-            if body or content_type:
-                if not _is_json_content_type(content_type):
-                    return JSONResponse(
-                        {"detail": "request must be application/json"},
-                        status_code=415,
-                    )
         authenticated = _bearer_matches(request.headers.get("authorization"), token)
         if token and request.url.path.startswith("/api/") and not authenticated:
             return JSONResponse(
@@ -646,6 +646,25 @@ def create_app(
                 status_code=401,
                 headers={"WWW-Authenticate": "Bearer"},
             )
+        if request.method in {"POST", "PUT", "PATCH"} and request.url.path.startswith("/api/"):
+            content_type = request.headers.get("content-type")
+            if not _is_json_content_type(content_type):
+                return JSONResponse(
+                    {"detail": "request must be application/json"},
+                    status_code=415,
+                )
+            content_length = request.headers.get("content-length")
+            if content_length is not None:
+                try:
+                    declared = int(content_length)
+                except ValueError:
+                    return JSONResponse({"detail": "invalid content-length"}, status_code=400)
+                if declared < 0:
+                    return JSONResponse({"detail": "invalid content-length"}, status_code=400)
+                if declared > _MAX_CONTROL_BODY_BYTES:
+                    return JSONResponse({"detail": "request body is too large"}, status_code=413)
+            if not await _cache_bounded_request_body(request, _MAX_CONTROL_BODY_BYTES):
+                return JSONResponse({"detail": "request body is too large"}, status_code=413)
         response = await call_next(request)
         response.headers.setdefault("X-Content-Type-Options", "nosniff")
         response.headers.setdefault("X-Frame-Options", "SAMEORIGIN")

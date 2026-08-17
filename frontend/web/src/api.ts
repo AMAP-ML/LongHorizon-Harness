@@ -238,23 +238,31 @@ export async function createRun(input: {
 }
 
 export async function refreshModels(): Promise<WebMeta> {
-  const response = await fetch('/api/models/refresh', { method: 'POST', headers: authHeaders() });
+  const response = await fetch('/api/models/refresh', {
+    method: 'POST', headers: { 'Content-Type': 'application/json', ...authHeaders() }, body: '{}',
+  });
   if (!response.ok) throw await responseError(response);
   return response.json() as Promise<WebMeta>;
 }
 
 export async function stopRun(runId: string, requestKey = idempotencyKey('stop')): Promise<void> {
-  const response = await fetch(`/api/runs/${encodeURIComponent(runId)}/stop`, { method: 'POST', headers: { ...authHeaders(), 'Idempotency-Key': requestKey } });
+  const response = await fetch(`/api/runs/${encodeURIComponent(runId)}/stop`, {
+    method: 'POST', headers: { 'Content-Type': 'application/json', ...authHeaders(), 'Idempotency-Key': requestKey }, body: '{}',
+  });
   if (!response.ok) throw await responseError(response);
 }
 
 export async function abortRun(runId: string, requestKey = idempotencyKey('abort')): Promise<void> {
-  const response = await fetch(`/api/runs/${encodeURIComponent(runId)}/abort`, { method: 'POST', headers: { ...authHeaders(), 'Idempotency-Key': requestKey } });
+  const response = await fetch(`/api/runs/${encodeURIComponent(runId)}/abort`, {
+    method: 'POST', headers: { 'Content-Type': 'application/json', ...authHeaders(), 'Idempotency-Key': requestKey }, body: '{}',
+  });
   if (!response.ok) throw await responseError(response);
 }
 
 export async function resumeRun(runId: string, requestKey = idempotencyKey('resume')): Promise<{ id: string }> {
-  const response = await fetch(`/api/runs/${encodeURIComponent(runId)}/resume`, { method: 'POST', headers: { ...authHeaders(), 'Idempotency-Key': requestKey } });
+  const response = await fetch(`/api/runs/${encodeURIComponent(runId)}/resume`, {
+    method: 'POST', headers: { 'Content-Type': 'application/json', ...authHeaders(), 'Idempotency-Key': requestKey }, body: '{}',
+  });
   if (!response.ok) throw await responseError(response);
   const data = await response.json() as { run: { id: string } };
   return data.run;

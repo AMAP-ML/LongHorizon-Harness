@@ -47,7 +47,7 @@ def test_web_supervisor_exposes_create_and_lifecycle_routes(monkeypatch, tmp_pat
     assert created.status_code == 200
     run_id = created.json()["run"]["id"]
     assert client.get(f"/api/runs/{run_id}/status").json()["managed"] is True
-    stopped = client.post(f"/api/runs/{run_id}/stop")
+    stopped = client.post(f"/api/runs/{run_id}/stop", json={})
     assert stopped.status_code == 200
     assert stopped.json()["signal"] == "SIGTERM"
     process.returncode = -15
@@ -148,8 +148,16 @@ def test_web_create_and_resume_forward_idempotency_key(monkeypatch, tmp_path: Pa
     process.returncode = 1
     # A report-less fake exit is reconciled as failed and can be retried.
     assert client.get(f"/api/runs/{run_id}/status").status_code == 200
-    resumed = client.post(f"/api/runs/{run_id}/resume", headers={"Idempotency-Key": "api-resume-1"})
-    resumed_again = client.post(f"/api/runs/{run_id}/resume", headers={"Idempotency-Key": "api-resume-1"})
+    resumed = client.post(
+        f"/api/runs/{run_id}/resume",
+        headers={"Idempotency-Key": "api-resume-1"},
+        json={},
+    )
+    resumed_again = client.post(
+        f"/api/runs/{run_id}/resume",
+        headers={"Idempotency-Key": "api-resume-1"},
+        json={},
+    )
     assert resumed.status_code == resumed_again.status_code == 200
     assert resumed.json()["run"]["id"] == resumed_again.json()["run"]["id"]
     assert resumed_again.json()["run"]["idempotent"] is True
