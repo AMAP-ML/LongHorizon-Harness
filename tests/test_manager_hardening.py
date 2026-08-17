@@ -212,3 +212,56 @@ async def test_provider_failure_stops_without_round_limit_approval(tmp_path: Pat
     assert failure["status"] == "failed"
     assert failure["episode_status"]["status"] == "error"
     assert failure["episode_status"]["error"] == f"模型不可用：{message}"
+
+
+@pytest.mark.asyncio
+async def test_late_crash_report_preserves_completed_rounds(tmp_path: Path) -> None:
+    outputs = iter(
+        (
+            "Next: cli\n\nCurrent Task State:\nwork pending",
+            "executor finished the requested work",
+            "Status: complete\nIntegrity: clean\nContract audit: aligned",
+            "Next: done\n\nCurrent Task State:\nwork finished",
+            "The requested work is complete.",
+        )
+    )
+
+    class SequencedAgent:
+        async def run_episode(self, _prompt, _env, _budget, live_trajectory_path=None):
+            return EpisodeResult(status="done", actions_log=next(outputs))
+
+    async def crashing_human_hook(context: dict[str, object]) -> dict[str, object]:
+        if context.get("outcome") == "completed":
+            raise RuntimeError("dashboard gate crashed after completion")
+        return {"action": "continue"}
+
+    log_dir = tmp_path / "logs"
+    config = HarnessConfig(
+        max_total_episodes=2,
+        manager_budget=EpisodeBudget(max_duration_seconds=10),
+        workspace_path=str(tmp_path / "workspace"),
+        harness_dir=str(tmp_path / "harness"),
+        log_dir=str(log_dir),
+    )
+
+    result = await run(
+        task="finish two managed rounds",
+        env=LocalEnvironment(str(tmp_path / "tmp")),
+        config=config,
+        agent=SequencedAgent(),
+        human_hook=crashing_human_hook,
+    )
+
+    assert result["status"] == "failed"
+    assert result["abort_reason"] == "worker_exception"
+    assert result["exception_type"] == "RuntimeError"
+    assert result["rounds_run"] == 2
+    assert [item["round_index"] for item in result["rounds"]] == [1, 2]
+    assert result["completion_satisfied"] is True
+    assert result["current_task_state"].endswith("work finished")
+    assert result["latest_auditor_report"].startswith("Status: complete")
+    assert result["final_response"] == "The requested work is complete."
+    assert result["elapsed_seconds"] >= 0
+
+    persisted = json.loads((log_dir / "report.json").read_text(encoding="utf-8"))
+    assert persisted == result
