@@ -114,6 +114,15 @@ def _invalid_plan_feedback(language: str) -> str:
     )
 
 
+@dataclass
+class _RunProgress:
+    """Mutable state retained by the worker boundary if the loop crashes."""
+
+    rounds: list[ManagedRound] = field(default_factory=list)
+    gate: _GateContext | None = None
+    started_at: float | None = None
+
+
 async def run(*args: Any, **kwargs: Any) -> dict[str, Any]:
     """Run the management loop and always leave a durable terminal record.
 
@@ -126,8 +135,9 @@ async def run(*args: Any, **kwargs: Any) -> dict[str, Any]:
 
     task = str(kwargs.get("task") or "")
     config = kwargs.get("config")
+    run_progress = _RunProgress()
     try:
-        return await _run_impl(*args, **kwargs)
+        return await _run_impl(*args, _run_progress=run_progress, **kwargs)
     except asyncio.CancelledError as exc:
         return _write_terminal_failure(
             config,
@@ -136,6 +146,7 @@ async def run(*args: Any, **kwargs: Any) -> dict[str, Any]:
             reason="worker task was cancelled",
             exc=exc,
             abort_reason="worker_cancelled",
+            progress=run_progress,
         )
     except BaseException as exc:  # worker boundary: persist even non-Exception failures
         # KeyboardInterrupt/SystemExit are intentionally converted to a
@@ -148,6 +159,7 @@ async def run(*args: Any, **kwargs: Any) -> dict[str, Any]:
             reason=f"management loop crashed: {exc}",
             exc=exc,
             abort_reason="worker_exception",
+            progress=run_progress,
         )
 
 
@@ -167,6 +179,7 @@ async def _run_impl(
     final_response_agent: AgentAdapter | None = None,
     human_hook: Callable[[dict[str, Any]], Awaitable[dict[str, Any]]] | None = None,
     progress: Callable[[str, dict[str, Any]], None] | None = None,
+    _run_progress: _RunProgress | None = None,
 ) -> dict[str, Any]:
     """Run the generic LongHorizon-Harness four-role management loop.
 
@@ -281,6 +294,12 @@ async def _run_impl(
         response_agent=final_response_agent or manager_agent,
         emit=emit,
     )
+    if _run_progress is not None:
+        # The list and gate are mutated in place, so the outer crash boundary
+        # always sees the latest completed rounds without checkpoint rewrites.
+        _run_progress.rounds = rounds
+        _run_progress.gate = gate
+        _run_progress.started_at = started
 
     while round_index < gate.round_budget:
         round_index += 1
@@ -1508,6 +1527,7 @@ def _write_terminal_failure(
     reason: str,
     exc: BaseException,
     abort_reason: str,
+    progress: _RunProgress | None = None,
 ) -> dict[str, Any]:
     """Best-effort local crash report and terminal event for the worker.
 
@@ -1547,11 +1567,45 @@ def _write_terminal_failure(
         "rounds_run": 0,
         "max_rounds": int(getattr(config, "max_total_episodes", 0) or 0),
         "abort_reason": abort_reason,
+        "failure_reason": reason,
         "error": reason,
+        "last_plan": "",
+        "current_task_state": "",
+        "current_task_contract": "",
+        "latest_auditor_report": "",
+        "final_response": "",
+        "rounds": [],
+        "elapsed_seconds": 0.0,
         "exception_type": type(exc).__name__,
         "traceback_tail": trace[-12000:],
         "supervisor_generated": False,
     }
+    if progress is not None:
+        rounds = list(progress.rounds)
+        latest = rounds[-1] if rounds else None
+        gate = progress.gate
+        report.update(
+            {
+                "completion_satisfied": bool(gate and gate.completion_satisfied),
+                "rounds_run": len(rounds),
+                "max_rounds": (
+                    gate.round_budget
+                    if gate is not None
+                    else int(getattr(config, "max_total_episodes", 0) or 0)
+                ),
+                "last_plan": latest.plan_text if latest is not None else "",
+                "current_task_state": latest.task_state if latest is not None else "",
+                "current_task_contract": latest.task_contract if latest is not None else "",
+                "latest_auditor_report": _latest_auditor_report_text(rounds),
+                "final_response": gate.final_response if gate is not None else "",
+                "rounds": [asdict(item) for item in rounds],
+                "elapsed_seconds": (
+                    round(max(0.0, time.monotonic() - progress.started_at), 3)
+                    if progress.started_at is not None
+                    else 0.0
+                ),
+            }
+        )
     encoded = json.dumps(report, ensure_ascii=False, indent=2) + "\n"
     for target in (report_path, role_report_path):
         try:
