@@ -43,6 +43,7 @@ _DASHBOARD_MIME_TYPES = {
 }
 
 _MAX_ARTIFACT_BYTES = 8 * 1024 * 1024
+_MAX_CONTROL_BODY_BYTES = 1 * 1024 * 1024
 
 # Agent-produced artifacts are untrusted.  Only a small, explicit raster
 # allow-list is rendered in the dashboard origin; everything else is a
@@ -102,6 +103,37 @@ def _is_loopback_host(host: str) -> bool:
         return ipaddress.ip_address(value).is_loopback
     except ValueError:
         return False
+
+
+def _request_hostname(host_header: str) -> str:
+    """Return the hostname from a Host header, ignoring an optional port."""
+
+    value = str(host_header or "").strip()
+    if not value:
+        return ""
+    if value.startswith("["):
+        end = value.find("]")
+        if end == -1:
+            return ""
+        return value[1:end]
+    if value.count(":") == 1:
+        return value.rsplit(":", 1)[0]
+    return value
+
+
+def _host_header_allowed(host_header: str, bind_host: str) -> bool:
+    hostname = _request_hostname(host_header)
+    if not hostname:
+        return False
+    if _is_loopback_host(hostname):
+        return True
+    configured = str(bind_host or "").strip().lower().strip("[]")
+    return bool(configured) and hostname.lower() == configured
+
+
+def _is_json_content_type(value: str | None) -> bool:
+    media = (value or "").split(";", 1)[0].strip().lower()
+    return media == "application/json"
 
 
 def _configured_token(explicit: str | None) -> str | None:
@@ -550,6 +582,7 @@ def create_app(
     supervisor: RunSupervisor | None = None,
     auth_token: str | None = None,
     allowed_origins: set[str] | list[str] | tuple[str, ...] | None = None,
+    bind_host: str = "127.0.0.1",
 ) -> FastAPI:
     """Create an API app over a live shared state or a historical runs root."""
 
@@ -570,6 +603,7 @@ def create_app(
     app.state.registry = registry
     app.state.auth_token = token
     app.state.allowed_origins = origins
+    app.state.bind_host = bind_host
     if supervisor is not None:
         async def _shutdown_owned_workers() -> None:
             await asyncio.to_thread(supervisor.shutdown)
@@ -582,6 +616,29 @@ def create_app(
         # shell, but every API route (including legacy compatibility routes and
         # artifact reads) shares one authentication boundary when a token is
         # configured.
+        if _is_loopback_host(bind_host) and not _host_header_allowed(
+            request.headers.get("host", ""), bind_host
+        ):
+            return JSONResponse({"detail": "host is not allowed"}, status_code=403)
+        if request.method in {"POST", "PUT", "PATCH"} and request.url.path.startswith("/api/"):
+            content_type = request.headers.get("content-type")
+            content_length = request.headers.get("content-length")
+            if content_length is not None:
+                try:
+                    declared = int(content_length)
+                except ValueError:
+                    return JSONResponse({"detail": "invalid content-length"}, status_code=400)
+                if declared > _MAX_CONTROL_BODY_BYTES:
+                    return JSONResponse({"detail": "request body is too large"}, status_code=413)
+            body = await request.body()
+            if len(body) > _MAX_CONTROL_BODY_BYTES:
+                return JSONResponse({"detail": "request body is too large"}, status_code=413)
+            if body or content_type:
+                if not _is_json_content_type(content_type):
+                    return JSONResponse(
+                        {"detail": "request must be application/json"},
+                        status_code=415,
+                    )
         authenticated = _bearer_matches(request.headers.get("authorization"), token)
         if token and request.url.path.startswith("/api/") and not authenticated:
             return JSONResponse(
@@ -731,6 +788,9 @@ def create_app(
             return
         origin = websocket.headers.get("origin")
         host = websocket.headers.get("host", "")
+        if _is_loopback_host(bind_host) and not _host_header_allowed(host, bind_host):
+            await websocket.close(code=4403, reason="host is not allowed")
+            return
         authenticated, selected_subprotocol = _websocket_auth(websocket, token)
         if not authenticated:
             await websocket.close(code=4401, reason="invalid or missing bearer token")
@@ -1081,6 +1141,7 @@ def run_web_server(
         supervisor=supervisor,
         auth_token=token,
         allowed_origins=allowed_origins,
+        bind_host=host,
     )
     uvicorn.run(app, host=host, port=port, log_level="info")
     return 0
@@ -1167,6 +1228,7 @@ def start_web_server(
         supervisor=supervisor,
         auth_token=token,
         allowed_origins=allowed_origins,
+        bind_host=host,
     )
     config = uvicorn.Config(app, host=host, port=port, log_level="warning", access_log=False)
     server = uvicorn.Server(config)

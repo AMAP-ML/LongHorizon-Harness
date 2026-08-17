@@ -15,7 +15,7 @@ from fastapi.testclient import TestClient
 import lh_harness.dashboard.state as dashboard_state
 from lh_harness.dashboard.state import DashboardState
 from lh_harness.webapi.events import EventTailer
-from lh_harness.webapi.server import create_app
+from lh_harness.webapi.server import _MAX_CONTROL_BODY_BYTES, create_app
 
 
 def _run(tmp_path: Path) -> tuple[Path, DashboardState]:
@@ -614,3 +614,79 @@ def test_attached_api_rejects_foreign_run_paths(tmp_path: Path) -> None:
 
     assert client.get("/api/runs/run-2/snapshot").status_code == 404
     assert client.post("/api/runs/run-2/stop").status_code == 404
+
+
+def test_loopback_host_header_rejects_dns_rebind(tmp_path: Path) -> None:
+    root, state = _run(tmp_path)
+    client = TestClient(create_app(state=state, runs_root=root, run_id="run-1"))
+
+    assert client.get("/api/meta").status_code == 200
+    assert client.get("/api/meta", headers={"Host": "127.0.0.1:8799"}).status_code == 200
+    assert client.get("/api/meta", headers={"Host": "localhost"}).status_code == 200
+    assert client.get("/api/meta", headers={"Host": "[::1]:8799"}).status_code == 200
+    assert client.get("/api/meta", headers={"Host": "evil.example"}).status_code == 403
+    assert client.get("/api/meta", headers={"Host": "evil.example:8799"}).status_code == 403
+    assert client.post(
+        "/api/runs/run-1/instructions",
+        headers={"Host": "evil.example"},
+        json={"instructions": "injected"},
+    ).status_code == 403
+
+
+def test_control_posts_require_json_and_bound_body(tmp_path: Path) -> None:
+    root, state = _run(tmp_path)
+    client = TestClient(create_app(state=state, runs_root=root, run_id="run-1"))
+
+    assert client.post(
+        "/api/runs/run-1/instructions",
+        content=b'{"instructions":"keep going"}',
+        headers={"Content-Type": "text/plain"},
+    ).status_code == 415
+    assert client.post(
+        "/api/runs/run-1/instructions",
+        data={"instructions": "keep going"},
+    ).status_code == 415
+    assert client.post(
+        "/api/runs/run-1/instructions",
+        content=b'{"instructions":"keep going"}',
+        headers={"Content-Type": "application/json; charset=utf-8"},
+    ).status_code == 200
+    oversized = client.post(
+        "/api/runs/run-1/instructions",
+        content=b"x" * (_MAX_CONTROL_BODY_BYTES + 1),
+        headers={
+            "Content-Type": "application/json",
+            "Content-Length": str(_MAX_CONTROL_BODY_BYTES + 1),
+        },
+    )
+    assert oversized.status_code == 413
+
+
+def test_bearer_and_non_loopback_host_behavior(tmp_path: Path) -> None:
+    root, state = _run(tmp_path)
+    loopback = TestClient(
+        create_app(state=state, runs_root=root, run_id="run-1", auth_token="secret")
+    )
+    assert loopback.get("/api/meta").status_code == 401
+    assert loopback.get(
+        "/api/meta", headers={"Authorization": "Bearer secret"}
+    ).status_code == 200
+    assert loopback.get(
+        "/api/meta",
+        headers={"Authorization": "Bearer secret", "Host": "evil.example"},
+    ).status_code == 403
+
+    exposed = TestClient(
+        create_app(
+            state=state,
+            runs_root=root,
+            run_id="run-1",
+            auth_token="secret",
+            bind_host="0.0.0.0",
+        )
+    )
+    assert exposed.get("/api/meta", headers={"Host": "evil.example"}).status_code == 401
+    assert exposed.get(
+        "/api/meta",
+        headers={"Authorization": "Bearer secret", "Host": "lan.example:8799"},
+    ).status_code == 200
