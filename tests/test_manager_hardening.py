@@ -215,6 +215,117 @@ async def test_provider_failure_stops_without_round_limit_approval(tmp_path: Pat
 
 
 @pytest.mark.asyncio
+async def test_episode_timeout_is_preserved_and_recovers_in_the_next_round(tmp_path: Path) -> None:
+    outputs = iter(
+        (
+            EpisodeResult(status="timeout", error="Episode timed out after 10s."),
+            EpisodeResult(
+                status="done",
+                actions_log="Next: blocked\n\nReason:\nNeed operator input after recovery check.",
+            ),
+            EpisodeResult(status="done", actions_log="The run stopped after preserving its state."),
+        )
+    )
+
+    class SequencedAgent:
+        async def run_episode(self, _prompt, _env, _budget, live_trajectory_path=None):
+            return next(outputs)
+
+    config = HarnessConfig(
+        max_total_episodes=2,
+        manager_budget=EpisodeBudget(max_duration_seconds=10),
+        workspace_path=str(tmp_path / "workspace"),
+        harness_dir=str(tmp_path / "harness"),
+        log_dir=str(tmp_path / "logs"),
+    )
+    result = await run(
+        task="recover after a local episode timeout",
+        env=LocalEnvironment(str(tmp_path / "tmp")),
+        config=config,
+        agent=SequencedAgent(),
+    )
+
+    assert result["status"] == "blocked"
+    assert result["rounds_run"] == 2
+    assert result["failure_reason"] == ""
+    assert result["rounds"][0]["manager_status"]["status"] == "timeout"
+    assert result["rounds"][0]["harness_feedback"] == (
+        "Agent 执行超时：Episode timed out after 10s."
+    )
+
+
+@pytest.mark.asyncio
+async def test_executor_timeout_preserves_partial_output_for_recovery(tmp_path: Path) -> None:
+    outputs = iter(
+        (
+            EpisodeResult(status="done", actions_log="Next: cli\n\nCurrent Task State:\nwork pending"),
+            EpisodeResult(
+                status="timeout",
+                actions_log="executor changed part of the workspace",
+                error="Episode timed out after 10s.",
+            ),
+            EpisodeResult(status="done", actions_log="Next: blocked\n\nReason:\nrecovery checked"),
+            EpisodeResult(status="done", actions_log="Partial work was preserved."),
+        )
+    )
+
+    class SequencedAgent:
+        async def run_episode(self, _prompt, _env, _budget, live_trajectory_path=None):
+            return next(outputs)
+
+    result = await run(
+        task="recover an executor timeout",
+        env=LocalEnvironment(str(tmp_path / "tmp")),
+        config=HarnessConfig(
+            max_total_episodes=2,
+            workspace_path=str(tmp_path / "workspace"),
+            harness_dir=str(tmp_path / "harness"),
+            log_dir=str(tmp_path / "logs"),
+        ),
+        agent=SequencedAgent(),
+    )
+
+    first_round = result["rounds"][0]
+    assert result["rounds_run"] == 2
+    assert first_round["executor_status"]["status"] == "timeout"
+    assert first_round["executor_output"] == "executor changed part of the workspace"
+
+
+@pytest.mark.asyncio
+async def test_auditor_timeout_keeps_executor_result_and_recovers(tmp_path: Path) -> None:
+    outputs = iter(
+        (
+            EpisodeResult(status="done", actions_log="Next: cli\n\nCurrent Task State:\nwork pending"),
+            EpisodeResult(status="done", actions_log="executor completed the requested change"),
+            EpisodeResult(status="timeout", error="Episode timed out after 10s."),
+            EpisodeResult(status="done", actions_log="Next: blocked\n\nReason:\nrecovery checked"),
+            EpisodeResult(status="done", actions_log="The executor result was preserved."),
+        )
+    )
+
+    class SequencedAgent:
+        async def run_episode(self, _prompt, _env, _budget, live_trajectory_path=None):
+            return next(outputs)
+
+    result = await run(
+        task="recover an auditor timeout",
+        env=LocalEnvironment(str(tmp_path / "tmp")),
+        config=HarnessConfig(
+            max_total_episodes=2,
+            workspace_path=str(tmp_path / "workspace"),
+            harness_dir=str(tmp_path / "harness"),
+            log_dir=str(tmp_path / "logs"),
+        ),
+        agent=SequencedAgent(),
+    )
+
+    first_round = result["rounds"][0]
+    assert result["rounds_run"] == 2
+    assert first_round["auditor_status"]["status"] == "timeout"
+    assert first_round["executor_output"] == "executor completed the requested change"
+
+
+@pytest.mark.asyncio
 async def test_late_crash_report_preserves_completed_rounds(tmp_path: Path) -> None:
     outputs = iter(
         (
