@@ -23,12 +23,14 @@ from typing import Any
 from .types import (
     DEFAULT_CLAUDE_MODEL,
     DEFAULT_CODEX_MODEL,
+    DEFAULT_COPILOT_MODEL,
     DEFAULT_DEEPSEEK_HARNESS_MODEL,
     DEFAULT_OPENCODE_MODEL,
 )
 from .utils.agent_cli import (
     is_agent_binary_available,
     resolve_codex_binary,
+    resolve_copilot_binary,
     resolve_dsh_binary,
     resolve_opencode_binary,
 )
@@ -50,6 +52,7 @@ def discover_model_catalog(
     codex_binary: str | None | object = _UNSET,
     dsh_binary: str | None | object = _UNSET,
     opencode_binary: str | None | object = _UNSET,
+    copilot_binary: str | None | object = _UNSET,
 ) -> dict[str, Any]:
     """Return agent/model choices plus honest discovery provenance.
 
@@ -73,12 +76,18 @@ def discover_model_catalog(
     )
     if resolved_opencode_binary is not None and not isinstance(resolved_opencode_binary, str):
         raise TypeError("opencode_binary must be a string or None")
+    resolved_copilot_binary = (
+        resolve_copilot_binary() if copilot_binary is _UNSET else copilot_binary
+    )
+    if resolved_copilot_binary is not None and not isinstance(resolved_copilot_binary, str):
+        raise TypeError("copilot_binary must be a string or None")
     claude_binary = shutil.which("claude")
     cache_key = (
         resolved_codex_binary or "",
         claude_binary or "",
         resolved_dsh_binary or "",
         resolved_opencode_binary or "",
+        resolved_copilot_binary or "",
     )
     with _cache_lock:
         if (
@@ -97,6 +106,9 @@ def discover_model_catalog(
         deepseek_models, deepseek_discovery = _discover_deepseek_models(resolved_dsh_binary)
         opencode_models, opencode_discovery = _discover_opencode_models(
             resolved_opencode_binary
+        )
+        copilot_models, copilot_discovery = _discover_copilot_models(
+            resolved_copilot_binary
         )
         result = {
             "agents": [
@@ -128,6 +140,15 @@ def discover_model_catalog(
                     "discovery": deepseek_discovery,
                 },
                 {
+                    "id": "copilot",
+                    "label": "GitHub Copilot CLI",
+                    "available": is_agent_binary_available(resolved_copilot_binary),
+                    "binary": resolved_copilot_binary,
+                    "default_model": DEFAULT_COPILOT_MODEL,
+                    "models": copilot_models,
+                    "discovery": copilot_discovery,
+                },
+                {
                     "id": "opencode",
                     "label": "OpenCode",
                     "available": is_agent_binary_available(resolved_opencode_binary),
@@ -140,12 +161,14 @@ def discover_model_catalog(
             "models": {
                 "codex": codex_models,
                 "claude_code": claude_models,
+                "copilot": copilot_models,
                 "deepseek_harness": deepseek_models,
                 "opencode": opencode_models,
             },
             "model_discovery": {
                 "codex": codex_discovery,
                 "claude_code": claude_discovery,
+                "copilot": copilot_discovery,
                 "deepseek_harness": deepseek_discovery,
                 "opencode": opencode_discovery,
             },
@@ -281,6 +304,31 @@ def _discover_opencode_models(
             "OpenCode 未提供稳定的账号级模型列表；可使用默认模型或输入端点暴露的自定义模型 ID。"
             if available
             else "未找到 OpenCode CLI（opencode）。"
+        ),
+    }
+
+
+def _discover_copilot_models(
+    binary: str | None,
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    models = [
+        _model_entry(
+            DEFAULT_COPILOT_MODEL,
+            "Claude Sonnet 4.6 · default",
+            "suggested",
+        )
+    ]
+    available = is_agent_binary_available(binary)
+    return models, {
+        "status": "suggested" if available else "unavailable",
+        "source": "copilot_default",
+        "account_scoped": False,
+        "refreshed_at": None,
+        "warning": (
+            "Copilot CLI 的可用模型取决于订阅与组织策略；可使用默认模型，"
+            "或输入 `copilot help` 中列出的模型 ID。"
+            if available
+            else "未找到 GitHub Copilot CLI（copilot）。"
         ),
     }
 

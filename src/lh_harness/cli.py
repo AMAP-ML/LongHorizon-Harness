@@ -26,6 +26,7 @@ from .config import (
 from .types import (
     DEFAULT_CLAUDE_MODEL,
     DEFAULT_CODEX_MODEL,
+    DEFAULT_COPILOT_MODEL,
     DEFAULT_DEEPSEEK_HARNESS_MODEL,
     DEFAULT_OPENCODE_MODEL,
     DEFAULT_MAX_ROUNDS,
@@ -56,6 +57,7 @@ _MAX_TASK_FILE_BYTES = 100_000
 _AGENTS = (
     ("claude_code", "claude", DEFAULT_CLAUDE_MODEL),
     ("codex", "codex", DEFAULT_CODEX_MODEL),
+    ("copilot", "copilot", DEFAULT_COPILOT_MODEL),
     ("deepseek_harness", "dsh", DEFAULT_DEEPSEEK_HARNESS_MODEL),
     ("opencode", "opencode", DEFAULT_OPENCODE_MODEL),
 )
@@ -1597,7 +1599,7 @@ def _run_command(args: argparse.Namespace) -> int:
     def resolve_mcp_config(agent_name: str) -> str | None:
         # The agent's own --*-mcp-config wins; otherwise the installed
         # computer-use plugin with the highest priority is loaded for this agent.
-        if agent_name in {"deepseek_harness", "opencode"}:
+        if agent_name in {"copilot", "deepseek_harness", "opencode"}:
             return None
         override = getattr(args, _MCP_CONFIG_DESTS[agent_name], None)
         if override:
@@ -1855,6 +1857,7 @@ def _public_role_configs_from_args(
     defaults = {
         "codex": DEFAULT_CODEX_MODEL,
         "claude_code": DEFAULT_CLAUDE_MODEL,
+        "copilot": DEFAULT_COPILOT_MODEL,
         "deepseek_harness": DEFAULT_DEEPSEEK_HARNESS_MODEL,
         "opencode": DEFAULT_OPENCODE_MODEL,
     }
@@ -2007,6 +2010,20 @@ def _build_agent(
         if model is not None:
             kwargs["model"] = model
         return ClaudeCodeAdapter(**kwargs)
+    if name == "copilot":
+        from .adapters.copilot import CopilotAdapter
+
+        kwargs = dict(
+            api_key=api_key,
+            base_url=base_url,
+            workspace_path=workspace_path,
+            prompt_dir=prompt_dir,
+            role=role,
+            hidden_paths=hidden_paths,
+        )
+        if model is not None:
+            kwargs["model"] = model
+        return CopilotAdapter(**kwargs)
     if name == "deepseek_harness":
         from .adapters.deepseek_harness import DeepSeekHarnessAdapter
 

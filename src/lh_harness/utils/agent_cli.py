@@ -31,6 +31,7 @@ _VERSION_RE = re.compile(r"\d+(?:\.\d+)+\S*")
 _CODEX_BINARY_ENV_VARS = ("LH_HARNESS_CODEX_BINARY", "CODEX_CLI_PATH")
 _DSH_BINARY_ENV_VAR = "LH_HARNESS_DSH_BINARY"
 _OPENCODE_BINARY_ENV_VAR = "LH_HARNESS_OPENCODE_BINARY"
+_COPILOT_BINARY_ENV_VAR = "LH_HARNESS_COPILOT_BINARY"
 _CODEX_DESKTOP_BINARY = "/Applications/ChatGPT.app/Contents/Resources/codex"
 
 
@@ -78,6 +79,11 @@ def resolve_agent_binary(
         if value:
             return os.path.expanduser(value)
 
+    if binary == "copilot":
+        value = str(env.get(_COPILOT_BINARY_ENV_VAR) or "").strip()
+        if value:
+            return os.path.expanduser(value)
+
     return shutil.which(binary)
 
 
@@ -109,6 +115,16 @@ def resolve_opencode_binary(
     """Resolve the OpenCode executable selected by the harness."""
 
     return resolve_agent_binary("opencode", environ=environ, platform_name=platform_name)
+
+
+def resolve_copilot_binary(
+    *,
+    environ: dict[str, str] | None = None,
+    platform_name: str | None = None,
+) -> str | None:
+    """Resolve the GitHub Copilot CLI executable selected by the harness."""
+
+    return resolve_agent_binary("copilot", environ=environ, platform_name=platform_name)
 
 
 def is_agent_binary_available(path: str | None) -> bool:

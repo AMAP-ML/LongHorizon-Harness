@@ -26,7 +26,12 @@ from ..supervisor.service import IdempotencyConflict, RunSupervisor
 from ..supervisor.lifecycle import TERMINAL_STATUSES, canonical_lifecycle_status
 from ..supervisor.control_bus import CommandConflict, RevisionConflict
 from ..types import DEFAULT_CODEX_MODEL, DEFAULT_MAX_ROUNDS, MAX_ROUNDS
-from ..utils.agent_cli import resolve_codex_binary, resolve_dsh_binary, resolve_opencode_binary
+from ..utils.agent_cli import (
+    resolve_codex_binary,
+    resolve_copilot_binary,
+    resolve_dsh_binary,
+    resolve_opencode_binary,
+)
 from ..utils.run_boundary import safe_run_control, safe_run_dir, safe_run_logs, safe_run_role, safe_run_rounds
 from .events import EventTailer
 from .protocol import build_meta
@@ -684,6 +689,7 @@ def create_app(
             codex_binary=resolve_codex_binary(),
             dsh_binary=resolve_dsh_binary(),
             opencode_binary=resolve_opencode_binary(),
+            copilot_binary=resolve_copilot_binary(),
         )
         return build_meta(
             endpoint=endpoint,

@@ -40,6 +40,7 @@ from ..types import (
     DEFAULT_CLAUDE_MODEL,
     DEFAULT_CODEX_MODEL,
     DEFAULT_DEEPSEEK_HARNESS_MODEL,
+    DEFAULT_COPILOT_MODEL,
     DEFAULT_OPENCODE_MODEL,
     DEFAULT_MAX_ROUNDS,
     MAX_ROUNDS,
@@ -63,12 +64,16 @@ _MAX_SAVED_TASK_BYTES = 100_000
 _MAX_ROUND_DIR_SCAN = 10_000
 _MISSING_COMPLETION_EVIDENCE = "worker reported completion without explicit completion evidence"
 _ROLE_KEYS = ("manager", "executor", "auditor")
-_AGENT_CHOICES = frozenset({"codex", "claude_code", "deepseek_harness", "opencode"})
+_AGENT_CHOICES = frozenset(
+    {"codex", "claude_code", "copilot", "deepseek_harness", "opencode"}
+)
 
 
 def _default_model_for_agent(agent: str) -> str:
     if agent == "claude_code":
         return DEFAULT_CLAUDE_MODEL
+    if agent == "copilot":
+        return DEFAULT_COPILOT_MODEL
     if agent == "deepseek_harness":
         return DEFAULT_DEEPSEEK_HARNESS_MODEL
     if agent == "opencode":
@@ -110,7 +115,8 @@ def _normalise_role_configs(
         role_agent = str(raw.get("agent") or agent).strip()
         if role_agent not in _AGENT_CHOICES:
             raise ValueError(
-                f"roles.{role}.agent must be codex, claude_code, deepseek_harness, or opencode"
+                f"roles.{role}.agent must be codex, claude_code, copilot, "
+                "deepseek_harness, or opencode"
             )
         raw_model = raw.get("model")
         if raw_model is None or (isinstance(raw_model, str) and not raw_model.strip()):
@@ -1393,7 +1399,9 @@ class RunSupervisor:
         if len(task) > 100_000 or "\x00" in task:
             raise ValueError("task is too large or contains a NUL byte")
         if agent not in _AGENT_CHOICES:
-            raise ValueError("agent must be codex, claude_code, deepseek_harness, or opencode")
+            raise ValueError(
+                "agent must be codex, claude_code, copilot, deepseek_harness, or opencode"
+            )
         if isinstance(max_rounds, bool) or not isinstance(max_rounds, int) or not 1 <= max_rounds <= MAX_ROUNDS:
             raise ValueError(f"max_rounds must be an integer from 1 to {MAX_ROUNDS}")
         if prompt_language not in {"en", "zh"}:

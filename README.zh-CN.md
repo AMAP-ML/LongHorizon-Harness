@@ -105,7 +105,7 @@ LongHorizon-Harness 不绑定特定模型或 Agent 后端。现有模型和 Agen
 | | 层级 | 支持选项 |
 |---|---|---|
 | 🧠 | **模型** | Claude、GPT、Qwen，以及 Agent 后端提供的其他模型 |
-| 🤖 | **Agent 后端** | Claude Code、Codex CLI、OpenCode、DeepSeek Harness（`dsh`，第一阶段仅 CLI），以及自定义 `AgentAdapter` 实现 |
+| 🤖 | **Agent 后端** | Claude Code、Codex CLI、OpenCode、GitHub Copilot CLI（第一阶段仅 CLI）、DeepSeek Harness（`dsh`，第一阶段仅 CLI），以及自定义 `AgentAdapter` 实现 |
 | 🎛️ | **角色分配** | Manager、Executor 和 Auditor 可以分别使用不同模型或后端 |
 | 🖥️ | **执行环境** | 本地，并提供可扩展的 `Environment` 协议 |
 
@@ -189,7 +189,7 @@ LongHorizon-Harness 不只展示了几个精心挑选的成功案例。
 |---|---|
 | [uv](https://docs.astral.sh/uv/getting-started/installation/) | 推荐的隔离安装方式。习惯用 pip 可以不装。 |
 | Python 3.10 或更高版本 | 运行 Harness。`uv tool install` 自带 Python；用 pip 安装则使用你当前的。 |
-| `PATH` 上有一个 Agent 运行时：[`codex`](https://github.com/openai/codex#installing-and-running-codex-cli)、[`claude`](https://docs.anthropic.com/en/docs/claude-code/getting-started)、[`opencode`](https://github.com/anomalyco/opencode) 或 [`dsh`](https://github.com/deepseek-ai/deepseek-harness) | 真正执行任务。想按角色混用多个后端就安装多个。 |
+| `PATH` 上有一个 Agent 运行时：[`codex`](https://github.com/openai/codex#installing-and-running-codex-cli)、[`claude`](https://docs.anthropic.com/en/docs/claude-code/getting-started)、[`opencode`](https://github.com/anomalyco/opencode)、[`copilot`](https://docs.github.com/en/copilot/how-tos/copilot-cli/set-up-copilot-cli/install-copilot-cli) 或 [`dsh`](https://github.com/deepseek-ai/deepseek-harness) | 真正执行任务。想按角色混用多个后端就安装多个。 |
 | [Node.js](https://nodejs.org) 20 或更高版本 | npm 分发的 computer-use 插件需要；DeepSeek Harness 本身目前要求 Node.js `^22.19.0` 或 `>=24.0.0`。 |
 
 > **平台状态：** 目前只在 macOS 上完成了测试；Windows 已支持，但尚未经过详细测试。
@@ -326,7 +326,7 @@ lh-harness check-update
 
 | 字段 | 默认值 | 说明 |
 |---|---|---|
-| `agent` | `"codex"` | 所有角色使用的后端（角色可单独覆盖）：`codex`、`claude_code`、`opencode` 或 `deepseek_harness`。 |
+| `agent` | `"codex"` | 所有角色使用的后端（角色可单独覆盖）：`codex`、`claude_code`、`opencode`、`copilot` 或 `deepseek_harness`。 |
 | `model` | `"gpt-5.6-sol"` | 所有角色使用的模型（角色可单独覆盖）。必须是所选后端支持的模型。 |
 | `env` | `"local"` | 执行环境，目前只有 `local`。 |
 | `runs_root` | `"./.lh-harness/runs"` | 运行目录的根路径，每次运行生成 `<runs_root>/<run-id>/`。 |
@@ -490,7 +490,7 @@ lh-harness web --workspace-root .               # 为指定目录启动工作台
 | 参数 | 说明 |
 |---|---|
 | `--task` | 任务文本或 `@task.md` |
-| `--agent` | `claude_code`、`codex`、`opencode` 或 `deepseek_harness`（第一阶段仅 CLI） |
+| `--agent` | `claude_code`、`codex`、`opencode`、`copilot`（第一阶段仅 CLI）或 `deepseek_harness`（第一阶段仅 CLI） |
 | `--env` | `local` |
 | `--max-rounds` | Manage-Execute-Audit 循环的最大轮数；CLI 默认为 30 |
 | `--dashboard` | 启动实时监控和人工介入功能 |
