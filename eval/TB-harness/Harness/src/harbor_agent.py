@@ -122,6 +122,14 @@ class CuaHarnessClaudeCodeAgent(BaseAgent):
             **kwargs,
         )
 
+        # Harbor's factory passes ``extra_env`` into the agent constructor, but
+        # ``BaseAgent.__init__`` (Harbor >= 0.13) does not persist unknown kwargs,
+        # so ``self.extra_env`` is never set by ``super().__init__``. The reads
+        # below (and in subclasses) would then raise ``AttributeError``. Store it
+        # explicitly so env-driven configuration works regardless of the Harbor
+        # version in the environment.
+        self.extra_env = dict(extra_env or {})
+
         default_config = HarnessConfig()
         self._api_key = api_key
         self._base_url = base_url
