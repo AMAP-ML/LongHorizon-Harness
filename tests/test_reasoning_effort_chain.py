@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import argparse
-import shlex
 from pathlib import Path
 
 import pytest
@@ -23,7 +22,7 @@ def test_codex_sends_the_effort_as_a_config_override() -> None:
     # Codex has no `--effort` flag; the depth is a config value.
     adapter = _codex(model="gpt-5.6-sol", reasoning_effort="xhigh")
 
-    tokens = shlex.split(adapter.command_template.replace("< {prompt_path}", ""))
+    tokens = adapter.argv
 
     assert 'model_reasoning_effort="xhigh"' in tokens
     assert tokens[tokens.index('model_reasoning_effort="xhigh"') - 1] == "-c"
@@ -32,7 +31,7 @@ def test_codex_sends_the_effort_as_a_config_override() -> None:
 def test_codex_without_an_effort_leaves_the_user_config_in_charge() -> None:
     adapter = _codex(model="gpt-5.6-sol")
 
-    assert "model_reasoning_effort" not in adapter.command_template
+    assert not any("model_reasoning_effort" in token for token in adapter.argv)
 
 
 def test_claude_sends_the_effort_as_a_cli_flag() -> None:
@@ -44,7 +43,7 @@ def test_claude_sends_the_effort_as_a_cli_flag() -> None:
         reasoning_effort="max",
     )
 
-    tokens = adapter.command_template.split()
+    tokens = adapter.argv
 
     assert tokens[tokens.index("--effort") + 1] == "max"
     assert adapter.reasoning_effort == "max"
@@ -58,7 +57,7 @@ def test_opencode_sends_the_effort_as_a_variant() -> None:
         reasoning_effort="high",
     )
 
-    tokens = adapter.command_template.split()
+    tokens = adapter.argv
 
     assert tokens[tokens.index("--variant") + 1] == "high"
 

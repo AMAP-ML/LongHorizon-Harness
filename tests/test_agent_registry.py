@@ -16,6 +16,8 @@ from lh_harness.agent_registry import (
 )
 from lh_harness.cli import _AGENT_CHOICES
 
+from .fake_cli import fake_cli
+
 
 @pytest.fixture(autouse=True)
 def _clear_probe_cache():
@@ -30,10 +32,9 @@ def _clear_probe_cache():
 
 
 def _stub(path: Path, body: str) -> str:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text("#!/bin/sh\n" + body, encoding="utf-8")
-    path.chmod(0o755)
-    return str(path)
+    # A Python-bodied stand-in runs identically on POSIX and on Windows,
+    # where `#!/bin/sh` scripts cannot be executed at all.
+    return fake_cli(path, body)
 
 
 def test_cli_agent_choices_match_the_registry() -> None:
@@ -56,7 +57,7 @@ def test_registry_default_models_match_the_cli_table() -> None:
 def test_binary_on_path_but_not_runnable_is_not_reported_usable(tmp_path: Path) -> None:
     # Worse than missing: it looks healthy while breaking every run, so it must
     # never collapse into `usable` or `missing`.
-    broken = _stub(tmp_path / "codex", "exit 3\n")
+    broken = _stub(tmp_path / "codex", "sys.exit(3)\n")
 
     probes = probe_agents(binaries={"codex": broken})
 
@@ -67,7 +68,7 @@ def test_binary_on_path_but_not_runnable_is_not_reported_usable(tmp_path: Path) 
 
 
 def test_binary_that_prints_no_version_is_not_reported_usable(tmp_path: Path) -> None:
-    silent = _stub(tmp_path / "codex", "exit 0\n")
+    silent = _stub(tmp_path / "codex", "pass\n")
 
     probes = probe_agents(binaries={"codex": silent})
 
@@ -82,7 +83,7 @@ def test_missing_binary_is_missing_not_broken() -> None:
 
 
 def test_runnable_binary_reports_its_version(tmp_path: Path) -> None:
-    good = _stub(tmp_path / "codex", 'echo "codex-cli 9.9.9"\nexit 0\n')
+    good = _stub(tmp_path / "codex", 'print("codex-cli 9.9.9")\n')
 
     probes = probe_agents(binaries={"codex": good})
 
@@ -94,7 +95,7 @@ def test_runnable_binary_reports_its_version(tmp_path: Path) -> None:
 def test_explicit_binary_is_probed_instead_of_rediscovering(tmp_path: Path) -> None:
     # The Web API resolves a path once per request so its response is
     # self-consistent; re-resolving here could describe another installation.
-    chosen = _stub(tmp_path / "chosen" / "codex", 'echo "1.0.0"\nexit 0\n')
+    chosen = _stub(tmp_path / "chosen" / "codex", 'print("1.0.0")\n')
 
     probes = probe_agents(binaries={"codex": chosen})
 
@@ -105,12 +106,12 @@ def test_claude_effort_tiers_are_read_from_cli_help(tmp_path: Path) -> None:
     # `claude --help` wraps the tier list onto a continuation line.
     claude = _stub(
         tmp_path / "claude",
-        'if [ "$1" = "--version" ]; then echo "2.1.212"; exit 0; fi\n'
-        'cat <<EOF\n'
-        "  --effort <level>                      Effort level for the current session\n"
-        "                                        (low, medium, high, xhigh, max)\n"
-        "  --other-flag                          Something else\n"
-        "EOF\n",
+        'if sys.argv[1:] == ["--version"]:\n'
+        '    print("2.1.212")\n'
+        "    sys.exit(0)\n"
+        'print("  --effort <level>                      Effort level for the current session")\n'
+        'print("                                        (low, medium, high, xhigh, max)")\n'
+        'print("  --other-flag                          Something else")\n',
     )
 
     probes = probe_agents(binaries={"claude_code": claude})
@@ -131,8 +132,10 @@ def test_effort_discovery_falls_back_to_declared_tiers_when_help_is_unparsable(
 ) -> None:
     claude = _stub(
         tmp_path / "claude",
-        'if [ "$1" = "--version" ]; then echo "2.1.212"; exit 0; fi\n'
-        'echo "  --effort <level>   Effort level (default)"\n',
+        'if sys.argv[1:] == ["--version"]:\n'
+        '    print("2.1.212")\n'
+        "    sys.exit(0)\n"
+        'print("  --effort <level>   Effort level (default)")\n',
     )
 
     probes = probe_agents(binaries={"claude_code": claude})

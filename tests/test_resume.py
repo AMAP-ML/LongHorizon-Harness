@@ -258,7 +258,16 @@ def supervisor(monkeypatch, tmp_path: Path) -> RunSupervisor:
         "lh_harness.supervisor.service.subprocess.Popen",
         lambda *args, **kwargs: FakeProcess(),
     )
-    monkeypatch.setattr("lh_harness.supervisor.service.os.killpg", lambda *args, **kwargs: None)
+    # os.killpg does not exist on Windows; the supervisor signals through the
+    # process-group helpers there, so patch both ends and tolerate the absence.
+    monkeypatch.setattr(
+        "lh_harness.supervisor.service.os.killpg", lambda *args, **kwargs: None, raising=False
+    )
+    monkeypatch.setattr(
+        "lh_harness.utils.process_group._windows_deliver",
+        lambda *args, **kwargs: None,
+        raising=False,
+    )
     workspace = tmp_path / "workspace"
     workspace.mkdir()
     return RunSupervisor(tmp_path / "runs", workspace_root=workspace)
