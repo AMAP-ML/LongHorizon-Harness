@@ -57,6 +57,21 @@ def test_copilot_adapter_quotes_binary_and_builds_command(monkeypatch, tmp_path:
     assert "-p" not in tokens
 
 
+def test_copilot_default_model_defers_the_choice_to_the_account(
+    monkeypatch, tmp_path: Path
+) -> None:
+    monkeypatch.setattr(
+        copilot_adapter_module, "resolve_copilot_binary", lambda: str(tmp_path / "copilot")
+    )
+
+    # Asserted as a literal on purpose.  Every other model assertion in this file
+    # compares against DEFAULT_COPILOT_MODEL, so they follow the constant wherever
+    # it goes and cannot catch a default that no account is guaranteed to have.
+    assert DEFAULT_COPILOT_MODEL == "auto"
+    tokens = _tokens(CopilotAdapter(prompt_dir=str(tmp_path), role="cli_executor"))
+    assert tokens[tokens.index("--model") + 1] == "auto"
+
+
 def test_copilot_executor_gets_full_permissions(monkeypatch, tmp_path: Path) -> None:
     monkeypatch.setattr(
         copilot_adapter_module, "resolve_copilot_binary", lambda: str(tmp_path / "copilot")

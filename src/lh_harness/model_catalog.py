@@ -314,7 +314,7 @@ def _discover_copilot_models(
     models = [
         _model_entry(
             DEFAULT_COPILOT_MODEL,
-            "Claude Sonnet 4.6 · default",
+            f"{DEFAULT_COPILOT_MODEL} · default",
             "suggested",
         )
     ]
@@ -325,8 +325,9 @@ def _discover_copilot_models(
         "account_scoped": False,
         "refreshed_at": None,
         "warning": (
-            "Copilot CLI 的可用模型取决于订阅与组织策略；可使用默认模型，"
-            "或输入 `copilot help` 中列出的模型 ID。"
+            "Copilot CLI 的可用模型取决于账号订阅与组织策略；默认的 `auto` 由 Copilot "
+            "选择该账号可用的模型。也可填写具体模型 ID；若该 ID 未对该账号开放，"
+            "Copilot 会在启动时报告该模型不可用并终止本次运行。"
             if available
             else "未找到 GitHub Copilot CLI（copilot）。"
         ),

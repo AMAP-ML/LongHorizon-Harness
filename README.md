@@ -326,7 +326,7 @@ Task text, run IDs, and API keys are deliberately **not** configurable here; the
 | Field | Default | Description |
 |---|---|---|
 | `agent` | `"codex"` | Backend for every role unless a role overrides it: `codex`, `claude_code`, `opencode`, `copilot`, or `deepseek_harness`. |
-| `model` | `"gpt-5.6-sol"` | Model for every role unless a role overrides it. Must be a model the chosen backend exposes. |
+| `model` | `"gpt-5.6-sol"` | Model for every role unless a role overrides it. Must be a model the chosen backend exposes, so change it whenever you change `agent` — this value is passed to the backend verbatim. With `copilot` the backend default is `auto`, which lets Copilot pick a model the account is entitled to. |
 | `env` | `"local"` | Execution environment. Only `local` today. |
 | `runs_root` | `"./.lh-harness/runs"` | Where run directories are created. Each run gets `<runs_root>/<run-id>/`. |
 | `workspace` | commented out | Working directory the agents operate in. Defaults to the directory `lh-harness` was started from, so a task acts on your real project; set it to isolate the run somewhere else. |

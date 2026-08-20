@@ -327,7 +327,7 @@ lh-harness check-update
 | 字段 | 默认值 | 说明 |
 |---|---|---|
 | `agent` | `"codex"` | 所有角色使用的后端（角色可单独覆盖）：`codex`、`claude_code`、`opencode`、`copilot` 或 `deepseek_harness`。 |
-| `model` | `"gpt-5.6-sol"` | 所有角色使用的模型（角色可单独覆盖）。必须是所选后端支持的模型。 |
+| `model` | `"gpt-5.6-sol"` | 所有角色使用的模型（角色可单独覆盖）。必须是所选后端支持的模型；该值会原样传给后端，因此更换 `agent` 时请一并修改。使用 `copilot` 时后端默认值为 `auto`，由 Copilot 选择该账号可用的模型。 |
 | `env` | `"local"` | 执行环境，目前只有 `local`。 |
 | `runs_root` | `"./.lh-harness/runs"` | 运行目录的根路径，每次运行生成 `<runs_root>/<run-id>/`。 |
 | `workspace` | 默认注释 | Agent 实际操作的工作目录。默认就是启动 `lh-harness` 的那个目录，任务直接作用于你的真实项目；需要隔离到别处时才设置。 |

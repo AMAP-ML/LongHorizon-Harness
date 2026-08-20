@@ -83,6 +83,12 @@ class CopilotAdapter(CommandAgentAdapter):
     agent from pausing for clarification in a run with no human attached, and
     the permission flags carry the same role separation the Claude Code adapter
     applies through its deny list.
+
+    The default model is ``auto`` because per-model access is account- and
+    organization-policy dependent and Copilot CLI has no discovery endpoint: a
+    pinned id makes the backend fail on first use for anyone whose policy does
+    not include it.  An explicit id still reaches ``--model`` unchanged, and is
+    rejected by Copilot itself when the account cannot use it.
     """
 
     def __init__(

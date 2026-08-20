@@ -5,6 +5,7 @@ from pathlib import Path
 
 from lh_harness.model_catalog import (
     _discover_codex_models,
+    _discover_copilot_models,
     _discover_deepseek_models,
     _normalise_codex_entries,
     discover_model_catalog,
@@ -78,6 +79,30 @@ def test_deepseek_catalog_exposes_default_model_and_cli_availability(tmp_path: P
     assert agent["available"] is True
     assert agent["default_model"] == "deepseek-v4-flash"
     assert catalog["models"]["deepseek_harness"] == models
+
+
+def test_copilot_catalog_exposes_auto_default_and_cli_availability(tmp_path: Path) -> None:
+    binary = tmp_path / "copilot"
+    binary.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    binary.chmod(0o755)
+
+    models, discovery = _discover_copilot_models(str(binary))
+    catalog = discover_model_catalog(codex_binary=None, copilot_binary=str(binary))
+    agent = next(item for item in catalog["agents"] if item["id"] == "copilot")
+
+    # Id and label are pinned together: a label naming one model family beside an
+    # id that selects another is exactly what the workbench would show a user.
+    assert models == [
+        {
+            "id": "auto",
+            "label": "auto · default",
+            "availability": "suggested",
+        }
+    ]
+    assert discovery["status"] == "suggested"
+    assert agent["available"] is True
+    assert agent["default_model"] == "auto"
+    assert catalog["models"]["copilot"] == models
 
 
 def test_invalid_model_failure_keeps_provider_message() -> None:

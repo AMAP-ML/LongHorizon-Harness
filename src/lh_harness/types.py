@@ -32,7 +32,11 @@ DEFAULT_CLAUDE_MODEL = "claude-opus-5"
 DEFAULT_CODEX_MODEL = "gpt-5.6-sol"
 DEFAULT_DEEPSEEK_HARNESS_MODEL = "deepseek-v4-flash"
 DEFAULT_OPENCODE_MODEL = "opencode/deepseek-v4-flash-free"
-DEFAULT_COPILOT_MODEL = "claude-sonnet-4.6"
+# Which concrete models a Copilot seat can reach depends on the account's
+# subscription and its organization's policy, and the CLI exposes no discovery
+# endpoint, so any pinned id is unavailable to somebody.  "auto" lets Copilot
+# pick a model the account is entitled to; an explicit id still wins.
+DEFAULT_COPILOT_MODEL = "auto"
 
 # A run is intentionally bounded at every ingress point.  Without a shared
 # ceiling, a malformed Web/CLI request can reserve an effectively unbounded
