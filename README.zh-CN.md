@@ -340,9 +340,12 @@ lh-harness check-update
 | `claude_mcp_config` | 默认注释 | Claude Code 用的 `.mcp.json` 路径，会覆盖已安装的插件。 |
 | `codex_mcp_config` | 默认注释 | Codex 用的 `[mcp_servers.*]` TOML 路径，会覆盖已安装的插件。 |
 | `mcp_add_dirs` | `[]` | 额外允许 MCP server 读取的目录。Claude Code 会拒绝该项，因为其角色隔离要求任务文件必须放在工作目录内。 |
+| `guard_exclude_paths` | `[]` | Auditor 只读 guard 在快照时跳过的工作区路径，用于会自行变动的构建产物和缓存，例如 `["target", "node_modules", ".venv"]`。Agent 仍可正常访问这些路径。 |
 | `max_rounds` | `30` | Manage-Execute-Audit 循环的最大轮数，达到即停止。 |
 | `dashboard` | `true` | 每次运行时启动 Web Dashboard。 |
 | `dashboard_port` | `0` | Dashboard 端口，`0` 表示由系统分配空闲端口。 |
+
+`guard_exclude_paths` 中的每一项都是审计的缺口：guard 是工作区改动的唯一见证者，而被排除的路径 Agent 仍可通过 Bash 读写。只排除构建产物，不要排除源码。路径相对工作目录解析并且必须留在工作目录内；`.git` 以及 Harness 自身的控制与状态目录会被拒绝，遇到第一个违规项时运行直接终止。最终生效的列表会在运行开始时打印，并记录在每个审计 episode 的 metadata 字段 `verifier_guard_exclude_paths` 中。对应的 CLI 参数 `--guard-exclude-path` 可重复传入；只要用了它，就会替换配置中的列表，而不是在其基础上追加。
 
 ##### `[run.timeouts]`
 

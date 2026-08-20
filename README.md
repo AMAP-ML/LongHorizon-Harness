@@ -339,9 +339,12 @@ Task text, run IDs, and API keys are deliberately **not** configurable here; the
 | `claude_mcp_config` | commented out | Path to a `.mcp.json` for Claude Code. Overrides the installed plugin. |
 | `codex_mcp_config` | commented out | Path to a `[mcp_servers.*]` TOML for Codex. Overrides the installed plugin. |
 | `mcp_add_dirs` | `[]` | Extra directories the MCP server may read. Claude Code rejects these, because its role isolation requires task files to live inside the workspace. |
+| `guard_exclude_paths` | `[]` | Workspace paths the auditor's read-only guard skips while snapshotting: build outputs and caches that churn on their own, such as `["target", "node_modules", ".venv"]`. Agents keep full access to them. |
 | `max_rounds` | `30` | Upper bound on Manage-Execute-Audit rounds before the run stops. |
 | `dashboard` | `true` | Start the web dashboard with each run. |
 | `dashboard_port` | `0` | Dashboard port; `0` lets the OS pick a free one. |
+
+Every entry in `guard_exclude_paths` is a hole in the audit: the guard is the only witness of workspace mutations, and the agents keep reading and writing an excluded path through Bash. Exclude build outputs, never source. Paths resolve against the workspace and must stay inside it; `.git` and the harness's own control and state directories are rejected, and the run refuses to start on the first violation. The effective list is printed at run start and recorded in every audited episode's metadata as `verifier_guard_exclude_paths`. The matching CLI flag, `--guard-exclude-path`, may be repeated, and a single use of it replaces the configured list rather than adding to it.
 
 ##### `[run.timeouts]`
 

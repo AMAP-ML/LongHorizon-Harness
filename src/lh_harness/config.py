@@ -85,12 +85,9 @@ prompt_language = "en"
 # codex_mcp_config = "/path/to/mcp.toml"
 mcp_add_dirs = []
 
-# Build/cache directories the auditor read-only guard should not snapshot,
-# e.g. ["target", "node_modules", "build", ".venv"]. Agents can still read
-# them. Exclusions must stay inside the workspace; ".git" and harness-owned
-# control/state paths are rejected at startup, and the effective list is
-# echoed at run start and recorded in each audited episode's metadata.
-# Passing --guard-exclude-path replaces this list rather than adding to it.
+# Build/cache directories the auditor guard skips while snapshotting, e.g.
+# ["target", "node_modules", ".venv"]. Agents can still read them.
+# --guard-exclude-path replaces this list rather than adding to it.
 guard_exclude_paths = []
 
 max_rounds = 25
