@@ -5,7 +5,6 @@ from __future__ import annotations
 from typing import Any
 
 from ..dashboard.state import DashboardState
-from ..types import EFFORT_CHOICES
 from ..supervisor.lifecycle import canonical_lifecycle_status
 from .events import EventTailer
 
@@ -106,8 +105,8 @@ def _safe_role_configs(value: object) -> dict[str, dict[str, str]]:
             continue
         result[role] = {"agent": agent, "model": model.strip()}
         effort = raw.get("effort")
-        if isinstance(effort, str) and effort in EFFORT_CHOICES:
-            result[role]["effort"] = effort
+        if isinstance(effort, str) and 0 < len(effort) <= 64 and "\x00" not in effort:
+            result[role]["effort"] = effort.strip()
     return result if len(result) == 3 else {}
 
 

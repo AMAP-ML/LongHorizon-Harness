@@ -327,7 +327,7 @@ Task text, run IDs, and API keys are deliberately **not** configurable here; the
 |---|---|---|
 | `agent` | `"codex"` | Backend for every role unless a role overrides it: `codex`, `claude_code`, `opencode`, or `deepseek_harness`. |
 | `model` | `"gpt-5.6-sol"` | Model for every role unless a role overrides it. Must be a model the chosen backend exposes. |
-| `effort` | `"med"` | Effort level for every role unless a role overrides it: `min`, `low`, `med`, `high`, `xhigh`, or `max`. See [Effort levels](#effort-levels). |
+| `effort` | `"medium"` | Effort level for every role unless a role overrides it, passed to the backend verbatim. See [Effort levels](#effort-levels). |
 | `env` | `"local"` | Execution environment. Only `local` today. |
 | `runs_root` | `"./.lh-harness/runs"` | Where run directories are created. Each run gets `<runs_root>/<run-id>/`. |
 | `workspace` | commented out | Working directory the agents operate in. Defaults to the directory `lh-harness` was started from, so a task acts on your real project; set it to isolate the run somewhere else. |
@@ -377,38 +377,30 @@ cli_auditor  → auditor  → [run].agent / [run].model / [run].effort
 
 ##### Effort levels
 
-`effort` controls how hard a role's model works — following Anthropic's umbrella term, where effort shapes the whole response, not only its thinking. One normalized scale covers every backend:
+`effort` controls how hard a role's model works. The value is passed to the backend **verbatim** — there is no cross-backend mapping — so each backend accepts exactly the levels it documents, and an unsupported value fails the run with a clear error instead of being silently substituted:
 
-```
-min · low · med · high · xhigh · max
-```
+| Backend | Dial | Accepted levels |
+|---|---|---|
+| Codex | `model_reasoning_effort` | `minimal`, `low`, `medium`, `high`, `xhigh` |
+| Claude Code | `CLAUDE_CODE_EFFORT_LEVEL` | `low`, `medium`, `high`, `xhigh`, `max` |
+| DeepSeek Harness | `reasoningEffort` | `low`, `high`, `max` |
+| OpenCode | `--variant` | the model's variant presets (OpenAI-style models ship `none`/`minimal`/`low`/`medium`/`high`/`xhigh`; custom variants come from `opencode.jsonc`) |
 
-Set it for all roles at once, per role, or per run:
+The web workbench offers each model's own discovered levels (from the model catalogue's `reasoning_efforts`). Set effort for all roles at once, per role, or per run:
 
 ```toml
 [run]
-effort = "med"
+effort = "medium"
 
 [run.roles.manager]
 effort = "high"       # a role's own effort outranks [run].effort
 ```
 
 ```bash
-lh-harness run --task "..." --effort med --auditor-effort low
+lh-harness run --task "..." --effort medium --auditor-effort low
 ```
 
-Each backend translates a level into its own dial, and a level a backend lacks maps to its nearest supported one:
-
-| You write | Codex (`model_reasoning_effort`) | Claude Code (`CLAUDE_CODE_EFFORT_LEVEL`) | OpenCode (`--variant`) | DeepSeek Harness (`reasoningEffort`) |
-|---|---|---|---|---|
-| `min` | `minimal` | `low` | `minimal` | `low` |
-| `low` | `low` | `low` | `low` | `low` |
-| `med` | `medium` | `medium` | `medium` | `high`* |
-| `high` | `high` | `high` | `high` | `high` |
-| `xhigh` | `xhigh` | `xhigh` | `xhigh` | `high`* |
-| `max` | `xhigh`* | `max` | `max` | `max` |
-
-\* The backend has no such level, so the nearest supported one is used; episode metadata records it as `effort_effective`.
+The requested level is recorded in every episode's metadata (`effort`) and shown in the run details view.
 
 Every field above also has a CLI flag (`--agent`, `--max-rounds`, `--gui-executor-model`, `--auditor-timeout`, `--effort`, `--manager-effort`, and so on) that overrides it for a single run. Run `lh-harness run --help` for the full list.
 

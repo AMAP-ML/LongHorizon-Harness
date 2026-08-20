@@ -112,7 +112,7 @@ export interface WebMeta {
   /** Server-discovered agent/model catalogue. Older servers may omit these. */
   agents?: Array<{ id: string; label?: string; available?: boolean; default_model?: string; models?: ModelChoice[]; discovery?: ModelDiscovery }>;
   models?: Record<string, ModelChoice[]>;
-  defaults?: { agent?: string; model?: string; effort_levels?: string[]; roles?: Record<string, RoleRuntimeConfig> };
+  defaults?: { agent?: string; model?: string; effort_levels?: Record<string, string[]>; roles?: Record<string, RoleRuntimeConfig> };
   model_discovery?: Record<string, ModelDiscovery>;
 }
 

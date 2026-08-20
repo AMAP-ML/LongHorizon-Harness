@@ -424,11 +424,11 @@ def main(argv: list[str] | None = None) -> int:
         default=run_default("effort"),
         choices=EFFORT_CHOICES,
         help=(
-            "Effort for every role, translated per backend "
+            "Effort for every role, passed to each backend verbatim "
             "(Codex model_reasoning_effort, Claude Code CLAUDE_CODE_EFFORT_LEVEL, "
-            "OpenCode --variant, DeepSeek Harness reasoningEffort); a level a "
-            "backend lacks maps to its nearest supported one. Defaults to each "
-            "backend's own default."
+            "OpenCode --variant, DeepSeek Harness reasoningEffort). Each backend "
+            "accepts its own documented subset and rejects the rest; defaults to "
+            "the backend's own default."
         ),
     )
     for role, _, scope in _ROLE_OPTIONS:

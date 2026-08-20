@@ -328,7 +328,7 @@ lh-harness check-update
 |---|---|---|
 | `agent` | `"codex"` | 所有角色使用的后端（角色可单独覆盖）：`codex`、`claude_code`、`opencode` 或 `deepseek_harness`。 |
 | `model` | `"gpt-5.6-sol"` | 所有角色使用的模型（角色可单独覆盖）。必须是所选后端支持的模型。 |
-| `effort` | `"med"` | 所有角色的 effort 等级（角色可单独覆盖）：`min`、`low`、`med`、`high`、`xhigh` 或 `max`。见 [Effort 等级](#effort-等级)。 |
+| `effort` | `"medium"` | 所有角色的 effort 等级（角色可单独覆盖），原样传给后端。见 [Effort 等级](#effort-等级)。 |
 | `env` | `"local"` | 执行环境，目前只有 `local`。 |
 | `runs_root` | `"./.lh-harness/runs"` | 运行目录的根路径，每次运行生成 `<runs_root>/<run-id>/`。 |
 | `workspace` | 默认注释 | Agent 实际操作的工作目录。默认就是启动 `lh-harness` 的那个目录，任务直接作用于你的真实项目；需要隔离到别处时才设置。 |
@@ -378,38 +378,30 @@ cli_auditor  → auditor  → [run].agent / [run].model / [run].effort
 
 ##### Effort 等级
 
-`effort` 控制角色模型的思考与执行投入——沿用 Anthropic 的总控概念：effort 影响整个响应，而不仅是 thinking。所有后端共用一套归一化等级：
+`effort` 控制角色模型的思考与执行投入。取值**原样传给后端**——不做跨后端映射——每个后端只接受自己文档中列出的等级，不支持的值会直接报错，而不是被悄悄替换：
 
-```
-min · low · med · high · xhigh · max
-```
+| 后端 | 原生参数 | 可用等级 |
+|---|---|---|
+| Codex | `model_reasoning_effort` | `minimal`、`low`、`medium`、`high`、`xhigh` |
+| Claude Code | `CLAUDE_CODE_EFFORT_LEVEL` | `low`、`medium`、`high`、`xhigh`、`max` |
+| DeepSeek Harness | `reasoningEffort` | `low`、`high`、`max` |
+| OpenCode | `--variant` | 模型自身的 variant 预设（OpenAI 系模型自带 `none`/`minimal`/`low`/`medium`/`high`/`xhigh`；自定义预设来自 `opencode.jsonc`） |
 
-可以全局设置、按角色设置，或对单次运行设置：
+Web 工作台会展示每个模型自己被检测到的等级（来自模型目录的 `reasoning_efforts`）。可以全局设置、按角色设置，或对单次运行设置：
 
 ```toml
 [run]
-effort = "med"
+effort = "medium"
 
 [run.roles.manager]
 effort = "high"       # 角色自己的 effort 优先于 [run].effort
 ```
 
 ```bash
-lh-harness run --task "..." --effort med --auditor-effort low
+lh-harness run --task "..." --effort medium --auditor-effort low
 ```
 
-每个后端会把等级翻译成自己的原生参数；后端缺少的等级会映射到最接近的支持等级：
-
-| 你写的 | Codex（`model_reasoning_effort`） | Claude Code（`CLAUDE_CODE_EFFORT_LEVEL`） | OpenCode（`--variant`） | DeepSeek Harness（`reasoningEffort`） |
-|---|---|---|---|---|
-| `min` | `minimal` | `low` | `minimal` | `low` |
-| `low` | `low` | `low` | `low` | `low` |
-| `med` | `medium` | `medium` | `medium` | `high`* |
-| `high` | `high` | `high` | `high` | `high` |
-| `xhigh` | `xhigh` | `xhigh` | `xhigh` | `high`* |
-| `max` | `xhigh`* | `max` | `max` | `max` |
-
-\* 后端没有该等级，使用最接近的支持等级；episode metadata 中记录为 `effort_effective`。
+请求的等级会记录在每个 episode 的 metadata（`effort`）中，并显示在任务详情页。
 
 上述每个字段都有对应的 CLI 参数（`--agent`、`--max-rounds`、`--gui-executor-model`、`--auditor-timeout`、`--effort`、`--manager-effort` 等）可以对单次运行覆盖。完整列表见 `lh-harness run --help`。
 

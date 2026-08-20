@@ -63,7 +63,7 @@ CONFIG_TEMPLATE = """# LongHorizon-Harness project defaults.
 [run]
 agent = "codex"
 model = "gpt-5.6-sol"
-effort = "med"
+effort = "medium"
 
 env = "local"
 runs_root = "./.lh-harness/runs"
@@ -108,43 +108,43 @@ auditor = 300
 [run.roles.manager]
 # agent = "codex"
 # model = "gpt-5.6-sol"
-# effort = "med"
+# effort = "medium"
 
 [run.roles.executor]
 # agent = "codex"
 # model = "gpt-5.6-sol"
-# effort = "med"
+# effort = "medium"
 
 [run.roles.auditor]
 # agent = "codex"
 # model = "gpt-5.6-sol"
-# effort = "med"
+# effort = "medium"
 
 # Writes the closing reply to you; falls back to the manager's agent/model.
 [run.roles.final_response]
 # agent = "codex"
 # model = "gpt-5.6-sol"
-# effort = "med"
+# effort = "medium"
 
 [run.roles.gui_executor]
 # agent = "codex"
 # model = "gpt-5.6-sol"
-# effort = "med"
+# effort = "medium"
 
 [run.roles.gui_auditor]
 # agent = "codex"
 # model = "gpt-5.6-sol"
-# effort = "med"
+# effort = "medium"
 
 [run.roles.cli_executor]
 # agent = "codex"
 # model = "gpt-5.6-sol"
-# effort = "med"
+# effort = "medium"
 
 [run.roles.cli_auditor]
 # agent = "codex"
 # model = "gpt-5.6-sol"
-# effort = "med"
+# effort = "medium"
 """
 
 

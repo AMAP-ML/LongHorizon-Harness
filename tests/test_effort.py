@@ -1,11 +1,9 @@
-"""Per-role effort: config keys, CLI fallback chain, adapter dials.
+"""Per-role effort: config keys, CLI fallback chain, verbatim backend dials.
 
-The harness exposes one normalized scale — min/low/med/high/xhigh/max,
-covering the union of the levels the backends document — and each adapter
-translates a level into its own documented dial and vocabulary, mapping a
-level its backend lacks to the nearest supported one.  Episode metadata
-records both the requested and the effective value so substitutions stay
-visible.
+Effort values pass through to each backend verbatim — no cross-backend
+mapping.  Each backend accepts exactly the levels it documents and rejects
+the rest, so an operator can never believe a run used a depth the backend
+silently substituted.
 """
 
 import argparse
@@ -25,7 +23,7 @@ from lh_harness.adapters.opencode import OpenCodeAdapter
 from lh_harness.cli import _ROLE_PARENTS, _build_agent, _resolve_role_effort
 from lh_harness.config import ProjectConfigError, _flatten_run_table
 from lh_harness.environment.local import LocalEnvironment
-from lh_harness.types import EpisodeBudget, EFFORT_CHOICES
+from lh_harness.types import BACKEND_EFFORT_LEVELS, EFFORT_CHOICES, EpisodeBudget
 
 
 # --- config ----------------------------------------------------------------
@@ -57,6 +55,11 @@ def test_config_rejects_unknown_effort_values(bad: object) -> None:
         _flatten_run_table({"roles": {"executor": {"effort": bad}}})
 
 
+def test_union_choices_cover_every_backend_level() -> None:
+    for backend, levels in BACKEND_EFFORT_LEVELS.items():
+        assert set(levels) <= set(EFFORT_CHOICES), backend
+
+
 # --- CLI fallback chain ----------------------------------------------------
 
 
@@ -76,49 +79,45 @@ def test_role_specific_effort_wins() -> None:
 
 
 def test_effort_inherits_down_the_role_chain() -> None:
-    args = _args(executor_effort="med")
+    args = _args(executor_effort="medium")
 
-    assert _resolve_role_effort(args, "cli_executor") == "med"
+    assert _resolve_role_effort(args, "cli_executor") == "medium"
     assert _resolve_role_effort(args, "manager") is None
 
 
 def test_effort_falls_back_to_the_global_flag() -> None:
-    args = _args(effort="min")
+    args = _args(effort="minimal")
 
-    assert _resolve_role_effort(args, "auditor") == "min"
+    assert _resolve_role_effort(args, "auditor") == "minimal"
 
 
 def test_effort_defaults_to_backend_default() -> None:
     assert _resolve_role_effort(_args(), "manager") is None
 
 
-# --- Codex: -c model_reasoning_effort (minimal|low|medium|high|xhigh) ------
+# --- Codex: -c model_reasoning_effort --------------------------------------
 
 
-def test_codex_passes_native_levels_through(tmp_path: Path) -> None:
+@pytest.mark.parametrize("level", BACKEND_EFFORT_LEVELS["codex"])
+def test_codex_passes_its_levels_verbatim(tmp_path: Path, level: str) -> None:
     adapter = CodexAdapter(
         workspace_path=str(tmp_path),
         prompt_dir=str(tmp_path / "prompts"),
-        effort="xhigh",
+        effort=level,
     )
 
-    assert 'model_reasoning_effort="xhigh"' in adapter.command_template
-    assert adapter.effort == "xhigh"
-    assert adapter.effort_effective == "xhigh"
+    assert f'model_reasoning_effort="{level}"' in adapter.command_template
+    assert adapter.effort == level
 
 
-def test_codex_maps_max_to_its_top_level(tmp_path: Path) -> None:
-    """Codex documents no "max"; the request lands on xhigh, visibly."""
-
-    adapter = CodexAdapter(
-        workspace_path=str(tmp_path),
-        prompt_dir=str(tmp_path / "prompts"),
-        effort="max",
-    )
-
-    assert 'model_reasoning_effort="xhigh"' in adapter.command_template
-    assert adapter.effort == "max"
-    assert adapter.effort_effective == "xhigh"
+@pytest.mark.parametrize("level", ["max", "none", "ultra"])
+def test_codex_rejects_levels_it_does_not_document(tmp_path: Path, level: str) -> None:
+    with pytest.raises(ValueError, match="effort must be one of"):
+        CodexAdapter(
+            workspace_path=str(tmp_path),
+            prompt_dir=str(tmp_path / "prompts"),
+            effort=level,
+        )
 
 
 def test_codex_omits_the_override_without_effort(tmp_path: Path) -> None:
@@ -130,39 +129,29 @@ def test_codex_omits_the_override_without_effort(tmp_path: Path) -> None:
     assert "model_reasoning_effort" not in adapter.command_template
 
 
-def test_codex_rejects_unknown_effort(tmp_path: Path) -> None:
-    with pytest.raises(ValueError, match="effort"):
-        CodexAdapter(
-            workspace_path=str(tmp_path),
-            prompt_dir=str(tmp_path / "prompts"),
-            effort="ultra",
-        )
+# --- Claude Code: CLAUDE_CODE_EFFORT_LEVEL ----------------------------------
 
 
-# --- Claude Code: CLAUDE_CODE_EFFORT_LEVEL (low|medium|high|xhigh|max) -----
-
-
-@pytest.mark.parametrize(
-    ("effort", "level"),
-    [
-        ("min", "low"),  # Claude documents no "min"; floor is low
-        ("low", "low"),
-        ("med", "medium"),
-        ("high", "high"),
-        ("xhigh", "xhigh"),
-        ("max", "max"),
-    ],
-)
-def test_claude_sets_the_effort_level_env(tmp_path: Path, effort: str, level: str) -> None:
+@pytest.mark.parametrize("level", BACKEND_EFFORT_LEVELS["claude_code"])
+def test_claude_passes_its_levels_verbatim(tmp_path: Path, level: str) -> None:
     adapter = ClaudeCodeAdapter(
         workspace_path=str(tmp_path),
         prompt_dir=str(tmp_path / "prompts"),
-        effort=effort,
+        effort=level,
     )
 
     assert f"CLAUDE_CODE_EFFORT_LEVEL={level}" in adapter.command_template
-    assert adapter.effort == effort
-    assert adapter.effort_effective == level
+    assert adapter.effort == level
+
+
+@pytest.mark.parametrize("level", ["minimal", "none", "ultra"])
+def test_claude_rejects_levels_it_does_not_document(tmp_path: Path, level: str) -> None:
+    with pytest.raises(ValueError, match="effort must be one of"):
+        ClaudeCodeAdapter(
+            workspace_path=str(tmp_path),
+            prompt_dir=str(tmp_path / "prompts"),
+            effort=level,
+        )
 
 
 def test_claude_omits_the_env_without_effort(tmp_path: Path) -> None:
@@ -174,41 +163,29 @@ def test_claude_omits_the_env_without_effort(tmp_path: Path) -> None:
     assert "CLAUDE_CODE_EFFORT_LEVEL" not in adapter.command_template
 
 
-def test_claude_rejects_unknown_effort(tmp_path: Path) -> None:
-    with pytest.raises(ValueError, match="effort"):
-        ClaudeCodeAdapter(
-            workspace_path=str(tmp_path),
-            prompt_dir=str(tmp_path / "prompts"),
-            effort="ultra",
-        )
+# --- DeepSeek Harness: reasoningEffort profile patch ------------------------
 
 
-# --- DeepSeek Harness: reasoningEffort patch (low|high|max) ----------------
-
-
-@pytest.mark.parametrize(
-    ("effort", "dsh_level"),
-    [
-        ("min", "low"),
-        ("low", "low"),
-        ("med", "high"),  # DeepSeek's own docs map medium onto high
-        ("high", "high"),
-        ("xhigh", "high"),  # ... and xhigh onto high
-        ("max", "max"),
-    ],
-)
-def test_deepseek_maps_effort_onto_dsh_levels(
-    tmp_path: Path, effort: str, dsh_level: str
-) -> None:
+@pytest.mark.parametrize("level", BACKEND_EFFORT_LEVELS["deepseek_harness"])
+def test_deepseek_passes_its_levels_verbatim(tmp_path: Path, level: str) -> None:
     adapter = DeepSeekHarnessAdapter(
         workspace_path=str(tmp_path),
         prompt_dir=str(tmp_path / "prompts"),
-        effort=effort,
+        effort=level,
     )
 
-    assert f"--reasoning-effort {dsh_level}" in adapter.command_template
-    assert adapter.effort == effort
-    assert adapter.effort_effective == dsh_level
+    assert f"--reasoning-effort {level}" in adapter.command_template
+    assert adapter.effort == level
+
+
+@pytest.mark.parametrize("level", ["minimal", "medium", "xhigh", "ultra"])
+def test_deepseek_rejects_levels_it_does_not_document(tmp_path: Path, level: str) -> None:
+    with pytest.raises(ValueError, match="effort must be one of"):
+        DeepSeekHarnessAdapter(
+            workspace_path=str(tmp_path),
+            prompt_dir=str(tmp_path / "prompts"),
+            effort=level,
+        )
 
 
 def test_deepseek_omits_the_flag_without_effort(tmp_path: Path) -> None:
@@ -218,15 +195,6 @@ def test_deepseek_omits_the_flag_without_effort(tmp_path: Path) -> None:
     )
 
     assert "--reasoning-effort" not in adapter.command_template
-
-
-def test_deepseek_rejects_unknown_effort(tmp_path: Path) -> None:
-    with pytest.raises(ValueError, match="effort"):
-        DeepSeekHarnessAdapter(
-            workspace_path=str(tmp_path),
-            prompt_dir=str(tmp_path / "prompts"),
-            effort="ultra",
-        )
 
 
 def test_deepseek_runner_writes_the_effort_patch(tmp_path: Path) -> None:
@@ -260,7 +228,7 @@ def test_deepseek_runner_patch_has_no_effort_entry_by_default(tmp_path: Path) ->
     assert "reasoningEffort" not in patch
 
 
-# --- OpenCode: --variant <preset name> -------------------------------------
+# --- OpenCode: --variant <preset name> --------------------------------------
 
 
 def test_build_agent_wires_effort_into_opencode_variant(tmp_path: Path) -> None:
@@ -274,34 +242,29 @@ def test_build_agent_wires_effort_into_opencode_variant(tmp_path: Path) -> None:
         base_url=None,
         workspace_path=str(tmp_path),
         prompt_dir=str(tmp_path / "prompts"),
-        effort="med",
+        effort="medium",
     )
 
     assert isinstance(adapter, OpenCodeAdapter)
     assert "--variant medium" in adapter.command_template
-    assert adapter.effort == "med"
-    assert adapter.effort_effective == "medium"
+    assert adapter.effort == "medium"
 
 
-def test_opencode_spells_min_out_to_the_minimal_variant(tmp_path: Path) -> None:
-    """OpenAI-style models ship a "minimal" variant; the scale's "min" maps to it."""
-
+def test_opencode_passes_custom_variant_names_verbatim(tmp_path: Path) -> None:
     adapter = OpenCodeAdapter(
         workspace_path=str(tmp_path),
         prompt_dir=str(tmp_path / "prompts"),
-        effort="min",
+        effort="my-custom-variant",
         role="cli_executor",
     )
 
-    assert "--variant minimal" in adapter.command_template
-    assert adapter.effort == "min"
-    assert adapter.effort_effective == "minimal"
+    assert "--variant my-custom-variant" in adapter.command_template
 
 
-# --- episode metadata ------------------------------------------------------
+# --- episode metadata -------------------------------------------------------
 
 
-def test_requested_and_effective_effort_land_in_episode_metadata(
+def test_requested_effort_lands_in_episode_metadata(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     events = "\n".join(
@@ -325,7 +288,7 @@ def test_requested_and_effective_effort_land_in_episode_metadata(
     adapter = OpenCodeAdapter(
         workspace_path=str(workspace),
         prompt_dir=str(tmp_path / "prompts"),
-        effort="med",
+        effort="medium",
         role="cli_executor",
     )
     result = asyncio.run(
@@ -336,20 +299,11 @@ def test_requested_and_effective_effort_land_in_episode_metadata(
         )
     )
 
-    assert result.metadata["effort"] == "med"
-    assert result.metadata["effort_effective"] == "medium"
+    assert result.metadata["effort"] == "medium"
     assert result.metadata["opencode_variant"] == "medium"
 
 
-def test_every_choice_has_a_translation_in_every_backend() -> None:
-    from lh_harness.adapters.claude_code import _CLAUDE_EFFORT_LEVELS
-    from lh_harness.adapters.deepseek_harness import _DSH_EFFORTS
-
-    assert set(_CLAUDE_EFFORT_LEVELS) == set(EFFORT_CHOICES)
-    assert set(_DSH_EFFORTS) == set(EFFORT_CHOICES)
-
-
-# --- web supervisor boundary -----------------------------------------------
+# --- web supervisor boundary ------------------------------------------------
 
 
 def test_supervisor_accepts_and_forwards_role_effort(tmp_path: Path) -> None:
@@ -378,26 +332,37 @@ def test_supervisor_accepts_and_forwards_role_effort(tmp_path: Path) -> None:
     assert not any("--manager-effort" in item for item in command)
 
 
-def test_supervisor_rejects_bad_role_effort() -> None:
+def test_supervisor_validates_effort_against_the_role_backend() -> None:
     from lh_harness.supervisor.service import _normalise_role_configs
 
+    # "max" is a Claude level, not a Codex one - no silent substitution.
     with pytest.raises(ValueError, match="effort must be one of"):
         _normalise_role_configs(
-            {"executor": {"effort": "ultra"}}, agent="codex", model=None
+            {"executor": {"agent": "codex", "effort": "max"}}, agent="codex", model=None
         )
+    # ... but it is valid verbatim on a Claude role.
+    resolved = _normalise_role_configs(
+        {"executor": {"agent": "claude_code", "effort": "max"}}, agent="codex", model=None
+    )
+    assert resolved["executor"]["effort"] == "max"
+    # OpenCode variants are per-model names; only their shape is checked.
+    resolved = _normalise_role_configs(
+        {"executor": {"agent": "opencode", "effort": "my-variant"}}, agent="codex", model=None
+    )
+    assert resolved["executor"]["effort"] == "my-variant"
 
 
-def test_snapshot_provenance_keeps_valid_role_effort() -> None:
+def test_snapshot_provenance_keeps_role_effort() -> None:
     from lh_harness.webapi.snapshot import _safe_role_configs
 
     cleaned = _safe_role_configs(
         {
             "manager": {"agent": "codex", "model": "m", "effort": "high"},
-            "executor": {"agent": "codex", "model": "m", "effort": "bogus"},
-            "auditor": {"agent": "codex", "model": "m"},
+            "executor": {"agent": "opencode", "model": "m", "effort": "my-variant"},
+            "auditor": {"agent": "codex", "model": "m", "effort": "x" * 65},
         }
     )
 
     assert cleaned["manager"]["effort"] == "high"
-    assert "effort" not in cleaned["executor"]
+    assert cleaned["executor"]["effort"] == "my-variant"
     assert "effort" not in cleaned["auditor"]

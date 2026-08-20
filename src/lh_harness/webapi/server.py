@@ -25,7 +25,7 @@ from ..model_catalog import discover_model_catalog
 from ..supervisor.service import IdempotencyConflict, RunSupervisor
 from ..supervisor.lifecycle import TERMINAL_STATUSES, canonical_lifecycle_status
 from ..supervisor.control_bus import CommandConflict, RevisionConflict
-from ..types import DEFAULT_CODEX_MODEL, DEFAULT_MAX_ROUNDS, EFFORT_CHOICES, MAX_ROUNDS
+from ..types import BACKEND_EFFORT_LEVELS, DEFAULT_CODEX_MODEL, DEFAULT_MAX_ROUNDS, MAX_ROUNDS
 from ..utils.agent_cli import resolve_codex_binary, resolve_dsh_binary, resolve_opencode_binary
 from ..utils.run_boundary import safe_run_control, safe_run_dir, safe_run_logs, safe_run_role, safe_run_rounds
 from .events import EventTailer
@@ -701,7 +701,7 @@ def create_app(
             defaults={
                 "agent": "codex",
                 "model": DEFAULT_CODEX_MODEL,
-                "effort_levels": list(EFFORT_CHOICES),
+                "effort_levels": {agent: list(levels) for agent, levels in BACKEND_EFFORT_LEVELS.items()},
                 "roles": {
                     role: {"agent": "codex", "model": DEFAULT_CODEX_MODEL}
                     for role in ("manager", "executor", "auditor")

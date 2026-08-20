@@ -43,7 +43,7 @@ from ..types import (
     DEFAULT_OPENCODE_MODEL,
     DEFAULT_MAX_ROUNDS,
     MAX_ROUNDS,
-    EFFORT_CHOICES,
+    BACKEND_EFFORT_LEVELS,
 )
 from ..utils.run_boundary import safe_run_control, safe_run_dir, safe_run_logs, safe_run_role, safe_run_rounds
 
@@ -125,9 +125,18 @@ def _normalise_role_configs(
         result[role] = {"agent": role_agent, "model": role_model}
         raw_effort = raw.get("effort")
         if raw_effort is not None and raw_effort != "":
-            if not isinstance(raw_effort, str) or raw_effort not in EFFORT_CHOICES:
+            if not isinstance(raw_effort, str):
+                raise ValueError(f"roles.{role}.effort must be a string")
+            if role_agent == "opencode":
+                # OpenCode's effort is a per-model variant name; custom
+                # variants come from opencode.jsonc, so only shape is checked.
+                if len(raw_effort) > 64 or "\x00" in raw_effort:
+                    raise ValueError(f"roles.{role}.effort is not a valid OpenCode variant name")
+            elif raw_effort not in BACKEND_EFFORT_LEVELS[role_agent]:
                 raise ValueError(
-                    f"roles.{role}.effort must be one of: " + ", ".join(EFFORT_CHOICES)
+                    f"roles.{role}.effort must be one of: "
+                    + ", ".join(BACKEND_EFFORT_LEVELS[role_agent])
+                    + f" for {role_agent}"
                 )
             result[role]["effort"] = raw_effort
     return result

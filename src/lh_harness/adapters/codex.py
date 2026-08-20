@@ -6,10 +6,10 @@ import os
 import shlex
 
 from ..types import (
+    BACKEND_EFFORT_LEVELS,
     DEFAULT_CODEX_MODEL,
     DEFAULT_TMP_DIR,
     DEFAULT_WORKSPACE_PATH,
-    EFFORT_CHOICES,
 )
 from ..agent_logs import visible_output as extract_codex_visible_output
 from ..utils.agent_cli import resolve_codex_binary
@@ -24,18 +24,6 @@ except ModuleNotFoundError:
 # target any OpenAI-compatible endpoint without editing ~/.codex/config.toml.
 _PROVIDER_ID = "lh_harness"
 _DEFAULT_BASE_URL = "https://api.openai.com/v1"
-
-# Codex documents minimal|low|medium|high|xhigh for model_reasoning_effort:
-# the scale's "min" spells out to "minimal" there, and "max" exists only on
-# the Claude side, so it lands on Codex's top level.
-_CODEX_EFFORTS = {
-    "min": "minimal",
-    "low": "low",
-    "med": "medium",
-    "high": "high",
-    "xhigh": "xhigh",
-    "max": "xhigh",
-}
 
 
 class CodexAdapter(CommandAgentAdapter):
@@ -53,12 +41,12 @@ class CodexAdapter(CommandAgentAdapter):
         hidden_paths: tuple[str, ...] = (),
         effort: str | None = None,
     ) -> None:
-        if effort is not None and effort not in EFFORT_CHOICES:
+        if effort is not None and effort not in BACKEND_EFFORT_LEVELS["codex"]:
             raise ValueError(
-                f"Codex effort must be one of {', '.join(EFFORT_CHOICES)}"
+                "Codex effort must be one of "
+                f"{', '.join(BACKEND_EFFORT_LEVELS['codex'])}"
             )
         self.effort = effort
-        self.effort_effective = _CODEX_EFFORTS[effort] if effort else None
         env_parts: list[str] = []
         if api_key:
             quoted_key = shlex.quote(api_key)
@@ -104,14 +92,9 @@ class CodexAdapter(CommandAgentAdapter):
 
         if model:
             command_parts.extend(["--model", shlex.quote(model)])
-        if self.effort_effective:
+        if effort:
             command_parts.extend(
-                [
-                    "-c",
-                    shlex.quote(
-                        f"model_reasoning_effort={json.dumps(self.effort_effective)}"
-                    ),
-                ]
+                ["-c", shlex.quote(f"model_reasoning_effort={json.dumps(effort)}")]
             )
         # `-` makes Codex read the prompt from stdin, keeping long prompts off
         # the command line and out of the process table.

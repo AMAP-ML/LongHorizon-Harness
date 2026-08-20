@@ -216,7 +216,7 @@ interface ActivityStep {
   imageWarning?: string;
 }
 
-const MODEL_PRESETS: Record<string, { id: string; label: string }[]> = {
+const MODEL_PRESETS: Record<string, { id: string; label: string; reasoning_efforts?: string[] }[]> = {
   codex: [{ id: 'gpt-5.6-sol', label: 'GPT-5.6 Sol · default' }],
   claude_code: [{ id: 'claude-opus-5', label: 'Claude Opus 5 · default' }],
   deepseek_harness: [{ id: 'deepseek-v4-flash', label: 'DeepSeek V4 Flash · default' }],
@@ -225,7 +225,12 @@ const MODEL_PRESETS: Record<string, { id: string; label: string }[]> = {
 
 type PublicRole = 'manager' | 'executor' | 'auditor';
 type RoleSelection = RoleRuntimeConfig & { custom: boolean };
-const EFFORT_LEVEL_FALLBACK = ['min', 'low', 'med', 'high', 'xhigh', 'max'];
+const EFFORT_LEVEL_FALLBACK: Record<string, string[]> = {
+  codex: ['minimal', 'low', 'medium', 'high', 'xhigh'],
+  claude_code: ['low', 'medium', 'high', 'xhigh', 'max'],
+  deepseek_harness: ['low', 'high', 'max'],
+  opencode: ['none', 'minimal', 'low', 'medium', 'high', 'xhigh'],
+};
 const PUBLIC_ROLES: Array<{ id: PublicRole; label: string; description: string }> = [
   { id: 'manager', label: 'Manager', description: '规划、路由与完成判定' },
   { id: 'executor', label: 'Executor', description: '执行 GUI / CLI 子任务' },
@@ -238,14 +243,14 @@ const PUBLIC_ROLES: Array<{ id: PublicRole; label: string; description: string }
 const MAX_TRAJECTORY_ROUNDS = 8;
 const MAX_TRAJECTORY_STEPS = 600;
 
-function normalizedModelChoices(value: unknown): { id: string; label: string; availability?: string }[] {
+function normalizedModelChoices(value: unknown): { id: string; label: string; availability?: string; reasoning_efforts?: string[] }[] {
   if (!Array.isArray(value)) return [];
   return value.flatMap((item) => {
     if (typeof item === 'string' && item.trim()) return [{ id: item.trim(), label: item.trim() }];
     if (!item || typeof item !== 'object') return [];
     const record = item as Record<string, unknown>;
     const id = typeof record.id === 'string' ? record.id.trim() : '';
-    return id ? [{ id, label: typeof record.label === 'string' && record.label.trim() ? record.label.trim() : id, availability: typeof record.availability === 'string' ? record.availability : undefined }] : [];
+    return id ? [{ id, label: typeof record.label === 'string' && record.label.trim() ? record.label.trim() : id, availability: typeof record.availability === 'string' ? record.availability : undefined, reasoning_efforts: Array.isArray(record.reasoning_efforts) ? record.reasoning_efforts.filter((level): level is string => typeof level === 'string') : undefined }] : [];
   });
 }
 
@@ -1709,6 +1714,14 @@ function RoleRuntimePicker({ role, selection, meta, onChange }: { role: typeof P
   );
   const choices = discovered.length ? discovered : MODEL_PRESETS[selection.agent] || [];
   const providerDefault = defaultModel(meta, selection.agent) || 'provider default';
+  // The effort options are the model's own discovered levels when the
+  // catalogue has them, otherwise the backend's documented set - values pass
+  // to the backend verbatim, so only levels it accepts are offered.
+  const chosenModelId = selection.model || defaultModel(meta, selection.agent);
+  const modelEfforts = choices.find((choice) => choice.id === chosenModelId)?.reasoning_efforts;
+  const effortLevels: string[] = modelEfforts?.length
+    ? modelEfforts
+    : meta?.defaults?.effort_levels?.[selection.agent] || EFFORT_LEVEL_FALLBACK[selection.agent] || [];
   const selectValue = selection.custom
     ? '__custom__'
     : selection.model && choices.some((choice) => choice.id === selection.model)
@@ -1732,9 +1745,9 @@ function RoleRuntimePicker({ role, selection, meta, onChange }: { role: typeof P
   return <section className="role-runtime-card">
     <div className="role-runtime-title"><span className="role-runtime-mark">{role.label[0]}</span><div><strong>{role.label}</strong><small>{roleDescription}</small></div></div>
     <div className="role-runtime-grid">
-      <label className="drawer-field"><span>Harness</span><select value={selection.agent} onChange={(event) => onChange({ agent: event.target.value, model: '', effort: selection.effort, custom: false })}>{agentChoices.map((choice) => <option value={choice.id} key={choice.id} disabled={choice.available === false}>{choice.label}{choice.available === false ? text(' · 未安装', ' · Not installed') : ''}</option>)}</select></label>
+      <label className="drawer-field"><span>Harness</span><select value={selection.agent} onChange={(event) => onChange({ agent: event.target.value, model: '', effort: undefined, custom: false })}>{agentChoices.map((choice) => <option value={choice.id} key={choice.id} disabled={choice.available === false}>{choice.label}{choice.available === false ? text(' · 未安装', ' · Not installed') : ''}</option>)}</select></label>
       <label className="drawer-field"><span>Model</span><select value={selectValue} onChange={(event) => { const value = event.target.value; onChange(value === '__custom__' ? { ...selection, model: '', custom: true } : { ...selection, model: value, custom: false }); }}><option value="">{text(`Provider 默认（${providerDefault}）`, `Provider default (${providerDefault})`)}</option>{choices.map((choice) => <option value={choice.id} key={choice.id}>{choice.label}</option>)}<option value="__custom__">{text('自定义模型…', 'Custom model…')}</option></select></label>
-      <label className="drawer-field"><span>{text('思考强度', 'Effort')}</span><select value={selection.effort || ''} onChange={(event) => onChange({ ...selection, effort: event.target.value || undefined })}><option value="">{text('默认', 'Default')}</option>{(meta?.defaults?.effort_levels?.length ? meta.defaults.effort_levels : EFFORT_LEVEL_FALLBACK).map((level) => <option value={level} key={level}>{level}</option>)}</select></label>
+      <label className="drawer-field"><span>{text('思考强度', 'Effort')}</span><select value={selection.effort && effortLevels.includes(selection.effort) ? selection.effort : ''} onChange={(event) => onChange({ ...selection, effort: event.target.value || undefined })}><option value="">{text('默认', 'Default')}</option>{effortLevels.map((level) => <option value={level} key={level}>{level}</option>)}</select></label>
     </div>
     {selection.custom && <input className="role-runtime-custom" autoFocus value={selection.model || ''} onChange={(event) => onChange({ ...selection, model: event.target.value })} placeholder={text('输入 provider 暴露的模型名', 'Enter a model name exposed by the provider')} />}
     <small className={`drawer-field-note ${discovery?.account_scoped ? 'model-detected' : ''}`}>{selection.custom ? text('自定义模型不在检测目录时仍允许尝试；若不存在、无权限或凭据错误，任务会立即失败并显示 provider 原因。', 'You may try a custom model that was not detected. If it is unavailable, unauthorized, or the credentials are invalid, the task will fail immediately with the provider reason.') : [backendScopeNote, discoveryNote].filter(Boolean).join(' ')}</small>

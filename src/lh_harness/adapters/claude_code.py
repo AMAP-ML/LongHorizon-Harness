@@ -16,6 +16,7 @@ from .claude_permissions import (
 from ..environment.base import Environment
 from ..provider_errors import GUARD_REJECTION_MESSAGE
 from ..types import (
+    BACKEND_EFFORT_LEVELS,
     DEFAULT_CLAUDE_MODEL,
     DEFAULT_TMP_DIR,
     DEFAULT_WORKSPACE_PATH,
@@ -24,18 +25,9 @@ from ..types import (
 )
 from .cli_agent import CommandAgentAdapter
 
-# Claude Code reads its effort level from CLAUDE_CODE_EFFORT_LEVEL (the env
-# var also outranks a session's /effort choice, which is exactly the isolation
-# a harness role needs).  It documents low|medium|high|xhigh|max; the scale's
-# "med" spells out to "medium" there, and "min" lands on Claude's floor.
-_CLAUDE_EFFORT_LEVELS = {
-    "min": "low",
-    "low": "low",
-    "med": "medium",
-    "high": "high",
-    "xhigh": "xhigh",
-    "max": "max",
-}
+# Claude Code reads its effort level from CLAUDE_CODE_EFFORT_LEVEL; the env
+# var also outranks a session's /effort choice, which is exactly the
+# isolation a harness role needs.
 
 
 class ClaudeCodeAdapter(CommandAgentAdapter):
@@ -54,13 +46,12 @@ class ClaudeCodeAdapter(CommandAgentAdapter):
         guard_exclude_paths: tuple[str, ...] = (),
         effort: str | None = None,
     ) -> None:
-        if effort is not None and effort not in _CLAUDE_EFFORT_LEVELS:
+        if effort is not None and effort not in BACKEND_EFFORT_LEVELS["claude_code"]:
             raise ValueError(
                 "Claude Code effort must be one of "
-                f"{', '.join(_CLAUDE_EFFORT_LEVELS)}"
+                f"{', '.join(BACKEND_EFFORT_LEVELS['claude_code'])}"
             )
         self.effort = effort
-        self.effort_effective = _CLAUDE_EFFORT_LEVELS[effort] if effort else None
         policy = policy_for_role(role)
         env_parts: list[str] = []
         if api_key:
@@ -79,8 +70,8 @@ class ClaudeCodeAdapter(CommandAgentAdapter):
                 f"LH_HARNESS_CLAUDE_ROLE={shlex.quote(role)}",
             ]
         )
-        if self.effort_effective:
-            env_parts.append(f"CLAUDE_CODE_EFFORT_LEVEL={self.effort_effective}")
+        if effort:
+            env_parts.append(f"CLAUDE_CODE_EFFORT_LEVEL={effort}")
 
         # MCP support remains opt-in. --strict-mcp-config keeps unrelated
         # user/project MCP servers out of every role.

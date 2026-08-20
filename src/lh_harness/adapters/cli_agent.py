@@ -43,12 +43,10 @@ class CommandAgentAdapter:
         self.workspace_path = workspace_path.rstrip("/")
         self.visible_output_parser = visible_output_parser
         self.hidden_paths = tuple(hidden_paths)
-        # Subclasses that translate the normalized effort scale set these
-        # around super().__init__; run_episode records them so both the
-        # requested depth and the backend-level substitution stay auditable in
+        # Subclasses with an effort dial set this around super().__init__;
+        # run_episode records it so the requested depth stays auditable in
         # every episode's artifacts.
         self.effort = getattr(self, "effort", None)
-        self.effort_effective = getattr(self, "effort_effective", None)
 
     async def run_episode(
         self,
@@ -121,14 +119,7 @@ class CommandAgentAdapter:
                 ),
                 "stderr_chars": len(result.stderr),
                 "stderr_tail": redact_secrets(result.stderr[-2000:]),
-                **(
-                    {
-                        "effort": self.effort,
-                        "effort_effective": self.effort_effective or self.effort,
-                    }
-                    if self.effort
-                    else {}
-                ),
+                **({"effort": self.effort} if self.effort else {}),
             },
         )
 
