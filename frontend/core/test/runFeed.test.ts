@@ -7,7 +7,7 @@ import {
 } from '../src/runFeed';
 import type { EventEnvelope, Snapshot } from '../src/types';
 import { availableCommands, commandHelp, normaliseMaxRounds, parseCommand, parseNewRunArgs } from '../src/commands';
-import { managerPlanSummary, managerPlanText } from '../src/runView';
+import { managerPlanSummary, managerPlanText, sortTranscript } from '../src/runView';
 import { DEFAULT_PANEL_STATE, reducePanelState } from '../src/panels';
 import { projectStatus } from '../src/statusView';
 import { isTrajectoryNoise, projectTrajectoryView } from '../src/trajectoryView';
@@ -160,6 +160,89 @@ test('approval responses render optimistically and survive stale snapshots', () 
   assert.equal(state.snapshot?.approvals[0]?.resolved_at, 15);
 });
 
+test('a resumed run replaces its own terminal state without a reload', () => {
+  // Every monotonic guard assumes a terminal frame is final. Resuming in place
+  // is the one case where it is not, so without the generation counter the UI
+  // kept showing the ended run (and an empty conversation) until a reload.
+  const ended = event('resume-ev-1', 10);
+  let state = reduce(createRunFeedState('run-a'), {
+    type: 'seed',
+    snapshot: {
+      ...snapshot('run-a', [ended]),
+      run: { id: 'run-a', status: 'incomplete', log_dir: '/tmp/run-a', finished_at: 20, exit_code: 1, failure_reason: 'stopped' },
+    },
+  });
+  assert.equal(state.snapshot?.run.status, 'incomplete');
+
+  state = reduceRunFeed(state, {
+    type: 'snapshot',
+    snapshot: {
+      ...snapshot('run-a', [ended]),
+      run: { id: 'run-a', status: 'starting', log_dir: '/tmp/run-a', resume_epoch: 1 },
+    },
+  });
+  assert.equal(state.snapshot?.run.status, 'starting');
+  assert.equal(state.snapshot?.run.resume_epoch, 1);
+  assert.equal(state.snapshot?.run.finished_at, undefined, 'the previous outcome must not be carried over');
+  assert.equal(state.snapshot?.run.exit_code, undefined);
+  assert.equal(state.snapshot?.run.failure_reason, undefined);
+});
+
+test('a stale frame from the previous generation is ignored', () => {
+  const ev = event('resume-ev-2', 10);
+  let state = reduce(createRunFeedState('run-a'), {
+    type: 'seed',
+    snapshot: { ...snapshot('run-a', [ev]), run: { id: 'run-a', status: 'running', log_dir: '/tmp/run-a', resume_epoch: 2 } },
+  });
+
+  state = reduceRunFeed(state, {
+    type: 'snapshot',
+    snapshot: { ...snapshot('run-a', [ev]), run: { id: 'run-a', status: 'cancelled', log_dir: '/tmp/run-a', finished_at: 5, resume_epoch: 1 } },
+  });
+
+  assert.equal(state.snapshot?.run.status, 'running', 'an older generation must not end the current one');
+  assert.equal(state.snapshot?.run.resume_epoch, 2);
+});
+
+test('terminality still wins inside one generation', () => {
+  const ev = event('resume-ev-3', 10);
+  let state = reduce(createRunFeedState('run-a'), {
+    type: 'seed',
+    snapshot: { ...snapshot('run-a', [ev]), run: { id: 'run-a', status: 'completed', log_dir: '/tmp/run-a', resume_epoch: 1 } },
+  });
+
+  state = reduceRunFeed(state, {
+    type: 'snapshot',
+    snapshot: { ...snapshot('run-a', [ev]), run: { id: 'run-a', status: 'running', log_dir: '/tmp/run-a', resume_epoch: 1 } },
+  });
+
+  assert.equal(state.snapshot?.run.status, 'completed');
+});
+
+test('keeps an operator round grant when a stale pending frame arrives', () => {
+  const base = {
+    approval_id: 'approval-rounds', title: 'Round limit reached', message: '', options: [], answers: [],
+    allow_input: true, input_label: '', allow_extra_rounds: true, context: { trigger: 'max_rounds' },
+    round_index: 5, status: 'pending', action: '', reason: '', user_input: '', created_at: 10, resolved_at: null,
+  };
+  const first = event('rounds-event-1', 10);
+  const second = event('rounds-event-2', 20);
+  let state = reduce(createRunFeedState('run-a'), {
+    type: 'seed',
+    snapshot: { ...snapshot('run-a', [first]), approvals: [{ ...base, status: 'resolved', action: 'continue', extra_rounds: 7, resolved_at: 15 }] },
+  });
+  assert.equal(state.snapshot?.approvals[0]?.extra_rounds, 7);
+
+  // A stale frame (or an older server that omits the field) must not erase it.
+  state = reduceRunFeed(state, {
+    type: 'snapshot',
+    snapshot: { ...snapshot('run-a', [first, second]), approvals: [base] },
+  });
+  assert.equal(state.snapshot?.approvals[0]?.extra_rounds, 7);
+  assert.equal(state.snapshot?.approvals[0]?.allow_extra_rounds, true);
+  assert.equal(state.snapshot?.approvals[0]?.status, 'resolved');
+});
+
 test('keeps the Manager plan body when a compact route is present', () => {
   assert.equal(
     managerPlanText({ round_index: 1, next_step: 'gui', plan_text: 'Task contract:\nOpen the page and verify the screenshot.' }),
@@ -188,6 +271,68 @@ Boundaries: Read only.`;
     'Inspect the repository first and return exact file evidence.',
   );
   assert.equal(managerPlanSummary('Question: Which account should be used?\n\nChoices: Work | Personal'), 'Which account should be used?');
+});
+
+test('orders a transcript strictly by time', () => {
+  const ordered = sortTranscript([
+    { kind: 'plan', round: 1, sortTime: 20, id: 'plan-1' },
+    { kind: 'verification', round: 1, sortTime: 40, id: 'audit-1' },
+    { kind: 'final', sortTime: 60, id: 'reply-round-1' },
+    { kind: 'plan', round: 2, sortTime: 120, id: 'plan-2' },
+    { kind: 'user', sortRound: -1, sortTime: 1, id: 'task' },
+    // Sent after reading the round-1 answer, so it must land below it.
+    { kind: 'user', sortTime: 80, id: 'follow-up' },
+  ] as const);
+
+  assert.deepEqual(ordered.map((item) => item.id), [
+    'task', 'plan-1', 'audit-1', 'reply-round-1', 'follow-up', 'plan-2',
+  ]);
+});
+
+test('an answer never floats below a reply the operator sent earlier', () => {
+  // The regression: a closing answer written at t=60 was pinned last, so a
+  // follow-up typed at t=80 appeared above the text it responded to.
+  const ordered = sortTranscript([
+    { kind: 'user', sortTime: 80, id: 'follow-up' },
+    { kind: 'final', sortTime: 60, id: 'answer' },
+  ] as const);
+
+  assert.deepEqual(ordered.map((item) => item.id), ['answer', 'follow-up']);
+});
+
+test('untimed entries stay next to their own round', () => {
+  // Only the plan carries an event time; the rest of round 2 has none yet.
+  const ordered = sortTranscript([
+    { kind: 'user', sortTime: 10, id: 'earlier-reply' },
+    { kind: 'live', sortRound: Number.MAX_SAFE_INTEGER, id: 'live' },
+    { kind: 'verification', round: 2, id: 'audit' },
+    { kind: 'assistant', round: 2, id: 'exec' },
+    { kind: 'plan', round: 2, sortTime: 50, id: 'plan' },
+  ] as const);
+
+  assert.deepEqual(ordered.map((item) => item.id), ['earlier-reply', 'plan', 'exec', 'audit', 'live']);
+});
+
+test('the original request stays first after a resume restamps the run', () => {
+  // Resuming sets `started_at` to the reopen time, so the task card's own
+  // timestamp is newer than every round it started.
+  const ordered = sortTranscript([
+    { kind: 'plan', round: 1, sortTime: 100, id: 'plan' },
+    { kind: 'final', sortTime: 200, id: 'answer' },
+    { kind: 'user', sortRound: -1, sortTime: 9_000, id: 'task' },
+  ] as const);
+
+  assert.deepEqual(ordered.map((item) => item.id), ['task', 'plan', 'answer']);
+});
+
+test('a stable sort keeps equal entries in their projected order', () => {
+  const ordered = sortTranscript([
+    { kind: 'user', round: 1, id: 'first' },
+    { kind: 'user', round: 1, id: 'second' },
+    { kind: 'user', round: 1, id: 'third' },
+  ] as const);
+
+  assert.deepEqual(ordered.map((item) => item.id), ['first', 'second', 'third']);
 });
 
 test('normalizes the Web round limit without changing a typed ten to one', () => {
@@ -382,7 +527,10 @@ test('same cursor snapshots merge durable round output instead of regressing it'
   assert.equal(state.snapshot?.run.final_response, 'Durable final reply');
 });
 
-test('same cursor lifecycle status does not fall back from waiting to running', () => {
+test('a resolved gate lets the run go back to running without a reload', () => {
+  // A run toggles waiting_approval -> running at every gate, so this is normal
+  // progress, not a stale frame. Treating it as a regression froze the UI on the
+  // answered approval until the page was reloaded.
   const cursor = event('waiting-cursor', 11);
   let state = reduceRunFeed(createRunFeedState('run-a'), {
     type: 'seed',
@@ -398,7 +546,26 @@ test('same cursor lifecycle status does not fall back from waiting to running', 
       run: { ...snapshot('run-a').run, status: 'running' },
     },
   });
-  assert.equal(state.snapshot?.run.status, 'waiting_approval');
+  assert.equal(state.snapshot?.run.status, 'running');
+});
+
+test('a terminal status still outranks an active one on the same cursor', () => {
+  const cursor = event('terminal-cursor', 12);
+  let state = reduceRunFeed(createRunFeedState('run-a'), {
+    type: 'seed',
+    snapshot: {
+      ...snapshot('run-a', [cursor]),
+      run: { ...snapshot('run-a').run, status: 'completed' },
+    },
+  });
+  state = reduceRunFeed(state, {
+    type: 'snapshot',
+    snapshot: {
+      ...snapshot('run-a', [cursor]),
+      run: { ...snapshot('run-a').run, status: 'waiting_approval' },
+    },
+  });
+  assert.equal(state.snapshot?.run.status, 'completed');
 });
 
 test('resync snapshots start a new event epoch and discard the old buffer', () => {
@@ -452,6 +619,27 @@ test('parses the shared command catalog and gates only explicit capabilities', (
   assert.match(commandHelp({}, snapshot('run-a'), true), /\/trajectory/);
 });
 
+test('keeps /abort typable while a stop is in flight', () => {
+  const base = snapshot('run-a');
+  // `can_abort` is false once the run is stopping, but escalating an ignored
+  // SIGTERM is exactly what the operator needs at that point.
+  const stopping = {
+    ...base,
+    run: { ...base.run, status: 'stopping' },
+    controls: { can_inject: false, can_abort: false, can_resume: false },
+  };
+  assert.equal(availableCommands({}, stopping, true).some((item) => item.name === 'abort'), true);
+  assert.equal(availableCommands({}, stopping, true).some((item) => item.name === 'stop'), false);
+
+  const terminal = {
+    ...base,
+    run: { ...base.run, status: 'cancelled' },
+    controls: { can_inject: false, can_abort: false, can_resume: true },
+  };
+  assert.equal(availableCommands({}, terminal, true).some((item) => item.name === 'abort'), false);
+  assert.equal(availableCommands({ abort: false }, stopping, true).some((item) => item.name === 'abort'), false);
+});
+
 test('parses /new options consistently and rejects malformed flags', () => {
   assert.deepEqual(parseNewRunArgs([
     'inspect', 'screenshots', '--agent', 'claude_code', '--model=gpt-test',
@@ -483,6 +671,38 @@ test('parses /new options consistently and rejects malformed flags', () => {
   assert.match(parseNewRunArgs(['task', '--rounds', '0']).error || '', /1–1000/);
   assert.match(parseNewRunArgs(['task', '--rounds=1.5']).error || '', /整数/);
   assert.match(parseNewRunArgs(['task', '--language', 'fr']).error || '', /zh 或 en/);
+});
+
+test('/new applies a global reasoning effort to every role and allows per-role overrides', () => {
+  assert.deepEqual(parseNewRunArgs(['task', '--effort', 'high']), {
+    task: 'task',
+    roles: {
+      manager: { reasoning_effort: 'high' },
+      executor: { reasoning_effort: 'high' },
+      auditor: { reasoning_effort: 'high' },
+    },
+  });
+  assert.deepEqual(parseNewRunArgs([
+    'task', '--effort=medium', '--manager-effort', 'ultra',
+  ]), {
+    task: 'task',
+    roles: {
+      manager: { reasoning_effort: 'ultra' },
+      executor: { reasoning_effort: 'medium' },
+      auditor: { reasoning_effort: 'medium' },
+    },
+  });
+});
+
+test('/new rejects effort values that could break out of a TOML string or argv', () => {
+  // The value reaches Codex as inline TOML and the other backends as argv.
+  for (const bad of ['a"b', "a'b", 'high low', 'x'.repeat(65), '$(id)']) {
+    assert.match(parseNewRunArgs(['task', `--effort=${bad}`]).error || '', /只能包含/, bad);
+  }
+  // An unknown tier is not rejected: the accepted set differs per backend and
+  // per model, and a newer tier must not need a harness release.
+  assert.equal(parseNewRunArgs(['task', '--effort=ultra']).error, undefined);
+  assert.equal(parseNewRunArgs(['task', '--effort=a.b_c:d-1']).error, undefined);
 });
 
 test('keeps Web panel transitions deterministic', () => {
@@ -675,6 +895,45 @@ test('terminal lifecycle hides stale pending approvals from the actionable proje
   assert.equal(terminal.approvals.length, 1);
   assert.equal(terminal.pendingApprovals.length, 0);
   assert.equal(stopping.pendingApprovals.length, 0);
+  // A stale record carries no operator decision, so it must not be mistaken for
+  // a fresh answer still travelling to the worker.
+  assert.equal(stopping.awaitingHandoff, false);
+});
+
+test('a submitted decision is projected as awaiting the worker handoff', () => {
+  const base = snapshot('run-handoff');
+  const approval = {
+    approval_id: 'a-1', title: 'Continue?', message: 'checkpoint',
+    options: [], answers: [], allow_input: false, input_label: '', context: {},
+    round_index: 1, action: '', reason: '', user_input: '',
+    created_at: 1,
+  };
+  // The lifecycle still reports `waiting_approval` because only the worker can
+  // clear it, so the answered state is the client's own optimistic record.
+  const answered = projectStatus({
+    ...base,
+    run: { ...base.run, status: 'waiting_approval' },
+    approvals: [{ ...approval, status: 'resolved', action: 'continue', resolved_at: 2 }],
+  });
+  assert.equal(answered.pendingApprovals.length, 0);
+  assert.equal(answered.awaitingHandoff, true);
+
+  const unanswered = projectStatus({
+    ...base,
+    run: { ...base.run, status: 'waiting_approval' },
+    approvals: [{ ...approval, status: 'pending', resolved_at: null }],
+  });
+  assert.equal(unanswered.pendingApprovals.length, 1);
+  assert.equal(unanswered.awaitingHandoff, false);
+
+  // Once the worker picks the decision up the run reports its own progress, so
+  // this placeholder must disappear instead of stacking with "Manager is working".
+  const running = projectStatus({
+    ...base,
+    run: { ...base.run, status: 'running' },
+    approvals: [{ ...approval, status: 'resolved', action: 'continue', resolved_at: 2 }],
+  });
+  assert.equal(running.awaitingHandoff, false);
 });
 
 test('terminal manager-only runs mark never-invoked roles as skipped', () => {

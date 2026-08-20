@@ -26,6 +26,7 @@ from .provider_errors import classify_agent_runtime_failure
 from .trajectory_artifacts import persist_trajectory_artifacts
 from .role_prompts import (
     MANAGER_NEXT_BLOCKED,
+    MANAGER_NEXT_CLI,
     MANAGER_NEXT_DONE,
     MANAGER_NEXT_GUI,
     MANAGER_NEXT_INVALID,
@@ -46,6 +47,7 @@ from .role_prompts import (
     parse_role_manager_next_step,
 )
 from .types import (
+    MAX_ROUNDS,
     EpisodeBudget,
     EpisodeResult,
     HarnessConfig,
@@ -178,7 +180,9 @@ async def _run_impl(
     auditor_format_repair_agent: AgentAdapter | None = None,
     final_response_agent: AgentAdapter | None = None,
     human_hook: Callable[[dict[str, Any]], Awaitable[dict[str, Any]]] | None = None,
+    pending_instructions: Callable[[], list[str]] | None = None,
     progress: Callable[[str, dict[str, Any]], None] | None = None,
+    resume: bool = False,
     _run_progress: _RunProgress | None = None,
 ) -> dict[str, Any]:
     """Run the generic LongHorizon-Harness four-role management loop.
@@ -255,6 +259,28 @@ async def _run_impl(
     started = time.monotonic()
 
     await _ensure_remote_layout(env, config)
+
+    rounds: list[ManagedRound] = []
+    last_plan = ""
+    current_task_state = ""
+    current_task_contract = ""
+    round_index = 0
+
+    if resume:
+        # A resumed worker reopens the same ledger, so the loop continues from
+        # the recorded rounds instead of restarting at 1.  The Manager prompt is
+        # rebuilt entirely from task + rounds + task state + contract, so
+        # replaying the ledger restores the full planning context.
+        rounds.extend(_recorded_rounds(role_dir))
+        if rounds:
+            round_index = rounds[-1].round_index
+            last_plan = rounds[-1].plan_text
+            current_task_state = rounds[-1].task_state
+            current_task_contract = rounds[-1].task_contract
+
+    # After a resume ``max_total_episodes`` is the *additional* budget, so the
+    # effective ceiling continues from the restored rounds.
+    round_budget = round_index + max(1, config.max_total_episodes)
     _append_event(
         events_path,
         "role_harness_start",
@@ -263,19 +289,33 @@ async def _run_impl(
             "task_chars": len(task),
             "workspace_path": config.workspace_path,
             "harness_dir": config.harness_dir,
-            "max_rounds": config.max_total_episodes,
+            "max_rounds": round_budget,
             "manager_budget": _budget_to_dict(manager_budget),
             "gui_executor_budget": _budget_to_dict(gui_executor_budget),
             "cli_executor_budget": _budget_to_dict(cli_executor_budget),
             "auditor_budget": _budget_to_dict(auditor_budget),
+            "resumed": bool(resume),
+            "resumed_rounds": len(rounds),
         },
     )
-
-    rounds: list[ManagedRound] = []
-    last_plan = ""
-    current_task_state = ""
-    current_task_contract = ""
-    round_index = 0
+    if resume:
+        _append_event(
+            events_path,
+            "role_harness_resumed",
+            {
+                "restored_rounds": len(rounds),
+                "resume_from_round": round_index,
+                "round_budget": round_budget,
+                "task_state_chars": len(current_task_state),
+                "task_contract_chars": len(current_task_contract),
+            },
+        )
+        emit(
+            "resumed",
+            restored_rounds=len(rounds),
+            from_round=round_index,
+            round_budget=round_budget,
+        )
 
     # The gate context bundles run-scoped dependencies with the loop state the
     # end-of-round human gate updates (round budget, completion, abort reason,
@@ -288,7 +328,7 @@ async def _run_impl(
         log_dir=log_dir,
         config=config,
         events_path=events_path,
-        round_budget=max(1, config.max_total_episodes),
+        round_budget=round_budget,
         env=env,
         role_dir=role_dir,
         response_agent=final_response_agent or manager_agent,
@@ -320,6 +360,18 @@ async def _run_impl(
             language=config.prompt_language,
             max_history_chars=config.role_history_chars,
         )
+
+        # Messages sent while the round was already running (or while the run
+        # was stopped) only reach the gate at the end of a round, so a resumed
+        # worker would replan a whole round before reading them. Claim them here
+        # so the round they precede is the round that acts on them.
+        if pending_instructions is not None:
+            queued = [text.strip() for text in pending_instructions() if text.strip()]
+            if queued:
+                gate.carryover_instructions = "\n".join(
+                    part for part in [gate.carryover_instructions, *queued] if part
+                )
+                gate.operator_instructions.extend(queued)
 
         # Instructions carried over from the end-of-round human gate (queued
         # operator notes and/or an approval's free-form input) are injected into
@@ -935,7 +987,11 @@ async def _run_impl(
         last_plan=last_plan,
         task_state=current_task_state,
         task_contract=current_task_contract,
-        max_rounds=max(1, config.max_total_episodes),
+        # Report the live budget, not the configured increment: after a resume
+        # (or an operator granting extra rounds) they differ, and the ratio
+        # rendered next to ``rounds_run`` must use the same denominator the
+        # loop actually enforced.
+        max_rounds=max(1, gate.round_budget),
         elapsed_seconds=elapsed,
         final_response=gate.final_response,
         failure_reason=gate.failure_reason,
@@ -1115,14 +1171,41 @@ async def _human_gate(ctx: _GateContext, outcome: str, round_index: int, task_st
     if outcome == "completed":
         ctx.completion_satisfied = False
     if reached_max or outcome in ("completed", "blocked"):
-        extra = int(decision.get("extra_rounds") or ctx.config.max_total_episodes or 1)
-        ctx.round_budget = round_index + max(1, extra)
+        # The hook is an injected callback (dashboard, tests, embedders), so its
+        # value is validated rather than coerced: a non-numeric or out-of-range
+        # answer falls back to the configured budget instead of raising inside
+        # the loop or granting an unbounded number of rounds.
+        extra = _extra_rounds(decision.get("extra_rounds")) or max(1, ctx.config.max_total_episodes or 1)
+        # Always grant at least one more round: clamping to MAX_ROUNDS must not
+        # produce a budget below the current round, which would end the run
+        # immediately after the operator asked to continue.
+        ctx.round_budget = max(round_index + 1, min(round_index + extra, MAX_ROUNDS))
         _append_event(
             ctx.events_path,
             "human_continue_after_finish",
-            {"round": round_index, "outcome": outcome, "extra_rounds": max(1, extra)},
+            {
+                "round": round_index,
+                "outcome": outcome,
+                "extra_rounds": extra,
+                "round_budget": ctx.round_budget,
+            },
         )
     return False
+
+
+def _extra_rounds(value: Any) -> int:
+    """Return a validated extra-round grant, or 0 when unusable."""
+
+    if value is None or isinstance(value, bool):
+        return 0
+    if isinstance(value, str):
+        try:
+            value = int(value.strip(), 10)
+        except ValueError:
+            return 0
+    if not isinstance(value, int) or value <= 0:
+        return 0
+    return min(value, MAX_ROUNDS)
 
 
 def _executor_binding(
@@ -1381,13 +1464,18 @@ async def _write_final_response(
 async def _discard_final_response(ctx: _GateContext) -> None:
     """Drop the published reply once the operator reopens the run.
 
-    The round's own artifacts stay for auditing; only the published copies go, so
-    a later ending that yields no reply cannot leave stale text next to a report
-    whose ``final_response`` is empty.
+    Auditing keeps the round's prompt, metadata, and trajectory; only the three
+    published copies go. ``rounds/round_NNN/final_response.txt`` is one of them:
+    the dashboard reads it as the round's current reply, so leaving it behind
+    kept a withdrawn answer on screen (and dated it from the wrong round).
     """
     if ctx.role_dir is not None:
         with contextlib.suppress(OSError):
             (ctx.role_dir / "final_response.txt").unlink(missing_ok=True)
+        if ctx.response_round > 0:
+            round_dir = ctx.role_dir / "rounds" / f"round_{ctx.response_round:03d}"
+            with contextlib.suppress(OSError):
+                (round_dir / "final_response.txt").unlink(missing_ok=True)
     if ctx.env is not None:
         await _write_remote_text(
             ctx.env, f"{ctx.config.harness_dir.rstrip('/')}/orchestration/final_response.txt", ""
@@ -2160,6 +2248,85 @@ def _read_local_text_tail(path: Path, max_bytes: int) -> tuple[str, bool]:
     except OSError:
         return "", False
     return raw.decode("utf-8", errors="replace"), truncated
+
+
+_MAX_ROUNDS_LEDGER_BYTES = 64 * 1024 * 1024
+_ROUTE_VALUES = frozenset(
+    {
+        MANAGER_NEXT_GUI,
+        MANAGER_NEXT_CLI,
+        MANAGER_NEXT_DONE,
+        MANAGER_NEXT_BLOCKED,
+        MANAGER_NEXT_INVALID,
+        MANAGER_NEXT_ASK,
+    }
+)
+
+
+def _recorded_rounds(role_dir: Path) -> list[ManagedRound]:
+    """Rebuild the finished rounds of an interrupted run from its own ledger.
+
+    ``rounds.jsonl`` is append-only and a round may be recorded more than once
+    (the loop re-records the last entry after a late gate decision), so the
+    latest entry for an index wins.  Unreadable or malformed lines are skipped:
+    a partially written tail must not prevent a resume.
+    """
+
+    path = role_dir / "rounds.jsonl"
+    try:
+        if not path.is_file() or path.stat().st_size > _MAX_ROUNDS_LEDGER_BYTES:
+            return []
+        raw = path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return []
+    by_index: dict[int, ManagedRound] = {}
+    for line in raw.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            payload = json.loads(line)
+        except ValueError:
+            continue
+        if not isinstance(payload, dict):
+            continue
+        index = payload.get("round_index")
+        if not isinstance(index, int) or isinstance(index, bool) or not 1 <= index <= MAX_ROUNDS:
+            continue
+        try:
+            by_index[index] = _managed_round_from_dict(payload)
+        except (TypeError, ValueError):
+            continue
+    return [by_index[index] for index in sorted(by_index)]
+
+
+def _managed_round_from_dict(payload: dict[str, Any]) -> ManagedRound:
+    def _text(key: str) -> str:
+        value = payload.get(key)
+        return value if isinstance(value, str) else ""
+
+    def _status(key: str) -> dict[str, Any]:
+        value = payload.get(key)
+        return value if isinstance(value, dict) else {}
+
+    next_step = payload.get("next_step")
+    refs = payload.get("related_report_refs")
+    return ManagedRound(
+        round_index=int(payload["round_index"]),
+        next_step=next_step if next_step in _ROUTE_VALUES else MANAGER_NEXT_INVALID,
+        plan_text=_text("plan_text"),
+        executor_output=_text("executor_output"),
+        auditor_report=_text("auditor_report"),
+        harness_feedback=_text("harness_feedback"),
+        task_state=_text("task_state"),
+        task_contract=_text("task_contract"),
+        related_report_refs=[item for item in refs if isinstance(item, str)]
+        if isinstance(refs, list)
+        else [],
+        manager_status=_status("manager_status"),
+        executor_status=_status("executor_status"),
+        auditor_status=_status("auditor_status"),
+    )
 
 
 async def _record_round(

@@ -69,12 +69,21 @@ function terminal(status: string): boolean {
   return ['completed', 'complete', 'success', 'succeeded', 'done', 'finished', 'failed', 'failure', 'blocked', 'incomplete', 'cancelled', 'canceled', 'stopped', 'aborted'].includes(String(status || '').trim().toLowerCase());
 }
 
+/** Resume generation of a snapshot; 0 for a run that was never resumed. */
+function epochOf(snapshot: Snapshot): number {
+  const value = snapshot.run?.resume_epoch;
+  return typeof value === 'number' && Number.isFinite(value) && value > 0 ? Math.floor(value) : 0;
+}
+
 function lifecycleRank(status: unknown): number {
   const normalized = String(status || '').trim().toLowerCase();
-  if (terminal(normalized)) return 5;
-  if (['stopping', 'aborting', 'stop_requested', 'abort_requested'].includes(normalized)) return 4;
-  if (['waiting_approval', 'waiting', 'blocked_waiting'].includes(normalized)) return 3;
-  if (['running', 'active', 'executing'].includes(normalized)) return 2;
+  if (terminal(normalized)) return 4;
+  if (['stopping', 'aborting', 'stop_requested', 'abort_requested'].includes(normalized)) return 3;
+  // `waiting_approval` and `running` are the same phase seen at two moments: a
+  // run toggles between them every gate. Ranking the gate higher made the
+  // return to `running` look stale, freezing the UI on the answered approval
+  // until a reload.
+  if (['running', 'active', 'executing', 'waiting_approval', 'waiting', 'blocked_waiting'].includes(normalized)) return 2;
   if (['starting', 'creating'].includes(normalized)) return 1;
   return 0;
 }
@@ -152,6 +161,13 @@ function mergeApprovals(current: Snapshot['approvals'], incoming: Snapshot['appr
       if (!meaningful(item[key]) && meaningful(previous[key])) merged[key] = previous[key];
     }
     if (!meaningful(item.resolved_at) && meaningful(previous.resolved_at)) merged.resolved_at = previous.resolved_at;
+    // A resolved record carries the operator's grant; a later pending frame
+    // (or an older server that omits the field) must not erase it.  0 is the
+    // "not chosen" sentinel here, so it counts as absent.
+    if (!item.extra_rounds && previous.extra_rounds) merged.extra_rounds = previous.extra_rounds;
+    if (item.allow_extra_rounds === undefined && previous.allow_extra_rounds !== undefined) {
+      merged.allow_extra_rounds = previous.allow_extra_rounds;
+    }
     if (previous.status === 'resolved' && item.status === 'pending') merged.status = previous.status;
     merged.options = item.options?.length ? item.options : previous.options;
     merged.answers = item.answers?.length ? item.answers : previous.answers;
@@ -189,8 +205,14 @@ function withDurableInteractions(preferred: Snapshot, other: Snapshot): Snapshot
  * durable role output, completion state, or approval decisions. */
 function mergeEqualCursorSnapshot(current: Snapshot, incoming: Snapshot): Snapshot {
   const run = { ...incoming.run };
-  if (lifecycleRank(current.run.status) > lifecycleRank(incoming.run.status)) run.status = current.run.status;
-  for (const key of ['started_at', 'finished_at', 'completion_satisfied', 'completion_authority', 'report_status', 'exit_code', 'failure_reason', 'final_response', 'agent', 'model', 'workspace', 'max_rounds', 'prompt_language'] as const) {
+  // A new generation supersedes the previous one outright: keeping its rank or
+  // back-filling its outcome would leave a resumed run looking finished.
+  const resumed = epochOf(incoming) > epochOf(current);
+  if (!resumed && lifecycleRank(current.run.status) > lifecycleRank(incoming.run.status)) run.status = current.run.status;
+  const carried = resumed
+    ? (['agent', 'model', 'workspace', 'max_rounds', 'prompt_language'] as const)
+    : (['started_at', 'finished_at', 'completion_satisfied', 'completion_authority', 'report_status', 'exit_code', 'failure_reason', 'final_response', 'agent', 'model', 'workspace', 'max_rounds', 'prompt_language'] as const);
+  for (const key of carried) {
     if (!meaningful(incoming.run[key]) && meaningful(current.run[key])) (run as Record<string, unknown>)[key] = current.run[key];
   }
   const roundsByIndex = new Map(current.rounds.map((round) => [round.round_index, round]));
@@ -258,6 +280,17 @@ function cursorRelation(current: Snapshot, incoming: Snapshot): -1 | 0 | 1 | nul
 /** Keep durable state monotonic when REST and WS snapshots race. */
 function preferSnapshot(current: Snapshot | null, incoming: Snapshot): Snapshot {
   if (!current) return incoming;
+  // A resume reopens a terminal run, so it is the one case where a non-terminal
+  // frame legitimately follows a terminal one. Every guard below assumes the
+  // opposite, which left a resumed run showing its old ended state until the
+  // page was reloaded. A higher generation is newer by definition.
+  const currentEpoch = epochOf(current);
+  const incomingEpoch = epochOf(incoming);
+  if (incomingEpoch !== currentEpoch) {
+    return incomingEpoch > currentEpoch
+      ? withDurableInteractions(incoming, current)
+      : withDurableInteractions(current, incoming);
+  }
   // Lifecycle terminality is stronger than event timestamps. A report/status
   // overlay can arrive without a new event (or with a zero timestamp), and a
   // timestamp-only comparison would otherwise keep a stale "running" rail

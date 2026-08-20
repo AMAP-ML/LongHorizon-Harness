@@ -1,5 +1,7 @@
 import { MAX_ROUNDS, type Snapshot } from './types';
 
+const STOPPING_STATUSES = new Set(['stopping', 'aborting', 'stop_requested', 'abort_requested']);
+
 export type CommandName =
   | 'help'
   | 'runs'
@@ -33,7 +35,7 @@ export const COMMAND_CATALOG: readonly CommandDefinition[] = [
   { name: 'approve', args: '<approval_id> <action>', description: 'Resolve an approval', capability: 'approvals', requiresRun: true },
   { name: 'stop', description: 'Request a graceful stop', capability: 'stop', requiresRun: true },
   { name: 'abort', description: 'Abort the active run', capability: 'abort', requiresRun: true },
-  { name: 'resume', description: 'Resume a finished run', capability: 'resume', requiresRun: true },
+  { name: 'resume', description: 'Continue a stopped run from its recorded rounds', capability: 'resume', requiresRun: true },
   { name: 'details', description: 'Open run details', requiresRun: true },
   { name: 'events', description: 'Open the event panel', requiresRun: true },
   { name: 'artifacts', description: 'Open the artifact panel', requiresRun: true },
@@ -53,9 +55,18 @@ export interface NewRunOptions {
   workspace?: string;
   maxRounds?: number;
   promptLanguage?: 'en' | 'zh';
-  roles?: Partial<Record<'manager' | 'executor' | 'auditor', { agent?: string; model?: string }>>;
+  roles?: Partial<Record<'manager' | 'executor' | 'auditor', { agent?: string; model?: string; reasoning_effort?: string }>>;
   error?: string;
 }
+
+/**
+ * Effort values reach the backends as inline TOML (Codex) or argv (the others),
+ * so the characters that could terminate a TOML string are rejected here as
+ * well as server-side. An allow-list of tiers would be wrong: the set differs
+ * per backend and per model, and operators must be able to pass a value a newer
+ * backend adds.
+ */
+const EFFORT_RE = /^[A-Za-z0-9._:-]{1,64}$/u;
 
 export function normaliseMaxRounds(value: string | number | null | undefined, fallback = 25): number {
   const safeFallback = Math.min(MAX_ROUNDS, Math.max(1, Number.isSafeInteger(fallback) ? fallback : 25));
@@ -101,22 +112,32 @@ export function parseNewRunArgs(args: readonly string[]): NewRunOptions {
     if (parseFlags) {
       let handledValueFlag = false;
       for (const flag of [
-        '--agent', '--model', '--workspace',
-        '--manager-agent', '--manager-model',
-        '--executor-agent', '--executor-model',
-        '--auditor-agent', '--auditor-model',
+        '--agent', '--model', '--workspace', '--effort',
+        '--manager-agent', '--manager-model', '--manager-effort',
+        '--executor-agent', '--executor-model', '--executor-effort',
+        '--auditor-agent', '--auditor-model', '--auditor-effort',
       ] as const) {
         const parsed = valueFor(token, flag, args[index + 1]);
         if (parsed.error) return { task: task.join(' ').trim(), error: parsed.error };
         if (parsed.value !== undefined) {
+          if (flag === '--effort' || flag.endsWith('-effort')) {
+            if (!EFFORT_RE.test(parsed.value)) {
+              return { task: task.join(' ').trim(), error: `${flag} 只能包含字母、数字、'.'、'_'、':' 或 '-'，且不超过 64 个字符` };
+            }
+          }
           if (flag === '--agent') agent = parsed.value;
           else if (flag === '--model') model = parsed.value;
           else if (flag === '--workspace') workspace = parsed.value;
-          else {
-            const match = /^--(manager|executor|auditor)-(agent|model)$/u.exec(flag);
+          else if (flag === '--effort') {
+            // A global --effort applies to every role, matching --agent/--model.
+            for (const role of ['manager', 'executor', 'auditor'] as const) {
+              roles[role] = { ...(roles[role] || {}), reasoning_effort: parsed.value };
+            }
+          } else {
+            const match = /^--(manager|executor|auditor)-(agent|model|effort)$/u.exec(flag);
             if (match) {
               const role = match[1] as 'manager' | 'executor' | 'auditor';
-              const field = match[2] as 'agent' | 'model';
+              const field = match[2] === 'effort' ? 'reasoning_effort' : (match[2] as 'agent' | 'model');
               roles[role] = { ...(roles[role] || {}), [field]: parsed.value };
             }
           }
@@ -194,7 +215,10 @@ export function availableCommands(
     if (command.capability && capabilities[command.capability] === false) return false;
     if (command.name === 'inject' && snapshot && !snapshot.controls.can_inject) return false;
     if (command.name === 'stop' && snapshot && !snapshot.controls.can_abort) return false;
-    if (command.name === 'abort' && snapshot && !snapshot.controls.can_abort) return false;
+    // `/abort` stays typable while stopping: escalating an ignored SIGTERM is
+    // the only lifecycle transition left, and `can_abort` is false by then.
+    if (command.name === 'abort' && snapshot && !snapshot.controls.can_abort
+      && !STOPPING_STATUSES.has(String(snapshot.run.status || '').trim().toLowerCase())) return false;
     if (command.name === 'resume' && snapshot && !snapshot.controls.can_resume) return false;
     return true;
   });

@@ -28,6 +28,7 @@ _TIMEOUT_NAMES = {"manager", "gui_executor", "cli_executor", "auditor"}
 _RUN_KEYS = {
     "agent",
     "model",
+    "reasoning_effort",
     "env",
     "runs_root",
     "workspace",
@@ -63,6 +64,12 @@ CONFIG_TEMPLATE = """# LongHorizon-Harness project defaults.
 agent = "codex"
 model = "gpt-5.6-sol"
 
+# Reasoning depth, forwarded to whichever backend exposes it (Codex through
+# `model_reasoning_effort`, Claude Code through `--effort`, OpenCode through
+# `--variant`). Any value the backend accepts is allowed, so a newer tier does
+# not need a harness release. Leave unset to keep the provider's own setting.
+# reasoning_effort = "high"
+
 env = "local"
 runs_root = "./.lh-harness/runs"
 # Agents work in the directory lh-harness was started from unless set here.
@@ -83,6 +90,7 @@ mcp_add_dirs = []
 # them. Exclusions must stay inside the workspace; ".git" and harness-owned
 # control/state paths are rejected at startup, and the effective list is
 # echoed at run start and recorded in each audited episode's metadata.
+# Passing --guard-exclude-path replaces this list rather than adding to it.
 guard_exclude_paths = []
 
 max_rounds = 25
@@ -101,6 +109,7 @@ auditor = 300
 [run.roles.manager]
 # agent = "codex"
 # model = "gpt-5.6-sol"
+# reasoning_effort = "high"
 
 [run.roles.executor]
 # agent = "codex"
@@ -182,6 +191,10 @@ def _flatten_run_table(run: dict[str, Any]) -> dict[str, Any]:
 
     if "agent" in run:
         defaults["agent"] = _choice(run["agent"], "run.agent", _AGENT_CHOICES)
+    if "reasoning_effort" in run:
+        defaults["reasoning_effort"] = _reasoning_effort(
+            run["reasoning_effort"], "run.reasoning_effort"
+        )
     if "env" in run:
         defaults["env"] = _choice(run["env"], "run.env", {"local"})
     if "prompt_language" in run:
@@ -214,7 +227,7 @@ def _flatten_run_table(run: dict[str, Any]) -> dict[str, Any]:
     for role, values in roles.items():
         if not isinstance(values, dict):
             raise ProjectConfigError(f"[run.roles.{role}] must be a TOML table")
-        unknown_role_keys = set(values) - {"agent", "model"}
+        unknown_role_keys = set(values) - {"agent", "model", "reasoning_effort"}
         if unknown_role_keys:
             raise ProjectConfigError(
                 f"unknown [run.roles.{role}] key(s): {_names(unknown_role_keys)}"
@@ -226,6 +239,10 @@ def _flatten_run_table(run: dict[str, Any]) -> dict[str, Any]:
         if "model" in values:
             defaults[f"{role}_model"] = _string(
                 values["model"], f"run.roles.{role}.model"
+            )
+        if "reasoning_effort" in values:
+            defaults[f"{role}_reasoning_effort"] = _reasoning_effort(
+                values["reasoning_effort"], f"run.roles.{role}.reasoning_effort"
             )
 
     timeouts = run.get("timeouts", {})
@@ -250,6 +267,15 @@ def _choice(value: Any, name: str, choices: set[str]) -> str:
     if result not in choices:
         raise ProjectConfigError(f"{name} must be one of: {_names(choices)}")
     return result
+
+
+def _reasoning_effort(value: Any, name: str) -> str:
+    from .agent_registry import normalise_reasoning_effort
+
+    try:
+        return normalise_reasoning_effort(_string(value, name))
+    except ValueError as exc:
+        raise ProjectConfigError(f"{name}: {exc}") from exc
 
 
 def _positive_int(value: Any, name: str) -> int:

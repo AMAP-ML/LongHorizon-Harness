@@ -19,9 +19,14 @@ from lh_harness.webapi import server as web_server
 
 
 def _executable(path: Path) -> str:
-    """Create a deterministic executable stand-in for a discovered binary."""
+    """Create a deterministic executable stand-in for a discovered binary.
+
+    Availability is proven by running `--version`, so the stub has to answer it
+    like a real CLI; a bare `exit 0` is correctly reported as installed but
+    unusable.
+    """
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    path.write_text('#!/bin/sh\necho "codex-cli 1.2.3"\nexit 0\n', encoding="utf-8")
     path.chmod(0o755)
     return str(path)
 

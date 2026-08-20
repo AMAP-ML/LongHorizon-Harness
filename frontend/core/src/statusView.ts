@@ -87,6 +87,8 @@ export interface StatusView {
   nextStepDetail: string;
   approvals: StatusApproval[];
   pendingApprovals: StatusApproval[];
+  /** A decision is queued but the worker has not yet picked it up. */
+  awaitingHandoff: boolean;
   warnings: string[];
   notices: string[];
   progress: {
@@ -542,6 +544,13 @@ export function projectStatus(snapshot: Snapshot, options: StatusViewOptions = {
   // keep the rule in the shared projection instead of duplicating it in each
   // renderer.
   const pendingApprovals = approvals.filter((item) => item.pending && !isTerminalRun(snapshot.run.status) && !isStoppingRun(snapshot.run.status));
+  // A resolved decision only reaches the worker through the command bus, so the
+  // lifecycle keeps reporting `waiting_approval` for a moment after the click.
+  // Without this the card disappears and nothing replaces it, which reads as a
+  // hang until the operator reloads.
+  const awaitingHandoff = normalized(snapshot.run.status) === 'waiting_approval'
+    && pendingApprovals.length === 0
+    && approvals.some((item) => !item.pending && item.action);
   const inconsistentCompletion = snapshot.run.completion_satisfied === true
     && stages.some((item) => item.key !== 'record' && !['done', 'skipped'].includes(item.status));
   const primaryWarnings = [
@@ -597,6 +606,7 @@ export function projectStatus(snapshot: Snapshot, options: StatusViewOptions = {
     nextStepDetail: next.detail,
     approvals,
     pendingApprovals,
+    awaitingHandoff,
     warnings,
     notices,
     progress: { completed: progressDone.length, total, ratio },

@@ -31,7 +31,28 @@ TERMINAL_STATUSES = frozenset({
     "incomplete",
 })
 
-ACTIVE_STATUSES = frozenset({"starting", "running", "waiting_approval", "stopping"})
+# ``creating`` is written before the worker is spawned.  It belongs here so a
+# run that died inside the launch transaction is reconciled as an interrupted
+# active run instead of lingering in a state that is neither active nor
+# terminal (which left it unresumable and spinning in the UI).
+ACTIVE_STATUSES = frozenset({"creating", "starting", "running", "waiting_approval", "stopping"})
+
+# One resume reopens a terminal run in place.  Command ids are scoped by epoch so
+# a previous epoch's `lifecycle-stop` receipt cannot make the next epoch's stop
+# look already-delivered.
+RESUME_EPOCH_KEY = "resume_epoch"
+MAX_RESUME_EPOCH = 10_000
+
+
+def resume_epoch(record: Any) -> int:
+    """Read the resume generation from an owner/status record, defaulting to 0."""
+
+    if not isinstance(record, dict):
+        return 0
+    value = record.get(RESUME_EPOCH_KEY)
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        return 0
+    return min(value, MAX_RESUME_EPOCH)
 
 
 def canonical_lifecycle_status(value: Any, *, default: str = "idle") -> str:

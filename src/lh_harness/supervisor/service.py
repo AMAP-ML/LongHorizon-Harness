@@ -35,7 +35,16 @@ from .control_bus import (
     _read_json_file,
     _read_jsonl,
 )
-from .lifecycle import ACTIVE_STATUSES, TERMINAL_STATUSES, canonical_lifecycle_status, is_terminal_status
+from .lifecycle import (
+    ACTIVE_STATUSES,
+    MAX_RESUME_EPOCH,
+    RESUME_EPOCH_KEY,
+    TERMINAL_STATUSES,
+    canonical_lifecycle_status,
+    is_terminal_status,
+    resume_epoch,
+)
+from ..agent_registry import normalise_reasoning_effort, supports_reasoning_effort
 from ..types import (
     DEFAULT_CLAUDE_MODEL,
     DEFAULT_CODEX_MODEL,
@@ -81,6 +90,7 @@ def _normalise_role_configs(
     *,
     agent: str,
     model: str | None,
+    reasoning_effort: str | None = None,
 ) -> dict[str, dict[str, str]]:
     """Validate and resolve the three public role bindings.
 
@@ -104,7 +114,7 @@ def _normalise_role_configs(
             raw = {}
         if not isinstance(raw, dict):
             raise ValueError(f"roles.{role} must be an object")
-        extra = set(raw) - {"agent", "model"}
+        extra = set(raw) - {"agent", "model", "reasoning_effort"}
         if extra:
             raise ValueError(f"unknown roles.{role} field: {sorted(extra)[0]}")
         role_agent = str(raw.get("agent") or agent).strip()
@@ -122,6 +132,21 @@ def _normalise_role_configs(
         if not role_model or len(role_model) > 256 or "\x00" in role_model:
             raise ValueError(f"roles.{role}.model must be a non-empty string of at most 256 characters")
         result[role] = {"agent": role_agent, "model": role_model}
+        # Effort tiers are backend-specific, so a global value only reaches a
+        # role that kept the global backend.
+        raw_effort = raw.get("reasoning_effort")
+        if raw_effort is None and role_agent == agent:
+            raw_effort = reasoning_effort
+        try:
+            role_effort = normalise_reasoning_effort(raw_effort)
+        except ValueError as exc:
+            raise ValueError(f"roles.{role}.reasoning_effort {exc}") from exc
+        if role_effort:
+            if not supports_reasoning_effort(role_agent):
+                raise ValueError(
+                    f"roles.{role}.agent {role_agent} does not accept a reasoning effort"
+                )
+            result[role]["reasoning_effort"] = role_effort
     return result
 
 
@@ -474,6 +499,24 @@ def _merge_lifecycle_status(
     candidate_lifecycle = canonical_lifecycle_status(candidate.get("status"), default="")
     current_action = str(current.get("requested_action") or "").strip().lower()
 
+    if resume_epoch(candidate) > resume_epoch(current):
+        # A resume is the one legitimate way out of a terminal state.  The
+        # monotonic guards below exist to stop *stale* observations from
+        # regressing a newer decision; a higher epoch is by definition newer,
+        # so it supersedes the previous generation's terminal record and its
+        # stop/abort intent (which belonged to the run we just reopened).
+        for field in (
+            "requested_action",
+            "stop_requested_at",
+            "abort_requested_at",
+            "finished_at",
+            "failure_reason",
+            "exit_code",
+        ):
+            merged.pop(field, None)
+        merged.update({key: value for key, value in candidate.items() if value is not None})
+        return merged
+
     if current_lifecycle in TERMINAL_STATUSES:
         merged["status"] = current_lifecycle
         merged["alive"] = False
@@ -511,6 +554,64 @@ def _merge_lifecycle_status(
         merged["status"] = current_lifecycle
 
     return merged
+
+
+RESUME_MODES = ("continue", "retry")
+
+# A reopened run keeps its identity and history but must not inherit the
+# previous generation's outcome, live process identity, or one-shot idempotency
+# marker.
+_RESUME_CLEARED_OWNER_KEYS = frozenset({
+    "pid",
+    "pgid",
+    "command",
+    "command_display",
+    "exit_code",
+    "finished_at",
+    "failure_reason",
+    "requested_action",
+    "stop_requested_at",
+    "abort_requested_at",
+    "idempotency_fingerprint",
+    "process_start_time",
+    "process_command",
+    "signal_mode",
+    "attached",
+})
+
+
+def _resume_round_budget(owner: dict[str, Any], extra_rounds: int | None) -> int:
+    """Choose the round budget for a resumed run.
+
+    ``max_rounds`` is *additional* rounds for the resumed worker (the manager
+    adds it to the rounds it restored), so the saved value is a sensible default
+    and an explicit operator value simply replaces it.
+    """
+
+    if extra_rounds is not None:
+        if isinstance(extra_rounds, bool) or not isinstance(extra_rounds, int):
+            raise ValueError("extra_rounds must be an integer")
+        if not 1 <= extra_rounds <= MAX_ROUNDS:
+            raise ValueError(f"extra_rounds must be an integer from 1 to {MAX_ROUNDS}")
+        return extra_rounds
+    try:
+        saved = int(owner.get("max_rounds") or DEFAULT_MAX_ROUNDS)
+    except (TypeError, ValueError):
+        return DEFAULT_MAX_ROUNDS
+    return saved if 1 <= saved <= MAX_ROUNDS else DEFAULT_MAX_ROUNDS
+
+
+def _lifecycle_command_id(kind: str, epoch: int) -> str:
+    """Scope a lifecycle command id to the run's resume generation.
+
+    Command ids are the idempotency key, so a run reopened by ``resume`` must
+    not inherit the previous generation's ``lifecycle-stop`` receipt -- that
+    would make the new worker's stop look already-delivered and leave it
+    running.  Epoch 0 keeps the historical unsuffixed id so existing run
+    directories stay compatible.
+    """
+
+    return f"lifecycle-{kind}" if epoch <= 0 else f"lifecycle-{kind}@{epoch}"
 
 
 class RunSupervisor:
@@ -845,7 +946,7 @@ class RunSupervisor:
         action = str(status.get("requested_action") or "").strip().lower()
         if action not in {"stop", "abort"} or canonical_lifecycle_status(status.get("status")) != "stopping":
             return status
-        command_id = f"lifecycle-{action}"
+        command_id = _lifecycle_command_id(action, resume_epoch(status))
         command = next((item for item in reversed(bus.commands()) if item.get("command_id") == command_id), None)
         if command is None or bus.receipt_for(command_id) is not None:
             return status
@@ -1203,6 +1304,8 @@ class RunSupervisor:
         workspace: str,
         max_rounds: int,
         prompt_language: str,
+        reasoning_effort: str | None = None,
+        resume: bool = False,
     ) -> list[str]:
         # Always launch through the interpreter that owns this supervisor.
         # A PATH lookup can select an older globally installed console script
@@ -1226,8 +1329,12 @@ class RunSupervisor:
             "--no-dashboard",
             "--supervised",
         ])
+        if resume:
+            command.append("--resume")
         if model:
             command.append(f"--model={model}")
+        if reasoning_effort and not role_configs:
+            command.append(f"--reasoning-effort={reasoning_effort}")
         for role in _ROLE_KEYS:
             spec = (role_configs or {}).get(role)
             if not spec:
@@ -1238,6 +1345,8 @@ class RunSupervisor:
                     f"--{role}-model={spec['model']}",
                 ]
             )
+            if spec.get("reasoning_effort"):
+                command.append(f"--{role}-reasoning-effort={spec['reasoning_effort']}")
         return command
 
     def create_run(
@@ -1251,6 +1360,7 @@ class RunSupervisor:
         max_rounds: int = DEFAULT_MAX_ROUNDS,
         prompt_language: str = "en",
         run_id: str | None = None,
+        reasoning_effort: str | None = None,
         _recover_reservation: bool = False,
         idempotency_key: str | None = None,
     ) -> dict[str, Any]:
@@ -1267,6 +1377,7 @@ class RunSupervisor:
                 max_rounds=max_rounds,
                 prompt_language=prompt_language,
                 run_id=run_id,
+                reasoning_effort=reasoning_effort,
             )
         request = {
             "task": task,
@@ -1277,6 +1388,7 @@ class RunSupervisor:
             "max_rounds": max_rounds,
             "prompt_language": prompt_language,
             "run_id": run_id,
+            "reasoning_effort": reasoning_effort,
         }
         fingerprint = hashlib.sha256(json.dumps(request, ensure_ascii=False, sort_keys=True, default=str).encode("utf-8")).hexdigest()
         path = self._idempotency_path("create", key)
@@ -1350,6 +1462,7 @@ class RunSupervisor:
                 max_rounds=max_rounds,
                 prompt_language=prompt_language,
                 run_id=reserved_run_id,
+                reasoning_effort=reasoning_effort,
                 _recover_reservation=bool(existing),
                 _idempotency_fingerprint=fingerprint,
             )
@@ -1380,6 +1493,7 @@ class RunSupervisor:
         max_rounds: int = DEFAULT_MAX_ROUNDS,
         prompt_language: str = "en",
         run_id: str | None = None,
+        reasoning_effort: str | None = None,
         _recover_reservation: bool = False,
         _idempotency_fingerprint: str | None = None,
     ) -> dict[str, Any]:
@@ -1402,10 +1516,14 @@ class RunSupervisor:
             if not isinstance(model, str) or not model.strip() or len(model.strip()) > 256 or "\x00" in model:
                 raise ValueError("model must be a non-empty string of at most 256 characters")
             model = model.strip()
+        reasoning_effort = normalise_reasoning_effort(reasoning_effort) or None
+        if reasoning_effort and not supports_reasoning_effort(agent):
+            raise ValueError(f"agent {agent} does not accept a reasoning effort")
         resolved_role_configs = _normalise_role_configs(
             role_configs,
             agent=agent,
             model=model,
+            reasoning_effort=reasoning_effort,
         )
         run_id = run_id or f"{time.strftime('%Y%m%dT%H%M%SZ', time.gmtime())}_{uuid.uuid4().hex[:8]}"
         run_dir = self._run_dir(run_id)
@@ -1457,6 +1575,7 @@ class RunSupervisor:
             workspace=str(workspace_path),
             max_rounds=max_rounds,
             prompt_language=prompt_language,
+            reasoning_effort=reasoning_effort,
         )
         started_at = time.time()
         # Reserve the run before launching a process.  This closes the orphan
@@ -1475,16 +1594,51 @@ class RunSupervisor:
             "prompt_language": prompt_language,
             "workspace": str(workspace_path),
         }
+        if reasoning_effort:
+            reservation["reasoning_effort"] = reasoning_effort
         if _idempotency_fingerprint:
             reservation["idempotency_fingerprint"] = _idempotency_fingerprint
+        return self._launch_worker(
+            run_id=run_id,
+            run_dir=run_dir,
+            bus=bus,
+            command=command,
+            reservation=reservation,
+            workspace_path=workspace_path,
+            task=task,
+        )
+
+    def _launch_worker(
+        self,
+        *,
+        run_id: str,
+        run_dir: Path,
+        bus: ControlBus,
+        command: list[str],
+        reservation: dict[str, Any],
+        workspace_path: Path,
+        task: str,
+    ) -> dict[str, Any]:
+        """Persist the reservation, spawn the worker, and promote the owner.
+
+        Shared by run creation and in-place resume so both paths get the same
+        launch transaction: no worker is ever left running without a durable
+        owner, and a failed launch always leaves a terminal status.
+        """
+
+        started_at = float(reservation.get("started_at") or time.time())
+        epoch = resume_epoch(reservation)
         bus.write_owner(reservation)
-        bus.write_status({
+        creating_status: dict[str, Any] = {
             "run_id": run_id,
             "status": "creating",
             "started_at": started_at,
             "workspace": str(workspace_path),
             "alive": False,
-        })
+        }
+        if epoch:
+            creating_status[RESUME_EPOCH_KEY] = epoch
+        bus.write_status(creating_status)
         output_path = run_dir / "worker.log"
         # Open the final log component with no-follow semantics and compact an
         # old retained tail before handing the descriptor to the child.  A
@@ -1553,16 +1707,19 @@ class RunSupervisor:
             "command_display": shlex.join(command),
             **_process_identity(process.pid, command),
         }
+        starting_status: dict[str, Any] = {
+            "run_id": run_id,
+            "status": "starting",
+            "pid": process.pid,
+            "started_at": owner["started_at"],
+            "workspace": str(workspace_path),
+            "alive": True,
+        }
+        if epoch:
+            starting_status[RESUME_EPOCH_KEY] = epoch
         try:
             bus.write_owner(owner)
-            bus.write_status({
-                "run_id": run_id,
-                "status": "starting",
-                "pid": process.pid,
-                "started_at": owner["started_at"],
-                "workspace": str(workspace_path),
-                "alive": True,
-            })
+            bus.write_status(starting_status)
         except Exception:
             # Metadata is part of the launch transaction.  Do not leave an
             # unowned worker running if the durable reservation cannot be
@@ -1767,8 +1924,11 @@ class RunSupervisor:
             current = self._refresh(run_id)
             # A stable command id gives stop/abort true idempotency even when
             # two API processes race.  Replaying the request returns the first
-            # durable receipt and never sends a second signal.
-            command_id = f"lifecycle-{kind}"
+            # durable receipt and never sends a second signal.  The id is
+            # scoped by resume generation so reopening a run does not inherit
+            # the previous generation's already-delivered stop.
+            epoch = resume_epoch(current)
+            command_id = _lifecycle_command_id(kind, epoch)
             existing = next(
                 (item for item in reversed(bus.commands()) if item.get("command_id") == command_id),
                 None,
@@ -1791,7 +1951,7 @@ class RunSupervisor:
                 # SIGKILL and updates the durable requested action below.
                 if not (kind == "abort" and requested_action == "stop"):
                     active_kind = requested_action if requested_action in {"stop", "abort"} else kind
-                    active_command_id = f"lifecycle-{active_kind}"
+                    active_command_id = _lifecycle_command_id(active_kind, epoch)
                     active_command = next(
                         (item for item in reversed(bus.commands()) if item.get("command_id") == active_command_id),
                         None,
@@ -1994,11 +2154,71 @@ class RunSupervisor:
             except (OSError, RuntimeError, ValueError):
                 pass
 
-    def resume(self, run_id: str, *, idempotency_key: str | None = None) -> dict[str, Any]:
+    def resume(
+        self,
+        run_id: str,
+        *,
+        mode: str = "continue",
+        extra_rounds: int | None = None,
+        idempotency_key: str | None = None,
+    ) -> dict[str, Any]:
+        """Restart an interrupted run.
+
+        ``continue`` (the default) reopens the same run directory so the worker
+        picks up its recorded rounds.  ``retry`` keeps the historical behaviour
+        of starting a fresh run from the saved task and configuration.
+        """
+
+        if mode not in RESUME_MODES:
+            raise ValueError("mode must be continue or retry")
+        if extra_rounds is not None and (
+            isinstance(extra_rounds, bool)
+            or not isinstance(extra_rounds, int)
+            or not 1 <= extra_rounds <= MAX_ROUNDS
+        ):
+            raise ValueError(f"extra_rounds must be an integer from 1 to {MAX_ROUNDS}")
         key = self._idempotency_key(idempotency_key)
         if not key:
-            return self._resume_once(run_id)
-        request = {"run_id": run_id}
+            return self._resume_once(run_id, mode=mode, extra_rounds=extra_rounds)
+        if mode == "continue":
+            # An in-place resume reuses the run id, so there is no new
+            # reservation to recover.  The epoch in the owner record already
+            # makes a replayed request observable; guard it with the durable
+            # idempotency file only to return the first result.
+            path = self._idempotency_path("resume", key)
+            request = {"run_id": run_id, "mode": mode, "extra_rounds": extra_rounds}
+            fingerprint = hashlib.sha256(json.dumps(request, sort_keys=True).encode("utf-8")).hexdigest()
+            with self._supervisor_locked():
+                existing = self._read_idempotency(path)
+                if existing:
+                    if existing.get("fingerprint") != fingerprint:
+                        raise IdempotencyConflict(
+                            "Idempotency-Key was already used for a different resume request"
+                        )
+                    result = existing.get("result")
+                    if isinstance(result, dict):
+                        return {**result, "idempotent": True}
+                created = self._resume_once(run_id, mode=mode, extra_rounds=extra_rounds)
+                self._write_idempotency(
+                    path,
+                    {
+                        "schema_version": 1,
+                        "operation": "resume",
+                        "key": key,
+                        "fingerprint": fingerprint,
+                        "run_id": run_id,
+                        "state": "completed",
+                        "result": created,
+                        "created_at": time.time(),
+                        "completed_at": time.time(),
+                    },
+                )
+                return created
+        # Keep the historical fingerprint for a plain retry so an Idempotency-Key
+        # issued before this option existed still replays instead of conflicting.
+        request: dict[str, Any] = {"run_id": run_id}
+        if extra_rounds is not None:
+            request["extra_rounds"] = extra_rounds
         fingerprint = hashlib.sha256(json.dumps(request, sort_keys=True).encode("utf-8")).hexdigest()
         path = self._idempotency_path("resume", key)
         with self._supervisor_locked():
@@ -2044,6 +2264,8 @@ class RunSupervisor:
                 return {**recovered, "idempotent": True}
             created = self._resume_once(
                 run_id,
+                mode=mode,
+                extra_rounds=extra_rounds,
                 target_run_id=target_run_id,
                 recover_reservation=bool(existing),
                 idempotency_fingerprint=fingerprint,
@@ -2068,6 +2290,8 @@ class RunSupervisor:
         self,
         run_id: str,
         *,
+        mode: str = "continue",
+        extra_rounds: int | None = None,
         target_run_id: str | None = None,
         recover_reservation: bool = False,
         idempotency_fingerprint: str | None = None,
@@ -2094,6 +2318,16 @@ class RunSupervisor:
             if not task.strip():
                 raise ValueError("cannot resume a run without a saved task")
             workspace = str(owner.get("workspace") or self.workspace_root)
+            if mode == "continue":
+                return self._continue_run_in_place(
+                    run_id,
+                    run_dir=run_dir,
+                    owner=owner,
+                    status=current,
+                    task=task,
+                    workspace=workspace,
+                    extra_rounds=extra_rounds,
+                )
             created = self._create_run_once(
                 task=task,
                 agent=str(owner.get("agent") or "codex"),
@@ -2104,22 +2338,130 @@ class RunSupervisor:
                     else None
                 ),
                 workspace=workspace,
-                max_rounds=int(owner.get("max_rounds") or DEFAULT_MAX_ROUNDS),
+                max_rounds=_resume_round_budget(owner, extra_rounds),
                 prompt_language=(
                     str(owner.get("prompt_language"))
                     if owner.get("prompt_language") in {"en", "zh"}
                     else "en"
                 ),
                 run_id=target_run_id or f"{run_id}-resume-{uuid.uuid4().hex[:6]}",
+                reasoning_effort=(
+                    str(owner.get("reasoning_effort"))
+                    if isinstance(owner.get("reasoning_effort"), str)
+                    else None
+                ),
                 _recover_reservation=recover_reservation,
                 _idempotency_fingerprint=idempotency_fingerprint,
             )
-            # Make the relationship explicit; this is currently a retry with
-            # the saved task/config, not a claim that round state was resumed.
+            # ``retry`` deliberately starts a fresh run directory from the
+            # saved task/config; it does not carry over round state.
             created_owner = {**created.get("owner", {}), "resumed_from": run_id, "resume_kind": "retry"}
             self._bus(created["id"]).write_owner(created_owner)
             created["owner"] = created_owner
             return created
+
+    def _continue_run_in_place(
+        self,
+        run_id: str,
+        *,
+        run_dir: Path,
+        owner: dict[str, Any],
+        status: dict[str, Any],
+        task: str,
+        workspace: str,
+        extra_rounds: int | None,
+    ) -> dict[str, Any]:
+        """Reopen a terminal run and continue its own round ledger.
+
+        The worker rebuilds the Manager prompt from ``rounds.jsonl``, so the new
+        process picks up the finished rounds instead of replanning from scratch.
+        The run directory, logs, and control bus are reused; only the resume
+        generation is incremented so lifecycle idempotency keys stay distinct.
+        """
+
+        if self.attached_only:
+            raise ValueError("this API is attached to an existing worker and cannot resume runs")
+        epoch = resume_epoch(owner) or resume_epoch(status)
+        if epoch >= MAX_RESUME_EPOCH:
+            raise ValueError("run has been resumed too many times")
+        epoch += 1
+        agent = str(owner.get("agent") or "codex")
+        if agent not in _AGENT_CHOICES:
+            raise ValueError(f"run cannot be continued: unknown agent {agent!r}")
+        model = str(owner["model"]) if owner.get("model") else None
+        role_configs = owner.get("role_configs") if isinstance(owner.get("role_configs"), dict) else None
+        reasoning_effort = (
+            str(owner.get("reasoning_effort")) if isinstance(owner.get("reasoning_effort"), str) else None
+        )
+        reasoning_effort = normalise_reasoning_effort(reasoning_effort) or None
+        resolved_role_configs = _normalise_role_configs(
+            role_configs,
+            agent=agent,
+            model=model,
+            reasoning_effort=reasoning_effort,
+        )
+        max_rounds = _resume_round_budget(owner, extra_rounds)
+        workspace_path = self._resolve_workspace(workspace)
+        workspace_path.mkdir(parents=True, exist_ok=True)
+        workspace_path = self._resolve_workspace(str(workspace_path))
+        if (
+            safe_run_logs(self.runs_root, run_dir, allow_missing=True) is None
+            or safe_run_control(self.runs_root, run_dir, allow_missing=True) is None
+        ):
+            raise ValueError("run reservation path is outside its run boundary")
+        self._run_logs_dir(run_id)
+        task_path = run_dir / "tmp" / "task.md"
+        self._write_task_file(task_path, task)
+        bus = ControlBus(run_dir)
+        command = self._worker_command(
+            run_id=run_id,
+            task=f"@{task_path}",
+            agent=agent,
+            model=model,
+            role_configs=resolved_role_configs,
+            workspace=str(workspace_path),
+            max_rounds=max_rounds,
+            prompt_language=(
+                str(owner.get("prompt_language")) if owner.get("prompt_language") in {"en", "zh"} else "en"
+            ),
+            reasoning_effort=reasoning_effort,
+            resume=True,
+        )
+        reservation = {
+            **{key: value for key, value in owner.items() if key not in _RESUME_CLEARED_OWNER_KEYS},
+            "run_id": run_id,
+            "state": "creating",
+            "supervisor_pid": os.getpid(),
+            "started_at": time.time(),
+            "task": task,
+            "agent": agent,
+            "model": model,
+            "role_configs": resolved_role_configs,
+            "max_rounds": max_rounds,
+            "workspace": str(workspace_path),
+            "resumed_from": run_id,
+            "resume_kind": "continue",
+            RESUME_EPOCH_KEY: epoch,
+        }
+        if reasoning_effort:
+            reservation["reasoning_effort"] = reasoning_effort
+        else:
+            reservation.pop("reasoning_effort", None)
+        bus.append(
+            "resume",
+            {"mode": "continue", "epoch": epoch, "max_rounds": max_rounds},
+            created_by="web",
+            command_id=f"resume@{epoch}",
+        )
+        return self._launch_worker(
+            run_id=run_id,
+            run_dir=run_dir,
+            bus=bus,
+            command=command,
+            reservation=reservation,
+            workspace_path=workspace_path,
+            task=task,
+        )
 
     def command_receipt(self, run_id: str, command_id: str) -> dict[str, Any] | None:
         return self._bus(run_id).receipt_for(command_id)

@@ -6,11 +6,13 @@ resolver must keep the holes inside the workspace and away from the paths the
 audit exists to protect.
 """
 
+import argparse
 from pathlib import Path
 
 import pytest
 
-from lh_harness.cli import _resolve_guard_exclude_paths
+import lh_harness.cli as cli
+from lh_harness.cli import _apply_repeatable_defaults, _resolve_guard_exclude_paths
 from lh_harness.config import ProjectConfigError, _flatten_run_table
 
 
@@ -102,3 +104,105 @@ def test_config_accepts_a_string_array() -> None:
 def test_config_rejects_non_string_arrays(bad: object) -> None:
     with pytest.raises(ProjectConfigError, match="guard_exclude_paths"):
         _flatten_run_table({"guard_exclude_paths": bad})
+
+
+# --- repeatable options: the command line replaces the project config --------
+#
+# ``action="append"`` appends to whatever default it is handed, so passing the
+# config list straight to argparse made ``--guard-exclude-path`` *extend* the
+# config rather than override it. That silently widened the audit hole: the
+# operator narrowing exclusions to one directory still got every configured
+# directory excluded too.
+
+_REPEATABLE = ("mcp_add_dir", "guard_exclude_path")
+
+
+def _namespace(**overrides: object) -> argparse.Namespace:
+    values: dict[str, object] = {name: None for name in _REPEATABLE}
+    values.update(overrides)
+    return argparse.Namespace(**values)
+
+
+@pytest.mark.parametrize("name", _REPEATABLE)
+def test_the_command_line_replaces_the_configured_list(name: str) -> None:
+    args = _namespace(**{name: ["from-cli"]})
+
+    _apply_repeatable_defaults(args, {name: ["from-config-a", "from-config-b"]})
+
+    assert getattr(args, name) == ["from-cli"]
+
+
+@pytest.mark.parametrize("name", _REPEATABLE)
+def test_the_configured_list_is_used_when_the_command_line_is_silent(name: str) -> None:
+    args = _namespace()
+
+    _apply_repeatable_defaults(args, {name: ["from-config"]})
+
+    assert getattr(args, name) == ["from-config"]
+
+
+@pytest.mark.parametrize("name", _REPEATABLE)
+def test_an_absent_option_and_config_becomes_an_empty_list(name: str) -> None:
+    args = _namespace()
+
+    _apply_repeatable_defaults(args, {})
+
+    assert getattr(args, name) == []
+
+
+@pytest.mark.parametrize("name", _REPEATABLE)
+def test_the_cached_defaults_are_never_aliased(name: str) -> None:
+    configured = ["from-config"]
+    args = _namespace()
+
+    _apply_repeatable_defaults(args, {name: configured})
+    getattr(args, name).append("mutated-later")
+
+    assert configured == ["from-config"]
+
+
+@pytest.mark.parametrize("bad", ["not-a-list", 7, None, {"a": 1}])
+def test_a_malformed_configured_value_does_not_leak_into_argv(bad: object) -> None:
+    # load_run_defaults validates these, but a Namespace built by another caller
+    # must not turn a stray string into a list of characters.
+    args = _namespace()
+
+    _apply_repeatable_defaults(args, {"guard_exclude_path": bad})
+
+    assert args.guard_exclude_path == []
+
+
+def test_repeating_the_option_still_accumulates() -> None:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--guard-exclude-path", action="append", default=None)
+
+    args = parser.parse_args(["--guard-exclude-path=a", "--guard-exclude-path=b"])
+    _apply_repeatable_defaults(args, {"guard_exclude_path": ["from-config"]})
+
+    assert args.guard_exclude_path == ["a", "b"]
+
+
+def test_run_parses_repeatable_options_without_inheriting_the_config(monkeypatch) -> None:
+    """End-to-end through ``main``: the flag overrides, the config fills in."""
+
+    captured: list[tuple[list[str], list[str]]] = []
+    monkeypatch.setattr(
+        cli,
+        "load_run_defaults",
+        lambda: {"guard_exclude_path": ["cfg-guard"], "mcp_add_dir": ["cfg-dir"]},
+    )
+    monkeypatch.setattr(
+        cli,
+        "_run_command",
+        lambda args: captured.append((list(args.guard_exclude_path), list(args.mcp_add_dir))) or 0,
+    )
+
+    assert cli.main(["run", "--task=t"]) == 0
+    assert captured[-1] == (["cfg-guard"], ["cfg-dir"])
+
+    assert cli.main(["run", "--task=t", "--guard-exclude-path=cli-guard"]) == 0
+    assert captured[-1] == (["cli-guard"], ["cfg-dir"]), "only the given option is overridden"
+
+    # A second call in the same process must not accumulate.
+    assert cli.main(["run", "--task=t", "--guard-exclude-path=cli-guard"]) == 0
+    assert captured[-1] == (["cli-guard"], ["cfg-dir"])

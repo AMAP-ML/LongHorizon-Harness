@@ -5,6 +5,7 @@ import shlex
 from pathlib import Path
 
 from ..agent_logs import visible_output as extract_claude_visible_output
+from ..agent_registry import normalise_reasoning_effort
 from .claude_permissions import (
     ClaudeRole,
     is_auditor_role,
@@ -39,8 +40,10 @@ class ClaudeCodeAdapter(CommandAgentAdapter):
         role: ClaudeRole = "cli_executor",
         hidden_paths: tuple[str, ...] = (),
         guard_exclude_paths: tuple[str, ...] = (),
+        reasoning_effort: str | None = None,
     ) -> None:
         policy = policy_for_role(role)
+        effort = normalise_reasoning_effort(reasoning_effort)
         env_parts: list[str] = []
         if api_key:
             quoted_key = shlex.quote(api_key)
@@ -104,9 +107,14 @@ class ClaudeCodeAdapter(CommandAgentAdapter):
         if self.computer_mcp_configured:
             command_parts.extend(["--mcp-config", shlex.quote(mcp_config)])
         command_parts.extend(["--model", shlex.quote(model)])
+        # Claude Code warns and continues at its default when the value is not
+        # one it knows, so an unusable effort will not fail the run here.
+        if effort:
+            command_parts.extend(["--effort", shlex.quote(effort)])
 
         self.role = role
         self.policy = policy
+        self.reasoning_effort = effort
         # Snapshot-only exclusions: unlike hidden_paths these are not denied
         # to the agent — the guard just refrains from walking directories that
         # legitimately churn (build outputs) during an audit window.
@@ -151,6 +159,7 @@ class ClaudeCodeAdapter(CommandAgentAdapter):
                 "claude_disallowed_tools": list(self.policy.disallowed_tools),
                 "claude_computer_mcp_loaded": self.computer_mcp_configured,
                 "claude_workspace_read_only": self.policy.workspace_read_only,
+                "claude_reasoning_effort": self.reasoning_effort,
             }
         )
         if before is not None:

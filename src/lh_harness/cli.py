@@ -53,7 +53,9 @@ _DEFAULT_RUNS_ROOT = "./.lh-harness/runs"
 _DEFAULT_MAX_ROUNDS = DEFAULT_MAX_ROUNDS
 _MAX_TASK_FILE_BYTES = 100_000
 
-# Agent backends as (choice, CLI binary, default model).
+# Agent backends as (choice, CLI binary, default model).  Kept literal so
+# `--help` needs no registry import; `_doctor_command` asserts it still agrees
+# with `agent_registry.AGENT_SPECS`.
 _AGENTS = (
     ("claude_code", "claude", DEFAULT_CLAUDE_MODEL),
     ("codex", "codex", DEFAULT_CODEX_MODEL),
@@ -134,6 +136,16 @@ def _port(value: str) -> int:
     if not 0 <= parsed <= 65535:
         raise argparse.ArgumentTypeError("must be between 0 and 65535")
     return parsed
+
+
+def _reasoning_effort(value: str) -> str:
+    # Imported here so `--help` still needs no registry import.
+    from .agent_registry import normalise_reasoning_effort
+
+    try:
+        return normalise_reasoning_effort(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(str(exc)) from exc
 
 
 def _reserve_run_dir(runs_root: str | Path, requested_run_id: str | None) -> tuple[str, Path]:
@@ -418,6 +430,15 @@ def main(argv: list[str] | None = None) -> int:
         default=run_default("model"),
         help="Model for every role. Defaults to the chosen agent's own default.",
     )
+    run_parser.add_argument(
+        "--reasoning-effort",
+        default=run_default("reasoning_effort"),
+        type=_reasoning_effort,
+        help=(
+            "Reasoning effort for every role, passed through to the agent that "
+            "supports it. Defaults to the provider's own setting."
+        ),
+    )
     for role, _, scope in _ROLE_OPTIONS:
         run_parser.add_argument(
             _flag(role, "agent"),
@@ -429,6 +450,16 @@ def main(argv: list[str] | None = None) -> int:
             _flag(role, "model"),
             default=run_default(f"{role}_model"),
             help=f"Model for {scope}; defaults to {_fallback_hint(role, 'model')}.",
+        )
+        run_parser.add_argument(
+            _flag(role, "reasoning-effort"),
+            dest=f"{role}_reasoning_effort",
+            default=run_default(f"{role}_reasoning_effort"),
+            type=_reasoning_effort,
+            help=(
+                f"Reasoning effort for {scope}; defaults to "
+                f"{_fallback_hint(role, 'reasoning-effort')}."
+            ),
         )
     # Only the local backend is implemented; kept as a flag so existing
     # `--env local` invocations keep working and future backends can slot in.
@@ -503,11 +534,16 @@ def main(argv: list[str] | None = None) -> int:
     run_parser.add_argument(
         "--guard-exclude-path",
         action="append",
-        default=run_default("guard_exclude_path"),
+        # Repeatable options must default to None and be filled in after
+        # parsing (see _apply_repeatable_defaults): argparse appends to whatever
+        # default it is given, so a project-config list would be extended by the
+        # command line instead of replaced by it.
+        default=None,
         help=(
             "Volatile workspace path the auditor read-only guard skips while "
             "snapshotting (build outputs and similar churn). Relative paths "
             "resolve against the workspace; agents may still read them. "
+            "Replaces run.guard_exclude_paths from the project config. "
             "May be repeated."
         ),
     )
@@ -559,6 +595,11 @@ def main(argv: list[str] | None = None) -> int:
     )
     run_parser.add_argument(
         "--supervised",
+        action="store_true",
+        help=argparse.SUPPRESS,
+    )
+    run_parser.add_argument(
+        "--resume",
         action="store_true",
         help=argparse.SUPPRESS,
     )
@@ -657,8 +698,7 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "run":
         if config_error is not None:
             parser.error(str(config_error))
-        if args.mcp_add_dir is None:
-            args.mcp_add_dir = list(run_defaults.get("mcp_add_dir", []))
+        _apply_repeatable_defaults(args, run_defaults)
         if PROJECT_CONFIG_PATH.is_file():
             print(f"Using config: {PROJECT_CONFIG_PATH.resolve()}")
         return _run_command(args)
@@ -717,21 +757,37 @@ def _doctor_command() -> int:
     else:
         _doctor_line("SKIP", "Project config", f"{PROJECT_CONFIG_PATH} does not exist")
 
+    from .agent_registry import AGENT_IDS, agent_spec, probe_agents, reasoning_choices
+
+    # `_AGENTS` stays literal so `--help` needs no registry import; this keeps
+    # the two from drifting apart silently.
+    if _AGENT_CHOICES != AGENT_IDS:
+        _doctor_line(
+            "FAIL",
+            "Agent registry",
+            f"CLI choices {list(_AGENT_CHOICES)} disagree with the registry {list(AGENT_IDS)}",
+        )
+        failures += 1
+
     found_agents: dict[str, str] = {}
+    probes = probe_agents()
     for name, binary, _ in _AGENTS:
-        cli = probe_agent_cli(binary)
-        if not cli.found:
-            _doctor_line("WARN", name, cli.problem)
+        probe = probes.get(name)
+        if probe is None or probe.availability == "missing":
+            _doctor_line("WARN", name, probe.problem if probe else f"`{binary}` was not found")
             warnings += 1
             continue
-        if not cli.usable:
+        if probe.availability == "found_but_broken":
             # On PATH but not runnable is worse than absent: it silently breaks
             # every run, so it is a failure rather than a warning.
-            _doctor_line("FAIL", name, cli.problem)
+            _doctor_line("FAIL", name, probe.problem)
             failures += 1
             continue
-        found_agents[name] = cli.path
-        _doctor_line("OK", name, f"{cli.version} ({cli.path})")
+        found_agents[name] = probe.binary
+        spec = agent_spec(name)
+        choices = reasoning_choices(spec, probe)
+        effort = f"; effort: {', '.join(choices)}" if choices else "; no effort switch"
+        _doctor_line("OK", name, f"{probe.version} ({probe.binary}){effort}")
 
     if not found_agents:
         _doctor_line(
@@ -1420,6 +1476,14 @@ def _run_command(args: argparse.Namespace) -> int:
             )
             return 1
 
+    # ``--resume`` reopens an existing run directory and continues its ledger.
+    # Only the supervisor may do that: it is the component that verifies the
+    # run is terminal, owns the reservation, and bumps the resume generation.
+    # Allowing it standalone would let any caller reattach to another run.
+    if getattr(args, "resume", False) and not getattr(args, "supervised", False):
+        print("Cannot start run: --resume is only available to supervised workers", file=sys.stderr)
+        return 2
+
     max_rounds = args.max_rounds
     if max_rounds is None:
         max_rounds = _DEFAULT_MAX_ROUNDS
@@ -1568,6 +1632,7 @@ def _run_command(args: argparse.Namespace) -> int:
     # The dashboard starts before agent creation so startup status is visible.
     dashboard_handle = None
     human_hook = None
+    gate_state = None
     dashboard_supervisor = None
     if getattr(args, "supervised", False):
         from .dashboard import make_human_hook
@@ -1578,6 +1643,7 @@ def _run_command(args: argparse.Namespace) -> int:
         # resolve approvals and queue instructions through the run control bus.
         worker_state = DashboardState(log_dir, task=task, control_enabled=True)
         human_hook = make_human_hook(worker_state)
+        gate_state = worker_state
     if getattr(args, "dashboard", False):
         from .dashboard import make_human_hook
 
@@ -1644,6 +1710,7 @@ def _run_command(args: argparse.Namespace) -> int:
             print(f"Dashboard failed to start: {exc}", file=sys.stderr)
             return 2
         human_hook = make_human_hook(dashboard_handle.state)
+        gate_state = dashboard_handle.state
         print(f"Dashboard live at {dashboard_handle.url} (log dir: {log_dir})")
         _write_dashboard_endpoint(run_dir / "dashboard.json", dashboard_handle, run_id=run_id, log_dir=log_dir)
         if not args.dashboard_no_open:
@@ -1684,8 +1751,9 @@ def _run_command(args: argparse.Namespace) -> int:
         # same model must never share a differently privileged adapter.
         name = _resolve_role_option(args, role, "agent")
         model = _resolve_role_model(args, role)
+        effort = _resolve_role_reasoning_effort(args, role, name)
         effective_permission_role = permission_role or role
-        key = (effective_permission_role, name, model)
+        key = (effective_permission_role, name, model, effort)
         if key not in agent_cache:
             agent_cache[key] = _build_agent(
                 name,
@@ -1699,6 +1767,7 @@ def _run_command(args: argparse.Namespace) -> int:
                 mcp_add_dirs=args.mcp_add_dir,
                 hidden_paths=hidden_paths,
                 guard_exclude_paths=guard_exclude_paths,
+                reasoning_effort=effort,
             )
         return agent_cache[key]
 
@@ -1743,7 +1812,11 @@ def _run_command(args: argparse.Namespace) -> int:
                     env=env,
                     config=config,
                     human_hook=human_hook,
+                    pending_instructions=(
+                        gate_state.drain_injections if gate_state is not None else None
+                    ),
                     progress=_print_progress,
+                    resume=bool(getattr(args, "resume", False)),
                     **role_agents,
                 ),
                 run_dir=run_dir,
@@ -1800,6 +1873,27 @@ def _outermost_paths(*paths: str | Path) -> tuple[str, ...]:
         if not any(path.is_relative_to(parent) for parent in kept):
             kept.append(path)
     return tuple(str(path) for path in kept)
+
+
+_REPEATABLE_RUN_OPTIONS = ("mcp_add_dir", "guard_exclude_path")
+
+
+def _apply_repeatable_defaults(args: argparse.Namespace, run_defaults: dict[str, object]) -> None:
+    """Let the command line replace a repeatable project-config list.
+
+    ``action="append"`` appends to whatever default argparse holds, so giving it
+    the config list directly makes ``--flag`` extend the config instead of
+    overriding it - the opposite of how every scalar option behaves. These
+    options therefore default to ``None`` and adopt the config only when the
+    command line said nothing. A fresh list is built so nothing later mutates
+    the cached defaults.
+    """
+
+    for name in _REPEATABLE_RUN_OPTIONS:
+        if getattr(args, name, None) is not None:
+            continue
+        configured = run_defaults.get(name)
+        setattr(args, name, list(configured) if isinstance(configured, list) else [])
 
 
 def _resolve_guard_exclude_paths(
@@ -1953,6 +2047,33 @@ def _resolve_role_model(args: argparse.Namespace, role: str) -> str | None:
     return getattr(args, "model", None)
 
 
+def _resolve_role_reasoning_effort(
+    args: argparse.Namespace, role: str, agent_name: str
+) -> str | None:
+    """Resolve a role's effort without crossing an explicit backend switch.
+
+    Effort values are backend-specific (Codex accepts ``ultra``, Claude Code
+    does not), so inheriting one across an explicit agent override would send a
+    tier the selected backend rejects or silently drops.  A backend with no
+    effort switch at all gets ``None`` rather than an error: the value was set
+    for a different role's agent, not for this one.
+    """
+
+    from .agent_registry import supports_reasoning_effort
+
+    if not supports_reasoning_effort(agent_name):
+        return None
+    current: str | None = role
+    while current:
+        value = getattr(args, f"{current}_reasoning_effort", None)
+        if value:
+            return value
+        if getattr(args, f"{current}_agent", None):
+            return None
+        current = _ROLE_PARENTS[current]
+    return getattr(args, "reasoning_effort", None)
+
+
 def _public_role_configs_from_args(
     args: argparse.Namespace,
 ) -> dict[str, dict[str, str | None]] | None:
@@ -1962,7 +2083,7 @@ def _public_role_configs_from_args(
     if not any(
         getattr(args, f"{role}_{field}", None)
         for role in public_roles
-        for field in ("agent", "model")
+        for field in ("agent", "model", "reasoning_effort")
     ):
         return None
     defaults = {
@@ -1974,9 +2095,12 @@ def _public_role_configs_from_args(
     result: dict[str, dict[str, str | None]] = {}
     for role in public_roles:
         role_agent = _resolve_role_option(args, role, "agent")
+        effort = _resolve_role_reasoning_effort(args, role, role_agent)
         result[role] = {
             "agent": role_agent,
             "model": _resolve_role_model(args, role) or defaults[role_agent],
+            # Only recorded when set: absence means "follow the provider".
+            **({"reasoning_effort": effort} if effort else {}),
         }
     return result
 
@@ -2089,6 +2213,7 @@ def _build_agent(
     mcp_add_dirs: list[str] | None = None,
     hidden_paths: tuple[str, ...] = (),
     guard_exclude_paths: tuple[str, ...] = (),
+    reasoning_effort: str | None = None,
 ):
     if name == "codex":
         from .adapters.codex import CodexAdapter
@@ -2101,6 +2226,7 @@ def _build_agent(
             mcp_config=mcp_config,
             add_dirs=mcp_add_dirs,
             hidden_paths=hidden_paths,
+            reasoning_effort=reasoning_effort,
         )
         if model is not None:
             kwargs["model"] = model
@@ -2120,6 +2246,7 @@ def _build_agent(
             # The Codex adapter has no auditor snapshot guard, so the
             # exclusions are a Claude-Code-only concern for now.
             guard_exclude_paths=guard_exclude_paths,
+            reasoning_effort=reasoning_effort,
         )
         if model is not None:
             kwargs["model"] = model
@@ -2135,6 +2262,7 @@ def _build_agent(
             add_dirs=mcp_add_dirs,
             role=role,
             hidden_paths=hidden_paths,
+            reasoning_effort=reasoning_effort,
         )
         if model is not None:
             kwargs["model"] = model
@@ -2149,6 +2277,7 @@ def _build_agent(
             prompt_dir=prompt_dir,
             role=role,
             hidden_paths=hidden_paths,
+            reasoning_effort=reasoning_effort,
         )
         if model is not None:
             kwargs["model"] = model

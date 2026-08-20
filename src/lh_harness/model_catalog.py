@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import selectors
 import shutil
 import subprocess
@@ -20,6 +21,13 @@ from pathlib import Path
 from threading import Lock
 from typing import Any
 
+from .agent_registry import (
+    AGENT_SPECS,
+    AgentProbe,
+    AgentSpec,
+    probe_agents,
+    reasoning_choices,
+)
 from .types import (
     DEFAULT_CLAUDE_MODEL,
     DEFAULT_CODEX_MODEL,
@@ -98,57 +106,52 @@ def discover_model_catalog(
         opencode_models, opencode_discovery = _discover_opencode_models(
             resolved_opencode_binary
         )
+        models_by_agent = {
+            "codex": codex_models,
+            "claude_code": claude_models,
+            "deepseek_harness": deepseek_models,
+            "opencode": opencode_models,
+        }
+        discovery_by_agent = {
+            "codex": codex_discovery,
+            "claude_code": claude_discovery,
+            "deepseek_harness": deepseek_discovery,
+            "opencode": opencode_discovery,
+        }
+        resolved_binaries = {
+            "codex": resolved_codex_binary,
+            "claude_code": claude_binary,
+            "deepseek_harness": resolved_dsh_binary,
+            "opencode": resolved_opencode_binary,
+        }
+        probes = probe_agents(force=force, binaries=resolved_binaries)
+        agents: list[dict[str, Any]] = []
+        for spec in AGENT_SPECS:
+            probe = probes.get(spec.id)
+            binary = probe.binary if probe and probe.binary else resolved_binaries.get(spec.id)
+            agents.append(
+                {
+                    "id": spec.id,
+                    "label": spec.label,
+                    # `available` stays a boolean for older clients; the
+                    # tri-state lives beside it so "on PATH but broken" is not
+                    # rendered as a healthy backend.
+                    "available": bool(probe and probe.usable),
+                    "availability": probe.availability if probe else "missing",
+                    "version": probe.version if probe else "",
+                    "problem": probe.problem if probe else "",
+                    "binary": binary,
+                    "capabilities": sorted(spec.capabilities),
+                    "default_model": spec.default_model,
+                    "models": models_by_agent.get(spec.id, []),
+                    "discovery": discovery_by_agent.get(spec.id, {}),
+                    "reasoning": _reasoning_payload(spec, probe),
+                }
+            )
         result = {
-            "agents": [
-                {
-                    "id": "codex",
-                    "label": "Codex",
-                    "available": is_agent_binary_available(resolved_codex_binary),
-                    "binary": resolved_codex_binary,
-                    "default_model": DEFAULT_CODEX_MODEL,
-                    "models": codex_models,
-                    "discovery": codex_discovery,
-                },
-                {
-                    "id": "claude_code",
-                    "label": "Claude Code",
-                    "available": bool(claude_binary),
-                    "binary": claude_binary,
-                    "default_model": DEFAULT_CLAUDE_MODEL,
-                    "models": claude_models,
-                    "discovery": claude_discovery,
-                },
-                {
-                    "id": "deepseek_harness",
-                    "label": "DeepSeek Harness (CLI)",
-                    "available": is_agent_binary_available(resolved_dsh_binary),
-                    "binary": resolved_dsh_binary,
-                    "default_model": DEFAULT_DEEPSEEK_HARNESS_MODEL,
-                    "models": deepseek_models,
-                    "discovery": deepseek_discovery,
-                },
-                {
-                    "id": "opencode",
-                    "label": "OpenCode",
-                    "available": is_agent_binary_available(resolved_opencode_binary),
-                    "binary": resolved_opencode_binary,
-                    "default_model": DEFAULT_OPENCODE_MODEL,
-                    "models": opencode_models,
-                    "discovery": opencode_discovery,
-                },
-            ],
-            "models": {
-                "codex": codex_models,
-                "claude_code": claude_models,
-                "deepseek_harness": deepseek_models,
-                "opencode": opencode_models,
-            },
-            "model_discovery": {
-                "codex": codex_discovery,
-                "claude_code": claude_discovery,
-                "deepseek_harness": deepseek_discovery,
-                "opencode": opencode_discovery,
-            },
+            "agents": agents,
+            "models": models_by_agent,
+            "model_discovery": discovery_by_agent,
         }
         _cached_at = time.monotonic()
         _cached_key = cache_key
@@ -367,12 +370,21 @@ def _normalise_codex_entries(raw: list[Any], *, source: str) -> list[dict[str, A
         efforts = item.get("supportedReasoningEfforts") or item.get("supported_reasoning_levels")
         if isinstance(efforts, list):
             values: list[str] = []
+            described: list[dict[str, str]] = []
             for effort in efforts:
-                value = effort.get("reasoningEffort") or effort.get("effort") if isinstance(effort, dict) else effort
+                if isinstance(effort, dict):
+                    value = effort.get("reasoningEffort") or effort.get("effort")
+                    description = str(effort.get("description") or "").strip()
+                else:
+                    value, description = effort, ""
                 if isinstance(value, str) and value.strip() and value.strip() not in values:
                     values.append(value.strip())
+                    described.append({"id": value.strip(), "description": description[:200]})
             if values:
                 entry["reasoning_efforts"] = values
+                # Codex ships a one-line rationale per tier; keeping it lets the
+                # workbench explain the choice instead of showing bare words.
+                entry["reasoning_effort_details"] = described
         try:
             priority = int(item.get("priority", 10_000))
         except (TypeError, ValueError):
@@ -407,6 +419,35 @@ def _codex_cache_path() -> Path:
     return (Path(root).expanduser() if root else Path.home() / ".codex") / "models_cache.json"
 
 
+_CODEX_CONFIG_EFFORT_RE = re.compile(
+    r"^\s*model_reasoning_effort\s*=\s*[\"']([^\"'\n]{1,64})[\"']", re.MULTILINE
+)
+
+
+def codex_configured_reasoning_effort() -> str:
+    """Read the effort Codex would apply on its own, for honest UI defaults.
+
+    When the operator leaves the effort empty the harness passes no override,
+    so Codex reads its own ``config.toml``.  Showing a bare "provider default"
+    would then contradict what actually runs.  This is strictly read-only: the
+    harness never writes an agent's own configuration.
+    """
+
+    root = os.environ.get("CODEX_HOME")
+    path = (Path(root).expanduser() if root else Path.home() / ".codex") / "config.toml"
+    try:
+        if not path.is_file() or path.stat().st_size > _MAX_CATALOG_BYTES:
+            return ""
+        text = path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return ""
+    # Only the top-level assignment counts; a value under a `[profiles.x]`
+    # table applies to that profile, which the harness does not select.
+    head = text.split("\n[", 1)[0]
+    match = _CODEX_CONFIG_EFFORT_RE.search(head)
+    return match.group(1).strip() if match else ""
+
+
 def _read_json_object(path: Path) -> dict[str, Any]:
     metadata = path.stat()
     if not path.is_file() or metadata.st_size > _MAX_CATALOG_BYTES:
@@ -420,6 +461,42 @@ def _read_json_object(path: Path) -> dict[str, Any]:
 
 def _model_entry(model_id: str, label: str, availability: str) -> dict[str, Any]:
     return {"id": model_id, "label": label, "availability": availability}
+
+
+def _reasoning_payload(spec: AgentSpec, probe: AgentProbe | None) -> dict[str, Any]:
+    """Describe how (and whether) this agent accepts a reasoning effort."""
+
+    if spec.reasoning is None:
+        return {
+            "supported": False,
+            "note": (
+                f"{spec.label} 未提供思考深度开关；请通过模型选择控制推理强度。"
+            ),
+        }
+    reasoning = spec.reasoning
+    choices = reasoning_choices(spec, probe)
+    detected = bool(probe and probe.discovered_efforts)
+    return {
+        "supported": True,
+        "transport": reasoning.transport,
+        "flag": reasoning.flag,
+        # What the backend applies when the harness passes nothing.  Only Codex
+        # persists this where the harness can read it.
+        "provider_default": (
+            codex_configured_reasoning_effort() if reasoning.transport == "codex_config" else ""
+        ),
+        # A per-model scope means the client must re-read the selected model's
+        # own list instead of caching one list for the whole agent.
+        "scope": reasoning.scope,
+        "source": "cli_help" if detected else reasoning.source,
+        "allow_custom": True,
+        "choices": [{"id": value, "label": value} for value in choices],
+        # Codex surfaces an unknown value as a provider 400 and the run fails
+        # with a readable reason; Claude Code prints a warning and silently
+        # continues at its default, so a custom value cannot be presented as
+        # verified there.
+        "validation": reasoning.validation,
+    }
 
 
 def _valid_model_id(value: object) -> bool:

@@ -59,8 +59,10 @@ def test_codex_catalog_keeps_reasoning_efforts_without_rejecting_new_values() ->
 
 
 def test_deepseek_catalog_exposes_default_model_and_cli_availability(tmp_path: Path) -> None:
+    # `available` is proven by running `--version`, not by a PATH lookup, so the
+    # stub has to answer it the way a real CLI does.
     binary = tmp_path / "dsh"
-    binary.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    binary.write_text('#!/bin/sh\necho "dsh 0.9.1"\nexit 0\n', encoding="utf-8")
     binary.chmod(0o755)
 
     models, discovery = _discover_deepseek_models(str(binary))

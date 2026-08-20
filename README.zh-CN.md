@@ -36,6 +36,7 @@ LongHorizon-Harness 将现有 Agent 变成可长期运行的 computer-use 系统
 
 ## ✨ News
 
+- **[v0.1.7 · 2026-08-20]** 任务跑完不再是终点，工作台变成了一场对话：看完回复直接追问，任务会沿用自己已完成的轮次继续跑，而不是从头重新规划。运行中发出的消息会被下一轮立即取用，先停止再继续也不会漏掉。同时新增 `--reasoning-effort` 统一设置各角色的推理强度（也可用 `--manager-reasoning-effort` 等单独覆盖），并转发给支持该能力的后端。对话现在严格按时间顺序展示，而强制中止只在 worker 忽略正常停止时才会出现。
 - **[v0.1.6 · 2026-08-15]** 新增 [OpenCode](https://github.com/anomalyco/opencode) CLI 支持。LongHorizon-Harness 现在可以通过 `--agent opencode` 调用 `opencode run prompt`，并支持按角色划分的读写权限、OpenCode API 端点覆盖、标准化 JSON 结果，以及 CLI/config/doctor 集成。Web 工作台可以为每个角色单独选择 OpenCode Harness 及其模型。
 - **[v0.1.5 · 2026-08-14]** 第一阶段已适配 [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness) CLI。LongHorizon-Harness 现在可以通过 `--agent deepseek_harness` 调用 `dsh --profile headless`，并提供隔离的 `DSH_HOME`、按角色划分的读写权限、DeepSeek API 端点覆盖、标准化 JSONL 结果以及 CLI/config/doctor 接入。Web 工作台支持为每个角色分别选择 DeepSeek Harness 及其模型；GUI computer-use 和 MCP 支持将在后续阶段补充。使用方式见 [CLI 配置说明](#5-也可以用命令行运行任务)。
 - **[v0.1.4 · 2026-08-11]** 新版 Dashboard 已上线：基于 React/FastAPI 的工作台，全部操作都能在浏览器里完成——发起任务、为每个角色分别选择后端和模型、处理审批、运行中追加指令、停止或重启任务。用 `lh-harness web` 启动，见[在网页上运行任务](#4-在网页上运行任务推荐)。
@@ -237,7 +238,7 @@ lh-harness init
 lh-harness web --workspace-root .
 ```
 
-该命令在 `http://127.0.0.1:8799/` 打开工作台，所有操作都在这里完成：发起任务、为每个角色分别选择后端和模型、处理审批请求、在运行中追加指令、停止或重启任务。`--workspace-root` 指定在工作台中创建任务时的默认工作目录，其余参数见 [Dashboard 命令](#dashboard-命令)。
+该命令在 `http://127.0.0.1:8799/` 打开工作台，所有操作都在这里完成：发起任务、为每个角色分别选择后端和模型、处理审批请求、在运行中追加指令、停止或重启任务，以及在任务结束后继续追问——追问会沿用它已完成的轮次继续同一个任务。`--workspace-root` 指定在工作台中创建任务时的默认工作目录，其余参数见 [Dashboard 命令](#dashboard-命令)。
 
 #### 5. 也可以用命令行运行任务
 
@@ -328,6 +329,7 @@ lh-harness check-update
 |---|---|---|
 | `agent` | `"codex"` | 所有角色使用的后端（角色可单独覆盖）：`codex`、`claude_code`、`opencode` 或 `deepseek_harness`。 |
 | `model` | `"gpt-5.6-sol"` | 所有角色使用的模型（角色可单独覆盖）。必须是所选后端支持的模型。 |
+| `reasoning_effort` | 默认注释 | 所有角色的推理强度（角色可单独覆盖），转发给支持该能力的后端。不设置则沿用服务方自身的默认值。 |
 | `env` | `"local"` | 执行环境，目前只有 `local`。 |
 | `runs_root` | `"./.lh-harness/runs"` | 运行目录的根路径，每次运行生成 `<runs_root>/<run-id>/`。 |
 | `workspace` | 默认注释 | Agent 实际操作的工作目录。默认就是启动 `lh-harness` 的那个目录，任务直接作用于你的真实项目；需要隔离到别处时才设置。 |
@@ -355,13 +357,13 @@ lh-harness check-update
 
 ##### `[run.roles.*]`
 
-每个角色都可以单独指定 `agent` 与 `model`，因此可以只在关键位置使用强模型：例如 Manager 与 Auditor 用强模型、Executor 用更便宜的。所有字段默认都是注释状态，表示「继承」。
+每个角色都可以单独指定 `agent`、`model` 与 `reasoning_effort`，因此可以只在关键位置使用强模型：例如 Manager 与 Auditor 用强模型、Executor 用更便宜的。所有字段默认都是注释状态，表示「继承」。
 
 取值时沿以下链路回退，直到找到值为止：
 
 ```
-gui_executor → executor → [run].agent / [run].model
-cli_auditor  → auditor  → [run].agent / [run].model
+gui_executor → executor → [run].agent / [run].model / [run].reasoning_effort
+cli_auditor  → auditor  → [run].agent / [run].model / [run].reasoning_effort
 ```
 
 | 配置段 | 回退到 | 作用范围 |
