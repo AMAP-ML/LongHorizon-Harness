@@ -2,10 +2,33 @@
 
 from __future__ import annotations
 
+import sys
 from urllib.parse import urljoin
 
 import fastapi.testclient as fastapi_testclient
+import pytest
 import starlette.testclient as starlette_testclient
+
+if sys.platform == "win32":
+
+    @pytest.hookimpl(wrapper=True)
+    def pytest_runtest_call(item):
+        """Skip, rather than fail, when Windows denies symlink creation.
+
+        Creating a symlink needs SeCreateSymbolicLinkPrivilege, which an
+        ordinary account only holds under Developer Mode. The no-follow tests
+        are still meaningful on Windows, so they run unchanged where the
+        privilege exists and report honestly where it does not. Only the test
+        body is wrapped: pytest's own tmp_path bookkeeping also makes symlinks,
+        and swallowing that would skip the entire suite.
+        """
+        try:
+            return (yield)
+        except OSError as exc:
+            if getattr(exc, "winerror", None) == 1314:
+                pytest.skip("symlink creation requires Developer Mode or admin rights")
+            raise
+
 
 _Orig = starlette_testclient.TestClient
 _Upgrade = starlette_testclient._Upgrade

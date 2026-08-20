@@ -216,7 +216,7 @@ def test_control_bus_accepts_trusted_macos_var_alias(tmp_path: Path) -> None:
 
 
 def test_control_bus_fails_closed_when_process_lock_breaks(monkeypatch, tmp_path: Path) -> None:
-    import fcntl
+    fcntl = pytest.importorskip("fcntl", reason="POSIX file locking; Windows uses msvcrt")
 
     def broken_flock(*_args, **_kwargs):
         raise OSError("lock unavailable")
@@ -369,9 +369,33 @@ def test_iter_run_control_dirs_skips_symlinked_run_boundaries(tmp_path: Path) ->
     assert list(iter_run_control_dirs(root)) == [root / "real"]
 
 
+def test_atomic_write_evicts_a_symlinked_destination(tmp_path: Path) -> None:
+    """A planted symlink is replaced by a private regular file, never followed.
+
+    This is what POSIX ``rename`` already guarantees and what the first
+    admin-privileged Windows CI run showed the Windows branch refusing to do:
+    it raised on the reparse point, the crash-report writer swallowed the
+    OSError, and the attacker's link stayed in place for a later writer.
+    """
+    from lh_harness.supervisor.control_bus import _atomic_bytes_write
+
+    outside = tmp_path / "outside.json"
+    outside.write_text("private", encoding="utf-8")
+    destination = tmp_path / "report.json"
+    destination.symlink_to(outside)
+
+    _atomic_bytes_write(destination, b"{}")
+
+    assert not destination.is_symlink()
+    assert destination.read_bytes() == b"{}"
+    assert outside.read_text(encoding="utf-8") == "private"
+
+
 def test_atomic_json_write_closes_mkstemp_fd_when_fdopen_fails(monkeypatch, tmp_path: Path) -> None:
     """The temporary descriptor must not leak if wrapping it raises."""
 
+    if sys.platform == "win32":
+        pytest.skip("the mkstemp/fdopen path is POSIX-only; Windows replaces atomically")
     captured: dict[str, int] = {}
     real_fdopen = control_bus.os.fdopen
 
@@ -399,7 +423,7 @@ def test_stop_keeps_stopping_state_while_stale_approval_is_present(
 
     process = _Process()
     monkeypatch.setattr("lh_harness.supervisor.service.subprocess.Popen", lambda *args, **kwargs: process)
-    monkeypatch.setattr("lh_harness.supervisor.service.os.killpg", lambda *args, **kwargs: None)
+    monkeypatch.setattr("lh_harness.supervisor.service.deliver_signal", lambda *args, **kwargs: None)
     supervisor = RunSupervisor(tmp_path / "runs", workspace_root=tmp_path / "workspace")
     created = supervisor.create_run(task="stop me")
     run_dir = tmp_path / "runs" / created["id"]
@@ -425,7 +449,7 @@ def test_abort_escalates_stop_and_cross_action_retries_are_idempotent(
     process = _Process()
     signals: list[object] = []
     monkeypatch.setattr("lh_harness.supervisor.service.subprocess.Popen", lambda *args, **kwargs: process)
-    monkeypatch.setattr("lh_harness.supervisor.service.os.killpg", lambda _pid, sig: signals.append(sig))
+    monkeypatch.setattr("lh_harness.supervisor.service.deliver_signal", lambda _pid, sig, **_kw: signals.append(sig))
     supervisor = RunSupervisor(tmp_path / "runs", workspace_root=tmp_path / "workspace")
     created = supervisor.create_run(task="stop then abort")
 
@@ -433,10 +457,10 @@ def test_abort_escalates_stop_and_cross_action_retries_are_idempotent(
     aborted = supervisor.abort(created["id"])
     repeated_stop = supervisor.stop(created["id"])
 
-    assert stopped["signal"] == "SIGTERM"
-    assert aborted["signal"] == "SIGKILL"
+    assert stopped["signal"] == supervisor_service.STOP_SIGNAL.name
+    assert aborted["signal"] == supervisor_service.ABORT_SIGNAL.name
     assert repeated_stop["idempotent"] is True
-    assert signals == [supervisor_service.signal.SIGTERM, supervisor_service.signal.SIGKILL]
+    assert signals == [supervisor_service.STOP_SIGNAL, supervisor_service.ABORT_SIGNAL]
     status = supervisor.status(created["id"])
     assert status["status"] == "stopping"
     assert status["requested_action"] == "abort"
@@ -446,7 +470,7 @@ def test_stop_after_abort_returns_abort_receipt_without_conflict(monkeypatch, tm
     process = _Process()
     signals: list[object] = []
     monkeypatch.setattr("lh_harness.supervisor.service.subprocess.Popen", lambda *args, **kwargs: process)
-    monkeypatch.setattr("lh_harness.supervisor.service.os.killpg", lambda _pid, sig: signals.append(sig))
+    monkeypatch.setattr("lh_harness.supervisor.service.deliver_signal", lambda _pid, sig, **_kw: signals.append(sig))
     supervisor = RunSupervisor(tmp_path / "runs", workspace_root=tmp_path / "workspace")
     created = supervisor.create_run(task="abort then stop")
 
@@ -454,9 +478,9 @@ def test_stop_after_abort_returns_abort_receipt_without_conflict(monkeypatch, tm
     repeated = supervisor.stop(created["id"])
 
     assert repeated["command_id"] == "lifecycle-abort"
-    assert repeated["signal"] == "SIGKILL"
+    assert repeated["signal"] == supervisor_service.ABORT_SIGNAL.name
     assert repeated["idempotent"] is True
-    assert signals == [supervisor_service.signal.SIGKILL]
+    assert signals == [supervisor_service.ABORT_SIGNAL]
 
 
 def test_first_role_event_promotes_starting_worker_to_running(monkeypatch, tmp_path: Path) -> None:
@@ -600,10 +624,10 @@ def test_stop_persists_intent_before_signal(monkeypatch, tmp_path: Path) -> None
     monkeypatch.setattr("lh_harness.supervisor.service.subprocess.Popen", lambda *args, **kwargs: process)
     observed: list[str] = []
 
-    def killpg(_pid: int, _sig: object) -> None:
+    def deliver(_pid: int, _sig: object, **_kwargs: object) -> None:
         observed.append(ControlBus(tmp_path / "runs" / created["id"]).read_status().get("status", ""))
 
-    monkeypatch.setattr("lh_harness.supervisor.service.os.killpg", killpg)
+    monkeypatch.setattr("lh_harness.supervisor.service.deliver_signal", deliver)
     supervisor = RunSupervisor(tmp_path / "runs", workspace_root=tmp_path / "workspace")
     created = supervisor.create_run(task="ordering")
     supervisor.stop(created["id"])
@@ -613,7 +637,7 @@ def test_stop_persists_intent_before_signal(monkeypatch, tmp_path: Path) -> None
 def test_signal_process_lookup_reconciles_stopping_to_failed(monkeypatch, tmp_path: Path) -> None:
     process = _Process()
     monkeypatch.setattr("lh_harness.supervisor.service.subprocess.Popen", lambda *args, **kwargs: process)
-    monkeypatch.setattr("lh_harness.supervisor.service.os.killpg", lambda *args, **kwargs: (_ for _ in ()).throw(ProcessLookupError()))
+    monkeypatch.setattr("lh_harness.supervisor.service.deliver_signal", lambda *args, **kwargs: (_ for _ in ()).throw(ProcessLookupError()))
     supervisor = RunSupervisor(tmp_path / "runs", workspace_root=tmp_path / "workspace")
     created = supervisor.create_run(task="vanish")
 
@@ -629,7 +653,7 @@ def test_signal_process_lookup_reconciles_stopping_to_failed(monkeypatch, tmp_pa
 def test_signal_permission_failure_restores_active_state(monkeypatch, tmp_path: Path) -> None:
     process = _Process()
     monkeypatch.setattr("lh_harness.supervisor.service.subprocess.Popen", lambda *args, **kwargs: process)
-    monkeypatch.setattr("lh_harness.supervisor.service.os.killpg", lambda *args, **kwargs: (_ for _ in ()).throw(PermissionError()))
+    monkeypatch.setattr("lh_harness.supervisor.service.deliver_signal", lambda *args, **kwargs: (_ for _ in ()).throw(PermissionError()))
     supervisor = RunSupervisor(tmp_path / "runs", workspace_root=tmp_path / "workspace")
     created = supervisor.create_run(task="permission")
 
@@ -646,7 +670,7 @@ def test_pending_lifecycle_command_is_replayed_after_supervisor_restart(monkeypa
     process = _Process()
     monkeypatch.setattr("lh_harness.supervisor.service.subprocess.Popen", lambda *args, **kwargs: process)
     sent: list[object] = []
-    monkeypatch.setattr("lh_harness.supervisor.service.os.killpg", lambda pid, sig: sent.append((pid, sig)))
+    monkeypatch.setattr("lh_harness.supervisor.service.deliver_signal", lambda pid, sig, **_kw: sent.append((pid, sig)))
     supervisor = RunSupervisor(tmp_path / "runs", workspace_root=tmp_path / "workspace")
     created = supervisor.create_run(task="replay stop")
     bus = ControlBus(tmp_path / "runs" / created["id"])
@@ -770,6 +794,29 @@ def test_worker_does_not_inherit_web_control_token(monkeypatch, tmp_path: Path) 
     assert worker_env.get("LH_HARNESS_WEB_TOKEN") is None
 
 
+def test_worker_pwd_points_at_the_workspace(monkeypatch, tmp_path: Path) -> None:
+    """Agent CLIs that read `PWD` inherit it from the worker, not from us."""
+
+    process = _Process()
+    captured: dict[str, object] = {}
+
+    def launch(*args, **kwargs):
+        captured.update(kwargs)
+        return process
+
+    monkeypatch.setenv("PWD", str(tmp_path / "wherever-the-supervisor-started"))
+    monkeypatch.setattr("lh_harness.supervisor.service.subprocess.Popen", launch)
+    supervisor = RunSupervisor(tmp_path / "runs", workspace_root=tmp_path / "workspace")
+    supervisor.create_run(task="stay in the workspace")
+
+    worker_env = captured.get("env")
+    assert isinstance(worker_env, dict)
+    # `abspath`, not `resolve`: the value must describe the directory the worker
+    # was actually started in, symlinks and all, exactly as a shell's own `PWD`
+    # would.
+    assert worker_env.get("PWD") == os.path.abspath(str(captured.get("cwd")))
+
+
 def test_run_listing_skips_symlinked_run_dirs(monkeypatch, tmp_path: Path) -> None:
     process = _Process()
     monkeypatch.setattr("lh_harness.supervisor.service.subprocess.Popen", lambda *args, **kwargs: process)
@@ -829,7 +876,10 @@ def test_worker_log_open_compacts_old_tail_and_tightens_permissions(
         output.seek(0)
         assert output.read() == bytes(range(68, 100))
         assert path.stat().st_size == 32
-        assert path.stat().st_mode & 0o777 == 0o600
+        if sys.platform != "win32":
+            # Windows reports 0o666/0o444 from the read-only attribute; there
+            # is no owner-only mode bit to assert.
+            assert path.stat().st_mode & 0o777 == 0o600
     finally:
         output.close()
 

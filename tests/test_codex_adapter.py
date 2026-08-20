@@ -17,18 +17,17 @@ from lh_harness.utils.agent_cli import (
 )
 from lh_harness.webapi import server as web_server
 
+from .fake_cli import fake_cli
+
 
 def _executable(path: Path) -> str:
     """Create a deterministic executable stand-in for a discovered binary.
 
     Availability is proven by running `--version`, so the stub has to answer it
-    like a real CLI; a bare `exit 0` is correctly reported as installed but
+    like a real CLI; a bare no-op is correctly reported as installed but
     unusable.
     """
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text('#!/bin/sh\necho "codex-cli 1.2.3"\nexit 0\n', encoding="utf-8")
-    path.chmod(0o755)
-    return str(path)
+    return fake_cli(path, 'print("codex-cli 1.2.3")\n')
 
 
 @pytest.mark.parametrize(
@@ -96,20 +95,17 @@ def test_codex_binary_falls_back_to_path_when_desktop_is_missing(
     assert resolve_codex_binary(environ={}, platform_name="darwin") == path_binary
 
 
-def test_codex_adapter_quotes_resolved_binary_with_spaces(monkeypatch, tmp_path: Path) -> None:
+def test_codex_adapter_keeps_a_spaced_binary_as_one_argument(monkeypatch, tmp_path: Path) -> None:
     binary = str(tmp_path / "ChatGPT Desktop.app" / "Contents" / "Resources" / "codex")
     monkeypatch.setattr(codex_adapter_module, "resolve_codex_binary", lambda: binary)
 
     adapter = CodexAdapter(model=None)
-    expected_binary = shlex.quote(binary)
 
-    assert adapter.command_template.startswith(f"{expected_binary} exec ")
-    assert adapter.command_template.endswith(" - < {prompt_path}")
-
-    # Parsing the command without the prompt placeholder confirms the quoted
-    # path remains one executable token when handed to a POSIX shell.
-    command_without_placeholder = adapter.command_template.removesuffix(" < {prompt_path}")
-    assert shlex.split(command_without_placeholder)[0] == binary
+    # There is no shell in the agent path any more, so a path with spaces needs
+    # no quoting: it simply stays one argv element.
+    assert adapter.argv[0] == binary
+    assert adapter.argv[1] == "exec"
+    assert adapter.argv[-1] == "-"
 
 
 def test_web_meta_reports_the_resolved_codex_binary(monkeypatch, tmp_path: Path) -> None:

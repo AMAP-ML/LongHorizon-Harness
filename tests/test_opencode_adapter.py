@@ -16,12 +16,7 @@ from lh_harness.types import DEFAULT_OPENCODE_MODEL, EpisodeBudget, EpisodeResul
 from lh_harness.utils.agent_cli import resolve_opencode_binary
 from lh_harness.webapi import server as web_server
 
-
-def _executable(path: Path, body: str) -> str:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text("#!/bin/sh\n" + body, encoding="utf-8")
-    path.chmod(0o755)
-    return str(path)
+from .fake_cli import fake_cli as _executable
 
 
 # Real events captured from `opencode run --format json` on v1.18.18.
@@ -127,13 +122,13 @@ def test_opencode_adapter_quotes_binary_and_builds_command(monkeypatch, tmp_path
         role="cli_executor",
     )
 
-    tokens = shlex.split(adapter.command_template.replace("{prompt_path}", "/tmp/prompt.md"))
-    assert tokens[0] == binary
-    assert tokens[1:5] == ["run", "--format", "json", "--yolo"]
-    assert tokens[tokens.index("--model") + 1] == "opencode/deepseek-v4-flash-free"
-    assert tokens[-2] == "<"
-    assert tokens[-1] == "/tmp/prompt.md"
-    assert "--variant" not in tokens
+    argv = adapter.argv
+    assert argv[0] == binary
+    assert argv[1:5] == ["run", "--format", "json", "--yolo"]
+    assert argv[argv.index("--model") + 1] == "opencode/deepseek-v4-flash-free"
+    # The prompt goes down stdin now, so no redirection token is built at all.
+    assert "<" not in argv
+    assert "--variant" not in argv
 
 
 def test_opencode_adapter_maps_effort_to_variant(monkeypatch, tmp_path: Path) -> None:
@@ -146,9 +141,9 @@ def test_opencode_adapter_maps_effort_to_variant(monkeypatch, tmp_path: Path) ->
         role="manager",
     )
 
-    tokens = shlex.split(adapter.command_template.replace("{prompt_path}", "/tmp/prompt.md"))
-    assert "--variant" in tokens
-    assert tokens[tokens.index("--variant") + 1] == "high"
+    argv = adapter.argv
+    assert "--variant" in argv
+    assert argv[argv.index("--variant") + 1] == "high"
 
 
 def test_opencode_adapter_writes_endpoint_config_for_base_url(
@@ -165,14 +160,11 @@ def test_opencode_adapter_writes_endpoint_config_for_base_url(
         role="cli_auditor",
     )
 
-    tokens = shlex.split(adapter.command_template.replace("{prompt_path}", "/tmp/prompt.md"))
-    env = dict(item.split("=", 1) for item in tokens if "=" in item and item.split("=", 1)[0] in {"OPENCODE_API_KEY", "OPENCODE_CONFIG"})
+    env = adapter.env
     assert env["OPENCODE_API_KEY"] == "sk-test"
     config_path = env["OPENCODE_CONFIG"]
     config = json.loads(Path(config_path).read_text(encoding="utf-8"))
     assert config["provider"]["opencode"]["options"]["baseURL"] == "https://api.example.com/v1"
-    assert "OPENCODE_CONFIG" in adapter.command_template
-    assert "OPENCODE_API_KEY" in adapter.command_template
 
 
 def test_opencode_jsonl_views() -> None:
@@ -234,7 +226,7 @@ def test_opencode_adapter_runs_end_to_end_with_fake_opencode(
     tmp_path: Path,
 ) -> None:
     events = "\n".join(json.dumps(event) for event in (_STEP_START, _TEXT, _TOOL_USE, _STEP_FINISH))
-    binary = _executable(tmp_path / "bin" / "opencode", f"cat <<'EOF'\n{events}\nEOF\n")
+    binary = _executable(tmp_path / "bin" / "opencode", f"sys.stdout.write({events!r})")
     monkeypatch.setattr(opencode_adapter_module, "resolve_opencode_binary", lambda: binary)
     workspace = tmp_path / "workspace"
     workspace.mkdir()
@@ -265,7 +257,7 @@ def test_opencode_adapter_runs_end_to_end_with_fake_opencode(
 def test_opencode_adapter_reports_failed_binary_stderr(monkeypatch, tmp_path: Path) -> None:
     binary = _executable(
         tmp_path / "bin" / "opencode",
-        "printf 'provider unavailable\\n' >&2\nexit 7\n",
+        "sys.stderr.write('provider unavailable\\n')\nsys.exit(7)\n",
     )
     monkeypatch.setattr(opencode_adapter_module, "resolve_opencode_binary", lambda: binary)
     workspace = tmp_path / "workspace"
@@ -295,7 +287,7 @@ def test_web_meta_exposes_opencode_backend_and_default_model(
     tmp_path: Path,
 ) -> None:
     # Availability is proven by running `--version`, so the stub answers it.
-    binary = _executable(tmp_path / "bin" / "opencode", 'echo "1.18.15"\nexit 0\n')
+    binary = _executable(tmp_path / "bin" / "opencode", 'print("1.18.15")\n')
     monkeypatch.setattr(web_server, "resolve_opencode_binary", lambda: binary)
 
     client = TestClient(web_server.create_app(runs_root=tmp_path / "runs"))

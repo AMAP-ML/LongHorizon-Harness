@@ -2,9 +2,11 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import shlex
 from pathlib import Path
 
+import pytest
 from fastapi.testclient import TestClient
 
 from lh_harness import agent_logs
@@ -13,18 +15,13 @@ from lh_harness.adapters.deepseek_harness import (
     DeepSeekHarnessAdapter,
     permission_mode_for_role,
 )
-from lh_harness.adapters.deepseek_runner import run
+from lh_harness.adapters.deepseek_runner import TASK_PLACEHOLDER, run
 from lh_harness.environment.local import LocalEnvironment
 from lh_harness.types import EpisodeBudget
 from lh_harness.utils.agent_cli import resolve_dsh_binary
 from lh_harness.webapi import server as web_server
 
-
-def _executable(path: Path, body: str) -> str:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text("#!/bin/sh\n" + body, encoding="utf-8")
-    path.chmod(0o755)
-    return str(path)
+from .fake_cli import fake_cli as _executable
 
 
 def test_dsh_binary_environment_override() -> None:
@@ -56,10 +53,11 @@ def test_deepseek_adapter_quotes_binary_and_configures_isolated_home(
         role="manager",
     )
 
-    tokens = shlex.split(adapter.command_template.replace("{prompt_path}", "/tmp/prompt.md"))
-    assert tokens[:2] == ["DSH_HOME=/tmp/run with spaces/dsh-home", "DSH_PERMISSION_MODE=read-only"]
-    assert "lh_harness.adapters.deepseek_runner" in tokens
-    assert tokens[tokens.index("--binary") + 1] == binary
+    argv = adapter.argv
+    assert adapter.env["DSH_HOME"] == "/tmp/run with spaces/dsh-home"
+    assert adapter.env["DSH_PERMISSION_MODE"] == "read-only"
+    assert "lh_harness.adapters.deepseek_runner" in argv
+    assert argv[argv.index("--binary") + 1] == binary
     assert adapter.permission_mode == "read-only"
 
 
@@ -67,7 +65,7 @@ def test_deepseek_runner_passes_headless_patch_and_emits_jsonl(
     tmp_path: Path,
     capsys,
 ) -> None:
-    binary = _executable(tmp_path / "bin" / "dsh", "printf '%s\\n' \"$*\"\n")
+    binary = _executable(tmp_path / "bin" / "dsh", "print(' '.join(sys.argv[1:]))\n")
     prompt_path = tmp_path / "prompt.md"
     prompt_path.write_text("fix the project", encoding="utf-8")
 
@@ -77,16 +75,70 @@ def test_deepseek_runner_passes_headless_patch_and_emits_jsonl(
     assert record["type"] == "dsh.result"
     assert record["is_error"] is False
     assert "--profile headless --patch" in record["text"]
-    assert record["text"].endswith("fix the project")
     patch_path = prompt_path.with_name(f"{prompt_path.name}.dsh-model-patch.yml")
-    assert "provider: deepseek-official" in patch_path.read_text(encoding="utf-8")
-    assert 'model: "deepseek-v4-flash"' in patch_path.read_text(encoding="utf-8")
+    patch_text = patch_path.read_text(encoding="utf-8")
+    assert "provider: deepseek-official" in patch_text
+    assert 'model: "deepseek-v4-flash"' in patch_text
+    if os.name == "nt":
+        # cmd.exe's 8191-char limit cannot carry a role prompt, so the task
+        # travels as a patch-layer config override and argv keeps a stand-in.
+        assert record["text"].endswith(TASK_PLACEHOLDER)
+        assert "- id: headless-runner" in patch_text
+        assert 'task: "fix the project"' in patch_text
+    else:
+        assert record["text"].endswith("fix the project")
+        assert "headless-runner" not in patch_text
+
+
+@pytest.mark.parametrize("via_patch", [False, True])
+def test_deepseek_runner_task_deliveries_work_on_every_platform(
+    tmp_path: Path,
+    capsys,
+    via_patch: bool,
+) -> None:
+    """Both deliveries, exercised regardless of the host OS.
+
+    The patch route is a contract with dsh's layer precedence; if only Windows
+    machines ever executed it, a change in dsh would surface as agents silently
+    receiving the placeholder as their task. This is the tripwire.
+    """
+    binary = _executable(tmp_path / "bin" / "dsh", "print(' '.join(sys.argv[1:]))\n")
+    prompt_path = tmp_path / "prompt.md"
+    if via_patch:
+        # Large enough that cmd.exe could never carry it, and awkward enough
+        # to prove the JSON-as-YAML escaping keeps the scalar on one line.
+        prompt = ("x" * 9000) + '\nline "two" ends with a backslash \\'
+    else:
+        # The positional route genuinely cannot carry a large, multi-line or
+        # quote-riddled argument through the Windows .CMD shim -- those limits
+        # are the whole reason the patch route exists -- so this case proves
+        # only the route itself: prompt on argv, no override row in the patch.
+        prompt = "fix the project via the positional route"
+    prompt_path.write_text(prompt, encoding="utf-8")
+
+    assert run(binary, prompt_path, "deepseek-v4-flash", task_via_patch=via_patch) == 0
+
+    record = json.loads(capsys.readouterr().out)
+    assert record["is_error"] is False
+    patch_path = prompt_path.with_name(f"{prompt_path.name}.dsh-model-patch.yml")
+    patch_text = patch_path.read_text(encoding="utf-8")
+    assert "provider: deepseek-official" in patch_text
+    if via_patch:
+        # The prompt must not appear on the command line at all...
+        assert "xxxx" not in record["text"]
+        assert record["text"].endswith(TASK_PLACEHOLDER)
+        # ...and must ride in the patch file as one exactly-escaped scalar.
+        assert f"task: {json.dumps(prompt, ensure_ascii=False)}" in patch_text
+        assert "- id: headless-runner" in patch_text
+    else:
+        assert record["text"].endswith("fix the project via the positional route")
+        assert "headless-runner" not in patch_text
 
 
 def test_deepseek_runner_preserves_failure_and_stderr(tmp_path: Path, capfd) -> None:
     binary = _executable(
         tmp_path / "bin" / "dsh",
-        "printf 'provider unavailable\\n' >&2\nexit 9\n",
+        "sys.stderr.write('provider unavailable\\n')\nsys.exit(9)\n",
     )
     prompt_path = tmp_path / "prompt.md"
     prompt_path.write_text("task", encoding="utf-8")
@@ -127,7 +179,7 @@ def test_deepseek_adapter_runs_end_to_end_with_fake_dsh(
     monkeypatch,
     tmp_path: Path,
 ) -> None:
-    binary = _executable(tmp_path / "DeepSeek Harness" / "dsh", "printf 'done by dsh\\n'\n")
+    binary = _executable(tmp_path / "DeepSeek Harness" / "dsh", "print('done by dsh')\n")
     monkeypatch.setattr(deepseek_adapter_module, "resolve_dsh_binary", lambda: binary)
     workspace = tmp_path / "workspace"
     workspace.mkdir()
@@ -157,7 +209,7 @@ def test_web_meta_exposes_deepseek_backend_and_default_model(
     tmp_path: Path,
 ) -> None:
     # Availability is proven by running `--version`, so the stub answers it.
-    binary = _executable(tmp_path / "bin" / "dsh", 'echo "dsh 0.9.1"\nexit 0\n')
+    binary = _executable(tmp_path / "bin" / "dsh", 'print("dsh 0.9.1")\n')
     monkeypatch.setattr(web_server, "resolve_dsh_binary", lambda: binary)
 
     client = TestClient(web_server.create_app(runs_root=tmp_path / "runs"))

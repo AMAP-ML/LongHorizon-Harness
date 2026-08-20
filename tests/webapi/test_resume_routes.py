@@ -29,7 +29,12 @@ class FakeProcess:
 def client(monkeypatch, tmp_path: Path):
     process = FakeProcess()
     monkeypatch.setattr("lh_harness.supervisor.service.subprocess.Popen", lambda *a, **k: process)
-    monkeypatch.setattr("lh_harness.supervisor.service.os.killpg", lambda *a, **k: None)
+    # os.killpg does not exist on Windows; the supervisor signals through the
+    # process-group helpers there, so patch both ends and tolerate the absence.
+    monkeypatch.setattr("lh_harness.supervisor.service.os.killpg", lambda *a, **k: None, raising=False)
+    monkeypatch.setattr(
+        "lh_harness.utils.process_group._windows_deliver", lambda *a, **k: None, raising=False
+    )
     root = tmp_path / "runs"
     workspace = tmp_path / "workspace"
     workspace.mkdir()

@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import posixpath
-import shlex
 import sys
 from collections.abc import Callable, Sequence
 
@@ -67,29 +66,29 @@ class DeepSeekHarnessAdapter(CommandAgentAdapter):
         )
         dsh_binary = resolve_dsh_binary() or "dsh"
 
-        environment = [
-            f"DSH_HOME={shlex.quote(isolated_home)}",
-            f"DSH_PERMISSION_MODE={shlex.quote(permission_mode)}",
-        ]
+        environment = {
+            "DSH_HOME": isolated_home,
+            "DSH_PERMISSION_MODE": permission_mode,
+        }
         if api_key:
-            environment.append(f"DEEPSEEK_API_KEY={shlex.quote(api_key)}")
+            environment["DEEPSEEK_API_KEY"] = api_key
         if base_url:
-            environment.append(f"DEEPSEEK_BASE_URL={shlex.quote(base_url)}")
+            environment["DEEPSEEK_BASE_URL"] = base_url
 
         command = [
-            *environment,
-            shlex.quote(sys.executable),
+            sys.executable,
             "-m",
             "lh_harness.adapters.deepseek_runner",
             "--binary",
-            shlex.quote(dsh_binary),
+            dsh_binary,
             "--prompt",
             "{prompt_path}",
             "--model",
-            shlex.quote(normalized_model),
+            normalized_model,
         ]
         super().__init__(
-            command_template=" ".join(command),
+            argv=command,
+            env=environment,
             workspace_path=workspace_path,
             prompt_dir=prompt_dir,
             visible_output_parser=visible_output_parser or extract_visible_output,

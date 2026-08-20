@@ -4,7 +4,6 @@ import json
 import os
 import posixpath
 import re
-import shlex
 
 from ..agent_logs import visible_output as extract_opencode_visible_output
 from ..agent_registry import normalise_reasoning_effort
@@ -59,11 +58,11 @@ class OpenCodeAdapter(CommandAgentAdapter):
         )
 
         opencode_binary = resolve_opencode_binary() or "opencode"
-        env_parts: list[str] = []
+        env_overrides: dict[str, str] = {}
         if api_key:
             # OpenCode falls back to OPENCODE_API_KEY when a provider has no
             # key of its own, so one harness credential covers every model.
-            env_parts.append(f"OPENCODE_API_KEY={shlex.quote(api_key)}")
+            env_overrides["OPENCODE_API_KEY"] = api_key
         if base_url:
             provider_id = normalized_model.split("/", 1)[0].strip() or "opencode"
             config_path = _write_endpoint_config(prompt_dir, provider_id, base_url)
@@ -71,26 +70,25 @@ class OpenCodeAdapter(CommandAgentAdapter):
             # OPENCODE_CONFIG sits between the global and project configs, so
             # a per-run file carrying only the provider override keeps the
             # user's own providers, models, and MCP servers intact.
-            env_parts.append(f"OPENCODE_CONFIG={shlex.quote(config_path)}")
+            env_overrides["OPENCODE_CONFIG"] = config_path
 
-        command_parts = [
-            shlex.quote(opencode_binary),
+        # `opencode run` reads the prompt from stdin when no positional message
+        # is given, which is exactly how the adapter feeds every CLI.
+        argv = [
+            opencode_binary,
             "run",
             "--format",
             "json",
             "--yolo",
             "--model",
-            shlex.quote(normalized_model),
+            normalized_model,
         ]
         if normalized_effort:
-            command_parts.extend(["--variant", shlex.quote(normalized_effort)])
-        # `opencode run` reads the prompt from stdin when no positional message
-        # is given, keeping long prompts off the command line.
-        command_parts.append("< {prompt_path}")
+            argv.extend(["--variant", normalized_effort])
 
-        env_prefix = (" ".join(env_parts) + " ") if env_parts else ""
         super().__init__(
-            command_template=f"{env_prefix}{' '.join(command_parts)}",
+            argv=argv,
+            env=env_overrides,
             prompt_dir=prompt_dir,
             workspace_path=workspace_path,
             visible_output_parser=extract_opencode_visible_output,

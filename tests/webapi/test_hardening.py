@@ -5,6 +5,7 @@ import os
 import base64
 import shutil
 import time
+import sys
 from pathlib import Path
 
 import pytest
@@ -246,18 +247,22 @@ def test_non_raster_documents_are_attachments_and_filename_is_header_safe(tmp_pa
     # The filesystem permits both quote-bearing and non-ASCII names.  They
     # must not make Starlette fail to encode the response header or alter its
     # disposition semantics.
-    quoted = round_dir / 'x";foo.pdf'
-    quoted.write_bytes(b"%PDF-fixture")
+    # Windows reserves the quote character outright, so that half of the
+    # fixture can only exist on POSIX.
+    quote_is_a_legal_filename_character = sys.platform != "win32"
+    if quote_is_a_legal_filename_character:
+        (round_dir / 'x";foo.pdf').write_bytes(b"%PDF-fixture")
     unicode_name = round_dir / "你好.svgz"
     unicode_name.write_bytes(b"not-an-inline-document")
     client = TestClient(create_app(state=state, runs_root=root, run_id="run-1"))
 
-    pdf = client.get('/api/runs/run-1/rounds/1/artifacts/x%22%3Bfoo.pdf/raw')
     svgz = client.get('/api/runs/run-1/rounds/1/artifacts/%E4%BD%A0%E5%A5%BD.svgz/raw')
 
-    assert pdf.status_code == 200
-    assert pdf.headers["content-type"].startswith("application/octet-stream")
-    assert pdf.headers["content-disposition"].startswith('attachment; filename="x_foo.pdf"; filename*=UTF-8\'\'')
+    if quote_is_a_legal_filename_character:
+        pdf = client.get('/api/runs/run-1/rounds/1/artifacts/x%22%3Bfoo.pdf/raw')
+        assert pdf.status_code == 200
+        assert pdf.headers["content-type"].startswith("application/octet-stream")
+        assert pdf.headers["content-disposition"].startswith('attachment; filename="x_foo.pdf"; filename*=UTF-8\'\'')
     assert svgz.status_code == 200
     assert svgz.headers["content-type"].startswith("text/plain")
     assert svgz.headers["content-disposition"].startswith('attachment; filename="artifact.svgz"; filename*=UTF-8\'\'')

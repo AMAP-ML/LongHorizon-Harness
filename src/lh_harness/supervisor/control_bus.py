@@ -11,12 +11,15 @@ import errno
 import json
 import os
 import stat
+import sys
 import threading
 import time
 import uuid
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Callable, Iterator
+
+_IS_WINDOWS = sys.platform == "win32"
 
 
 _MAX_CONTROL_RECORD_BYTES = 512 * 1024
@@ -51,6 +54,41 @@ def _absolute_anchored_path(path: str | Path) -> Path:
     return target.joinpath(*parts[2:])
 
 
+def _reject_reparse_chain_windows(path: str | Path) -> Path:
+    """Return an absolute path after refusing a reparse point in any component.
+
+    Windows has no ``O_NOFOLLOW`` and no directory descriptors, so the anchored
+    walk below cannot run there.  Checking each component for a reparse point
+    (symlinks and junctions both surface that way) is the closest the platform
+    gets; the difference is that the check is not anchored, so the same
+    check-then-use window documented on ``_ensure_dir_nofollow`` applies.
+    """
+
+    absolute = _absolute_anchored_path(path)
+    current = Path(absolute.anchor)
+    for component in absolute.parts[1:]:
+        if component in {"", ".", ".."}:
+            raise OSError("unsafe control-bus path component")
+        current = current / component
+        if current.is_symlink():
+            raise OSError(f"refusing to traverse a reparse point: {current}")
+    return absolute
+
+
+def _open_nofollow_windows(path: str | Path, *, directory: bool = False) -> int:
+    from ..utils import paths as long_paths
+
+    absolute = _reject_reparse_chain_windows(path)
+    if directory:
+        # Windows cannot hand back a directory descriptor at all.  The only
+        # caller that wants one, ``iter_run_control_dirs``, has its own branch.
+        raise OSError("control-bus directory descriptors are unavailable")
+    return os.open(
+        long_paths.os_path(absolute),
+        os.O_RDONLY | os.O_BINARY | getattr(os, "O_NOINHERIT", 0),
+    )
+
+
 def _open_nofollow(path: str | Path, *, directory: bool = False) -> int:
     """Open an absolute path without following any component symlink.
 
@@ -60,6 +98,8 @@ def _open_nofollow(path: str | Path, *, directory: bool = False) -> int:
     descriptors and open every component with ``O_NOFOLLOW``.
     """
 
+    if _IS_WINDOWS:
+        return _open_nofollow_windows(path, directory=directory)
     nofollow = getattr(os, "O_NOFOLLOW", 0)
     directory_flag = getattr(os, "O_DIRECTORY", 0)
     cloexec = getattr(os, "O_CLOEXEC", 0)
@@ -105,6 +145,27 @@ def _open_nofollow(path: str | Path, *, directory: bool = False) -> int:
             except OSError:
                 pass
         raise
+
+
+def _ensure_dir_windows(path: str | Path) -> None:
+    """Build a directory chain on Windows, refusing reparse points."""
+
+    from ..utils import paths as long_paths
+
+    absolute = _absolute_anchored_path(path)
+    current = Path(absolute.anchor)
+    for component in absolute.parts[1:]:
+        if component in {"", ".", ".."}:
+            raise OSError("unsafe control-bus directory component")
+        current = current / component
+        if current.is_symlink():
+            raise OSError(f"refusing to traverse a reparse point: {current}")
+        try:
+            long_paths.makedirs(current, exist_ok=True)
+        except FileExistsError:
+            pass
+        if not current.is_dir():
+            raise OSError(f"control-bus path component is not a directory: {current}")
 
 
 def _ensure_dir_fd_nofollow(path: str | Path, *, mode: int = 0o700) -> int:
@@ -174,8 +235,20 @@ def _ensure_dir_fd_nofollow(path: str | Path, *, mode: int = 0o700) -> int:
 
 
 def _ensure_dir_nofollow(path: str | Path, *, mode: int = 0o700) -> None:
-    """Create/validate a directory chain without traversing symlinks."""
+    """Create/validate a directory chain without traversing symlinks.
 
+    Windows has no ``O_NOFOLLOW`` and no directory descriptors, so the anchored
+    POSIX walk cannot run there at all. Callers still need the directory, so it
+    gets the closest available guarantee: build the chain component by
+    component, refusing any existing component that is a reparse point
+    (symlinks and junctions both surface that way). The unavoidable difference
+    is that the check is not anchored, so a sufficiently privileged local actor
+    could still win a check-then-use race.
+    """
+
+    if _IS_WINDOWS:
+        _ensure_dir_windows(path)
+        return None
     fd = _ensure_dir_fd_nofollow(path, mode=mode)
     try:
         return None
@@ -267,10 +340,47 @@ def _open_unique_temp(parent_fd: int, *, prefix: str, suffix: str) -> tuple[int,
     raise FileExistsError("could not allocate a unique control-bus temporary file")
 
 
+def _atomic_bytes_write_windows(path: Path, payload: bytes) -> None:
+    from ..utils import paths as long_paths
+
+    _ensure_dir_windows(path.parent)
+    # No reparse-point refusal for the *destination*: replacing operates on the
+    # name and never follows it. The POSIX branch's ``rename`` atomically
+    # evicts a planted symlink and installs a private regular file in its
+    # place, and ``os.replace`` (MoveFileEx) does exactly the same here --
+    # refusing would be strictly weaker, leaving the attacker's link standing
+    # for some later, less careful writer to follow.
+    temporary = path.with_name(f".{path.name}.{uuid.uuid4().hex[:12]}.tmp")
+    target_tmp = long_paths.os_path(temporary)
+    try:
+        with open(target_tmp, "wb") as handle:
+            handle.write(payload)
+            handle.flush()
+            try:
+                os.fsync(handle.fileno())
+            except OSError:
+                pass
+        os.replace(target_tmp, long_paths.os_path(path))
+    except BaseException:
+        try:
+            os.unlink(target_tmp)
+        except OSError:
+            pass
+        raise
+
+
 def _atomic_bytes_write(path: Path, payload: bytes, *, mode: int = 0o600) -> None:
-    """Atomically write bytes below an anchored, no-follow parent directory."""
+    """Atomically write bytes below an anchored, no-follow parent directory.
+
+    The Windows branch keeps the atomic write-then-replace guarantee (which
+    ``os.replace`` provides there too) and the reparse-point refusal; only the
+    anchored-descriptor part is unavailable on that platform.
+    """
 
     path = Path(path)
+    if _IS_WINDOWS:
+        _atomic_bytes_write_windows(path, payload)
+        return
     parent_fd = _ensure_dir_fd_nofollow(path.parent)
     fd: int | None = None
     temporary_name: str | None = None
@@ -332,6 +442,19 @@ def _append_jsonl(path: Path, record: dict[str, Any]) -> None:
     # ``Path.open('a')`` follows a final symlink.  Commands and receipts are
     # control-plane data, so fail closed unless the whole parent chain and
     # final file can be opened with anchored no-follow semantics.
+    if _IS_WINDOWS:
+        # No anchored descriptors on Windows; refuse reparse points and
+        # hard-link aliases instead, then append through one checked handle.
+        _ensure_dir_windows(path.parent)
+        handle = _open_private_regular_windows(path, os.O_WRONLY | os.O_APPEND)
+        with handle:
+            handle.write(line.encode("utf-8"))
+            handle.flush()
+            try:
+                os.fsync(handle.fileno())
+            except OSError:
+                pass
+        return
     fd: int | None = None
     parent_fd: int | None = None
     try:
@@ -380,6 +503,82 @@ def _append_locked_handle(handle: Any, line: str) -> None:
             flock = None
         if flock is not None:
             flock.flock(handle.fileno(), flock.LOCK_UN)
+
+
+_WINDOWS_LOCK_TIMEOUT_SECONDS = 120.0
+
+
+def _open_private_regular_windows(path: Path, flags: int):
+    """Open one control file on Windows, refusing links and aliases.
+
+    Mirrors what ``_open_private_regular_at`` guarantees on POSIX minus the
+    anchoring: no reparse point in the chain, a regular file, and exactly one
+    directory entry -- a hard link is another way to alias control-plane data,
+    and NTFS creates them without any special privilege.
+    """
+
+    from ..utils import paths as long_paths
+
+    absolute = _reject_reparse_chain_windows(path)
+    fd = os.open(long_paths.os_path(absolute), flags | os.O_CREAT | os.O_BINARY, 0o600)
+    try:
+        metadata = os.fstat(fd)
+        if not stat.S_ISREG(metadata.st_mode):
+            raise OSError("control file is not a regular file")
+        if metadata.st_nlink != 1:
+            raise OSError("control file has multiple hard links")
+        handle = os.fdopen(fd, "r+b" if flags & os.O_RDWR else "ab", buffering=0)
+        fd = -1
+        return handle
+    finally:
+        if fd >= 0:
+            os.close(fd)
+
+
+def _acquire_lock_windows(path: Path) -> Any:
+    """Take the run's cross-process control lock through ``msvcrt``.
+
+    ``fcntl.flock`` does not exist on Windows.  Locking one byte of the lock
+    file gives the property the control bus actually depends on: a single
+    exclusive holder per run, released by the kernel if that holder dies.
+    """
+
+    import msvcrt
+
+    # Directory-boundary failures stay OSError so callers can tell an invalid
+    # run layout from a platform that cannot provide the lock; everything from
+    # the lock file down is normalized to RuntimeError, as on POSIX.
+    _ensure_dir_windows(path.parent)
+    try:
+        handle = _open_private_regular_windows(path, os.O_RDWR)
+    except OSError as exc:
+        raise RuntimeError("secure control-bus locking is unavailable") from exc
+    try:
+        deadline = time.monotonic() + _WINDOWS_LOCK_TIMEOUT_SECONDS
+        while True:
+            handle.seek(0)
+            try:
+                msvcrt.locking(handle.fileno(), msvcrt.LK_LOCK, 1)
+                return handle
+            except OSError as exc:
+                # LK_LOCK gives up after roughly ten seconds. A run legitimately
+                # holds the lock longer than that while a control append fsyncs,
+                # so retry to the deadline rather than failing a valid caller.
+                if time.monotonic() >= deadline:
+                    raise RuntimeError("secure control-bus locking is unavailable") from exc
+    except BaseException:
+        handle.close()
+        raise
+
+
+def _release_lock_windows(handle: Any) -> None:
+    import msvcrt
+
+    try:
+        handle.seek(0)
+        msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+    finally:
+        handle.close()
 
 
 def _read_jsonl(path: Path) -> list[dict[str, Any]]:
@@ -496,6 +695,13 @@ class ControlBus:
         """
 
         with self._lock:
+            if _IS_WINDOWS:
+                handle = _acquire_lock_windows(self.lock_path)
+                try:
+                    yield
+                finally:
+                    _release_lock_windows(handle)
+                return
             lock_handle = None
             # Directory-boundary failures are surfaced as OSError so callers
             # can distinguish an invalid/symlinked run layout from a platform
@@ -727,8 +933,28 @@ class ControlBus:
         return _read_json_file(self.owner_path)
 
 
+def _iter_run_control_dirs_windows(root: Path) -> Iterator[Path]:
+    from ..utils import paths as long_paths
+
+    try:
+        entries = list(os.scandir(long_paths.os_path(root)))
+    except OSError:
+        return
+    for entry in entries:
+        if entry.is_symlink():
+            continue
+        control = root / entry.name / "control"
+        # ``is_dir`` follows links, so the reparse check has to come first.
+        if control.is_symlink() or not control.is_dir():
+            continue
+        yield root / entry.name
+
+
 def iter_run_control_dirs(runs_root: str | Path) -> Iterator[Path]:
     root = Path(runs_root).expanduser().resolve()
+    if _IS_WINDOWS:
+        yield from _iter_run_control_dirs_windows(root)
+        return
     try:
         root_fd = _open_nofollow(root, directory=True)
     except OSError:

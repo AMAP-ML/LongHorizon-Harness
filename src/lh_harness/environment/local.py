@@ -3,23 +3,28 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import os
-import shlex
 import shutil
-import signal
 import stat
 import sys
 import time
+from collections.abc import Mapping, Sequence
 from pathlib import Path
 
 from ..types import DEFAULT_TMP_DIR, ExecResult
 from ..supervisor.control_bus import _ensure_dir_fd_nofollow, _open_private_regular_at
 from ..trajectory_artifacts import StreamingTrajectoryArtifactWriter
+from ..utils import paths as long_paths
+from ..utils.child_env import apply_working_directory
 from ..utils.process_group import (
+    force_kill_process_group,
     kill_process_group,
-    signal_process_group,
+    new_process_group_kwargs,
+    terminate_process_group,
     track_process_group,
     untrack_process_group,
 )
+
+IS_WINDOWS = sys.platform == "win32"
 
 
 # Agent CLIs can emit very large tool results or base64 screenshots.  Keep the
@@ -43,6 +48,35 @@ def _append_bounded_tail(buffer: bytearray, chunk: bytes, limit: int) -> None:
     buffer.extend(chunk)
 
 
+def _open_trajectory_file_windows(path: Path):
+    """Best-effort no-follow trajectory open for Windows.
+
+    Symlinks and junctions both surface as reparse points, so rejecting those
+    keeps the redirect attack the POSIX path guards against out of reach. What
+    cannot be reproduced is the *anchored* guarantee: without directory
+    descriptors there is an unavoidable check-then-open window.
+    """
+
+    long_paths.makedirs(path.parent)
+    for candidate in (path.parent, path):
+        if candidate.is_symlink():
+            raise OSError(f"refusing to follow a reparse point: {candidate}")
+    target = long_paths.os_path(path)
+    handle = open(target, "ab", buffering=0)
+    try:
+        metadata = os.fstat(handle.fileno())
+        # Windows supports hard links too, so an alias would otherwise be
+        # truncated along with the trajectory. Check before truncating, exactly
+        # as the POSIX branch does.
+        if not stat.S_ISREG(metadata.st_mode) or getattr(metadata, "st_nlink", 1) > 1:
+            raise OSError("trajectory file is not a private regular file")
+        handle.truncate(0)
+    except BaseException:
+        handle.close()
+        raise
+    return handle
+
+
 def _open_trajectory_file(path: Path):
     """Open a live trajectory below an anchored, no-follow parent directory.
 
@@ -51,8 +85,15 @@ def _open_trajectory_file(path: Path):
     swapped ``round_*`` or ``logs`` symlink and redirect screenshots/tool
     traces outside the run. Keep the parent descriptor anchored through the
     open, then retain only the file descriptor used by the tee.
+
+    Windows has neither ``O_NOFOLLOW`` nor directory descriptors, so the
+    anchored variant is impossible there. It gets the closest equivalent the
+    platform allows: refuse any reparse point on the way in, then open the
+    resolved path directly (with long-path support, which run trees need).
     """
 
+    if IS_WINDOWS:
+        return _open_trajectory_file_windows(path)
     parent_fd = _ensure_dir_fd_nofollow(path.parent)
     fd: int | None = None
     try:
@@ -94,11 +135,64 @@ class LocalEnvironment:
         """Where callers may stage files before uploading them into this env."""
         return self._tmp_dir
 
+    async def run(
+        self,
+        argv: Sequence[str],
+        *,
+        timeout: int = 30,
+        cwd: str | None = None,
+        env: Mapping[str, str] | None = None,
+        stdin: str | None = None,
+        tee_path: str | None = None,
+    ) -> ExecResult:
+        """Run an argv list directly, with no shell in between.
+
+        The agent's working directory, environment and prompt all travel as real
+        subprocess arguments, so nothing here has to be quoted for a shell.
+        """
+        return await self._spawn(
+            list(argv),
+            timeout=timeout,
+            cwd=cwd,
+            env=env,
+            stdin=stdin,
+            tee_path=tee_path,
+            shell=False,
+        )
+
     async def exec(
         self,
         command: str,
         timeout: int = 30,
         tee_path: str | None = None,
+    ) -> ExecResult:
+        """Run a shell command string. Escape hatch: the caller owns the syntax.
+
+        Nothing in the harness's own agent path uses this -- it exists for
+        callers that need a pipeline or a builtin. The shell is chosen
+        explicitly rather than inherited from ``COMSPEC``/``/bin/sh`` guesswork.
+        """
+        argv = ["cmd.exe", "/c", command] if IS_WINDOWS else ["/bin/sh", "-c", command]
+        return await self._spawn(
+            argv, timeout=timeout, cwd=None, env=None, stdin=None, tee_path=tee_path, shell=True
+        )
+
+    async def makedirs(self, path: str) -> None:
+        long_paths.makedirs(Path(path).expanduser())
+
+    async def write_text(self, path: str, content: str) -> None:
+        long_paths.write_text(Path(path).expanduser(), content)
+
+    async def _spawn(
+        self,
+        argv: list[str],
+        *,
+        timeout: int,
+        cwd: str | None,
+        env: Mapping[str, str] | None,
+        stdin: str | None,
+        tee_path: str | None,
+        shell: bool,
     ) -> ExecResult:
         start = time.monotonic()
         proc = None
@@ -112,15 +206,26 @@ class LocalEnvironment:
             # worker sanitisation would expose that credential to the agent.
             child_env = os.environ.copy()
             child_env.pop("LH_HARNESS_WEB_TOKEN", None)
-            proc = await asyncio.create_subprocess_shell(
-                command,
+            # `cwd=` alone is not enough: an agent CLI that reads `PWD` (OpenCode
+            # does) would otherwise work in the directory the operator launched
+            # the harness from, outside the workspace.  The old `sh -c` wrapper
+            # rewrote `PWD` on the shell's own startup and hid this.
+            apply_working_directory(child_env, cwd)
+            child_env.update(env or {})
+            proc = await asyncio.create_subprocess_exec(
+                *argv,
+                stdin=asyncio.subprocess.PIPE,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
-                # Own session, so one killpg reaps the agent CLI and everything
-                # it spawned. It also detaches the child from our terminal, so
-                # Ctrl+C never reaches it, so every exit path below must kill it.
-                start_new_session=True,
+                cwd=cwd,
+                # Overrides are layered onto the real environment (minus the
+                # scrubbed token); a partial mapping would wipe PATH and the
+                # agent's own credentials.
                 env=child_env,
+                # Own group, so one sweep reaps the agent CLI and everything it
+                # spawned. It also detaches the child from our terminal, so
+                # Ctrl+C never reaches it, so every exit path below must kill it.
+                **new_process_group_kwargs(),
                 # Claude Code emits one JSON object per line in stream-json mode.
                 # A single line (e.g. a tool_result carrying a base64 screenshot)
                 # can far exceed asyncio's default 64KB StreamReader limit and
@@ -134,6 +239,7 @@ class LocalEnvironment:
             io_task = asyncio.create_task(
                 self._communicate_streaming(
                     proc,
+                    stdin,
                     tee_path,
                     stdout_chunks,
                     stderr_chunks,
@@ -170,16 +276,16 @@ class LocalEnvironment:
 
     @staticmethod
     async def _terminate(proc) -> None:
-        """SIGTERM the agent's whole group, escalating to SIGKILL if it lingers."""
+        """Ask the agent's whole group to stop, escalating if it lingers."""
         if proc is None or proc.returncode is not None:
             return
-        signal_process_group(proc.pid, signal.SIGTERM)
+        terminate_process_group(proc.pid)
         try:
             # Shielded because this often runs while a CancelledError propagates,
             # and an unshielded await would be cancelled before the child exits.
             await asyncio.shield(asyncio.wait_for(proc.wait(), timeout=5))
         except asyncio.TimeoutError:
-            signal_process_group(proc.pid, signal.SIGKILL)
+            force_kill_process_group(proc.pid)
             with contextlib.suppress(asyncio.TimeoutError, asyncio.CancelledError):
                 await asyncio.shield(asyncio.wait_for(proc.wait(), timeout=5))
         except asyncio.CancelledError:
@@ -197,11 +303,12 @@ class LocalEnvironment:
     @staticmethod
     async def _communicate_streaming(
         proc,
+        stdin: str | None,
         tee_path: str | None,
         stdout_chunks: bytearray,
         stderr_chunks: bytearray,
     ) -> None:
-        """Drain both streams while optionally teeing stdout to a live file.
+        """Feed stdin, then drain both streams, optionally teeing stdout live.
 
         stdout is written incrementally (one line at a time) so an external
         reader (the dashboard) sees the agent's stream-json trajectory grow
@@ -209,6 +316,24 @@ class LocalEnvironment:
         when the wait is interrupted by timeout or cancellation.
         """
         path = Path(tee_path) if tee_path else None
+        if path is not None:
+            long_paths.makedirs(path.parent)
+
+        async def _write_stdin() -> None:
+            # The prompt goes straight down the pipe, which is what removes the
+            # `< prompt.md` redirect (and therefore the shell) from the agent
+            # command. Closing stdin is what tells the CLI the prompt is done.
+            if proc.stdin is None:
+                return
+            try:
+                if stdin:
+                    proc.stdin.write(stdin.encode("utf-8"))
+                    await proc.stdin.drain()
+            except (BrokenPipeError, ConnectionResetError, OSError):
+                pass
+            finally:
+                with contextlib.suppress(BrokenPipeError, ConnectionResetError, OSError):
+                    proc.stdin.close()
 
         async def _read_stdout() -> None:
             # Open in binary truncating mode once at episode start. Every later
@@ -265,7 +390,7 @@ class LocalEnvironment:
                     return
                 _append_bounded_tail(stderr_chunks, chunk, _MAX_STDERR_CAPTURE_BYTES)
 
-        await asyncio.gather(_read_stdout(), _read_stderr(), proc.wait())
+        await asyncio.gather(_write_stdin(), _read_stdout(), _read_stderr(), proc.wait())
 
     async def screenshot(self) -> bytes:
         self._tmp_dir.mkdir(parents=True, exist_ok=True)
@@ -274,24 +399,43 @@ class LocalEnvironment:
             path.unlink(missing_ok=True)
         except OSError:
             return b""
-        quoted_path = shlex.quote(str(path))
-        command = (
-            f"screencapture -x {quoted_path} 2>/dev/null"
-            if sys.platform == "darwin"
-            else (
-                f"gnome-screenshot -f {quoted_path} 2>/dev/null || "
-                f"import -window root {quoted_path} 2>/dev/null"
-            )
-        )
-        result = await self.exec(command, timeout=10)
-        if result is not None and result.exit_code != 0:
-            return b""
+        for argv in _screenshot_commands(path):
+            result = await self.run(argv, timeout=15)
+            if result.exit_code == 0 and path.exists() and path.stat().st_size:
+                break
         return path.read_bytes() if path.exists() else b""
 
     async def upload(self, local_path: str, remote_path: str) -> None:
-        Path(remote_path).parent.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(local_path, remote_path)
+        long_paths.makedirs(Path(remote_path).parent)
+        shutil.copy2(long_paths.os_path(local_path), long_paths.os_path(remote_path))
 
     async def download(self, remote_path: str, local_path: str) -> None:
-        Path(local_path).parent.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(remote_path, local_path)
+        long_paths.makedirs(Path(local_path).parent)
+        shutil.copy2(long_paths.os_path(remote_path), long_paths.os_path(local_path))
+
+
+def _screenshot_commands(path: Path) -> list[list[str]]:
+    """Whole-screen capture, tried in order until one produces a file."""
+    if IS_WINDOWS:
+        # The scratch directory is caller-controlled and an apostrophe is a
+        # legal Windows filename character, so it has to be escaped for the
+        # single-quoted PowerShell literal below -- otherwise the path would
+        # close the string and the rest would run as script.
+        literal = str(path).replace("'", "''")
+        # .NET is always present on Windows, so this needs no extra install.
+        script = (
+            "Add-Type -AssemblyName System.Windows.Forms,System.Drawing; "
+            "$b=[System.Windows.Forms.SystemInformation]::VirtualScreen; "
+            "$bmp=New-Object System.Drawing.Bitmap $b.Width,$b.Height; "
+            "$g=[System.Drawing.Graphics]::FromImage($bmp); "
+            "$g.CopyFromScreen($b.Location,[System.Drawing.Point]::Empty,$b.Size); "
+            f"$bmp.Save('{literal}',[System.Drawing.Imaging.ImageFormat]::Png)"
+        )
+        return [["powershell", "-NoProfile", "-NonInteractive", "-Command", script]]
+    if sys.platform == "darwin":
+        return [["screencapture", "-x", str(path)]]
+    return [
+        ["gnome-screenshot", "-f", str(path)],
+        ["import", "-window", "root", str(path)],
+        ["scrot", str(path)],
+    ]
