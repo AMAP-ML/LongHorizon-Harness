@@ -6,6 +6,7 @@ import os
 import shlex
 from pathlib import Path
 
+import pytest
 from fastapi.testclient import TestClient
 
 from lh_harness import agent_logs
@@ -14,7 +15,7 @@ from lh_harness.adapters.deepseek_harness import (
     DeepSeekHarnessAdapter,
     permission_mode_for_role,
 )
-from lh_harness.adapters.deepseek_runner import run
+from lh_harness.adapters.deepseek_runner import TASK_PLACEHOLDER, run
 from lh_harness.environment.local import LocalEnvironment
 from lh_harness.types import EpisodeBudget
 from lh_harness.utils.agent_cli import resolve_dsh_binary
@@ -81,11 +82,49 @@ def test_deepseek_runner_passes_headless_patch_and_emits_jsonl(
     if os.name == "nt":
         # cmd.exe's 8191-char limit cannot carry a role prompt, so the task
         # travels as a patch-layer config override and argv keeps a stand-in.
-        assert record["text"].endswith("task delivered via --patch")
+        assert record["text"].endswith(TASK_PLACEHOLDER)
         assert "- id: headless-runner" in patch_text
         assert 'task: "fix the project"' in patch_text
     else:
         assert record["text"].endswith("fix the project")
+        assert "headless-runner" not in patch_text
+
+
+@pytest.mark.parametrize("via_patch", [False, True])
+def test_deepseek_runner_task_deliveries_work_on_every_platform(
+    tmp_path: Path,
+    capsys,
+    via_patch: bool,
+) -> None:
+    """Both deliveries, exercised regardless of the host OS.
+
+    The patch route is a contract with dsh's layer precedence; if only Windows
+    machines ever executed it, a change in dsh would surface as agents silently
+    receiving the placeholder as their task. This is the tripwire.
+    """
+    binary = _executable(tmp_path / "bin" / "dsh", "print(' '.join(sys.argv[1:]))\n")
+    prompt_path = tmp_path / "prompt.md"
+    # Large enough that cmd.exe could never carry it, and awkward enough to
+    # prove the JSON-as-YAML escaping keeps the scalar on one line.
+    prompt = ("x" * 9000) + '\nline "two" ends with a backslash \\'
+    prompt_path.write_text(prompt, encoding="utf-8")
+
+    assert run(binary, prompt_path, "deepseek-v4-flash", task_via_patch=via_patch) == 0
+
+    record = json.loads(capsys.readouterr().out)
+    assert record["is_error"] is False
+    patch_path = prompt_path.with_name(f"{prompt_path.name}.dsh-model-patch.yml")
+    patch_text = patch_path.read_text(encoding="utf-8")
+    assert "provider: deepseek-official" in patch_text
+    if via_patch:
+        # The prompt must not appear on the command line at all...
+        assert "xxxx" not in record["text"]
+        assert record["text"].endswith(TASK_PLACEHOLDER)
+        # ...and must ride in the patch file as one exactly-escaped scalar.
+        assert f"task: {json.dumps(prompt, ensure_ascii=False)}" in patch_text
+        assert "- id: headless-runner" in patch_text
+    else:
+        assert record["text"].endswith('ends with a backslash \\')
         assert "headless-runner" not in patch_text
 
 

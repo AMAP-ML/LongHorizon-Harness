@@ -32,7 +32,33 @@ def _model_patch_path(prompt_path: Path) -> Path:
     return prompt_path.with_name(f"{prompt_path.name}.dsh-model-patch.yml")
 
 
-def run(binary: str, prompt_path: Path, model: str) -> int:
+# What the positional argument says when the real task rides in the patch
+# layer. Deliberately human-readable: if dsh ever stopped preferring the patch
+# override, this string is what an agent would receive as its task, and it
+# should scream misconfiguration rather than pass as a plausible instruction.
+TASK_PLACEHOLDER = "task delivered via --patch"
+
+
+def run(
+    binary: str,
+    prompt_path: Path,
+    model: str,
+    *,
+    task_via_patch: bool | None = None,
+) -> int:
+    """Bridge one episode to the dsh headless runner.
+
+    ``task_via_patch`` picks how the prompt reaches dsh; ``None`` follows the
+    platform. It is a parameter rather than a hardcoded ``os.name`` check so
+    the test suite exercises both deliveries on both platforms -- the patch
+    route is a contract with dsh's layer precedence, and a contract only a
+    Windows machine could test would rot quietly.
+    """
+    if task_via_patch is None:
+        # The dsh npm launcher is a .CMD shim on Windows, so the task
+        # positional would travel through cmd.exe and its 8191-character
+        # command-line limit; role prompts are far larger.
+        task_via_patch = os.name == "nt"
     try:
         prompt = prompt_path.read_text(encoding="utf-8")
         patch_lines = [
@@ -41,13 +67,11 @@ def run(binary: str, prompt_path: Path, model: str) -> int:
             "    provider: deepseek-official",
             f"    model: {json.dumps(model, ensure_ascii=False)}",
         ]
-        if os.name == "nt":
-            # The dsh npm launcher is a .CMD shim, so the task positional would
-            # travel through cmd.exe and its 8191-character command-line limit;
-            # role prompts are far larger. The headless runner's `task` config
-            # normally resolves from the command line, but a later patch layer
-            # may override it with a literal, exactly like the model row above.
-            # JSON string escaping is valid YAML, so the prompt stays one line.
+        if task_via_patch:
+            # The headless runner's `task` config normally resolves from the
+            # command line, but a later patch layer may override that row with
+            # a literal, exactly like the model row above. JSON string escaping
+            # is valid YAML, so the prompt stays one line however gnarly it is.
             patch_lines += [
                 "- id: headless-runner",
                 "  config:",
@@ -67,9 +91,9 @@ def run(binary: str, prompt_path: Path, model: str) -> int:
         "headless",
         "--patch",
         os.fspath(patch_path),
-        # cmd.exe cannot carry the real prompt (see above); the config override
-        # supplies it, and this placeholder only satisfies the non-empty check.
-        "task delivered via --patch" if os.name == "nt" else prompt,
+        # The config override supplies the real prompt on the patch route; the
+        # placeholder only satisfies the runner's non-empty check.
+        TASK_PLACEHOLDER if task_via_patch else prompt,
     ]
     try:
         completed = subprocess.run(
