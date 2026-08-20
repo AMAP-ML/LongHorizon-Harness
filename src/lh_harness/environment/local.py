@@ -47,6 +47,35 @@ def _append_bounded_tail(buffer: bytearray, chunk: bytes, limit: int) -> None:
     buffer.extend(chunk)
 
 
+def _open_trajectory_file_windows(path: Path):
+    """Best-effort no-follow trajectory open for Windows.
+
+    Symlinks and junctions both surface as reparse points, so rejecting those
+    keeps the redirect attack the POSIX path guards against out of reach. What
+    cannot be reproduced is the *anchored* guarantee: without directory
+    descriptors there is an unavoidable check-then-open window.
+    """
+
+    long_paths.makedirs(path.parent)
+    for candidate in (path.parent, path):
+        if candidate.is_symlink():
+            raise OSError(f"refusing to follow a reparse point: {candidate}")
+    target = long_paths.os_path(path)
+    handle = open(target, "ab", buffering=0)
+    try:
+        metadata = os.fstat(handle.fileno())
+        # Windows supports hard links too, so an alias would otherwise be
+        # truncated along with the trajectory. Check before truncating, exactly
+        # as the POSIX branch does.
+        if not stat.S_ISREG(metadata.st_mode) or getattr(metadata, "st_nlink", 1) > 1:
+            raise OSError("trajectory file is not a private regular file")
+        handle.truncate(0)
+    except BaseException:
+        handle.close()
+        raise
+    return handle
+
+
 def _open_trajectory_file(path: Path):
     """Open a live trajectory below an anchored, no-follow parent directory.
 
@@ -55,8 +84,15 @@ def _open_trajectory_file(path: Path):
     swapped ``round_*`` or ``logs`` symlink and redirect screenshots/tool
     traces outside the run. Keep the parent descriptor anchored through the
     open, then retain only the file descriptor used by the tee.
+
+    Windows has neither ``O_NOFOLLOW`` nor directory descriptors, so the
+    anchored variant is impossible there. It gets the closest equivalent the
+    platform allows: refuse any reparse point on the way in, then open the
+    resolved path directly (with long-path support, which run trees need).
     """
 
+    if IS_WINDOWS:
+        return _open_trajectory_file_windows(path)
     parent_fd = _ensure_dir_fd_nofollow(path.parent)
     fd: int | None = None
     try:

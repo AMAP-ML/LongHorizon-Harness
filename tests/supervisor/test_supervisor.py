@@ -36,7 +36,7 @@ def test_supervisor_creates_owned_run_without_touching_manager(monkeypatch, tmp_
 def test_web_supervisor_exposes_create_and_lifecycle_routes(monkeypatch, tmp_path: Path) -> None:
     process = FakeProcess()
     monkeypatch.setattr("lh_harness.supervisor.service.subprocess.Popen", lambda *args, **kwargs: process)
-    monkeypatch.setattr("lh_harness.supervisor.service.os.killpg", lambda *args, **kwargs: None)
+    monkeypatch.setattr("lh_harness.supervisor.service.deliver_signal", lambda *args, **kwargs: None)
     root = tmp_path / "runs"
     supervisor = RunSupervisor(root, workspace_root=tmp_path / "workspace")
     client = TestClient(create_app(runs_root=root, supervisor=supervisor))
@@ -104,7 +104,7 @@ def test_web_supervisor_creates_deepseek_run_with_role_models(
 def test_websocket_pushes_supervisor_lifecycle_without_role_events(monkeypatch, tmp_path: Path) -> None:
     process = FakeProcess()
     monkeypatch.setattr("lh_harness.supervisor.service.subprocess.Popen", lambda *args, **kwargs: process)
-    monkeypatch.setattr("lh_harness.supervisor.service.os.killpg", lambda *args, **kwargs: None)
+    monkeypatch.setattr("lh_harness.supervisor.service.deliver_signal", lambda *args, **kwargs: None)
     root = tmp_path / "runs"
     supervisor = RunSupervisor(root, workspace_root=tmp_path / "workspace")
     client = TestClient(create_app(runs_root=root, supervisor=supervisor))
@@ -213,12 +213,12 @@ def test_supervisor_shutdown_stops_owned_live_workers(monkeypatch, tmp_path: Pat
     process = FakeProcess()
     signals: list[object] = []
 
-    def killpg(_pid: int, sig: object) -> None:
+    def deliver(_pid: int, sig: object, **_kwargs: object) -> None:
         signals.append(sig)
         process.returncode = -15
 
     monkeypatch.setattr("lh_harness.supervisor.service.subprocess.Popen", lambda *args, **kwargs: process)
-    monkeypatch.setattr("lh_harness.supervisor.service.os.killpg", killpg)
+    monkeypatch.setattr("lh_harness.supervisor.service.deliver_signal", deliver)
     supervisor = RunSupervisor(tmp_path / "runs", workspace_root=tmp_path / "workspace")
     created = supervisor.create_run(task="stop with the Web API")
 

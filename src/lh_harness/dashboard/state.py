@@ -18,6 +18,7 @@ import json
 import os
 import re
 import stat as stat_module
+import sys
 import threading
 import time
 import uuid
@@ -27,12 +28,22 @@ from pathlib import Path
 from typing import Any
 
 from ..types import DEFAULT_LOG_DIR, MAX_ROUNDS
-from ..supervisor.control_bus import ControlBus, _ensure_dir_fd_nofollow, _open_private_regular_at
+from ..supervisor.control_bus import (
+    ControlBus,
+    _acquire_lock_windows,
+    _ensure_dir_fd_nofollow,
+    _ensure_dir_windows,
+    _open_private_regular_at,
+    _reject_reparse_chain_windows,
+    _release_lock_windows,
+)
 from ..supervisor.lifecycle import ACTIVE_STATUSES, TERMINAL_STATUSES, canonical_lifecycle_status
 from ..utils.run_boundary import safe_run_dir, safe_run_logs, safe_run_role, safe_run_rounds
 
 from ..agent_logs import parse_trajectory as parse_agent_trajectory
 from ..role_prompts import parse_role_manager_next_step
+
+_IS_WINDOWS = sys.platform == "win32"
 
 # Roles whose raw trajectory a round directory can hold.
 _TRAJECTORY_ROLES = (
@@ -485,6 +496,8 @@ class DashboardState:
         round_dir = self._safe_round_dir(round_index)
         if round_dir is None:
             return []
+        if _IS_WINDOWS:
+            return _list_round_artifacts_windows(round_dir)
         try:
             fd = _open_nofollow(round_dir, directory=True, strict_parent=True)
         except OSError:
@@ -886,6 +899,9 @@ class DashboardState:
     def _persist_approval(self, record: dict[str, Any]) -> None:
         """Append an approval record (pending or resolved) to the run log dir."""
         path = self._role_dir / "approvals.jsonl"
+        if _IS_WINDOWS:
+            _persist_approval_windows(path, record)
+            return
         fd: int | None = None
         parent_fd: int | None = None
         try:
@@ -1155,6 +1171,74 @@ class DashboardState:
         return drained
 
 
+def _open_nofollow_windows(path: Path, *, directory: bool = False) -> int:
+    """Windows stand-in: refuse reparse points, then open by (long) path.
+
+    There are no directory descriptors here, so ``directory=True`` has no
+    answer at all; the one caller that needs it scans by path instead.
+    ``O_BINARY`` matters because ``os.open`` defaults to text mode on Windows,
+    which would silently rewrite CRLF inside artifacts and JSONL logs.
+    """
+
+    from ..utils import paths as long_paths
+
+    if directory:
+        raise OSError("directory descriptors are unavailable on this platform")
+    absolute = _reject_reparse_chain_windows(path)
+    return os.open(long_paths.os_path(absolute), os.O_RDONLY | os.O_BINARY)
+
+
+def _list_round_artifacts_windows(round_dir: Path) -> list[str]:
+    from ..utils import paths as long_paths
+
+    try:
+        _reject_reparse_chain_windows(round_dir)
+        entries = list(os.scandir(long_paths.os_path(round_dir)))
+    except OSError:
+        return []
+    artifacts: list[str] = []
+    for entry_number, entry in enumerate(entries):
+        if entry_number >= _MAX_ARTIFACT_SCAN:
+            break
+        name = str(entry.name)
+        if len(name) > _MAX_ARTIFACT_NAME_CHARS:
+            continue
+        if entry.is_symlink():
+            continue
+        try:
+            if not stat_module.S_ISREG(entry.stat(follow_symlinks=False).st_mode):
+                continue
+        except OSError:
+            continue
+        artifacts.append(name)
+    return sorted(artifacts)
+
+
+def _persist_approval_windows(path: Path, record: dict[str, Any]) -> None:
+    """Append one approval record under the run's cross-process control lock.
+
+    ``fcntl.flock`` does not exist here, so the lock file the control bus
+    already uses for this run provides the critical section instead.
+    """
+
+    from ..utils import paths as long_paths
+
+    try:
+        line = json.dumps(record, ensure_ascii=False, sort_keys=True) + "\n"
+        _ensure_dir_windows(path.parent)
+        if path.is_symlink():
+            raise OSError(f"refusing to follow a reparse point: {path}")
+        handle = _acquire_lock_windows(path.with_name(f".{path.name}.lock"))
+        try:
+            long_paths.append_line(path, line)
+        finally:
+            _release_lock_windows(handle)
+    except OSError:
+        # Approval persistence is diagnostic/control state. A read-only or
+        # unavailable log must not crash the manager's execution loop.
+        pass
+
+
 def _open_nofollow(path: Path, *, directory: bool = False, strict_parent: bool = False) -> int:
     """Open a path for reading without following any path component symlink.
 
@@ -1166,6 +1250,8 @@ def _open_nofollow(path: Path, *, directory: bool = False, strict_parent: bool =
     usable on platforms without ``dir_fd`` support.
     """
 
+    if _IS_WINDOWS:
+        return _open_nofollow_windows(path, directory=directory)
     absolute = Path(os.path.abspath(os.fspath(path)))
     # macOS exposes /var (and a few other system roots) as symlinks.  Resolve
     # the parent once so the component walk starts from a canonical directory;

@@ -27,6 +27,7 @@ from typing import Any
 from .control_bus import (
     ControlBus,
     RevisionConflict,
+    _acquire_lock_windows,
     _atomic_bytes_write,
     _ensure_dir_fd_nofollow,
     _ensure_dir_nofollow,
@@ -34,6 +35,8 @@ from .control_bus import (
     _open_private_regular_at,
     _read_json_file,
     _read_jsonl,
+    _reject_reparse_chain_windows,
+    _release_lock_windows,
 )
 from .lifecycle import (
     ACTIVE_STATUSES,
@@ -53,7 +56,18 @@ from ..types import (
     DEFAULT_MAX_ROUNDS,
     MAX_ROUNDS,
 )
+from ..utils.process_group import deliver_signal, new_process_group_kwargs
 from ..utils.run_boundary import safe_run_control, safe_run_dir, safe_run_logs, safe_run_role, safe_run_rounds
+
+_IS_WINDOWS = sys.platform == "win32"
+
+# Windows has no SIGKILL. The lifecycle distinction that matters is carried by
+# ``kind`` ("stop" / "abort") throughout; these constants only name the signal
+# in durable receipts and pick graceful-vs-forced delivery. SIGBREAK stands in
+# for the forced one there so an operator can still tell a stop receipt from an
+# abort receipt after the fact.
+STOP_SIGNAL = signal.SIGTERM
+ABORT_SIGNAL = getattr(signal, "SIGKILL", None) or signal.SIGBREAK
 
 
 # Keep a private handle for read-only ``ps`` probes. Tests and embedding code
@@ -159,6 +173,121 @@ def _write_all(fd: int, data: bytes) -> None:
         view = view[written:]
 
 
+def _open_worker_log_windows(path: Path):
+    """Windows stand-in for the anchored no-follow worker-log open.
+
+    Windows offers neither ``O_NOFOLLOW`` nor directory descriptors, so the
+    walk refuses a reparse point in any component instead of anchoring the
+    open. Everything the log itself depends on is preserved: regular-file and
+    hard-link checks, tail compaction, and append positioning. The one lost
+    guarantee is that the check is not anchored -- a sufficiently privileged
+    local actor could still win a check-then-use race.
+    """
+
+    from ..utils import paths as long_paths
+
+    absolute = _reject_reparse_chain_windows(path)
+    long_paths.makedirs(absolute.parent)
+    fd = os.open(
+        long_paths.os_path(absolute),
+        os.O_RDWR | os.O_CREAT | os.O_BINARY,
+        0o600,
+    )
+    try:
+        metadata = os.fstat(fd)
+        if not stat.S_ISREG(metadata.st_mode):
+            raise OSError(errno.EINVAL, "worker log is not a regular file")
+        if metadata.st_nlink != 1:
+            raise OSError(errno.ELOOP, "worker log has multiple hard links")
+        if metadata.st_size > _MAX_WORKER_LOG_BYTES:
+            keep = max(1, min(_WORKER_LOG_KEEP_BYTES, _MAX_WORKER_LOG_BYTES))
+            os.lseek(fd, max(0, metadata.st_size - keep), os.SEEK_SET)
+            tail = bytearray()
+            remaining = keep
+            while remaining:
+                chunk = os.read(fd, remaining)
+                if not chunk:
+                    break
+                tail.extend(chunk)
+                remaining -= len(chunk)
+            os.ftruncate(fd, 0)
+            os.lseek(fd, 0, os.SEEK_SET)
+            _write_all(fd, bytes(tail))
+        os.lseek(fd, 0, os.SEEK_END)
+        output = os.fdopen(fd, "a+b", buffering=0)
+        fd = None
+        return output
+    finally:
+        if fd is not None:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+
+
+def _saved_task_from_rounds_windows(
+    runs_root: Path,
+    run_id: str,
+    *,
+    first_line: bool,
+) -> str:
+    """Windows stand-in for the anchored walk over saved task contracts."""
+
+    from ..utils import paths as long_paths
+
+    run_path = safe_run_dir(runs_root, run_id)
+    if run_path is None:
+        return ""
+    logs_path = safe_run_logs(runs_root, run_path, allow_missing=False)
+    role_path = safe_run_role(runs_root, run_path, allow_missing=False)
+    if logs_path is None or role_path is None:
+        return ""
+    rounds_path = role_path / "rounds"
+    try:
+        _reject_reparse_chain_windows(rounds_path)
+        entries = list(os.scandir(long_paths.os_path(rounds_path)))
+    except OSError:
+        return ""
+    candidates: list[tuple[int, str]] = []
+    for entry_number, entry in enumerate(entries):
+        if entry_number >= _MAX_ROUND_DIR_SCAN:
+            break
+        name = str(entry.name)
+        suffix = name.removeprefix("round_")
+        if suffix == name or not suffix.isdecimal():
+            continue
+        candidates.append((int(suffix), name))
+    for _, name in sorted(candidates):
+        contract = rounds_path / name / "task_contract.txt"
+        try:
+            _reject_reparse_chain_windows(contract)
+            fd = os.open(long_paths.os_path(contract), os.O_RDONLY | os.O_BINARY)
+        except OSError:
+            continue
+        try:
+            metadata = os.fstat(fd)
+            if (
+                not stat.S_ISREG(metadata.st_mode)
+                or metadata.st_nlink != 1
+                or metadata.st_size > _MAX_SAVED_TASK_BYTES
+            ):
+                continue
+            raw = os.read(fd, _MAX_SAVED_TASK_BYTES + 1)
+        except OSError:
+            continue
+        finally:
+            os.close(fd)
+        if len(raw) > _MAX_SAVED_TASK_BYTES:
+            continue
+        # A contract may have been written by any Windows tool, so normalize
+        # line endings before this becomes a run title in the dashboard.
+        text = raw.decode("utf-8", errors="replace").replace("\r\n", "\n").strip()
+        if not text:
+            continue
+        return text.splitlines()[0].strip() if first_line else text
+    return ""
+
+
 def _open_worker_log(path: Path):
     """Open a run-local worker log without following the final symlink.
 
@@ -175,6 +304,8 @@ def _open_worker_log(path: Path):
     """
 
     path = Path(path)
+    if _IS_WINDOWS:
+        return _open_worker_log_windows(path)
     nofollow = getattr(os, "O_NOFOLLOW", 0)
     if not nofollow:
         raise OSError(errno.ENOTSUP, "worker log requires O_NOFOLLOW")
@@ -269,6 +400,8 @@ def _saved_task_from_rounds(
     and ``O_NOFOLLOW`` for every component, then read a bounded regular file.
     """
 
+    if _IS_WINDOWS:
+        return _saved_task_from_rounds_windows(runs_root, run_id, first_line=first_line)
     nofollow = getattr(os, "O_NOFOLLOW", 0)
     directory = getattr(os, "O_DIRECTORY", 0)
     cloexec = getattr(os, "O_CLOEXEC", 0)
@@ -641,6 +774,13 @@ class RunSupervisor:
         """Serialize launch/resume idempotency transactions across workers."""
 
         lock_path = self.runs_root / ".supervisor.lock"
+        if _IS_WINDOWS:
+            windows_handle = _acquire_lock_windows(lock_path)
+            try:
+                yield
+            finally:
+                _release_lock_windows(windows_handle)
+            return
         handle = None
         flock = None
         raw_fd: int | None = None
@@ -1008,7 +1148,7 @@ class RunSupervisor:
             # Identity mismatch is intentionally fail-closed: never signal a
             # reused PID merely because the old owner record said it was alive.
             return reconcile_unavailable("worker is no longer running or its identity changed")
-        sig = signal.SIGKILL if action == "abort" else signal.SIGTERM
+        sig = ABORT_SIGNAL if action == "abort" else STOP_SIGNAL
         # Record an attempt for diagnostics under the same lock used by status
         # merges. Do not use it as a once-only gate: a crash after the signal
         # and before the receipt needs one safe retry.
@@ -1020,9 +1160,9 @@ class RunSupervisor:
                 }
             )
             if str(owner.get("signal_mode") or "pgid") == "pid":
-                os.kill(pid, sig)
+                deliver_signal(pid, sig, group=False)
             else:
-                os.killpg(pgid, sig)
+                deliver_signal(pgid, sig)
         except ProcessLookupError:
             return reconcile_unavailable("worker is no longer running")
         except PermissionError:
@@ -1682,8 +1822,8 @@ class RunSupervisor:
                 stdin=subprocess.DEVNULL,
                 stdout=output,
                 stderr=subprocess.STDOUT,
-                start_new_session=True,
                 env=worker_env,
+                **new_process_group_kwargs(),
             )
         except Exception:
             output.close()
@@ -1725,7 +1865,7 @@ class RunSupervisor:
             # unowned worker running if the durable reservation cannot be
             # promoted to a live owner.
             try:
-                os.killpg(process.pid, signal.SIGKILL)
+                deliver_signal(process.pid, ABORT_SIGNAL)
             except OSError:
                 pass
             raise
@@ -1957,7 +2097,7 @@ class RunSupervisor:
                         None,
                     )
                     receipt = bus.receipt_for(active_command_id)
-                    active_signal = signal.SIGKILL.name if active_kind == "abort" else signal.SIGTERM.name
+                    active_signal = ABORT_SIGNAL.name if active_kind == "abort" else STOP_SIGNAL.name
                     return {
                         "command_id": active_command_id,
                         "status": str((receipt or {}).get("status") or "accepted"),
@@ -2042,9 +2182,9 @@ class RunSupervisor:
                 return {"command_id": command["command_id"], "status": "accepted", "signal": sig.name}
             try:
                 if str(owner.get("signal_mode") or "pgid") == "pid":
-                    os.kill(owner_pid, sig)
+                    deliver_signal(owner_pid, sig, group=False)
                 else:
-                    os.killpg(pgid, sig)
+                    deliver_signal(pgid, sig)
             except ProcessLookupError:
                 # The signal raced with process exit.  Do not leave a durable
                 # ``stopping`` state behind: reconcile from the final report,
@@ -2099,10 +2239,10 @@ class RunSupervisor:
             return {"command_id": command["command_id"], "status": "accepted", "signal": sig.name}
 
     def stop(self, run_id: str) -> dict[str, Any]:
-        return self._signal(run_id, signal.SIGTERM, kind="stop")
+        return self._signal(run_id, STOP_SIGNAL, kind="stop")
 
     def abort(self, run_id: str) -> dict[str, Any]:
-        return self._signal(run_id, signal.SIGKILL, kind="abort")
+        return self._signal(run_id, ABORT_SIGNAL, kind="abort")
 
     def shutdown(self, *, grace_seconds: float = 5.0) -> None:
         """Stop workers launched by this supervisor before its API exits.
@@ -2135,12 +2275,12 @@ class RunSupervisor:
             if process.poll() is not None:
                 continue
             try:
-                os.killpg(process.pid, signal.SIGKILL)
+                deliver_signal(process.pid, ABORT_SIGNAL)
             except ProcessLookupError:
                 pass
-            except PermissionError:
+            except (PermissionError, OSError):
                 # These are still verified in-memory children; fall back to
-                # Popen's direct signal when a platform denies killpg.
+                # Popen's direct signal when a platform denies group delivery.
                 try:
                     process.kill()
                 except OSError:
