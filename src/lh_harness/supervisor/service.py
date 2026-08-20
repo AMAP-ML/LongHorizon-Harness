@@ -57,7 +57,7 @@ from ..types import (
     MAX_ROUNDS,
 )
 from ..utils.child_env import apply_working_directory
-from ..utils.process_group import deliver_signal, new_process_group_kwargs
+from ..utils.process_group import deliver_signal, new_process_group_kwargs, process_alive
 from ..utils.run_boundary import safe_run_control, safe_run_dir, safe_run_logs, safe_run_role, safe_run_rounds
 
 _IS_WINDOWS = sys.platform == "win32"
@@ -776,7 +776,12 @@ class RunSupervisor:
 
         lock_path = self.runs_root / ".supervisor.lock"
         if _IS_WINDOWS:
-            windows_handle = _acquire_lock_windows(lock_path)
+            try:
+                windows_handle = _acquire_lock_windows(lock_path)
+            except RuntimeError as exc:
+                # The shared Windows helper reports in control-bus terms; keep
+                # this lock's own contract for the supervisor's callers.
+                raise RuntimeError("secure supervisor locking is unavailable") from exc
             try:
                 yield
             finally:
@@ -959,9 +964,10 @@ class RunSupervisor:
         pid = int(owner.get("pid", 0) or 0)
         if pid <= 0:
             return False
-        try:
-            os.kill(pid, 0)
-        except OSError:
+        # A dedicated probe, not ``os.kill(pid, 0)``: on Windows os.kill
+        # cannot ask, only terminate, so the POSIX idiom would kill the very
+        # worker (or an innocent pid-reuse victim) it is checking on.
+        if not process_alive(pid):
             return False
         # An embedded supervisor controls its hosting process directly.  The
         # PID cannot be reused while that same process is executing this code;

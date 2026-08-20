@@ -36,6 +36,7 @@ from .types import (
     HarnessConfig,
 )
 from .utils.agent_cli import probe_agent_cli
+from .utils.process_group import process_alive
 from .supervisor.control_bus import (
     _append_jsonl as _append_jsonl_nofollow,
     _atomic_bytes_write,
@@ -263,11 +264,10 @@ def _supervisor_pid_matches(recorded_parent: int) -> bool:
         return True
     if os.name != "nt":
         return False
-    try:
-        os.kill(recorded_parent, 0)
-    except OSError:
-        return False
-    return True
+    # process_alive, never ``os.kill(pid, 0)``: on Windows os.kill terminates
+    # for every non-console-event signal, so the POSIX probe idiom would kill
+    # the supervisor this check is trying to accept.
+    return process_alive(recorded_parent)
 
 
 def _adopt_supervised_run_dir(

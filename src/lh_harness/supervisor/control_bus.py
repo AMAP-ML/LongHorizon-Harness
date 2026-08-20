@@ -344,8 +344,12 @@ def _atomic_bytes_write_windows(path: Path, payload: bytes) -> None:
     from ..utils import paths as long_paths
 
     _ensure_dir_windows(path.parent)
-    if path.is_symlink():
-        raise OSError(f"refusing to follow a reparse point: {path}")
+    # No reparse-point refusal for the *destination*: replacing operates on the
+    # name and never follows it. The POSIX branch's ``rename`` atomically
+    # evicts a planted symlink and installs a private regular file in its
+    # place, and ``os.replace`` (MoveFileEx) does exactly the same here --
+    # refusing would be strictly weaker, leaving the attacker's link standing
+    # for some later, less careful writer to follow.
     temporary = path.with_name(f".{path.name}.{uuid.uuid4().hex[:12]}.tmp")
     target_tmp = long_paths.os_path(temporary)
     try:

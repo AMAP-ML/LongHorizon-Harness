@@ -68,6 +68,32 @@ def process_group_alive(pid: int) -> bool:
     return _posix_signal(pid, 0)
 
 
+def process_alive(pid: int) -> bool:
+    """Whether this exact process is still running, without touching it.
+
+    Deliberately NOT ``os.kill(pid, 0)`` on Windows: ``os.kill`` there can
+    only deliver console control events, and *any other* signal value -- zero
+    included -- unconditionally kills the target via ``TerminateProcess``.
+    The idiomatic POSIX liveness probe is a kill switch on Windows.
+    """
+    if pid <= 0:
+        # POSIX gives pid 0 and negatives group semantics (os.kill(0, 0)
+        # probes our own group and always succeeds), and Windows pid 0 is the
+        # idle process, which tasklist happily reports. Neither is ever a
+        # worker of ours.
+        return False
+    if IS_WINDOWS:
+        return _windows_alive(pid)
+    try:
+        os.kill(pid, 0)
+    except PermissionError:
+        # The pid exists; it just belongs to someone else.
+        return True
+    except OSError:
+        return False
+    return True
+
+
 def terminate_process_group(pid: int) -> bool:
     """Ask the group to exit cleanly; False means it is already gone.
 

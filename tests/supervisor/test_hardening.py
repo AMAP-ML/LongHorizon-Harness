@@ -369,6 +369,28 @@ def test_iter_run_control_dirs_skips_symlinked_run_boundaries(tmp_path: Path) ->
     assert list(iter_run_control_dirs(root)) == [root / "real"]
 
 
+def test_atomic_write_evicts_a_symlinked_destination(tmp_path: Path) -> None:
+    """A planted symlink is replaced by a private regular file, never followed.
+
+    This is what POSIX ``rename`` already guarantees and what the first
+    admin-privileged Windows CI run showed the Windows branch refusing to do:
+    it raised on the reparse point, the crash-report writer swallowed the
+    OSError, and the attacker's link stayed in place for a later writer.
+    """
+    from lh_harness.supervisor.control_bus import _atomic_bytes_write
+
+    outside = tmp_path / "outside.json"
+    outside.write_text("private", encoding="utf-8")
+    destination = tmp_path / "report.json"
+    destination.symlink_to(outside)
+
+    _atomic_bytes_write(destination, b"{}")
+
+    assert not destination.is_symlink()
+    assert destination.read_bytes() == b"{}"
+    assert outside.read_text(encoding="utf-8") == "private"
+
+
 def test_atomic_json_write_closes_mkstemp_fd_when_fdopen_fails(monkeypatch, tmp_path: Path) -> None:
     """The temporary descriptor must not leak if wrapping it raises."""
 
