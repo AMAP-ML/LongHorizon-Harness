@@ -4,7 +4,7 @@ import importlib
 from pathlib import Path
 from typing import Any
 
-from .types import EFFORT_CHOICES, MAX_ROUNDS
+from .types import MAX_ROUNDS
 
 try:
     tomllib = importlib.import_module("tomllib")
@@ -198,7 +198,7 @@ def _flatten_run_table(run: dict[str, Any]) -> dict[str, Any]:
     if "agent" in run:
         defaults["agent"] = _choice(run["agent"], "run.agent", _AGENT_CHOICES)
     if "effort" in run:
-        defaults["effort"] = _choice(run["effort"], "run.effort", set(EFFORT_CHOICES))
+        defaults["effort"] = _effort(run["effort"], "run.effort")
     if "env" in run:
         defaults["env"] = _choice(run["env"], "run.env", {"local"})
     if "prompt_language" in run:
@@ -245,8 +245,8 @@ def _flatten_run_table(run: dict[str, Any]) -> dict[str, Any]:
                 values["model"], f"run.roles.{role}.model"
             )
         if "effort" in values:
-            defaults[f"{role}_effort"] = _choice(
-                values["effort"], f"run.roles.{role}.effort", set(EFFORT_CHOICES)
+            defaults[f"{role}_effort"] = _effort(
+                values["effort"], f"run.roles.{role}.effort"
             )
 
     timeouts = run.get("timeouts", {})
@@ -270,6 +270,16 @@ def _choice(value: Any, name: str, choices: set[str]) -> str:
     result = _string(value, name)
     if result not in choices:
         raise ProjectConfigError(f"{name} must be one of: {_names(choices)}")
+    return result
+
+
+def _effort(value: Any, name: str) -> str:
+    # Effort names are backend-defined (OpenCode variants may even be
+    # user-defined), so only the shape is checked here; the role's own
+    # backend validates the value when the agent is built.
+    result = _string(value, name)
+    if len(result) > 64 or "\x00" in result:
+        raise ProjectConfigError(f"{name} must be a printable name of at most 64 characters")
     return result
 
 

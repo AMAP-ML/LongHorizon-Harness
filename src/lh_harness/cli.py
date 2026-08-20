@@ -32,7 +32,6 @@ from .types import (
     DEFAULT_MAX_ROUNDS,
     DEFAULT_WORKSPACE_PATH,
     MAX_ROUNDS,
-    EFFORT_CHOICES,
     EpisodeBudget,
     HarnessConfig,
 )
@@ -422,13 +421,13 @@ def main(argv: list[str] | None = None) -> int:
     run_parser.add_argument(
         "--effort",
         default=run_default("effort"),
-        choices=EFFORT_CHOICES,
         help=(
             "Effort for every role, passed to each backend verbatim "
             "(Codex model_reasoning_effort, Claude Code CLAUDE_CODE_EFFORT_LEVEL, "
             "OpenCode --variant, DeepSeek Harness reasoningEffort). Each backend "
-            "accepts its own documented subset and rejects the rest; defaults to "
-            "the backend's own default."
+            "validates the value itself: codex/claude_code/deepseek_harness "
+            "accept only their documented levels, opencode accepts any variant "
+            "name the model defines; defaults to the backend's own default."
         ),
     )
     for role, _, scope in _ROLE_OPTIONS:
@@ -446,7 +445,6 @@ def main(argv: list[str] | None = None) -> int:
         run_parser.add_argument(
             _flag(role, "effort"),
             default=run_default(f"{role}_effort"),
-            choices=EFFORT_CHOICES,
             help=f"Effort for {scope}; defaults to {_fallback_hint(role, 'effort')}.",
         )
     # Only the local backend is implemented; kept as a flag so existing

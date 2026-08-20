@@ -386,7 +386,7 @@ cli_auditor  → auditor  → [run].agent / [run].model / [run].effort
 | DeepSeek Harness | `reasoningEffort` | `low`, `high`, `max` |
 | OpenCode | `--variant` | the model's variant presets (OpenAI-style models ship `none`/`minimal`/`low`/`medium`/`high`/`xhigh`; custom variants come from `opencode.jsonc`) |
 
-The web workbench offers each model's own discovered levels (from the model catalogue's `reasoning_efforts`). Set effort for all roles at once, per role, or per run:
+The config file and CLI accept any well-formed name and leave the judgement to the backend the value is addressed to — the same boundary the web workbench uses — so OpenCode's user-defined variant names work everywhere, and a typo on the other backends still fails fast at agent setup with the list of valid levels. The web workbench offers each model's own discovered levels (from the model catalogue's `reasoning_efforts`). Set effort for all roles at once, per role, or per run:
 
 ```toml
 [run]

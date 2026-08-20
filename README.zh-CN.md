@@ -387,7 +387,7 @@ cli_auditor  → auditor  → [run].agent / [run].model / [run].effort
 | DeepSeek Harness | `reasoningEffort` | `low`、`high`、`max` |
 | OpenCode | `--variant` | 模型自身的 variant 预设（OpenAI 系模型自带 `none`/`minimal`/`low`/`medium`/`high`/`xhigh`；自定义预设来自 `opencode.jsonc`） |
 
-Web 工作台会展示每个模型自己被检测到的等级（来自模型目录的 `reasoning_efforts`）。可以全局设置、按角色设置，或对单次运行设置：
+配置文件和 CLI 接受任何格式合法的名称，把判断交给该值实际送达的后端——与 Web 工作台使用的是同一道校验边界——因此 OpenCode 用户自定义的 variant 名称在任何入口都可用，而其他后端上的拼写错误仍会在 agent 启动阶段快速报错并列出有效等级。Web 工作台会展示每个模型自己被检测到的等级（来自模型目录的 `reasoning_efforts`）。可以全局设置、按角色设置，或对单次运行设置：
 
 ```toml
 [run]

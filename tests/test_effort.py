@@ -23,7 +23,7 @@ from lh_harness.adapters.opencode import OpenCodeAdapter
 from lh_harness.cli import _ROLE_PARENTS, _build_agent, _resolve_role_effort
 from lh_harness.config import ProjectConfigError, _flatten_run_table
 from lh_harness.environment.local import LocalEnvironment
-from lh_harness.types import BACKEND_EFFORT_LEVELS, EFFORT_CHOICES, EpisodeBudget
+from lh_harness.types import BACKEND_EFFORT_LEVELS, EpisodeBudget
 
 
 # --- config ----------------------------------------------------------------
@@ -47,17 +47,22 @@ def test_config_accepts_per_role_effort() -> None:
     assert defaults["auditor_effort"] == "low"
 
 
-@pytest.mark.parametrize("bad", ["ultra", "", 3, True, ["high"]])
-def test_config_rejects_unknown_effort_values(bad: object) -> None:
+def test_config_accepts_custom_opencode_variant_names() -> None:
+    # Effort names are backend-defined (OpenCode variants may be user-defined
+    # in opencode.jsonc), so the config layer checks only the shape; the
+    # role's own backend rejects names it does not support when the agent is
+    # built, exactly like the web supervisor boundary.
+    assert _flatten_run_table({"effort": "deep"}) == {"effort": "deep"}
+    defaults = _flatten_run_table({"roles": {"executor": {"effort": "my-variant"}}})
+    assert defaults["executor_effort"] == "my-variant"
+
+
+@pytest.mark.parametrize("bad", ["", 3, True, ["high"], "x" * 65, "nul\x00led"])
+def test_config_rejects_malformed_effort_values(bad: object) -> None:
     with pytest.raises(ProjectConfigError, match=r"\beffort\b"):
         _flatten_run_table({"effort": bad})
     with pytest.raises(ProjectConfigError, match=r"\beffort\b"):
         _flatten_run_table({"roles": {"executor": {"effort": bad}}})
-
-
-def test_union_choices_cover_every_backend_level() -> None:
-    for backend, levels in BACKEND_EFFORT_LEVELS.items():
-        assert set(levels) <= set(EFFORT_CHOICES), backend
 
 
 # --- CLI fallback chain ----------------------------------------------------

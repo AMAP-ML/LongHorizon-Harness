@@ -36,18 +36,19 @@ DEFAULT_OPENCODE_MODEL = "opencode/deepseek-v4-flash-free"
 # Effort levels pass through to each backend verbatim - no cross-backend
 # mapping.  BACKEND_EFFORT_LEVELS lists the levels each CLI documents for its
 # own dial (Codex `model_reasoning_effort`, Claude Code
-# CLAUDE_CODE_EFFORT_LEVELS, OpenCode `--variant` presets, DeepSeek Harness
-# `reasoningEffort`); a value outside a backend's set is a configuration
-# error, not a candidate for silent substitution.  EFFORT_CHOICES is the
-# union, used only as a typo guard at the config/CLI boundary where the
-# backend is not yet known.
+# CLAUDE_CODE_EFFORT_LEVELS, DeepSeek Harness `reasoningEffort`); a value
+# outside a backend's set is a configuration error, not a candidate for
+# silent substitution.  OpenCode's `--variant` takes per-model preset names
+# that may be user-defined in opencode.jsonc, so its values are not
+# enumerable: its entry is only the common OpenAI-style preset names the web
+# picker offers as a fallback - every layer accepts any well-formed name for
+# it and OpenCode resolves the variant itself.
 BACKEND_EFFORT_LEVELS: dict[str, tuple[str, ...]] = {
     "codex": ("minimal", "low", "medium", "high", "xhigh"),
     "claude_code": ("low", "medium", "high", "xhigh", "max"),
     "deepseek_harness": ("low", "high", "max"),
     "opencode": ("none", "minimal", "low", "medium", "high", "xhigh"),
 }
-EFFORT_CHOICES: tuple[str, ...] = ("none", "minimal", "low", "medium", "high", "xhigh", "max")
 
 # A run is intentionally bounded at every ingress point.  Without a shared
 # ceiling, a malformed Web/CLI request can reserve an effectively unbounded
