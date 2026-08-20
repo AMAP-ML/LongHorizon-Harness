@@ -1,0 +1,44 @@
+name: 🧪 Tests
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: tests-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  pytest:
+    name: 🐍 ${{ matrix.os }} · py${{ matrix.python }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        # Ubuntu only while this branch is based on a main that predates the
+        # Windows support in #57: the Windows lanes there exercise platform
+        # code this branch does not carry, and fail on main's known
+        # POSIX-only layers (os.killpg and friends). #57 brings the full
+        # ubuntu + windows matrix; on merge, its version of this file wins.
+        os: [ubuntu-latest]
+        python: ["3.10", "3.14"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+
+      - name: 📦 Install with test dependencies
+        run: python -m pip install -e ".[test]"
+
+      - name: 🧪 Run the suite
+        # The Windows symlink fixtures skip themselves when the runner lacks
+        # SeCreateSymbolicLinkPrivilege; those skips are expected and green.
+        run: python -m pytest -q

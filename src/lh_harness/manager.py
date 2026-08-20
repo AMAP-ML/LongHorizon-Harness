@@ -22,7 +22,7 @@ from .agent_logs import (
 from .environment.base import Environment
 from .environment.remote_files import ensure_remote_dir, write_remote_text
 from .runtime_signals import hard_signal_labels
-from .provider_errors import classify_agent_runtime_failure
+from .provider_errors import classify_agent_runtime_failure, is_retryable_failure
 from .trajectory_artifacts import persist_trajectory_artifacts
 from .role_prompts import (
     MANAGER_NEXT_BLOCKED,
@@ -406,6 +406,9 @@ async def _run_impl(
             env,
             manager_budget,
             live_trajectory_path=str(round_dir / "manager_raw_trajectory.jsonl"),
+            on_retry=lambda a, d, f: _emit_retry_event(
+                events_path, emit, round_index, "manager", a, d, f
+            ),
         )
         _save_role_result(
             round_dir,
@@ -664,6 +667,9 @@ async def _run_impl(
             env,
             executor_budget,
             live_trajectory_path=str(round_dir / "executor_raw_trajectory.jsonl"),
+            on_retry=lambda a, d, f: _emit_retry_event(
+                events_path, emit, round_index, f"{next_step}_executor", a, d, f
+            ),
         )
         executor_episode_root = log_dir / (
             "gui_executor_episodes" if next_step == MANAGER_NEXT_GUI else "cli_executor_episodes"
@@ -804,6 +810,9 @@ async def _run_impl(
             env,
             auditor_budget,
             live_trajectory_path=str(round_dir / "auditor_raw_trajectory.jsonl"),
+            on_retry=lambda a, d, f: _emit_retry_event(
+                events_path, emit, round_index, f"{next_step}_auditor", a, d, f
+            ),
         )
         auditor_episode_root = log_dir / (
             "gui_auditor_episodes" if next_step == MANAGER_NEXT_GUI else "cli_auditor_episodes"
@@ -1221,6 +1230,74 @@ def _executor_binding(
     return cli_executor_agent, cli_executor_budget
 
 
+@dataclass(frozen=True)
+class _RetryPolicy:
+    max_attempts: int
+    base_seconds: float
+    cap_seconds: float
+    max_total_seconds: float
+
+
+def _env_float(name: str, default: float) -> float:
+    raw = os.getenv(name)
+    if raw is None or not raw.strip():
+        return default
+    try:
+        value = float(raw)
+    except ValueError:
+        return default
+    return value if value >= 0 else default
+
+
+def _provider_retry_policy() -> _RetryPolicy:
+    """Backoff for transient provider failures (rate limit / network).
+
+    Defaults wait out a rate-limit window (exp backoff 60s -> cap 900s, up to 8
+    attempts or 2h total) so a run PAUSES and RESUMES instead of aborting the
+    moment the provider returns a 429/overloaded/connection error. Override via
+    LH_HARNESS_PROVIDER_RETRY_{MAX_ATTEMPTS,BASE_SECONDS,CAP_SECONDS,MAX_TOTAL_SECONDS};
+    set MAX_ATTEMPTS=0 to restore the old fail-fast behaviour.
+    """
+    return _RetryPolicy(
+        max_attempts=int(_env_float("LH_HARNESS_PROVIDER_RETRY_MAX_ATTEMPTS", 8)),
+        base_seconds=_env_float("LH_HARNESS_PROVIDER_RETRY_BASE_SECONDS", 60.0),
+        cap_seconds=_env_float("LH_HARNESS_PROVIDER_RETRY_CAP_SECONDS", 900.0),
+        max_total_seconds=_env_float("LH_HARNESS_PROVIDER_RETRY_MAX_TOTAL_SECONDS", 7200.0),
+    )
+
+
+def _emit_retry_event(
+    events_path: Path,
+    emit: Callable[..., None],
+    round_index: int,
+    phase: str,
+    attempt: int,
+    delay: float,
+    failure: Any,
+) -> None:
+    """Surface a provider backoff wait in the event log + progress stream."""
+    _append_event(
+        events_path,
+        "agent_runtime_retry",
+        {
+            "round": round_index,
+            "phase": phase,
+            "attempt": attempt,
+            "delay_seconds": round(delay, 1),
+            "kind": failure.kind,
+            "message": failure.message,
+        },
+    )
+    emit(
+        "role_retry",
+        round=round_index,
+        role=phase,
+        attempt=attempt,
+        delay_ms=int(delay * 1000),
+        error=failure.user_message,
+    )
+
+
 async def _run_role_episode(
     agent: AgentAdapter,
     prompt: str,
@@ -1228,23 +1305,55 @@ async def _run_role_episode(
     budget: EpisodeBudget,
     *,
     live_trajectory_path: str | None = None,
+    on_retry: Callable[[int, float, Any], None] | None = None,
 ) -> EpisodeResult:
-    """Normalize cooperative cancellation for every adapter implementation."""
-    started = time.monotonic()
-    try:
-        return await agent.run_episode(
-            prompt,
-            env,
-            budget,
-            live_trajectory_path=live_trajectory_path,
-        )
-    except asyncio.CancelledError:
-        return EpisodeResult(
-            status="cancelled",
-            error="Execution cancelled by operator",
-            duration_ms=int((time.monotonic() - started) * 1000),
-            metadata={"cancelled": True},
-        )
+    """Run one role episode.
+
+    Normalizes cooperative cancellation, and waits out transient provider
+    failures (rate limit / network) with exponential backoff so the run pauses
+    and resumes rather than aborting. Terminal failures return immediately for
+    the caller to classify and abort as before.
+    """
+    policy = _provider_retry_policy()
+    started_total = time.monotonic()
+    attempt = 0
+    while True:
+        started = time.monotonic()
+        try:
+            result = await agent.run_episode(
+                prompt,
+                env,
+                budget,
+                live_trajectory_path=live_trajectory_path,
+            )
+        except asyncio.CancelledError:
+            return EpisodeResult(
+                status="cancelled",
+                error="Execution cancelled by operator",
+                duration_ms=int((time.monotonic() - started) * 1000),
+                metadata={"cancelled": True},
+            )
+        failure = classify_agent_runtime_failure(result)
+        if not is_retryable_failure(failure):
+            return result
+        attempt += 1
+        elapsed = time.monotonic() - started_total
+        if policy.max_attempts <= 0 or attempt >= policy.max_attempts or elapsed >= policy.max_total_seconds:
+            return result
+        delay = min(policy.cap_seconds, policy.base_seconds * (2 ** (attempt - 1)))
+        delay = max(0.0, min(delay, policy.max_total_seconds - elapsed))
+        if on_retry is not None:
+            with contextlib.suppress(Exception):
+                on_retry(attempt, delay, failure)
+        try:
+            await asyncio.sleep(delay)
+        except asyncio.CancelledError:
+            return EpisodeResult(
+                status="cancelled",
+                error="Execution cancelled by operator during provider backoff",
+                duration_ms=int((time.monotonic() - started) * 1000),
+                metadata={"cancelled": True},
+            )
 
 
 async def _auditor_report_with_format_repair(
