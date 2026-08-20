@@ -480,12 +480,21 @@ def format_audit_findings(
 
 def parse_role_manager_next_step(text: str) -> RoleNextStep:
     for line in str(text or "").splitlines():
-        normalized = line.strip().strip("*").replace(" ", "").replace("　", "").lower()
+        # `*` covers bold; the backtick covers code spans. The prompt itself
+        # displays every route inside backticks ("exactly one route:
+        # `Next: gui`, ..."), and models -- reliably the smaller ones -- copy
+        # that formatting into their answer, so a parser that accepts
+        # `**Next: cli**` but not "`Next: cli`" burns a whole round on
+        # formatting the harness's own instruction taught the model.
+        normalized = line.strip().strip("*`").replace(" ", "").replace("　", "").lower()
         # Models commonly append a short rationale after the required route,
         # e.g. `Next: done — all constraints passed`. Treat only an explicitly
         # delimited suffix as commentary so prose such as `Next: done later`
         # remains invalid.
-        normalized = re.split(r"(?:—|–|--|//|#|[（(])", normalized, maxsplit=1)[0]
+        # Strip wrappers again after cutting the rationale: in
+        # "`Next: cli` — reason" the closing backtick sits before the dash and
+        # survives the first strip.
+        normalized = re.split(r"(?:—|–|--|//|#|[（(])", normalized, maxsplit=1)[0].strip("*`")
         if normalized in {"下一步:gui任务", "下一步：gui任务", "next:gui"}:
             return MANAGER_NEXT_GUI
         if normalized in {"下一步:cli任务", "下一步：cli任务", "next:cli"}:
