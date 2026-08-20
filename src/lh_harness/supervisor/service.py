@@ -56,6 +56,7 @@ from ..types import (
     DEFAULT_MAX_ROUNDS,
     MAX_ROUNDS,
 )
+from ..utils.child_env import apply_working_directory
 from ..utils.process_group import deliver_signal, new_process_group_kwargs
 from ..utils.run_boundary import safe_run_control, safe_run_dir, safe_run_logs, safe_run_role, safe_run_rounds
 
@@ -1815,6 +1816,11 @@ class RunSupervisor:
             os.pathsep + inherited_pythonpath if inherited_pythonpath else ""
         )
         worker_env.pop("LH_HARNESS_WEB_TOKEN", None)
+        # The worker really starts in the workspace, so `PWD` must say so too:
+        # it is inherited by every agent CLI the worker spawns, and the ones
+        # that trust it over `getcwd` would otherwise work in the directory the
+        # supervisor was started from.
+        apply_working_directory(worker_env, workspace_path)
         try:
             process = subprocess.Popen(
                 command,

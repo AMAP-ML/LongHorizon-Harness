@@ -772,6 +772,29 @@ def test_worker_does_not_inherit_web_control_token(monkeypatch, tmp_path: Path) 
     assert worker_env.get("LH_HARNESS_WEB_TOKEN") is None
 
 
+def test_worker_pwd_points_at_the_workspace(monkeypatch, tmp_path: Path) -> None:
+    """Agent CLIs that read `PWD` inherit it from the worker, not from us."""
+
+    process = _Process()
+    captured: dict[str, object] = {}
+
+    def launch(*args, **kwargs):
+        captured.update(kwargs)
+        return process
+
+    monkeypatch.setenv("PWD", str(tmp_path / "wherever-the-supervisor-started"))
+    monkeypatch.setattr("lh_harness.supervisor.service.subprocess.Popen", launch)
+    supervisor = RunSupervisor(tmp_path / "runs", workspace_root=tmp_path / "workspace")
+    supervisor.create_run(task="stay in the workspace")
+
+    worker_env = captured.get("env")
+    assert isinstance(worker_env, dict)
+    # `abspath`, not `resolve`: the value must describe the directory the worker
+    # was actually started in, symlinks and all, exactly as a shell's own `PWD`
+    # would.
+    assert worker_env.get("PWD") == os.path.abspath(str(captured.get("cwd")))
+
+
 def test_run_listing_skips_symlinked_run_dirs(monkeypatch, tmp_path: Path) -> None:
     process = _Process()
     monkeypatch.setattr("lh_harness.supervisor.service.subprocess.Popen", lambda *args, **kwargs: process)

@@ -8,6 +8,7 @@ on `mkdir -p`, and every timeout raised `AttributeError: os.killpg`.
 from __future__ import annotations
 
 import asyncio
+import os
 import sys
 import time
 
@@ -59,6 +60,38 @@ def test_working_directory_comes_from_cwd(tmp_path, env):
     target.mkdir()
     result = run(env.run([PY, "-c", "import os; print(os.getcwd())"], timeout=30, cwd=str(target)))
     assert result.stdout.strip() == str(target)
+
+
+def test_pwd_agrees_with_the_working_directory(tmp_path, env):
+    """OpenCode reads `PWD`, not `getcwd`: a stale one puts the agent outside the workspace.
+
+    The `sh -c` wrapper this replaced set `PWD` from `getcwd()` when the shell
+    started, so nothing here had to.  Executing argv directly means the
+    launcher's `PWD` is inherited unless it is overwritten.
+    """
+    target = tmp_path / "workspace"
+    target.mkdir()
+    script = "import os; print(os.environ.get('PWD'))"
+    result = run(env.run([PY, "-c", script], timeout=30, cwd=str(target)))
+    assert result.stdout.strip() == str(target)
+
+
+def test_oldpwd_is_not_inherited_when_a_working_directory_is_imposed(monkeypatch, tmp_path, env):
+    """`cd -` must not jump to a directory this run never chose."""
+    monkeypatch.setenv("OLDPWD", str(tmp_path / "somewhere-else"))
+    target = tmp_path / "workspace"
+    target.mkdir()
+    script = "import os; print(os.environ.get('OLDPWD', 'unset'))"
+    result = run(env.run([PY, "-c", script], timeout=30, cwd=str(target)))
+    assert result.stdout.strip() == "unset"
+
+
+def test_pwd_is_left_alone_without_a_working_directory(monkeypatch, env):
+    """No `cwd` means the child really does inherit ours, and so should `PWD`."""
+    monkeypatch.setenv("PWD", "/inherited/from/the/launcher")
+    script = "import os; print(os.environ.get('PWD', 'unset'))"
+    result = run(env.run([PY, "-c", script], timeout=30))
+    assert result.stdout.strip() == "/inherited/from/the/launcher"
 
 
 def test_env_overrides_are_layered_onto_the_real_environment(env):

@@ -14,6 +14,7 @@ from ..types import DEFAULT_TMP_DIR, ExecResult
 from ..supervisor.control_bus import _ensure_dir_fd_nofollow, _open_private_regular_at
 from ..trajectory_artifacts import StreamingTrajectoryArtifactWriter
 from ..utils import paths as long_paths
+from ..utils.child_env import apply_working_directory
 from ..utils.process_group import (
     force_kill_process_group,
     kill_process_group,
@@ -205,6 +206,11 @@ class LocalEnvironment:
             # worker sanitisation would expose that credential to the agent.
             child_env = os.environ.copy()
             child_env.pop("LH_HARNESS_WEB_TOKEN", None)
+            # `cwd=` alone is not enough: an agent CLI that reads `PWD` (OpenCode
+            # does) would otherwise work in the directory the operator launched
+            # the harness from, outside the workspace.  The old `sh -c` wrapper
+            # rewrote `PWD` on the shell's own startup and hid this.
+            apply_working_directory(child_env, cwd)
             child_env.update(env or {})
             proc = await asyncio.create_subprocess_exec(
                 *argv,
