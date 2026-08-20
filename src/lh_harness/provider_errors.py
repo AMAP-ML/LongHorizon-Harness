@@ -29,6 +29,18 @@ class AgentRuntimeFailure:
     user_message: str
 
 
+# Provider failures that are transient: the provider is momentarily unhappy
+# (429/overloaded, dropped connection) but the run can continue once it recovers.
+# Terminal kinds (authentication, quota/billing, model_unavailable, timeout) are
+# NOT here — retrying those wastes time or masks a real hang.
+RETRYABLE_KINDS: frozenset[str] = frozenset({"rate_limit", "network"})
+
+
+def is_retryable_failure(failure: "AgentRuntimeFailure | None") -> bool:
+    """True when the failure is a transient provider hiccup worth waiting out."""
+    return failure is not None and failure.kind in RETRYABLE_KINDS
+
+
 _CLASSIFIERS: tuple[tuple[str, re.Pattern[str], str], ...] = (
     (
         "model_unavailable",
@@ -61,7 +73,11 @@ _CLASSIFIERS: tuple[tuple[str, re.Pattern[str], str], ...] = (
     ),
     (
         "rate_limit",
-        re.compile(r"(?:\b429\b|rate[ _-]?limit|too many requests|overloaded|请求过多|限流|过载)", re.I),
+        re.compile(
+            r"(?:\b429\b|\b529\b|rate[ _-]?limit|ratelimittype|five[_ -]?hour|session limit|"
+            r"usage limit|too many requests|overloaded|请求过多|限流|过载|会话限制|用量限制)",
+            re.I,
+        ),
         "Provider 限流或过载",
     ),
     (
@@ -188,8 +204,20 @@ def _failure_messages(result: EpisodeResult, metadata: dict[str, Any]) -> list[s
             _append(values, error.get("message") if isinstance(error, dict) else error)
         elif record_type == "error":
             _append(values, record.get("message") or record.get("error"))
-        elif record_type == "result" and record.get("is_error"):
-            _append(values, record.get("result") or record.get("error") or record.get("subtype"))
+        elif record_type == "result":
+            # A session/usage-limit rejection comes back as subtype "success" with
+            # is_error false but api_error_status 429 and a "session limit" result
+            # string, so key off the HTTP status too, not just is_error.
+            status_code = record.get("api_error_status") or record.get("status_code")
+            if record.get("is_error") or (isinstance(status_code, int) and status_code >= 400):
+                _append(values, record.get("result") or record.get("error") or record.get("subtype"))
+        elif record_type == "rate_limit_event":
+            info = record.get("rate_limit_info")
+            if isinstance(info, dict) and "rejected" in {
+                str(info.get("status", "")).lower(),
+                str(info.get("overageStatus", "")).lower(),
+            }:
+                _append(values, "provider rate limit rejected (session limit reached)")
     _append(values, result.error)
     _append(values, metadata.get("stderr_tail"))
     signals = metadata.get("runtime_signals")
