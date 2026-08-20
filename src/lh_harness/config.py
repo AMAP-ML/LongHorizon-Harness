@@ -38,6 +38,7 @@ _RUN_KEYS = {
     "claude_mcp_config",
     "codex_mcp_config",
     "mcp_add_dirs",
+    "guard_exclude_paths",
     "max_rounds",
     "dashboard",
     "dashboard_port",
@@ -76,6 +77,13 @@ prompt_language = "en"
 # claude_mcp_config = "/path/to/mcp.json"
 # codex_mcp_config = "/path/to/mcp.toml"
 mcp_add_dirs = []
+
+# Build/cache directories the auditor read-only guard should not snapshot,
+# e.g. ["target", "node_modules", "build", ".venv"]. Agents can still read
+# them. Exclusions must stay inside the workspace; ".git" and harness-owned
+# control/state paths are rejected at startup, and the effective list is
+# echoed at run start and recorded in each audited episode's metadata.
+guard_exclude_paths = []
 
 max_rounds = 25
 dashboard = true
@@ -191,6 +199,11 @@ def _flatten_run_table(run: dict[str, Any]) -> dict[str, Any]:
         if not isinstance(value, list) or not all(isinstance(item, str) and item for item in value):
             raise ProjectConfigError("run.mcp_add_dirs must be an array of non-empty strings")
         defaults["mcp_add_dir"] = list(value)
+    if "guard_exclude_paths" in run:
+        value = run["guard_exclude_paths"]
+        if not isinstance(value, list) or not all(isinstance(item, str) and item for item in value):
+            raise ProjectConfigError("run.guard_exclude_paths must be an array of non-empty strings")
+        defaults["guard_exclude_path"] = list(value)
 
     roles = run.get("roles", {})
     if not isinstance(roles, dict):

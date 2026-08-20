@@ -14,6 +14,7 @@ from .claude_permissions import (
     workspace_snapshot_diff,
 )
 from ..environment.base import Environment
+from ..provider_errors import GUARD_REJECTION_MESSAGE
 from ..types import (
     DEFAULT_CLAUDE_MODEL,
     DEFAULT_TMP_DIR,
@@ -37,6 +38,7 @@ class ClaudeCodeAdapter(CommandAgentAdapter):
         add_dirs: list[str] | None = None,
         role: ClaudeRole = "cli_executor",
         hidden_paths: tuple[str, ...] = (),
+        guard_exclude_paths: tuple[str, ...] = (),
     ) -> None:
         policy = policy_for_role(role)
         env_parts: list[str] = []
@@ -105,6 +107,10 @@ class ClaudeCodeAdapter(CommandAgentAdapter):
 
         self.role = role
         self.policy = policy
+        # Snapshot-only exclusions: unlike hidden_paths these are not denied
+        # to the agent — the guard just refrains from walking directories that
+        # legitimately churn (build outputs) during an audit window.
+        self.guard_exclude_paths = tuple(guard_exclude_paths)
         super().__init__(
             command_template=f"{env_prefix}{' '.join(command_parts)} < {{prompt_path}}",
             prompt_dir=prompt_dir,
@@ -121,7 +127,10 @@ class ClaudeCodeAdapter(CommandAgentAdapter):
         live_trajectory_path: str | None = None,
     ) -> EpisodeResult:
         before = (
-            snapshot_workspace(self.workspace_path, self.hidden_paths)
+            snapshot_workspace(
+                self.workspace_path,
+                (*self.hidden_paths, *self.guard_exclude_paths),
+            )
             if is_auditor_role(self.role)
             else None
         )
@@ -145,15 +154,22 @@ class ClaudeCodeAdapter(CommandAgentAdapter):
             }
         )
         if before is not None:
-            after = snapshot_workspace(self.workspace_path, self.hidden_paths)
+            after = snapshot_workspace(
+                self.workspace_path,
+                (*self.hidden_paths, *self.guard_exclude_paths),
+            )
             diff = workspace_snapshot_diff(before, after)
             result.metadata.update(diff)
+            # Record the effective exclusions with every audited episode so
+            # the guard's reduced coverage is visible in the run artifacts.
+            result.metadata["verifier_guard_exclude_paths"] = list(self.guard_exclude_paths)
             snapshot_errors = diff.get("verifier_workspace_snapshot_errors")
             if snapshot_errors:
-                result.status = "error"
-                guard_error = (
-                    "Auditor workspace read-only guard could not inspect every path; "
-                    "the audit was rejected fail-closed."
-                )
+                # Escalate only a successful status: a real timeout (or
+                # cancellation) is stronger evidence and must stay visible to
+                # the runtime-failure classifier.
+                if result.status == "done":
+                    result.status = "error"
+                guard_error = GUARD_REJECTION_MESSAGE
                 result.error = f"{result.error}\n{guard_error}".strip() if result.error else guard_error
         return result

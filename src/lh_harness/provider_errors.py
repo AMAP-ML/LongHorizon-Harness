@@ -11,6 +11,16 @@ from .runtime_signals import hard_signal_labels
 from .types import EpisodeResult
 
 
+# The exact sentence the Claude Code adapter appends when the read-only guard
+# rejects an audit fail-closed. The classifier strips it from failure evidence
+# so a guard-only rejection stays a round-level problem while any coexisting
+# provider failure keeps its terminal classification.
+GUARD_REJECTION_MESSAGE = (
+    "Auditor workspace read-only guard could not inspect every path; "
+    "the audit was rejected fail-closed."
+)
+
+
 @dataclass(frozen=True)
 class AgentRuntimeFailure:
     kind: str
@@ -81,6 +91,12 @@ def classify_agent_runtime_failure(result: EpisodeResult) -> AgentRuntimeFailure
     if result.status not in {"error", "timeout"} and not hard_signals:
         return None
     candidates = _failure_messages(result, metadata)
+    guard_rejected = bool(metadata.get("verifier_workspace_snapshot_errors"))
+    if guard_rejected:
+        # The guard's fail-closed rejection sentence is local bookkeeping,
+        # not provider evidence; classify only what remains so a coexisting
+        # authentication/network/quota failure keeps its terminal kind.
+        candidates = _strip_guard_rejection(candidates)
     combined = "\n".join(candidates)
     kind = "timeout" if result.status == "timeout" else "provider_error"
     label = "Agent 执行超时" if kind == "timeout" else "Agent provider 启动或运行失败"
@@ -89,12 +105,30 @@ def classify_agent_runtime_failure(result: EpisodeResult) -> AgentRuntimeFailure
     # adapter's own "Episode timed out after ..." message matches the generic
     # network classifier below. Keep the explicit status authoritative so the
     # manager can recover from the real workspace in a later round.
+    matched_provider_kind = False
     if result.status != "timeout":
         for candidate_kind, pattern, candidate_label in _CLASSIFIERS:
             if pattern.search(combined):
                 kind = candidate_kind
                 label = candidate_label
+                matched_provider_kind = True
                 break
+    # Downgrade to a round-level failure only when the failure is proven to
+    # be caused solely by the snapshot guard: the guard rejected the audit,
+    # nothing matched a provider classifier, no hard runtime signal fired,
+    # the episode did not time out, and the episode's own failure channels
+    # (actions log, error field) carry nothing beyond the guard rejection.
+    # The audit is already rejected fail-closed by the adapter, so the round
+    # fails and is retried instead of the whole run aborting over a transient
+    # filesystem race, e.g. a build directory churning underneath the walk.
+    if (
+        guard_rejected
+        and not matched_provider_kind
+        and not hard_signals
+        and result.status != "timeout"
+        and not _non_guard_failure_evidence(result)
+    ):
+        return None
     message = next((item for item in candidates if _specific_message(item)), None)
     message = message or next(iter(candidates), "agent runtime failed")
     message = _clean(message, 1200)
@@ -104,6 +138,45 @@ def classify_agent_runtime_failure(result: EpisodeResult) -> AgentRuntimeFailure
         message=message,
         user_message=f"{label}：{message}",
     )
+
+
+def _strip_guard_rejection(candidates: list[str]) -> list[str]:
+    """Remove the guard's own rejection sentence, keeping any other evidence."""
+
+    stripped: list[str] = []
+    for item in candidates:
+        text = item.replace(GUARD_REJECTION_MESSAGE, " ")
+        text = " ".join(text.split())
+        if text and text not in stripped:
+            stripped.append(text)
+    return stripped
+
+
+def _non_guard_failure_evidence(result: EpisodeResult) -> bool:
+    """True when the episode's failure channels carry more than the guard.
+
+    Looks only at channels that are silent on a successful episode (failure
+    records in the actions log and the episode error field), so stderr noise
+    from a healthy run cannot escalate a guard-only rejection back into a
+    terminal provider failure.
+    """
+
+    values: list[str] = []
+    for record in _json_records(result.actions_log):
+        record_type = str(record.get("type") or "")
+        if record_type == "turn.failed":
+            error = record.get("error")
+            _append(values, error.get("message") if isinstance(error, dict) else error)
+        elif record_type == "error":
+            _append(values, record.get("message") or record.get("error"))
+        elif record_type == "result" and record.get("is_error"):
+            _append(values, record.get("result") or record.get("error") or record.get("subtype"))
+    _append(values, result.error)
+    for value in values:
+        text = _clean(value, 2000).replace(GUARD_REJECTION_MESSAGE, " ").strip()
+        if text:
+            return True
+    return False
 
 
 def _failure_messages(result: EpisodeResult, metadata: dict[str, Any]) -> list[str]:
