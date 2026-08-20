@@ -104,9 +104,16 @@ def test_deepseek_runner_task_deliveries_work_on_every_platform(
     """
     binary = _executable(tmp_path / "bin" / "dsh", "print(' '.join(sys.argv[1:]))\n")
     prompt_path = tmp_path / "prompt.md"
-    # Large enough that cmd.exe could never carry it, and awkward enough to
-    # prove the JSON-as-YAML escaping keeps the scalar on one line.
-    prompt = ("x" * 9000) + '\nline "two" ends with a backslash \\'
+    if via_patch:
+        # Large enough that cmd.exe could never carry it, and awkward enough
+        # to prove the JSON-as-YAML escaping keeps the scalar on one line.
+        prompt = ("x" * 9000) + '\nline "two" ends with a backslash \\'
+    else:
+        # The positional route genuinely cannot carry a large, multi-line or
+        # quote-riddled argument through the Windows .CMD shim -- those limits
+        # are the whole reason the patch route exists -- so this case proves
+        # only the route itself: prompt on argv, no override row in the patch.
+        prompt = "fix the project via the positional route"
     prompt_path.write_text(prompt, encoding="utf-8")
 
     assert run(binary, prompt_path, "deepseek-v4-flash", task_via_patch=via_patch) == 0
@@ -124,7 +131,7 @@ def test_deepseek_runner_task_deliveries_work_on_every_platform(
         assert f"task: {json.dumps(prompt, ensure_ascii=False)}" in patch_text
         assert "- id: headless-runner" in patch_text
     else:
-        assert record["text"].endswith('ends with a backslash \\')
+        assert record["text"].endswith("fix the project via the positional route")
         assert "headless-runner" not in patch_text
 
 

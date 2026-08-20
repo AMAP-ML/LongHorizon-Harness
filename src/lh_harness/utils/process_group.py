@@ -201,22 +201,37 @@ def _windows_alive(pid: int) -> bool:
     )[1]
 
 
+# Captured at import time, the same way service.py keeps ``_REAL_POPEN``:
+# tests routinely stub ``subprocess.Popen`` to model a worker, and the platform
+# probes below must keep reaching the real OS regardless -- ``subprocess.run``
+# resolves ``Popen`` through the (stubbed) module namespace at call time.
+_REAL_POPEN = subprocess.Popen
+
+
 def _run_quiet(argv: list[str], *, capture: bool = False):
     """Run a Windows helper without flashing a console window."""
+    proc = None
     try:
-        completed = subprocess.run(
+        proc = _REAL_POPEN(
             argv,
-            capture_output=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            stdin=subprocess.DEVNULL,
             text=True,
-            timeout=15,
-            check=False,
             creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
         )
+        stdout, stderr = proc.communicate(timeout=15)
     except (OSError, subprocess.SubprocessError):
+        if proc is not None:
+            try:
+                proc.kill()
+                proc.communicate(timeout=15)
+            except (OSError, subprocess.SubprocessError):
+                pass
         return (1, "") if capture else 1
     if not capture:
-        return completed.returncode
-    return completed.returncode, (completed.stdout or "") + (completed.stderr or "")
+        return proc.returncode
+    return proc.returncode, (stdout or "") + (stderr or "")
 
 
 def _install_handlers() -> None:
