@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import errno
 import json
 import os
 import platform
@@ -1355,7 +1356,19 @@ async def _run_with_attached_control(
 
     async def watch_control() -> None:
         while not manager_task.done():
-            status = bus.read_status()
+            # A stolen-descriptor EBADF must cost one poll, not the whole
+            # watcher: if this task dies, stop/abort requests go unheard for
+            # the rest of the run and the stored exception resurfaces at
+            # shutdown as the process exit status of an otherwise clean run.
+            # Only EBADF is recoverable noise; permission, I/O, or filesystem
+            # failures would silently blind the watcher to legitimate
+            # stop/abort requests, so they propagate.
+            try:
+                status = bus.read_status()
+            except OSError as exc:
+                if exc.errno != errno.EBADF:
+                    raise
+                status = {}
             action = str(status.get("requested_action") or "").strip().lower()
             if action in {"stop", "abort"}:
                 manager_task.cancel()
@@ -1371,6 +1384,12 @@ async def _run_with_attached_control(
             await watcher
         except asyncio.CancelledError:
             pass
+        except OSError as exc:
+            # A stored stolen-descriptor EBADF must not override the outcome
+            # of the finished run; any other I/O failure in the watcher is a
+            # real problem and keeps propagating.
+            if exc.errno != errno.EBADF:
+                raise
 
 
 def _run_command(args: argparse.Namespace) -> int:

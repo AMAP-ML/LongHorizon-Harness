@@ -169,6 +169,70 @@ def test_embedded_control_watcher_cancels_manager_task(tmp_path: Path) -> None:
     assert asyncio.run(_run_with_attached_control(worker(), run_dir=run_dir, enabled=True)) == {"status": "cancelled"}
 
 
+def test_embedded_control_watcher_survives_isolated_ebadf(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """One stolen-descriptor EBADF costs one poll; the next poll still cancels."""
+    import errno
+
+    from lh_harness.supervisor.control_bus import ControlBus
+
+    run_dir = tmp_path / "run"
+    bus = ControlBus(run_dir)
+    bus.write_status({"run_id": "run", "status": "stopping", "requested_action": "abort"})
+
+    real_read_status = ControlBus.read_status
+    calls: list[int] = []
+
+    def flaky_read_status(self):
+        calls.append(1)
+        if len(calls) == 1:
+            raise OSError(errno.EBADF, "Bad file descriptor")
+        return real_read_status(self)
+
+    monkeypatch.setattr(ControlBus, "read_status", flaky_read_status)
+
+    async def worker() -> dict[str, object]:
+        try:
+            await asyncio.sleep(30)
+        except asyncio.CancelledError:
+            return {"status": "cancelled"}
+        return {"status": "unexpected"}
+
+    result = asyncio.run(
+        _run_with_attached_control(worker(), run_dir=run_dir, enabled=True, poll_interval=0.01)
+    )
+    assert result == {"status": "cancelled"}
+    assert len(calls) >= 2
+
+
+def test_embedded_control_watcher_propagates_non_ebadf_errors(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Permission or I/O failures must surface, not blind the watcher."""
+    import errno
+
+    from lh_harness.supervisor.control_bus import ControlBus
+
+    run_dir = tmp_path / "run"
+    ControlBus(run_dir)
+
+    def denied_read_status(self):
+        raise OSError(errno.EACCES, "Permission denied")
+
+    monkeypatch.setattr(ControlBus, "read_status", denied_read_status)
+
+    async def worker() -> dict[str, object]:
+        await asyncio.sleep(0.05)
+        return {"status": "complete"}
+
+    with pytest.raises(OSError) as excinfo:
+        asyncio.run(
+            _run_with_attached_control(worker(), run_dir=run_dir, enabled=True, poll_interval=0.01)
+        )
+    assert excinfo.value.errno == errno.EACCES
+
+
 @pytest.mark.parametrize("requested_action", ["stop", "abort"])
 def test_dashboard_control_stop_keeps_embedded_server_alive(tmp_path: Path, requested_action: str) -> None:
     from lh_harness.supervisor.control_bus import ControlBus

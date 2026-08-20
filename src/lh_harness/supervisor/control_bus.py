@@ -7,6 +7,7 @@ an operator action. A receipt is the only terminal authority for a command.
 
 from __future__ import annotations
 
+import errno
 import json
 import os
 import stat
@@ -404,7 +405,16 @@ def _read_jsonl(path: Path) -> list[dict[str, Any]]:
         if len(raw) > _MAX_CONTROL_LOG_BYTES:
             raise ValueError("control log grew beyond the safe read limit")
     finally:
-        os.close(fd)
+        # Tolerate EBADF only: a stray double-close elsewhere in the process
+        # can recycle this descriptor number between our open and close, and
+        # crashing the reader over that stolen close would take down an
+        # otherwise healthy run.  Any other close failure is a real I/O
+        # problem and must propagate.
+        try:
+            os.close(fd)
+        except OSError as exc:
+            if exc.errno != errno.EBADF:
+                raise
     records: list[dict[str, Any]] = []
     for line in raw.splitlines():
         if len(line) > _MAX_CONTROL_RECORD_BYTES:
@@ -435,7 +445,15 @@ def _read_json_file(path: Path, *, max_bytes: int = _MAX_CONTROL_RECORD_BYTES) -
     except OSError:
         return {}
     finally:
-        os.close(fd)
+        # Same tolerance as above: this poller runs for the whole run, so a
+        # single stolen-descriptor EBADF must degrade to one empty poll, not
+        # a crash that surfaces at shutdown as the process exit status.
+        # Everything else propagates.
+        try:
+            os.close(fd)
+        except OSError as exc:
+            if exc.errno != errno.EBADF:
+                raise
     try:
         value = json.loads(raw.decode("utf-8"))
     except (UnicodeDecodeError, json.JSONDecodeError):
