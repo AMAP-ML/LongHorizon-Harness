@@ -385,7 +385,24 @@ def _fallback_hint(role: str, suffix: str) -> str:
     return ", then ".join(chain)
 
 
+def _use_utf8_console() -> None:
+    """Stop a legacy console codec from mangling harness output.
+
+    Windows still defaults stdout to cp1252, which turns the routing summary's
+    separators into `?` and makes Chinese prompt output unprintable.
+    """
+    for stream in (sys.stdout, sys.stderr):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if reconfigure is None:
+            continue
+        try:
+            reconfigure(encoding="utf-8", errors="replace")
+        except (OSError, ValueError):
+            pass
+
+
 def main(argv: list[str] | None = None) -> int:
+    _use_utf8_console()
     raw_argv = list(sys.argv[1:] if argv is None else argv)
     run_defaults: dict[str, object] = {}
     config_error: ProjectConfigError | None = None
