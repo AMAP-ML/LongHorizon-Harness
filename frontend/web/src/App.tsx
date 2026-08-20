@@ -225,6 +225,7 @@ const MODEL_PRESETS: Record<string, { id: string; label: string }[]> = {
 
 type PublicRole = 'manager' | 'executor' | 'auditor';
 type RoleSelection = RoleRuntimeConfig & { custom: boolean };
+const EFFORT_LEVEL_FALLBACK = ['min', 'low', 'med', 'high', 'xhigh', 'max'];
 const PUBLIC_ROLES: Array<{ id: PublicRole; label: string; description: string }> = [
   { id: 'manager', label: 'Manager', description: '规划、路由与完成判定' },
   { id: 'executor', label: 'Executor', description: '执行 GUI / CLI 子任务' },
@@ -1731,8 +1732,9 @@ function RoleRuntimePicker({ role, selection, meta, onChange }: { role: typeof P
   return <section className="role-runtime-card">
     <div className="role-runtime-title"><span className="role-runtime-mark">{role.label[0]}</span><div><strong>{role.label}</strong><small>{roleDescription}</small></div></div>
     <div className="role-runtime-grid">
-      <label className="drawer-field"><span>Harness</span><select value={selection.agent} onChange={(event) => onChange({ agent: event.target.value, model: '', custom: false })}>{agentChoices.map((choice) => <option value={choice.id} key={choice.id} disabled={choice.available === false}>{choice.label}{choice.available === false ? text(' · 未安装', ' · Not installed') : ''}</option>)}</select></label>
+      <label className="drawer-field"><span>Harness</span><select value={selection.agent} onChange={(event) => onChange({ agent: event.target.value, model: '', effort: selection.effort, custom: false })}>{agentChoices.map((choice) => <option value={choice.id} key={choice.id} disabled={choice.available === false}>{choice.label}{choice.available === false ? text(' · 未安装', ' · Not installed') : ''}</option>)}</select></label>
       <label className="drawer-field"><span>Model</span><select value={selectValue} onChange={(event) => { const value = event.target.value; onChange(value === '__custom__' ? { ...selection, model: '', custom: true } : { ...selection, model: value, custom: false }); }}><option value="">{text(`Provider 默认（${providerDefault}）`, `Provider default (${providerDefault})`)}</option>{choices.map((choice) => <option value={choice.id} key={choice.id}>{choice.label}</option>)}<option value="__custom__">{text('自定义模型…', 'Custom model…')}</option></select></label>
+      <label className="drawer-field"><span>{text('思考强度', 'Effort')}</span><select value={selection.effort || ''} onChange={(event) => onChange({ ...selection, effort: event.target.value || undefined })}><option value="">{text('默认', 'Default')}</option>{(meta?.defaults?.effort_levels?.length ? meta.defaults.effort_levels : EFFORT_LEVEL_FALLBACK).map((level) => <option value={level} key={level}>{level}</option>)}</select></label>
     </div>
     {selection.custom && <input className="role-runtime-custom" autoFocus value={selection.model || ''} onChange={(event) => onChange({ ...selection, model: event.target.value })} placeholder={text('输入 provider 暴露的模型名', 'Enter a model name exposed by the provider')} />}
     <small className={`drawer-field-note ${discovery?.account_scoped ? 'model-detected' : ''}`}>{selection.custom ? text('自定义模型不在检测目录时仍允许尝试；若不存在、无权限或凭据错误，任务会立即失败并显示 provider 原因。', 'You may try a custom model that was not detected. If it is unavailable, unauthorized, or the credentials are invalid, the task will fail immediately with the provider reason.') : [backendScopeNote, discoveryNote].filter(Boolean).join(' ')}</small>
@@ -1743,9 +1745,9 @@ function DetailsDrawer({ creating, runId, snapshot, meta, selectedRound, setSele
   const { language, text } = useUiLanguage();
   const [task, setTask] = useState('');
   const [roleSelections, setRoleSelections] = useState<Record<PublicRole, RoleSelection>>({
-    manager: { agent: 'codex', model: '', custom: false },
-    executor: { agent: 'codex', model: '', custom: false },
-    auditor: { agent: 'codex', model: '', custom: false },
+    manager: { agent: 'codex', model: '', effort: undefined, custom: false },
+    executor: { agent: 'codex', model: '', effort: undefined, custom: false },
+    auditor: { agent: 'codex', model: '', effort: undefined, custom: false },
   });
   const rolesInitialised = useRef(false);
   const [modelRefreshBusy, setModelRefreshBusy] = useState(false);
@@ -1760,7 +1762,7 @@ function DetailsDrawer({ creating, runId, snapshot, meta, selectedRound, setSele
     setRoleSelections(Object.fromEntries(PUBLIC_ROLES.map(({ id }) => {
       const configured = meta.defaults?.roles?.[id];
       const roleAgent = configured?.agent || fallbackAgent;
-      return [id, { agent: roleAgent, model: configured?.model || '', custom: false }];
+      return [id, { agent: roleAgent, model: configured?.model || '', effort: configured?.effort || undefined, custom: false }];
     })) as Record<PublicRole, RoleSelection>);
     rolesInitialised.current = true;
   }, [meta]);
@@ -1778,6 +1780,7 @@ function DetailsDrawer({ creating, runId, snapshot, meta, selectedRound, setSele
   const resolvedRoles = Object.fromEntries(PUBLIC_ROLES.map(({ id }) => [id, {
     agent: roleSelections[id].agent,
     model: roleSelections[id].model?.trim() || defaultModel(meta, roleSelections[id].agent),
+    ...(roleSelections[id].effort ? { effort: roleSelections[id].effort } : {}),
   }])) as Record<PublicRole, RoleRuntimeConfig>;
   return <div className="drawer-backdrop" onClick={onClose}><aside className={`details-drawer ${creating ? 'create-drawer' : ''}`} role="dialog" aria-modal="true" aria-label={creating ? text('创建新任务', 'Create new task') : text('会话详情', 'Task details')} onClick={(event) => event.stopPropagation()}>
     <div className="drawer-header"><div><div className="drawer-eyebrow">{creating ? text('新任务', 'NEW TASK') : text('会话详情', 'TASK DETAILS')}</div><h2>{creating ? text('创建 LongHorizon 任务', 'Create a LongHorizon task') : text('详情', 'Details')}</h2></div><button className="drawer-close" onClick={onClose} aria-label={text('关闭', 'Close')}><X size={18} /></button></div>
@@ -1792,6 +1795,7 @@ function DetailsDrawer({ creating, runId, snapshot, meta, selectedRound, setSele
       <label className="drawer-field"><span>Workspace <small>{text('可选', 'optional')}</small></span><input value={workspace} onChange={(event) => setWorkspace(event.target.value)} placeholder={text('使用 Web 服务的工作区根目录', 'Use the Web server workspace root')} /></label>
       <div className="drawer-actions"><button onClick={onClose}>{text('取消', 'Cancel')}</button><button className="primary-action" disabled={!task.trim() || controlBusy || PUBLIC_ROLES.some(({ id }) => !roleSelections[id].agent || roleSelections[id].custom && !roleSelections[id].model?.trim())} onClick={() => void onCreate(task.trim(), resolvedRoles, workspace.trim(), maxRounds, promptLanguage)}>{controlBusy ? text('正在启动…', 'Starting…') : text('开始任务', 'Start task')}</button></div>
     </> : <>
+      {snapshot.run.role_configs && <div className="role-binding-strip" aria-label={text('角色运行配置', 'Role runtime configuration')}>{PUBLIC_ROLES.map(({ id, label }) => { const spec = snapshot.run.role_configs?.[id]; return spec ? <span className="role-binding-chip" key={id} title={`${label}: ${spec.agent} · ${spec.model}${spec.effort ? ` · effort ${spec.effort}` : ''}`}><strong>{label}</strong><span>{spec.model}</span>{spec.effort && <em>{spec.effort}</em>}</span> : null; })}</div>}
       <div className="details-tabs" role="tablist" aria-label={text('详情类别', 'Detail categories')}><button id="details-tab-artifacts" role="tab" aria-controls="details-panel-artifacts" aria-selected={tab === 'artifacts'} tabIndex={tab === 'artifacts' ? 0 : -1} className={tab === 'artifacts' ? 'active' : ''} onClick={() => setTab('artifacts')}>{text('运行记录', 'Run records')}</button><button id="details-tab-trajectory" role="tab" aria-controls="details-panel-trajectory" aria-selected={tab === 'trajectory'} tabIndex={tab === 'trajectory' ? 0 : -1} className={tab === 'trajectory' ? 'active' : ''} onClick={() => setTab('trajectory')}>{text('执行轨迹', 'Trajectory')}</button><button id="details-tab-events" role="tab" aria-controls="details-panel-events" aria-selected={tab === 'events'} tabIndex={tab === 'events' ? 0 : -1} className={tab === 'events' ? 'active' : ''} onClick={() => setTab('events')}>{text('事件', 'Events')}</button></div>
       <div className="drawer-rounds"><span>{text('轮次', 'Rounds')}</span>{hiddenRounds > 0 && <button className="drawer-round-more" onClick={() => setRoundLimit((limit) => Math.min(snapshot.rounds.length, limit + MAX_TRAJECTORY_ROUNDS))}>{text(`+${hiddenRounds} 更早`, `+${hiddenRounds} earlier`)}</button>}{roundChoices.map((round) => <button className={round.round_index === selectedRound ? 'active' : ''} key={round.round_index} onClick={() => setSelectedRound(round.round_index)}>R{round.round_index}</button>)}</div>
       {tab === 'artifacts' && <div id="details-panel-artifacts" className="drawer-content" role="tabpanel" aria-labelledby="details-tab-artifacts"><p className="drawer-artifact-note">{text(`这里是本轮三角色的运行记录。真实交付物保存在任务 Workspace${snapshot.run.workspace ? `：${snapshot.run.workspace}` : ''} 或目标应用中，Auditor 会在同一真实环境里独立检查。`, `These are the three roles' records for this round. Actual deliverables are saved in the task workspace${snapshot.run.workspace ? `: ${snapshot.run.workspace}` : ''} or the target application, where the Auditor independently checks them.`)}</p><div className="artifact-list-drawer">{artifactList?.artifacts.map((name) => <button className={name === artifactName ? 'active' : ''} title={name} key={name} onClick={() => void openArtifact(selectedRound || 0, name)}>{name}</button>)}{selectedRound === null && <span className="drawer-muted">{text('暂无轮次结果。', 'No round results yet.')}</span>}{selectedRound !== null && artifactError && <div className="drawer-error-state"><span className="drawer-error">{text('记录加载失败：', 'Failed to load records: ')}{compactText(artifactError, 240)}</span>{retryArtifacts && <button type="button" onClick={retryArtifacts}>{text('重试', 'Retry')}</button>}</div>}{selectedRound !== null && !artifactError && !artifactList && <span className="drawer-muted">{text('正在加载运行记录…', 'Loading run records…')}</span>}{artifactList && !artifactList.artifacts.length && <span className="drawer-muted">{text('本轮暂无运行记录。', 'No run records for this round.')}</span>}</div>{artifactName && isImageArtifact(artifactName) ? <div className="drawer-image-preview"><ImageGallery images={[artifactRawUrl(runId, selectedRound || 0, artifactName)]} label={artifactName} /></div> : <pre className="drawer-pre">{artifactText || text('请选择一条运行记录。', 'Select a run record.')}</pre>}</div>}

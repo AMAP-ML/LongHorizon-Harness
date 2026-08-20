@@ -483,7 +483,12 @@ body { -webkit-font-smoothing: antialiased; -moz-osx-font-smoothing: grayscale; 
 .role-runtime-title strong { color: #35383b; font-size: 11px; }
 .role-runtime-title small { color: #929497; font-size: 9px; }
 .role-runtime-mark { display: grid; place-items: center; width: 22px; height: 22px; border-radius: 6px; color: #2f6f5b; background: #e8f3ee; font-size: 10px; font-weight: 700; }
-.role-runtime-grid { display: grid; grid-template-columns: minmax(0, .8fr) minmax(0, 1.2fr); gap: 8px; }
+.role-runtime-grid { display: grid; grid-template-columns: minmax(0, .95fr) minmax(0, 1.15fr) minmax(0, .5fr); gap: 8px; }
+.role-binding-strip { display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 10px; }
+.role-binding-chip { display: inline-flex; align-items: center; gap: 6px; max-width: 100%; padding: 4px 9px; border: 1px solid #e2e3e4; border-radius: 999px; background: #fafafa; font-size: 11px; color: #62666a; }
+.role-binding-chip strong { color: #26292c; font-weight: 600; }
+.role-binding-chip span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 220px; }
+.role-binding-chip em { font-style: normal; padding: 1px 7px; border-radius: 999px; background: #e8f0ec; color: #39735f; font-weight: 600; }
 .role-runtime-grid .drawer-field { margin: 0; }
 .role-runtime-custom { width: 100%; box-sizing: border-box; }
 .drawer-field-note.model-detected { color: #39735f; }

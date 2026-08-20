@@ -385,3 +385,19 @@ def test_supervisor_rejects_bad_role_effort() -> None:
         _normalise_role_configs(
             {"executor": {"effort": "ultra"}}, agent="codex", model=None
         )
+
+
+def test_snapshot_provenance_keeps_valid_role_effort() -> None:
+    from lh_harness.webapi.snapshot import _safe_role_configs
+
+    cleaned = _safe_role_configs(
+        {
+            "manager": {"agent": "codex", "model": "m", "effort": "high"},
+            "executor": {"agent": "codex", "model": "m", "effort": "bogus"},
+            "auditor": {"agent": "codex", "model": "m"},
+        }
+    )
+
+    assert cleaned["manager"]["effort"] == "high"
+    assert "effort" not in cleaned["executor"]
+    assert "effort" not in cleaned["auditor"]

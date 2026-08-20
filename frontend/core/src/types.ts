@@ -77,7 +77,7 @@ export interface RunSummary {
   log_dir: string;
   agent?: string;
   model?: string | null;
-  role_configs?: Record<'manager' | 'executor' | 'auditor', { agent: string; model: string }>;
+  role_configs?: Record<'manager' | 'executor' | 'auditor', { agent: string; model: string; effort?: string }>;
   workspace?: string;
   max_rounds?: number;
   prompt_language?: 'en' | 'zh';
@@ -101,7 +101,7 @@ export interface Snapshot {
     final_response?: string;
     agent?: string;
     model?: string | null;
-    role_configs?: Record<'manager' | 'executor' | 'auditor', { agent: string; model: string }>;
+    role_configs?: Record<'manager' | 'executor' | 'auditor', { agent: string; model: string; effort?: string }>;
     workspace?: string;
     max_rounds?: number;
     prompt_language?: 'en' | 'zh';

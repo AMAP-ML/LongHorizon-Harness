@@ -112,13 +112,13 @@ export interface WebMeta {
   /** Server-discovered agent/model catalogue. Older servers may omit these. */
   agents?: Array<{ id: string; label?: string; available?: boolean; default_model?: string; models?: ModelChoice[]; discovery?: ModelDiscovery }>;
   models?: Record<string, ModelChoice[]>;
-  defaults?: { agent?: string; model?: string; roles?: Record<string, RoleRuntimeConfig> };
+  defaults?: { agent?: string; model?: string; effort_levels?: string[]; roles?: Record<string, RoleRuntimeConfig> };
   model_discovery?: Record<string, ModelDiscovery>;
 }
 
 export interface ModelChoice { id: string; label?: string; availability?: string; is_default?: boolean; reasoning_efforts?: string[] }
 export interface ModelDiscovery { status?: string; source?: string; account_scoped?: boolean; refreshed_at?: string | number | null; warning?: string }
-export interface RoleRuntimeConfig { agent: string; model?: string }
+export interface RoleRuntimeConfig { agent: string; model?: string; effort?: string }
 
 export async function getJson<T>(path: string): Promise<T> {
   const response = await fetch(path, { headers: authHeaders() });
