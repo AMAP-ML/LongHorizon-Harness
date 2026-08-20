@@ -19,12 +19,7 @@ from lh_harness.types import EpisodeBudget
 from lh_harness.utils.agent_cli import resolve_dsh_binary
 from lh_harness.webapi import server as web_server
 
-
-def _executable(path: Path, body: str) -> str:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text("#!/bin/sh\n" + body, encoding="utf-8")
-    path.chmod(0o755)
-    return str(path)
+from .fake_cli import fake_cli as _executable
 
 
 def test_dsh_binary_environment_override() -> None:
@@ -56,10 +51,11 @@ def test_deepseek_adapter_quotes_binary_and_configures_isolated_home(
         role="manager",
     )
 
-    tokens = shlex.split(adapter.command_template.replace("{prompt_path}", "/tmp/prompt.md"))
-    assert tokens[:2] == ["DSH_HOME=/tmp/run with spaces/dsh-home", "DSH_PERMISSION_MODE=read-only"]
-    assert "lh_harness.adapters.deepseek_runner" in tokens
-    assert tokens[tokens.index("--binary") + 1] == binary
+    argv = adapter.argv
+    assert adapter.env["DSH_HOME"] == "/tmp/run with spaces/dsh-home"
+    assert adapter.env["DSH_PERMISSION_MODE"] == "read-only"
+    assert "lh_harness.adapters.deepseek_runner" in argv
+    assert argv[argv.index("--binary") + 1] == binary
     assert adapter.permission_mode == "read-only"
 
 
@@ -67,7 +63,7 @@ def test_deepseek_runner_passes_headless_patch_and_emits_jsonl(
     tmp_path: Path,
     capsys,
 ) -> None:
-    binary = _executable(tmp_path / "bin" / "dsh", "printf '%s\\n' \"$*\"\n")
+    binary = _executable(tmp_path / "bin" / "dsh", "print(' '.join(sys.argv[1:]))\n")
     prompt_path = tmp_path / "prompt.md"
     prompt_path.write_text("fix the project", encoding="utf-8")
 
@@ -86,7 +82,7 @@ def test_deepseek_runner_passes_headless_patch_and_emits_jsonl(
 def test_deepseek_runner_preserves_failure_and_stderr(tmp_path: Path, capfd) -> None:
     binary = _executable(
         tmp_path / "bin" / "dsh",
-        "printf 'provider unavailable\\n' >&2\nexit 9\n",
+        "sys.stderr.write('provider unavailable\\n')\nsys.exit(9)\n",
     )
     prompt_path = tmp_path / "prompt.md"
     prompt_path.write_text("task", encoding="utf-8")
@@ -127,7 +123,7 @@ def test_deepseek_adapter_runs_end_to_end_with_fake_dsh(
     monkeypatch,
     tmp_path: Path,
 ) -> None:
-    binary = _executable(tmp_path / "DeepSeek Harness" / "dsh", "printf 'done by dsh\\n'\n")
+    binary = _executable(tmp_path / "DeepSeek Harness" / "dsh", "print('done by dsh')\n")
     monkeypatch.setattr(deepseek_adapter_module, "resolve_dsh_binary", lambda: binary)
     workspace = tmp_path / "workspace"
     workspace.mkdir()
@@ -157,7 +153,7 @@ def test_web_meta_exposes_deepseek_backend_and_default_model(
     tmp_path: Path,
 ) -> None:
     # Availability is proven by running `--version`, so the stub answers it.
-    binary = _executable(tmp_path / "bin" / "dsh", 'echo "dsh 0.9.1"\nexit 0\n')
+    binary = _executable(tmp_path / "bin" / "dsh", 'print("dsh 0.9.1")\n')
     monkeypatch.setattr(web_server, "resolve_dsh_binary", lambda: binary)
 
     client = TestClient(web_server.create_app(runs_root=tmp_path / "runs"))

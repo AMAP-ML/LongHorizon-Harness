@@ -82,18 +82,32 @@ def path_deny_rules(paths: tuple[str, ...] | list[str]) -> tuple[str, ...]:
     Deny rules still apply under `--dangerously-skip-permissions`, and a `Read`
     deny also blocks the Edit tool. `//` anchors the pattern at the filesystem
     root; anything else would resolve against the settings source.
+
+    On Windows an absolute path already starts with a drive letter, so the bare
+    `C:/...` form is emitted alongside the `//` one. Both are listed because a
+    deny rule that fails to match would silently expose the run's own logs and
+    prompts to the auditor, and an extra unmatched rule costs nothing.
     """
     rules: list[str] = []
     for raw in paths:
-        resolved = Path(raw).expanduser().resolve().as_posix().lstrip("/")
-        if not resolved:
+        posix = Path(raw).expanduser().resolve().as_posix()
+        stripped = posix.lstrip("/")
+        if not stripped:
             continue
+        roots = [f"//{stripped}"]
+        if _has_drive_letter(posix):
+            roots.append(posix)
         for tool in ("Read", "Edit"):
-            for pattern in (f"//{resolved}", f"//{resolved}/**"):
-                rule = f"{tool}({pattern})"
-                if rule not in rules:
-                    rules.append(rule)
+            for root in roots:
+                for pattern in (root, f"{root}/**"):
+                    rule = f"{tool}({pattern})"
+                    if rule not in rules:
+                        rules.append(rule)
     return tuple(rules)
+
+
+def _has_drive_letter(posix_path: str) -> bool:
+    return len(posix_path) >= 2 and posix_path[1] == ":" and posix_path[0].isalpha()
 
 
 @dataclass(frozen=True)

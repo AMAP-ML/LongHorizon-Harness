@@ -12,6 +12,8 @@ from lh_harness.model_catalog import (
 from lh_harness.provider_errors import classify_agent_runtime_failure
 from lh_harness.types import EpisodeResult
 
+from .fake_cli import fake_cli
+
 
 def test_codex_catalog_uses_visible_account_cache(monkeypatch, tmp_path: Path) -> None:
     cache = tmp_path / "models_cache.json"
@@ -61,12 +63,10 @@ def test_codex_catalog_keeps_reasoning_efforts_without_rejecting_new_values() ->
 def test_deepseek_catalog_exposes_default_model_and_cli_availability(tmp_path: Path) -> None:
     # `available` is proven by running `--version`, not by a PATH lookup, so the
     # stub has to answer it the way a real CLI does.
-    binary = tmp_path / "dsh"
-    binary.write_text('#!/bin/sh\necho "dsh 0.9.1"\nexit 0\n', encoding="utf-8")
-    binary.chmod(0o755)
+    binary = fake_cli(tmp_path / "dsh", 'print("dsh 0.9.1")\n')
 
-    models, discovery = _discover_deepseek_models(str(binary))
-    catalog = discover_model_catalog(codex_binary=None, dsh_binary=str(binary))
+    models, discovery = _discover_deepseek_models(binary)
+    catalog = discover_model_catalog(codex_binary=None, dsh_binary=binary)
     agent = next(item for item in catalog["agents"] if item["id"] == "deepseek_harness")
 
     assert models == [

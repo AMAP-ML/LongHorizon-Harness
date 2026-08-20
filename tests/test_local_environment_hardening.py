@@ -1,12 +1,16 @@
 from __future__ import annotations
 
 import asyncio
-import shlex
+import sys
 from pathlib import Path
 
 import pytest
 
-from lh_harness.environment.local import LocalEnvironment, _open_trajectory_file
+from lh_harness.environment.local import (
+    LocalEnvironment,
+    _open_trajectory_file,
+    _screenshot_commands,
+)
 
 
 def test_trajectory_writer_rejects_symlinked_parent(tmp_path: Path) -> None:
@@ -38,28 +42,27 @@ def test_trajectory_writer_rejects_hardlink_without_truncating_alias(tmp_path: P
     assert target.read_bytes() == b"private trajectory"
 
 
-async def _capture_screenshot_command(env: LocalEnvironment, monkeypatch) -> str:
-    captured: list[str] = []
+def test_screenshot_never_lets_a_scratch_path_become_command_syntax(tmp_path: Path) -> None:
+    """A caller-controlled scratch directory must stay data, not syntax.
 
-    async def fake_exec(command: str, **_kwargs):
-        captured.append(command)
-        return None
+    The capture is argv-based now, so on POSIX the path is simply its own
+    element and cannot be reparsed. Windows still has to embed it in a
+    PowerShell literal, which is where the escaping is asserted.
+    """
 
-    monkeypatch.setattr(env, "exec", fake_exec)
-    await env.screenshot()
-    return captured[0]
-
-
-def test_screenshot_path_is_shell_quoted(tmp_path: Path, monkeypatch) -> None:
-    # A caller-controlled scratch directory must not become shell syntax in
-    # the fallback screenshot command.
-    unsafe = tmp_path / "scratch;touch pwned"
+    unsafe = tmp_path / "scratch;touch pwned" if sys.platform != "win32" else tmp_path / "scratch'touch pwned"
     unsafe.mkdir()
-    command = asyncio.run(_capture_screenshot_command(LocalEnvironment(str(unsafe)), monkeypatch))
+    target = unsafe / "_lh_harness_screenshot.png"
+    commands = _screenshot_commands(target)
 
-    expected = shlex.quote(str(unsafe / "_lh_harness_screenshot.png"))
-    assert expected in command
-    assert f"-f {unsafe / '_lh_harness_screenshot.png'}" not in command
+    assert commands, "every supported platform provides at least one capture command"
+    for argv in commands:
+        if sys.platform == "win32":
+            script = argv[-1]
+            assert f"'{str(target)}'" not in script
+            assert str(target).replace("'", "''") in script
+        else:
+            assert str(target) in argv
 
 
 def test_embedded_agent_does_not_inherit_web_control_token(monkeypatch) -> None:
@@ -75,6 +78,7 @@ def test_embedded_agent_does_not_inherit_web_control_token(monkeypatch) -> None:
     class FakeProcess:
         pid = 4242
         returncode = 0
+        stdin = None
         stdout = EmptyStream()
         stderr = EmptyStream()
 
@@ -86,7 +90,9 @@ def test_embedded_agent_does_not_inherit_web_control_token(monkeypatch) -> None:
         return FakeProcess()
 
     monkeypatch.setenv("LH_HARNESS_WEB_TOKEN", "control-secret")
-    monkeypatch.setattr(asyncio, "create_subprocess_shell", launch)
+    # exec() spawns an explicit shell binary through create_subprocess_exec;
+    # there is no create_subprocess_shell anywhere in the harness any more.
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", launch)
     monkeypatch.setattr("lh_harness.environment.local.track_process_group", lambda _pid: None)
     monkeypatch.setattr("lh_harness.environment.local.untrack_process_group", lambda _pid: None)
 
