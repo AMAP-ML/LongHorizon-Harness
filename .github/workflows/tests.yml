@@ -21,11 +21,12 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # Both supported platforms, at both ends of requires-python: the
-        # oldest interpreter the project promises and the newest it is
-        # developed against. The suite needs no Node toolchain -- the Web
-        # bundle is a packaging artifact, not a test dependency.
-        os: [ubuntu-latest, windows-latest]
+        # Ubuntu only while this branch is based on a main that predates the
+        # Windows support in #57: the Windows lanes there exercise platform
+        # code this branch does not carry, and fail on main's known
+        # POSIX-only layers (os.killpg and friends). #57 brings the full
+        # ubuntu + windows matrix; on merge, its version of this file wins.
+        os: [ubuntu-latest]
         python: ["3.10", "3.14"]
     steps:
       - uses: actions/checkout@v4
