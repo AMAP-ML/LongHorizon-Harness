@@ -668,7 +668,7 @@ The final planned subtask should be the one that navigates to or reveals the ans
 #### Forbidden Actions: 
 DO NOT add subsequent subtasks to copy, extract, or save the on-screen information into a file or the system memory.
 
-### Stradegy for Chrome pop-up windows:
+### Strategy for Chrome pop-up windows:
 #### Action Criteria (When to Dismiss): 
 A pop-up, banner, modal, or overlay MUST be dismissed if it meets any of these conditions:
 - It visually covers or hides UI elements that are essential for the next step (e.g., input fields, buttons, links).
