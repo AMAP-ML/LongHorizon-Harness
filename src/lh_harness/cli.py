@@ -727,7 +727,8 @@ def _doctor_command() -> int:
         _doctor_line(
             "FAIL",
             "Agent runtime",
-            "install Claude Code, Codex CLI, OpenCode, or DeepSeek Harness and add it to PATH",
+            "install Claude Code, Codex CLI, OpenCode, GitHub Copilot CLI, or DeepSeek Harness"
+            " and add it to PATH",
         )
         failures += 1
 
