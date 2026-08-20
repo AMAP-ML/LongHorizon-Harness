@@ -8,6 +8,7 @@ metacharacter, quote, or redirect survives into the command the harness runs.
 from __future__ import annotations
 
 import asyncio
+import os
 
 import pytest
 
@@ -217,7 +218,11 @@ def test_deny_rules_cover_drive_letter_paths():
 
     rules = path_deny_rules(("C:/runs/logs",))
     joined = " ".join(rules)
-    if ":" in str(__import__("pathlib").Path("C:/runs/logs").resolve()):
+    # The platform has to be asked directly. `"C:/runs/logs"` is a *relative*
+    # path on POSIX, where it resolves to `<cwd>/C:/runs/logs` -- a string that
+    # contains a colon too, so inspecting the resolved path for one would run
+    # the Windows-only assertion on Linux and fail there.
+    if os.name == "nt":
         # On Windows the bare drive form must be emitted alongside the // form,
         # or harness-owned paths would not actually be hidden.
         assert "Read(C:/runs/logs)" in joined
