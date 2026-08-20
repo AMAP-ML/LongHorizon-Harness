@@ -192,7 +192,7 @@ Steps 1–2 are once per machine; step 3 is once per project. Then run tasks fro
 | One agent runtime on `PATH`: [`codex`](https://github.com/openai/codex#installing-and-running-codex-cli), [`claude`](https://docs.anthropic.com/en/docs/claude-code/getting-started), [`opencode`](https://github.com/anomalyco/opencode), or [`dsh`](https://github.com/deepseek-ai/deepseek-harness) | Actually executing the work. Install more than one if you want to mix backends across roles. |
 | [Node.js](https://nodejs.org) 20 or later | The npm-distributed computer-use plugins. DeepSeek Harness itself currently requires Node.js `^22.19.0` or `>=24.0.0`. |
 
-> **Platform status:** Currently tested on macOS. Windows support is included but has not yet been thoroughly tested.
+> **Platform status:** Tested on macOS and Windows. Agent CLIs are launched as plain subprocesses — no shell is involved — so command construction behaves identically on every platform. On Windows the harness also escapes the 260-character `MAX_PATH` limit automatically, which run directories reach easily on a deep project path.
 
 Run `lh-harness doctor` at any point to check all of the above; see [Verify the environment](#verify-the-environment).
 
