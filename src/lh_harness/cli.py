@@ -229,6 +229,47 @@ def _read_supervised_record(
     return value
 
 
+def _worker_identity_pids() -> frozenset[int]:
+    """PIDs that legitimately identify this worker process.
+
+    On Windows, a Python 3.13+ venv ``Scripts\\python.exe`` is a launcher that
+    starts the real interpreter as a *child* process.  The pid the supervisor
+    recorded from ``Popen`` is then our parent's pid, not our own, so the
+    parent is part of this worker's identity there.  POSIX keeps the exact
+    single-pid match.
+    """
+
+    pids = {os.getpid()}
+    if os.name == "nt":
+        pids.add(os.getppid())
+    return frozenset(pids)
+
+
+def _supervisor_pid_matches(recorded_parent: int) -> bool:
+    """Check a reservation's ``supervisor_pid`` against this worker's lineage.
+
+    POSIX: the supervisor is exactly our parent.  Windows: the venv launcher
+    sits between us and the supervisor, so ``getppid`` is the launcher and the
+    grandparent is not portably reachable without extra dependencies; accept a
+    recorded parent that is our direct parent or a process that is still
+    alive.  The window this guards is the milliseconds between ``Popen`` and
+    the owner-promotion write, so the liveness check keeps the practical
+    protection (a stale reservation whose supervisor died is still rejected).
+    """
+
+    if recorded_parent <= 0:
+        return False
+    if recorded_parent == os.getppid():
+        return True
+    if os.name != "nt":
+        return False
+    try:
+        os.kill(recorded_parent, 0)
+    except OSError:
+        return False
+    return True
+
+
 def _adopt_supervised_run_dir(
     runs_root: str | Path,
     requested_run_id: str | None,
@@ -293,7 +334,7 @@ def _adopt_supervised_run_dir(
         owner_pid = int(owner.get("pid", 0) or 0)
     except (TypeError, ValueError) as exc:
         raise ValueError("supervised run reservation has an invalid owner pid") from exc
-    if owner_pid not in {0, os.getpid()}:
+    if owner_pid != 0 and owner_pid not in _worker_identity_pids():
         raise ValueError("supervised run reservation belongs to another process")
     if owner_pid == 0:
         # There is a small, legitimate window between Popen() returning and
@@ -304,7 +345,7 @@ def _adopt_supervised_run_dir(
             reservation_parent = int(owner.get("supervisor_pid", 0) or 0)
         except (TypeError, ValueError) as exc:
             raise ValueError("supervised run reservation has an invalid parent pid") from exc
-        if reservation_parent <= 0 or reservation_parent != os.getppid():
+        if not _supervisor_pid_matches(reservation_parent):
             raise ValueError("supervised run reservation is not owned by this worker")
     if str(status.get("run_id") or candidate) != candidate:
         raise ValueError("supervised run status has the wrong run id")
@@ -358,15 +399,18 @@ def _claim_supervised_owner(run_id: str, run_dir: Path) -> None:
         existing_pid = int(value.get("pid", 0) or 0)
     except (TypeError, ValueError) as exc:
         raise ValueError("supervised run owner pid is invalid") from exc
-    if existing_pid not in {0, os.getpid()}:
+    if existing_pid != 0 and existing_pid not in _worker_identity_pids():
         raise ValueError("supervised run owner belongs to another process")
-    if existing_pid == os.getpid():
+    if existing_pid in _worker_identity_pids():
+        # The owner already points at this worker. On Windows that may be the
+        # venv launcher's pid rather than our own; keep it — the supervisor
+        # signals the whole tree, so the launcher is the better kill handle.
         return
     try:
         parent_pid = int(value.get("supervisor_pid", 0) or 0)
     except (TypeError, ValueError) as exc:
         raise ValueError("supervised run parent pid is invalid") from exc
-    if parent_pid != os.getppid():
+    if not _supervisor_pid_matches(parent_pid):
         raise ValueError("supervised run parent does not match its reservation")
     from .supervisor.control_bus import ControlBus
 
