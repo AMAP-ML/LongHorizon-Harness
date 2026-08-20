@@ -4,7 +4,7 @@
 
 ### Loop Engineering for Computer-Use Agents
 
-**Give Claude Code, Codex, OpenCode, or DeepSeek Harness a goal once. Keep it working across desktop apps and the terminal for dozens of hours.**
+**Give Claude Code, Codex, OpenCode, GitHub Copilot CLI, or DeepSeek Harness a goal once. Keep it working across desktop apps and the terminal for dozens of hours.**
 
 **Plan → act → verify → checkpoint or recover → repeat — until the work is actually done.**
 
@@ -18,7 +18,7 @@
 </p>
 
 [![Python](https://img.shields.io/badge/python-≥3.10-blue?logo=python&logoColor=white)](https://www.python.org/)
-[![Agents](https://img.shields.io/badge/backends-Claude%20Code%20|%20Codex%20|%20OpenCode%20|%20DeepSeek-8A2BE2)](#any-model-any-agent-backend)
+[![Agents](https://img.shields.io/badge/backends-Claude%20Code%20|%20Codex%20|%20OpenCode%20|%20Copilot%20|%20DeepSeek-8A2BE2)](#any-model-any-agent-backend)
 [![Benchmarks](https://img.shields.io/badge/benchmarks-WeaveBench%20|%20OSWorld%202.0%20|%20Terminal--Bench%202.1-orange)](#hundreds-of-real-tasks-measured-gains)
 
 [Usage](#one-command-full-visibility) · [The Loop](#loop-engineering-for-real-computer-environments) · [Computer Use](#desktop-apps-and-cli-one-continuous-task) · [Results](#hundreds-of-real-tasks-measured-gains) · [Project Website](https://lh-harness.pages.dev) · [简体中文](README.zh-CN.md)
@@ -30,7 +30,7 @@
 
 > **The model determines what an agent can do in one round. LongHorizon-Harness engineers the loop around it: what to do next, how to verify the result in the real computer, what progress to preserve, and how to continue after failure or context refresh.**
 
-**A Loop Engineering system for Claude Code, Codex, OpenCode, and DeepSeek Harness. One-command install, ready to run.**
+**A Loop Engineering system for Claude Code, Codex, OpenCode, GitHub Copilot CLI, and DeepSeek Harness. One-command install, ready to run.**
 
 LongHorizon-Harness turns existing agents into long-running computer-use systems. Across desktop apps and the terminal CLI, it continuously recovers the goal and verified state, selects the next bounded step, executes it with a fresh context, checks the actual result, and then checkpoints accepted progress or feeds failure evidence into the next round. It does not train a new model or replace an existing agent; it provides the durable execution loop around one.
 

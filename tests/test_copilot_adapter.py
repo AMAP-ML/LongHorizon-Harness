@@ -11,6 +11,8 @@ from fastapi.testclient import TestClient
 from lh_harness.adapters import copilot as copilot_adapter_module
 from lh_harness.adapters.copilot import CopilotAdapter, visible_output
 from lh_harness.environment.local import LocalEnvironment
+from lh_harness.provider_errors import classify_agent_runtime_failure
+from lh_harness.runtime_signals import hard_signal_labels
 from lh_harness.types import DEFAULT_COPILOT_MODEL, EpisodeBudget
 from lh_harness.utils.agent_cli import resolve_copilot_binary
 from lh_harness.webapi import server as web_server
@@ -138,6 +140,62 @@ def test_copilot_visible_output_strips_decoration_and_prefers_structured() -> No
     # A future structured mode is handled by the shared parsers.
     structured = json.dumps({"role": "assistant", "content": "structured answer"})
     assert visible_output(structured) == "structured answer"
+
+
+def test_copilot_visible_output_keeps_prose_that_quotes_a_json_record() -> None:
+    # Copilot is the only backend whose stdout is prose, and the shared format
+    # detector switches on a single JSON-looking line.  An agent quoting a
+    # record mid-answer must not have that record stand in for the answer.
+    answer = (
+        "Status: complete\n"
+        "The offending record was:\n"
+        '{"role": "assistant", "content": "ok"}\n'
+        "Conclusion: no rework needed."
+    )
+    assert visible_output(answer) == answer
+
+    for record in (
+        '{"type": "result", "result": "42"}',
+        '{"type": "dsh.result", "text": "HIJACKED"}',
+    ):
+        prose = f"Everything is fine.\n{record}\nDone."
+        assert visible_output(prose) == prose
+
+
+def test_copilot_answer_quoting_an_error_record_is_not_a_runtime_failure(
+    monkeypatch, tmp_path: Path
+) -> None:
+    binary = _executable(
+        tmp_path / "bin" / "copilot",
+        "cat > /dev/null\n"
+        "printf 'Fixed it. The log said:\\n"
+        '{"type": "error", "message": "ENOENT"}\\nAll good.\\n\'\n',
+    )
+    monkeypatch.setattr(copilot_adapter_module, "resolve_copilot_binary", lambda: binary)
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    adapter = CopilotAdapter(
+        workspace_path=str(workspace),
+        prompt_dir=str(tmp_path / "prompts"),
+        role="cli_executor",
+    )
+
+    result = asyncio.run(
+        adapter.run_episode(
+            "task",
+            LocalEnvironment(tmp_dir=str(tmp_path / "tmp")),
+            EpisodeBudget(max_duration_seconds=10),
+        )
+    )
+
+    # The signal detector reads stdout as a provider event stream; for Copilot
+    # stdout is the answer, so a quoted error record must not fail an exit-0
+    # round. A real failure still arrives on stderr with a non-zero exit code.
+    assert result.status == "done"
+    assert result.metadata["exit_code"] == 0
+    assert hard_signal_labels(result.metadata["runtime_signals"]) == []
+    assert "All good." in result.metadata["assistant_visible_output"]
+    assert classify_agent_runtime_failure(result) is None
 
 
 def test_copilot_adapter_runs_end_to_end_with_fake_copilot(monkeypatch, tmp_path: Path) -> None:

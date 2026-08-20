@@ -4,7 +4,7 @@
 
 ### 面向 Computer-Use Agent 的 Loop Engineering
 
-**只需向 Claude Code、Codex、OpenCode 或 DeepSeek Harness 给出一次目标，即可让它跨桌面 App 与终端持续工作数十个小时。**
+**只需向 Claude Code、Codex、OpenCode、GitHub Copilot CLI 或 DeepSeek Harness 给出一次目标，即可让它跨桌面 App 与终端持续工作数十个小时。**
 
 **规划 → 执行 → 验证 → 保存或恢复 → 重复，直到任务真正完成。**
 
@@ -18,7 +18,7 @@
 </p>
 
 [![Python](https://img.shields.io/badge/python-≥3.10-blue?logo=python&logoColor=white)](https://www.python.org/)
-[![Agents](https://img.shields.io/badge/backends-Claude%20Code%20|%20Codex%20|%20OpenCode%20|%20DeepSeek-8A2BE2)](#任意模型任意-agent-后端)
+[![Agents](https://img.shields.io/badge/backends-Claude%20Code%20|%20Codex%20|%20OpenCode%20|%20Copilot%20|%20DeepSeek-8A2BE2)](#任意模型任意-agent-后端)
 [![Benchmarks](https://img.shields.io/badge/benchmarks-WeaveBench%20|%20OSWorld%202.0%20|%20Terminal--Bench%202.1-orange)](#数百个真实任务规模化验证)
 
 [Usage](#一条命令全程可见) · [The Loop](#面向真实电脑环境的-loop-engineering) · [Computer Use](#桌面-app-与命令行一个连续任务) · [Results](#数百个真实任务规模化验证) · [Project Website](https://lh-harness.pages.dev) · [English](README.md)
@@ -30,7 +30,7 @@
 
 > **模型决定 Agent 一轮能做什么。LongHorizon-Harness 负责工程化模型外部的执行闭环：下一步做什么、如何在真实电脑中验证、哪些进度可以保存，以及在失败或上下文刷新后如何继续。**
 
-**一套面向 Claude Code、Codex、OpenCode 和 DeepSeek Harness 的 Loop Engineering 系统。一条命令安装，开箱即用。**
+**一套面向 Claude Code、Codex、OpenCode、GitHub Copilot CLI 和 DeepSeek Harness 的 Loop Engineering 系统。一条命令安装，开箱即用。**
 
 LongHorizon-Harness 将现有 Agent 变成可长期运行的 computer-use 系统。它在桌面 App 与终端 CLI 之间持续恢复目标和已验证状态、选择下一项有明确边界的工作、用全新上下文执行、检查真实结果，再保存通过验收的进度，或把失败证据带入下一轮。它不训练新模型，也不替换现有 Agent，而是为现有 Agent 提供一套可持续运行的执行闭环。
 

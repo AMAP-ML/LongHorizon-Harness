@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import re
 import shlex
 
@@ -25,19 +26,45 @@ _READ_ONLY_ROLES = {"manager", "final_response"}
 _EXECUTOR_ROLES = {"gui_executor", "cli_executor"}
 
 
+def _is_structured_log(text: str) -> bool:
+    """Return whether the whole stream is a structured log rather than an answer.
+
+    ``detect_format`` switches on a single JSON-looking line, which is correct
+    for a backend that only ever writes JSONL and wrong for this one: Copilot's
+    stdout is the agent's prose, so one quoted record inside an ordinary reply
+    would otherwise stand in for the entire reply.  A genuine structured stream
+    is JSON on every line, so require exactly that before handing the text to
+    the shared parsers.
+    """
+
+    lines = [line for line in text.splitlines() if line.strip()]
+    if not lines:
+        return False
+    for line in lines:
+        try:
+            decoded = json.loads(line)
+        except ValueError:
+            return False
+        if not isinstance(decoded, (dict, list)):
+            return False
+    return True
+
+
 def visible_output(raw: str) -> str:
     """Return the assistant-visible text from a Copilot CLI episode.
 
     Copilot CLI has no structured output mode: in programmatic mode it prints
     the agent's answer as plain text, and ``-s`` strips the surrounding session
-    metadata.  The shared JSON parsers are tried first so that a future
-    structured mode is picked up without touching this adapter.
+    metadata.  A fully structured stream is still handed to the shared JSON
+    parsers, so a future structured mode is picked up without touching this
+    adapter, but prose is returned as prose.
     """
 
     text = str(raw or "")
-    structured = extract_structured_visible_output(text)
-    if structured:
-        return structured
+    if _is_structured_log(text):
+        structured = extract_structured_visible_output(text)
+        if structured:
+            return structured
     return _ANSI_RE.sub("", text).strip()
 
 
@@ -156,6 +183,12 @@ class CopilotAdapter(CommandAgentAdapter):
             budget,
             live_trajectory_path=live_trajectory_path,
         )
+        # The shared runtime-signal detector reads stdout as a provider event
+        # stream.  Copilot's stdout is the agent's own answer, so an ordinary
+        # reply that quotes an error record would raise a hard failure signal on
+        # an exit-0 episode.  A real Copilot failure arrives on stderr with a
+        # non-zero exit code, which the base adapter already reports.
+        result.metadata["runtime_signals"] = []
         result.metadata.update(
             {
                 "copilot_role": self.role,
