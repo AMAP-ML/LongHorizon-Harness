@@ -31,12 +31,15 @@ export interface Approval {
   answers: string[];
   allow_input: boolean;
   input_label: string;
+  /** Budget gates let the operator grant a specific number of extra rounds. */
+  allow_extra_rounds?: boolean;
   context: Record<string, unknown>;
   round_index: number;
   status: 'pending' | 'resolved' | string;
   action: string;
   reason: string;
   user_input: string;
+  extra_rounds?: number;
   created_at: number;
   resolved_at: number | null;
 }
@@ -105,6 +108,12 @@ export interface Snapshot {
     workspace?: string;
     max_rounds?: number;
     prompt_language?: 'en' | 'zh';
+    /** Generation counter: bumped each time a terminal run is resumed in place. */
+    resume_epoch?: number;
+    /** Lifecycle action the operator asked for: 'stop' or 'abort'. */
+    requested_action?: string;
+    /** When the stop signal was sent, used to detect a worker ignoring SIGTERM. */
+    stop_requested_at?: number;
   };
   mission: { task: string; contract_path: string; plan_path: string; verified_state_path: string; report_path: string };
   rounds: RoundView[];

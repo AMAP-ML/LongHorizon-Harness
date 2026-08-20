@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useReducer, useRef, useState, type ReactNode } from 'react';
+import { useEffect, useMemo, useReducer, useRef, useState, type MouseEvent as ReactMouseEvent, type ReactNode } from 'react';
 import { createPortal } from 'react-dom';
 import {
   AlertTriangle,
@@ -41,7 +41,7 @@ import {
   type LucideIcon,
 } from 'lucide-react';
 import { MAX_ROUNDS, type ArtifactList, type EventEnvelope, type RunSummary, type Snapshot } from '../../core/src/types';
-import { availableCommands, isTrajectoryNoise, managerPlanSummary, managerPlanText, normaliseMaxRounds, projectArtifactView, projectStatus, dedupeEvents, parseCommand, parseNewRunArgs, phaseLabel, projectTrajectoryView, reducePanelState, DEFAULT_PANEL_STATE, type ArtifactProjection, type FileChangeItem, type PanelName, type StatusView, type TrajectoryItem, type ValidationResultSummary } from '../../core/src';
+import { availableCommands, isTrajectoryNoise, managerPlanSummary, managerPlanText, normaliseMaxRounds, projectArtifactView, projectStatus, dedupeEvents, parseCommand, parseNewRunArgs, phaseLabel, projectTrajectoryView, reducePanelState, sortTranscript, DEFAULT_PANEL_STATE, type ArtifactProjection, type FileChangeItem, type PanelName, type StatusView, type TrajectoryItem, type ValidationResultSummary } from '../../core/src';
 import {
   abortRun,
   createRun,
@@ -58,10 +58,13 @@ import {
   artifactRawUrl,
   fetchImageSource,
   idempotencyKey,
+  isConflict,
   isUnauthorized,
   setStoredAuthToken,
   storedAuthToken,
   type WebMeta,
+  type AgentChoice,
+  type ModelChoice,
   type RoleRuntimeConfig,
   type TrajectoryView,
 } from './api';
@@ -90,6 +93,29 @@ function rememberRunId(value: string): void {
 
 function useful(text?: string | null): text is string {
   return Boolean(text && text.trim() && !text.includes('produced no readable natural-language output'));
+}
+
+/** Props that dismiss an overlay on a real backdrop click, but not on a drag.
+ *
+ * A plain `onClick` on the backdrop also fires when a text selection *starts*
+ * inside the dialog and ends on the backdrop, because `click` is dispatched to
+ * the nearest common ancestor of mousedown/mouseup. That closed the panel and
+ * discarded the selection mid-gesture, so require both ends on the backdrop.
+ * The armed flag lives in a ref because a re-render (status polling) can land
+ * between the two events.
+ */
+function useBackdropDismiss(onDismiss: () => void) {
+  const armed = useRef(false);
+  return {
+    onMouseDown: (event: ReactMouseEvent) => {
+      armed.current = event.target === event.currentTarget && event.button === 0;
+    },
+    onMouseUp: (event: ReactMouseEvent) => {
+      const dismiss = armed.current && event.target === event.currentTarget;
+      armed.current = false;
+      if (dismiss) onDismiss();
+    },
+  };
 }
 
 function compactText(text: string, limit = 1600): string {
@@ -165,7 +191,7 @@ function commandHelpText(capabilities: Record<string, boolean>, snapshot: Snapsh
   const descriptions: Record<string, [string, string]> = {
     help: ['显示可用命令', 'Show available commands'], runs: ['列出任务', 'List tasks'], new: ['开始新任务', 'Start a new task'], attach: ['切换到任务', 'Switch to a task'],
     inject: ['追加指令', 'Queue an instruction'], approve: ['处理待确认请求', 'Resolve an approval'], stop: ['请求安全停止', 'Request a graceful stop'], abort: ['中止当前任务', 'Abort the active task'],
-    resume: ['重新开始已结束任务', 'Restart a finished task'], details: ['打开详情', 'Open task details'], events: ['打开事件面板', 'Open the event panel'], artifacts: ['打开运行记录', 'Open run records'], trajectory: ['打开执行轨迹', 'Open the trajectory panel'],
+    resume: ['从已完成的轮次继续跑', 'Continue from the rounds already finished'], details: ['打开详情', 'Open task details'], events: ['打开事件面板', 'Open the event panel'], artifacts: ['打开运行记录', 'Open run records'], trajectory: ['打开执行轨迹', 'Open the trajectory panel'],
   };
   return availableCommands(capabilities, snapshot, hasRun).map((command) => {
     const description = descriptions[command.name] || [command.description, command.description];
@@ -195,6 +221,8 @@ interface ConversationMessage {
   time?: number;
   /** Internal timestamp used to interleave durable operator follow-ups. */
   sortTime?: number;
+  /** Round slot for messages that sit between rounds rather than inside one. */
+  sortRound?: number;
   /** Whether the text is backed by the harness completion authority. */
   authority?: 'final_response' | 'auditor' | 'report' | 'none';
 }
@@ -224,7 +252,7 @@ const MODEL_PRESETS: Record<string, { id: string; label: string }[]> = {
 };
 
 type PublicRole = 'manager' | 'executor' | 'auditor';
-type RoleSelection = RoleRuntimeConfig & { custom: boolean };
+type RoleSelection = RoleRuntimeConfig & { custom: boolean; effortCustom?: boolean };
 const PUBLIC_ROLES: Array<{ id: PublicRole; label: string; description: string }> = [
   { id: 'manager', label: 'Manager', description: '规划、路由与完成判定' },
   { id: 'executor', label: 'Executor', description: '执行 GUI / CLI 子任务' },
@@ -260,6 +288,40 @@ function defaultModel(meta: WebMeta | null, agent: string): string {
     || normalizedModelChoices(meta?.models?.[agent])[0]?.id
     || MODEL_PRESETS[agent]?.[0]?.id
     || '';
+}
+
+function agentEntry(meta: WebMeta | null, agent: string): AgentChoice | undefined {
+  return meta?.agents?.find((item) => item.id === agent);
+}
+
+/** Older servers only sent a boolean, so absence of `availability` is not "missing". */
+function agentAvailability(item: Pick<AgentChoice, 'availability' | 'available'>): 'usable' | 'found_but_broken' | 'missing' | 'unknown' {
+  if (item.availability) return item.availability;
+  if (item.available === true) return 'usable';
+  if (item.available === false) return 'missing';
+  return 'unknown';
+}
+
+/**
+ * Effort choices for one role. Codex advertises them per model and the lists are
+ * uneven between models, so the selected model wins over the agent-wide list.
+ */
+function reasoningChoicesFor(meta: WebMeta | null, agent: string, model: string): { id: string; label: string; description?: string }[] {
+  const support = agentEntry(meta, agent)?.reasoning;
+  if (!support?.supported) return [];
+  if (support.scope === 'per_model') {
+    const modelId = model.trim() || defaultModel(meta, agent);
+    const entry = normalizedModelEntries(meta, agent).find((item) => item.id === modelId);
+    const details = entry?.reasoning_effort_details;
+    if (details?.length) return details.map((item) => ({ id: item.id, label: item.id, description: item.description }));
+    if (entry?.reasoning_efforts?.length) return entry.reasoning_efforts.map((id) => ({ id, label: id }));
+  }
+  return (support.choices || []).map((item) => ({ id: item.id, label: item.label || item.id }));
+}
+
+function normalizedModelEntries(meta: WebMeta | null, agent: string): ModelChoice[] {
+  const raw = meta?.models?.[agent] || agentEntry(meta, agent)?.models;
+  return Array.isArray(raw) ? raw.filter((item): item is ModelChoice => Boolean(item) && typeof item === 'object') : [];
 }
 
 interface ImageSourceProjection {
@@ -521,19 +583,46 @@ function approvalResponseText(approval: Snapshot['approvals'][number], language:
   return label;
 }
 
-function insertConversationInteraction(messages: ConversationMessage[], message: ConversationMessage): void {
-  const insertion = message.sortTime
-    ? messages.findIndex((candidate, index) => index > 0 && Boolean(candidate.sortTime && candidate.sortTime > message.sortTime!))
-    : -1;
-  if (insertion >= 0) messages.splice(insertion, 0, message);
-  else messages.push(message);
+/** Shared clip length for every conversation card. */
+const CONVERSATION_TEXT_LIMIT = 900;
+
+/** How long a graceful stop may run before a force-kill is offered. */
+const STOP_GRACE_MS = 3_000;
+
+/**
+ * When the shown reply was written.
+ *
+ * Taken from the `completed` event of the last round that produced one. A
+ * discarded reply keeps its text in `run.final_response` while its round text
+ * is cleared, so neither the round list nor the round's latest event (which
+ * would be the discard) can date it.
+ */
+function finalResponseTime(snapshot: Snapshot): number | undefined {
+  const completed = snapshot.events
+    .filter((event) => event.type === 'round.final_response.completed')
+    .map((event) => event.ts)
+    .filter((value) => Number.isFinite(value) && value > 0);
+  return completed.length ? Math.max(...completed) : snapshot.run.finished_at || undefined;
+}
+
+/** Round a free-form operator message belongs to, from the rounds' own event times. */
+function roundForTime(snapshot: Snapshot, time: number | undefined): number {
+  if (!time) return Number.MAX_SAFE_INTEGER;
+  let slot = 0;
+  for (const round of snapshot.rounds) {
+    const started = conversationStageTime(snapshot, round.round_index, 'manager');
+    if (started && started <= time) slot = round.round_index;
+  }
+  return slot;
 }
 
 function conversationFor(snapshot: Snapshot, trajectoryMap: Record<string, TrajectoryView>, liveTrajectory: TrajectoryView | null, artifacts: ArtifactProjection, language: UiLanguage): ConversationMessage[] {
   const messages: ConversationMessage[] = [];
   const task = snapshot.mission.task.trim();
   const taskTime = snapshot.run.started_at || snapshot.events.find((event) => event.type === 'run.started')?.ts;
-  if (task) messages.push({ id: 'task', kind: 'user', role: 'You', title: 'You', text: task, sortTime: taskTime || undefined });
+  // The original request precedes every round, including the collapsed-history
+  // notice, so it gets a slot below the first round rather than round 0.
+  if (task) messages.push({ id: 'task', kind: 'user', role: 'You', title: 'You', text: task, sortTime: taskTime || undefined, sortRound: -1 });
 
   const hiddenRounds = Math.max(0, snapshot.rounds.length - MAX_TRAJECTORY_ROUNDS);
   if (hiddenRounds > 0) {
@@ -541,6 +630,7 @@ function conversationFor(snapshot: Snapshot, trajectoryMap: Record<string, Traje
       id: 'history-collapsed',
       kind: 'plan',
       role: 'LongHorizon',
+      sortRound: 0,
       title: uiText(language, '历史轮次已折叠', 'Earlier rounds collapsed'),
       text: uiText(language, `为保持长任务流畅，已折叠更早 ${hiddenRounds} 轮；可在详情 → 执行轨迹 / 事件中按轮次查看。`, `${hiddenRounds} earlier rounds were collapsed to keep long tasks responsive. Open Details → Trajectory / Events to inspect them.`),
     });
@@ -555,7 +645,9 @@ function conversationFor(snapshot: Snapshot, trajectoryMap: Record<string, Traje
         round: round.round_index,
         title: uiText(language, `计划 · 第 ${round.round_index} 轮`, `Plan · Round ${round.round_index}`),
         input: task,
-        text: managerPlanSummary(managerText),
+        // Full section: a pre-truncated summary silently dropped text and left
+        // no expand affordance, since the card only clips what it is given.
+        text: managerPlanSummary(managerText, Number.MAX_SAFE_INTEGER),
         sortTime: conversationStageTime(snapshot, round.round_index, 'manager'),
         activity: trajectoryActivity(trajectoryMap[`${round.round_index}:manager`], false, language),
       });
@@ -604,6 +696,8 @@ function conversationFor(snapshot: Snapshot, trajectoryMap: Record<string, Traje
         title: uiText(language, `${roleTitle(liveTrajectory.role)} 正在处理`, `${roleTitle(liveTrajectory.role)} is working`),
         text: compactText(latest || uiText(language, '中间截图', 'Intermediate screenshot')),
         activity,
+        // Work happening right now is always the newest thing in the transcript.
+        sortRound: Number.MAX_SAFE_INTEGER,
         artifacts: hasExecutionArtifacts(artifacts) ? artifacts : undefined,
       });
     }
@@ -637,16 +731,18 @@ function conversationFor(snapshot: Snapshot, trajectoryMap: Record<string, Traje
         : authoritativeText && latestAuditor && (evidence.satisfied || nonSuccessTerminal)
           ? 'auditor'
           : 'none',
-      sortTime: snapshot.rounds.at(-1)?.round_index
-        ? conversationStageTime(snapshot, snapshot.rounds.at(-1)!.round_index, 'final_response')
-        : snapshot.run.finished_at || undefined,
+      // The reply is written mid-run (before the completion gate), so it takes
+      // its own event time: pinning it last placed it below replies the operator
+      // sent after reading it.
+      sortTime: finalResponseTime(snapshot),
+      sortRound: finalResponseTime(snapshot) ? undefined : Number.MAX_SAFE_INTEGER,
       artifacts: hasExecutionArtifacts(artifacts) ? artifacts : undefined,
     });
   }
 
   for (const item of [...(snapshot.operator_messages || [])].sort((left, right) => left.created_at - right.created_at)) {
     const time = Number.isFinite(item.created_at) && item.created_at > 0 ? item.created_at : undefined;
-    const message: ConversationMessage = {
+    messages.push({
       id: `operator-${item.id}`,
       kind: 'user',
       role: uiText(language, '你', 'You'),
@@ -654,13 +750,13 @@ function conversationFor(snapshot: Snapshot, trajectoryMap: Record<string, Traje
       text: item.text,
       time,
       sortTime: time,
-    };
-    insertConversationInteraction(messages, message);
+      sortRound: roundForTime(snapshot, time),
+    });
   }
   for (const approval of snapshot.approvals) {
     if (approval.status === 'pending' || (!approval.user_input.trim() && !approval.action.trim())) continue;
     const time = approval.resolved_at && Number.isFinite(approval.resolved_at) ? approval.resolved_at : undefined;
-    insertConversationInteraction(messages, {
+    messages.push({
       id: `approval-response-${approval.approval_id}`,
       kind: 'user',
       role: uiText(language, '你', 'You'),
@@ -668,9 +764,12 @@ function conversationFor(snapshot: Snapshot, trajectoryMap: Record<string, Traje
       text: approvalResponseText(approval, language),
       time,
       sortTime: time,
+      // Only used when the record has no resolved_at: the round that raised the
+      // approval is a better guess than dropping it to the top.
+      sortRound: Number.isFinite(approval.round_index) ? approval.round_index : roundForTime(snapshot, time),
     });
   }
-  return messages;
+  return sortTranscript(messages);
 }
 
 export default function App() {
@@ -682,9 +781,12 @@ export default function App() {
   const [instruction, setInstruction] = useState('');
   const [busy, setBusy] = useState(false);
   const [approvalInputs, setApprovalInputs] = useState<Record<string, string>>({});
+  // Kept as raw text so a half-typed value is not silently coerced to a number.
+  const [approvalRounds, setApprovalRounds] = useState<Record<string, string>>({});
   const [capabilities, setCapabilities] = useState<Record<string, boolean>>({});
   const [meta, setMeta] = useState<WebMeta | null>(null);
   const [controlBusy, setControlBusy] = useState(false);
+  const [stopIgnored, setStopIgnored] = useState(false);
   const [search, setSearch] = useState('');
   const [detailsOpen, setDetailsOpen] = useState(false);
   const [creatingNew, setCreatingNew] = useState(false);
@@ -753,30 +855,40 @@ export default function App() {
   const canCreateRun = meta !== null && capabilities.create_run !== false;
   const canStopRun = capabilities.stop !== false && snapshot.controls.can_abort
     && !terminalLifecycle(snapshot.run.status) && !stoppingLifecycle(snapshot.run.status);
-  const canAbortRun = capabilities.abort !== false && snapshot.controls.can_abort
-    && !terminalLifecycle(snapshot.run.status) && !stoppingLifecycle(snapshot.run.status);
+  // Force-kill is offered only while a stop is still visibly stuck: SIGKILL
+  // costs the run its final report, so it must not be a same-click alternative
+  // to a graceful stop, and it must disappear as soon as the worker does.
+  const canAbortRun = capabilities.abort !== false && stopIgnored
+    && stoppingLifecycle(snapshot.run.status);
   const canResumeRun = capabilities.resume !== false && snapshot.controls.can_resume;
-  const composerInteractive = Boolean(runId && snapshot.controls.can_inject);
+  // A resumable run accepts typing too: sending reopens the run and delivers the
+  // text as the first instruction, so the operator does not have to continue
+  // first and then race the worker to type.
+  const composerResumes = Boolean(runId) && !snapshot.controls.can_inject && canResumeRun;
+  const composerInteractive = Boolean(runId && snapshot.controls.can_inject) || composerResumes;
   const composerCanSend = composerInteractive && Boolean(instruction.trim()) && Boolean(
     typedCommand ? commandOptions.some((item) => item.name === typedCommandName) : true,
   );
-  const composerPlaceholder = composerInteractive
-    ? text('输入后续指令', 'Enter a follow-up instruction')
-    : !runId
-      ? text('点击左侧“新任务”开始', 'Click “New task” in the sidebar to begin')
-      : pendingApprovals.length > 0
-        ? text('请先处理上方的待确认请求', 'Resolve the approval request above first')
-        : stoppingLifecycle(snapshot.run.status)
-          ? text('正在停止任务…', 'Stopping the task…')
-          : canResumeRun
-            ? text('任务已结束，可点击顶部“重新开始”继续', 'Task ended. Click “Restart” above to continue')
+  // Sending from a resumable run goes through the lifecycle call, which tracks
+  // `controlBusy`; without it the send button stays live and fires twice.
+  const composerBusy = busy || (composerResumes && controlBusy);
+  const composerPlaceholder = composerResumes
+    ? text('输入指令并发送，将带着它继续运行', 'Type an instruction and send to continue the run with it')
+    : composerInteractive
+      ? text('输入后续指令', 'Enter a follow-up instruction')
+      : !runId
+        ? text('点击左侧“新任务”开始', 'Click “New task” in the sidebar to begin')
+        : pendingApprovals.length > 0
+          ? text('请先处理上方的待确认请求', 'Resolve the approval request above first')
+          : stoppingLifecycle(snapshot.run.status)
+            ? text('正在停止任务…', 'Stopping the task…')
             : terminalLifecycle(snapshot.run.status)
               ? text('任务已结束', 'Task ended')
               : text('当前阶段暂不可输入', 'Input is unavailable during the current stage');
-  const composerFooter = composerInteractive
-    ? text('操作指令', 'Command')
-    : canResumeRun
-      ? text('可重新开始或创建新任务', 'Restart or create a new task')
+  const composerFooter = composerResumes
+    ? text('发送即继续运行', 'Sending continues the run')
+    : composerInteractive
+      ? text('操作指令', 'Command')
       : pendingApprovals.length > 0
         ? text('等待你的确认', 'Waiting for your approval')
         : text('输入已停用', 'Input disabled');
@@ -996,6 +1108,20 @@ export default function App() {
     if (followLatest && conversationRef.current) conversationRef.current.scrollTop = conversationRef.current.scrollHeight;
   }, [messages, pendingApprovals.length, snapshot.run.status, followLatest]);
 
+  // Measure how long the run stays in `stopping` locally rather than comparing
+  // `stop_requested_at` against the browser clock, which may be skewed from the
+  // server's. An abort already requested needs no second escalation offer.
+  useEffect(() => {
+    const stopping = stoppingLifecycle(snapshot.run.status);
+    const alreadyAborting = String(snapshot.run.requested_action || '') === 'abort';
+    if (!stopping || alreadyAborting) {
+      setStopIgnored(false);
+      return undefined;
+    }
+    const timer = window.setTimeout(() => setStopIgnored(true), STOP_GRACE_MS);
+    return () => window.clearTimeout(timer);
+  }, [runId, snapshot.run.status, snapshot.run.requested_action, snapshot.run.stop_requested_at]);
+
   useEffect(() => {
     if (!mobileStatusOpen) return undefined;
     const onKeyDown = (event: KeyboardEvent) => { if (event.key === 'Escape') setMobileStatusOpen(false); };
@@ -1071,7 +1197,7 @@ export default function App() {
       if (command.name === 'new') {
         const parsed = parseNewRunArgs(command.args);
         if (parsed.error || !parsed.task) {
-          setError(parsed.error ? commandErrorText(parsed.error, language) : text('用法：/new <task> [--language zh|en] [--manager-agent id] [--manager-model id] [--executor-agent id] [--executor-model id] [--auditor-agent id] [--auditor-model id] [--workspace path] [--rounds n]', 'Usage: /new <task> [--language zh|en] [--manager-agent id] [--manager-model id] [--executor-agent id] [--executor-model id] [--auditor-agent id] [--auditor-model id] [--workspace path] [--rounds n]'));
+          setError(parsed.error ? commandErrorText(parsed.error, language) : text('用法：/new <task> [--language zh|en] [--effort level] [--manager-agent id] [--manager-model id] [--manager-effort level] [--executor-agent id] [--executor-model id] [--executor-effort level] [--auditor-agent id] [--auditor-model id] [--auditor-effort level] [--workspace path] [--rounds n]', 'Usage: /new <task> [--language zh|en] [--effort level] [--manager-agent id] [--manager-model id] [--manager-effort level] [--executor-agent id] [--executor-model id] [--executor-effort level] [--auditor-agent id] [--auditor-model id] [--auditor-effort level] [--workspace path] [--rounds n]'));
           setInstruction('');
           return;
         }
@@ -1113,6 +1239,11 @@ export default function App() {
     }
     if (!runId) return;
     if (!snapshot.controls.can_inject) {
+      if (composerResumes) {
+        setInstruction('');
+        await lifecycle('resume', inputText);
+        return;
+      }
       setError(text('当前任务已结束或不可控；可使用 /new、/attach、/resume 或打开详情。', 'This task has ended or cannot accept input. Use /new, /attach, /resume, or open Details.'));
       setInstruction('');
       return;
@@ -1120,13 +1251,18 @@ export default function App() {
     await submitOperatorInstruction(inputText);
   }
 
-  async function approve(approvalId: string, action: string, inputOverride?: string) {
+  async function approve(approvalId: string, action: string, inputOverride?: string, extraRounds?: number) {
     const submittedInput = inputOverride ?? (approvalInputs[approvalId] || '');
     setBusy(true); setError('');
     try {
-      await resolveApproval(runId, approvalId, action, submittedInput);
+      await resolveApproval(runId, approvalId, action, submittedInput, undefined, extraRounds);
       feed.recordApprovalResponse(approvalId, action, submittedInput.trim(), Date.now() / 1000);
       setApprovalInputs((current) => {
+        const next = { ...current };
+        delete next[approvalId];
+        return next;
+      });
+      setApprovalRounds((current) => {
         const next = { ...current };
         delete next[approvalId];
         return next;
@@ -1137,15 +1273,46 @@ export default function App() {
     finally { setBusy(false); }
   }
 
-  async function lifecycle(action: 'stop' | 'abort' | 'resume') {
+  /** Deliver a resume instruction once the reopened worker accepts injections. */
+  async function queueResumeInstruction(targetRunId: string, messageText: string) {
+    const requestKey = idempotencyKey('instruction');
+    const createdAt = Date.now() / 1000;
+    feed.appendOperatorMessage({ id: requestKey, text: messageText, created_at: createdAt, status: 'queued' });
+    // The worker is forked asynchronously, so `can_control` stays false for a
+    // moment and the API answers 409.  Bounded retries keep a genuine rejection
+    // (revoked capability, run replaced) from looping forever.
+    for (let attempt = 0; attempt < 20; attempt += 1) {
+      try {
+        await postInstruction(targetRunId, messageText, requestKey);
+        await feed.refresh();
+        return;
+      } catch (reason) {
+        if (!isConflict(reason) || attempt === 19) {
+          feed.appendOperatorMessage({ id: requestKey, text: messageText, created_at: createdAt, status: 'failed' });
+          setError(text('续跑指令未能送达，请在任务运行后重新发送。', 'The follow-up instruction could not be delivered. Send it again once the task is running.'));
+          return;
+        }
+        await new Promise((resolve) => setTimeout(resolve, 500));
+      }
+    }
+  }
+
+  async function lifecycle(action: 'stop' | 'abort' | 'resume' | 'restart', resumeInstruction = '') {
     setControlBusy(true); setError('');
     const request = operationKey(action, runId);
     try {
       if (action === 'stop') await stopRun(runId, request.key);
       if (action === 'abort') await abortRun(runId, request.key);
-      if (action === 'resume') {
-        const created = await resumeRun(runId, request.key);
-        setRunId(created.id);
+      if (action === 'resume' || action === 'restart') {
+        const mode = action === 'resume' ? 'continue' : 'retry';
+        const created = await resumeRun(runId, request.key, { mode });
+        // The instruction cannot be queued before this call: injection requires
+        // a live worker, so a terminal run rejects it with 409.
+        if (resumeInstruction) void queueResumeInstruction(created.id, resumeInstruction);
+        // "continue" reuses the same id, so the feed must still be refreshed to
+        // pick up the reopened lifecycle status.
+        if (created.id === runId) await feed.refresh();
+        else setRunId(created.id);
       } else {
         // Stop/Abort changes supervisor control state without appending a role
         // event. Refresh immediately so the header and rail switch to
@@ -1153,7 +1320,14 @@ export default function App() {
         await feed.refresh();
       }
       clearOperationKey(request.id);
-    } catch (reason) { setError(String(reason)); }
+    } catch (reason) {
+      // A force-kill races the worker's own exit, so "no longer running" means
+      // the goal is already met: reconcile instead of showing a dead-end error.
+      if (action === 'abort' && isConflict(reason)) {
+        clearOperationKey(request.id);
+        await feed.refresh().catch(() => undefined);
+      } else setError(String(reason));
+    }
     finally { setControlBusy(false); }
   }
 
@@ -1206,18 +1380,19 @@ export default function App() {
       </aside>
 
       <main className="codex-main">
-        <header className="codex-header"><div className="header-context"><span className="header-folder"><PanelTop size={16} /></span><strong className="header-title">{currentRun?.task || runId || text('新会话', 'New task')}</strong><span className="header-more"><Ellipsis size={16} /></span></div><div className="header-actions"><span className={statusClass(snapshot.run.status)} /><span className="header-status">{statusLabel(snapshot.run.status, Boolean(statusView.finalResponse), language)}</span><button className="mobile-status-button" onClick={() => setMobileStatusOpen((open) => !open)} aria-label={text('打开任务状态', 'Open task status')} title={text('任务状态', 'Task status')}><PanelRight size={14} /><span>{text('状态', 'Status')}</span></button>{canStopRun && <button onClick={() => void lifecycle('stop')} disabled={controlBusy}>{text('停止', 'Stop')}</button>}{canAbortRun && <button className="danger-text" onClick={() => void lifecycle('abort')} disabled={controlBusy}>{text('中止', 'Abort')}</button>}{canResumeRun && <button onClick={() => void lifecycle('resume')} disabled={controlBusy}>{text('重新开始', 'Restart')}</button>}<button className="details-button" disabled={!runId} onClick={() => { if (!runId) return; setCreatingNew(false); setSelectedRound(activeRound); dispatchPanel({ type: 'open', panel: 'details' }); setDetailsOpen(true); }} aria-label={text('查看详情', 'View details')} title={runId ? text('详情', 'Details') : text('选择任务后查看详情', 'Select a task to view details')}><FolderOpen size={14} /><span>{text('详情', 'Details')}</span></button></div></header>
+        <header className="codex-header"><div className="header-context"><span className="header-folder"><PanelTop size={16} /></span><strong className="header-title">{currentRun?.task || runId || text('新会话', 'New task')}</strong><span className="header-more"><Ellipsis size={16} /></span></div><div className="header-actions"><span className={statusClass(snapshot.run.status)} /><span className="header-status">{statusLabel(snapshot.run.status, Boolean(statusView.finalResponse), language)}</span><button className="mobile-status-button" onClick={() => setMobileStatusOpen((open) => !open)} aria-label={text('打开任务状态', 'Open task status')} title={text('任务状态', 'Task status')}><PanelRight size={14} /><span>{text('状态', 'Status')}</span></button>{canStopRun && <button onClick={() => void lifecycle('stop')} disabled={controlBusy} title={text('让 worker 收尾并写出报告', 'Let the worker finish up and write its report')}>{text('停止', 'Stop')}</button>}{canAbortRun && <button className="danger-text" onClick={() => void lifecycle('abort')} disabled={controlBusy} title={text('停止未生效，强制结束进程；本次运行不会写出报告', 'The stop did not take effect. Force-kill the process; this run will not write a report')}>{text('强制中止', 'Force stop')}</button>}{canResumeRun && <button onClick={() => void lifecycle('resume')} disabled={controlBusy} title={text('沿用已完成的轮次继续跑，不会重头开始', 'Continue from the rounds already finished instead of starting over')}>{text('继续运行', 'Continue')}</button>}{canResumeRun && <button onClick={() => void lifecycle('restart')} disabled={controlBusy} title={text('用同样的任务和配置，从第 1 轮重新开始一个新任务', 'Start a new task from round 1 with the same task and configuration')}>{text('重新开始', 'Restart')}</button>}<button className="details-button" disabled={!runId} onClick={() => { if (!runId) return; setCreatingNew(false); setSelectedRound(activeRound); dispatchPanel({ type: 'open', panel: 'details' }); setDetailsOpen(true); }} aria-label={text('查看详情', 'View details')} title={runId ? text('详情', 'Details') : text('选择任务后查看详情', 'Select a task to view details')}><FolderOpen size={14} /><span>{text('详情', 'Details')}</span></button></div></header>
 
         <section className="conversation" aria-label="LongHorizon conversation" ref={conversationRef} onScroll={(event) => { const node = event.currentTarget; setFollowLatest(node.scrollHeight - node.scrollTop - node.clientHeight < 48); }}>
           {!runId && <div className="welcome"><div className="welcome-mark"><Sparkles size={20} /></div><h1>{text('你想完成什么？', 'What do you want to accomplish?')}</h1><p>{text('开始一个真实的 LongHorizon 任务。计划、中间过程、验证和最终回答会像 Codex 一样显示在这里。', 'Start a real LongHorizon task. Plans, intermediate work, verification, and the final answer will appear here as they happen.')}</p>{meta && !canCreateRun && <p className="welcome-note">{text('当前连接为只读模式；启动 ', 'This connection is read-only. Start ')}<code>lh-harness web</code>{text(' 后即可创建任务。', ' to create tasks.')}</p>}{!meta && <p className="welcome-note">{text('正在连接 Web 服务…', 'Connecting to the Web service…')}</p>}<button className="welcome-button" disabled={!canCreateRun} onClick={() => { setCreatingNew(true); setDetailsOpen(true); }}><Plus size={15} />{text('开始任务', 'Start task')}</button></div>}
           {runId && messages.map((message) => <ConversationMessage key={message.id} message={message} />)}
           {runId && !messages.length && <div className="empty-conversation"><span className="thinking-dot" />{text('等待 LongHorizon 启动…', 'Waiting for LongHorizon to start…')}</div>}
           {['running', 'starting', 'stopping', 'aborting'].includes(snapshot.run.status) && <div className="working-line" role="status" aria-live="polite"><span className="thinking-dot" /><span>{snapshot.run.status === 'stopping' || snapshot.run.status === 'aborting' ? text('正在收尾并停止 worker', 'Finishing up and stopping the worker') : activeRole ? text(`${roleTitle(activeRole)} 正在处理`, `${roleTitle(activeRole)} is working`) : text('LongHorizon 正在处理', 'LongHorizon is working')}</span></div>}
-          {pendingApprovals.map((approval) => <ApprovalCard key={approval.approval_id} approval={approval} busy={busy} userInput={approvalInputs[approval.approval_id] || ''} onUserInput={(value) => setApprovalInputs((current) => ({ ...current, [approval.approval_id]: value }))} onApprove={approve} />)}
+          {statusView.awaitingHandoff && <div className="working-line" role="status" aria-live="polite"><span className="thinking-dot" /><span>{text('已提交，正在等待 worker 接手…', 'Submitted. Waiting for the worker to pick it up…')}</span></div>}
+          {pendingApprovals.map((approval) => <ApprovalCard key={approval.approval_id} approval={approval} busy={busy} userInput={approvalInputs[approval.approval_id] || ''} onUserInput={(value) => setApprovalInputs((current) => ({ ...current, [approval.approval_id]: value }))} extraRounds={approvalRounds[approval.approval_id] || ''} onExtraRounds={(value) => setApprovalRounds((current) => ({ ...current, [approval.approval_id]: value }))} onApprove={approve} />)}
         </section>
 
         {visibleError && <div className="error-line" role="alert" aria-live="assertive"><span><AlertTriangle size={14} /></span>{visibleError}<button onClick={() => { setError(''); setDismissedFeedError(feed.error); }}>{text('关闭', 'Dismiss')}</button></div>}
-        <div className={`composer-wrap ${composerInteractive ? '' : 'composer-disabled'}`}><textarea value={instruction} onChange={(event) => setInstruction(event.target.value)} onKeyDown={(event) => { if ((event.metaKey || event.ctrlKey) && event.key === 'Enter') { event.preventDefault(); void sendInstruction(); } }} placeholder={composerPlaceholder} disabled={busy || !composerInteractive} /><div className="composer-footer"><span>{composerFooter}{composerInteractive && <> · <kbd>⌘</kbd><kbd>↵</kbd> {text('发送', 'Send')}</>}</span><button onClick={() => void sendInstruction()} disabled={busy || !composerCanSend}>{text('发送', 'Send')}</button></div></div>
+        <div className={`composer-wrap ${composerInteractive ? '' : 'composer-disabled'}`}><textarea value={instruction} onChange={(event) => setInstruction(event.target.value)} onKeyDown={(event) => { if ((event.metaKey || event.ctrlKey) && event.key === 'Enter') { event.preventDefault(); void sendInstruction(); } }} placeholder={composerPlaceholder} disabled={composerBusy || !composerInteractive} /><div className="composer-footer"><span>{composerFooter}{composerInteractive && <> · <kbd>⌘</kbd><kbd>↵</kbd> {text('发送', 'Send')}</>}</span><button onClick={() => void sendInstruction()} disabled={composerBusy || !composerCanSend}>{text('发送', 'Send')}</button></div></div>
       </main>
 
       {mobileStatusOpen && <button type="button" className="status-mobile-backdrop" onClick={() => setMobileStatusOpen(false)} aria-label={text('关闭任务状态', 'Close task status')} />}
@@ -1268,6 +1443,44 @@ function localizedRoleSummary(role: StatusView['roleStatuses'][number], language
   if (/^Status:\s*complete\b/iu.test(summary)) return uiText(language, '审计通过，完整性正常。', 'Audit passed; the result is complete.');
   if (/^Status:\s*(?:incomplete|blocked)\b/iu.test(summary)) return uiText(language, '审计发现问题，需要处理。', 'The audit found an issue that needs attention.');
   return summary;
+}
+
+/** Clamped text that expands in place when there is more to read.
+ *
+ * Role summaries can be a single unbroken path or command far wider than the
+ * rail, so they are clamped to a few lines and only opened on request. The
+ * toggle is a real button so keyboard and screen-reader users get the same
+ * affordance, and `lh-clamp` keeps the collapsed height stable.
+ */
+function ExpandableText({ text: value, lines = 2 }: { text: string; lines?: number }) {
+  const { text } = useUiLanguage();
+  const [expanded, setExpanded] = useState(false);
+  const [clamped, setClamped] = useState(false);
+  const ref = useRef<HTMLSpanElement | null>(null);
+  // Measured rather than guessed from length: whether the text overflows
+  // depends on the rail width and on where the string can wrap.
+  useEffect(() => {
+    const node = ref.current;
+    if (!node) return;
+    const measure = () => setClamped(node.scrollHeight - node.clientHeight > 1);
+    measure();
+    if (typeof ResizeObserver === 'undefined') return;
+    const observer = new ResizeObserver(measure);
+    observer.observe(node);
+    return () => observer.disconnect();
+  }, [value, lines, expanded]);
+  const toggleable = clamped || expanded;
+  return <span className="lh-clamp-wrap">
+    <span
+      ref={ref}
+      className={`lh-clamp ${expanded ? 'lh-clamp-open' : ''}`}
+      style={expanded ? undefined : { WebkitLineClamp: lines }}
+      title={toggleable && !expanded ? value : undefined}
+    >{value}</span>
+    {toggleable && <button type="button" className="lh-clamp-toggle" onClick={() => setExpanded((open) => !open)}>
+      {expanded ? text('收起', 'Show less') : text('展开', 'Show more')}
+    </button>}
+  </span>;
 }
 
 function localizedStageStatus(status: string, language: UiLanguage): string {
@@ -1322,7 +1535,7 @@ function StatusPanel({ view, snapshot, connection, mobileOpen, onMobileClose, on
     <div className="status-overview"><div className="status-overview-line"><strong>{localized}</strong><span>{connectionLabel}</span></div><p>{view.taskSummary || text('尚未选择任务', 'No task selected')}</p><div className={`status-progress status-progress-${view.status}`}><i style={{ width: `${percent}%` }} /></div><div className="status-progress-meta"><span>{executionStages.length ? text(`${percent}% 全局 · ${resultLabel}${totalCount ? ` · 本轮 ${doneCount}/${totalCount}` : ''}`, `${percent}% overall · ${resultLabel}${totalCount ? ` · This round ${doneCount}/${totalCount}` : ''}`) : hasRun ? text('等待第一轮', 'Waiting for the first round') : text('尚未开始', 'Not started')}</span><span>{roundLabel}</span></div></div>
     <section className="status-section"><div className="status-section-title"><span>{text('本轮执行链', 'Execution chain')}</span><small>{totalCount ? `${doneCount}/${totalCount}` : '—'}</small></div>{stages.length ? <ol className="status-stage-list">{stages.filter((stage) => stage.key !== 'record').map((stage) => <li className={`status-stage stage-${stage.status}`} key={stage.id}><span className="stage-marker">{stage.status === 'done' ? <Check size={10} /> : stage.status === 'failed' ? <X size={10} /> : stage.status === 'active' || stage.status === 'stopping' ? <LoaderCircle className="trajectory-spinner" size={10} /> : stage.status === 'waiting' ? <CircleDotDashed size={10} /> : stage.status === 'blocked' ? <AlertTriangle size={10} /> : <Circle size={8} />}</span><div><strong>{stage.label}</strong><small>{localizedStageStatus(stage.status, language)}</small></div></li>)}</ol> : <p className="status-empty-copy">{text('暂无轮次结果；任务开始后会在这里显示每个阶段。', 'No round results yet. Each stage will appear here after the task starts.')}</p>}</section>
     <section className="status-section"><div className="status-section-title"><span>{text('下一步', 'Next step')}</span><small>{round ? (view.activeRound !== null ? `R${round.round}` : text(`最近 R${round.round}`, `Latest R${round.round}`)) : '—'}</small></div><div className="status-next-step"><span className="status-next-icon"><ArrowRight size={13} /></span><div><strong>{nextStep}</strong><p>{nextDetail}</p></div></div></section>
-    {hasRun && <section className="status-section"><div className="status-section-title"><span>{text('角色输出', 'Role output')}</span><small>{roleItems.length}</small></div><div className="status-role-list">{roleItems.map((role) => <div className="status-role-row" key={role.key}><span className={`role-marker phase-${role.status}`}>{role.key === 'manager' ? 'M' : role.key === 'executor' ? 'E' : 'A'}</span><div className="status-role-copy"><div><strong>{role.label}</strong><span className={`role-status-text phase-${role.status}`}>{roleState(role.status)}</span></div><small>{localizedRoleSummary(role, language)}</small></div></div>)}</div></section>}
+    {hasRun && <section className="status-section"><div className="status-section-title"><span>{text('角色输出', 'Role output')}</span><small>{roleItems.length}</small></div><div className="status-role-list">{roleItems.map((role) => <div className="status-role-row" key={role.key}><span className={`role-marker phase-${role.status}`}>{role.key === 'manager' ? 'M' : role.key === 'executor' ? 'E' : 'A'}</span><div className="status-role-copy"><div><strong>{role.label}</strong><span className={`role-status-text phase-${role.status}`}>{roleState(role.status)}</span></div><small><ExpandableText text={localizedRoleSummary(role, language)} lines={2} /></small></div></div>)}</div></section>}
     {(view.pendingApprovals.length > 0 || view.warnings.length > 0) && <section className="status-section status-notices"><div className="status-section-title"><span>{text('需要关注', 'Needs attention')}</span><small>{view.pendingApprovals.length + view.warnings.length}</small></div>{view.pendingApprovals.length > 0 && <div className="status-notice notice-approval"><span><AlertTriangle size={11} /></span><div><strong>{text('等待你的确认', 'Waiting for your approval')}</strong><small>{text(`${view.pendingApprovals.length} 个审批请求暂停了任务`, `${view.pendingApprovals.length} approval request${view.pendingApprovals.length === 1 ? '' : 's'} paused the task`)}</small></div></div>}{view.warnings.map((warning, index) => <div className="status-notice notice-warning" key={`${warning}-${index}`}><span><AlertTriangle size={11} /></span><div><strong>{text('运行提示', 'Run notice')}</strong><small>{compactText(warning, 180)}</small></div></div>)}</section>}
     {hasRun && <button className="status-details-link" onClick={onDetails}>{text('查看 artifacts、轨迹与事件', 'View artifacts, trajectory, and events')} <ExternalLink size={13} /></button>}
   </aside>;
@@ -1467,16 +1680,18 @@ function ConversationMessage({ message }: { message: ConversationMessage }) {
   const { text } = useUiLanguage();
   const [expanded, setExpanded] = useState(false);
   const [showInput, setShowInput] = useState(false);
-  const limit = message.kind === 'plan' ? 320 : message.kind === 'verification' ? 720 : message.kind === 'final' ? 2200 : 1200;
-  const clipped = !expanded && message.text.length > limit;
-  const displayText = clipped ? `${message.text.slice(0, limit).trimEnd()}…` : message.text;
+  // One threshold for every role card: per-kind limits made otherwise identical
+  // messages clip inconsistently, which reads as a rendering glitch.
+  const clipped = !expanded && message.text.length > CONVERSATION_TEXT_LIMIT;
+  const displayText = clipped ? `${message.text.slice(0, CONVERSATION_TEXT_LIMIT).trimEnd()}…` : message.text;
   const isAgent = ['plan', 'assistant', 'verification'].includes(message.kind);
-  return <article className={`conversation-message message-${message.kind}`}><div className="message-avatar">{message.kind === 'user' ? text('你', 'You') : message.kind === 'final' ? <Sparkles size={12} /> : message.role.slice(0, 1)}</div><div className="message-body"><div className="message-meta"><strong>{message.title}</strong>{message.time && <time>{formatTime(message.time)}</time>}</div>{isAgent && message.input && <><button className="agent-input-row" onClick={() => setShowInput((current) => !current)}><span className="agent-step-icon"><ArrowRight size={14} /></span><span className="agent-input-copy"><small>{text('输入', 'Input')}</small>{compactText(message.input, 220)}</span><span className="agent-chevron">{showInput ? <ChevronUp size={14} /> : <ChevronDown size={14} />}</span></button>{showInput && <div className="agent-input-expanded"><MessageText text={message.input} /></div>}<div className="agent-output-label">{message.kind === 'plan' ? text('计划摘要', 'Plan summary') : message.kind === 'verification' ? text('验证结论', 'Verification result') : text('执行结果', 'Execution result')}</div></>}{message.activity && message.activity.length > 0 && <TrajectorySteps steps={message.activity} />}<MessageText text={displayText} />{message.artifacts && <ExecutionArtifacts projection={message.artifacts} live={message.kind === 'live'} />}{clipped && <details className="raw-output-details"><summary>{text('查看完整输出', 'View full output')}</summary><MessageText text={message.text} /></details>}{message.kind === 'plan' && <span className="message-hint">{text('已隐藏内部 prompt，仅保留可执行摘要', 'Internal prompts are hidden; only the actionable summary is shown')}</span>}{message.kind === 'final' && <span className={`final-badge final-authority-${message.authority || 'none'}`}>{message.authority === 'final_response' ? text('LongHorizon 最终回复', 'LongHorizon final response') : message.authority === 'report' ? text('Auditor 最终报告', 'Auditor final report') : message.authority === 'auditor' ? text('Auditor 验证', 'Auditor verification') : text('等待权威报告', 'Awaiting authoritative report')}</span>}</div></article>;
+  return <article className={`conversation-message message-${message.kind}`}><div className="message-avatar">{message.kind === 'user' ? text('你', 'You') : message.kind === 'final' ? <Sparkles size={12} /> : message.role.slice(0, 1)}</div><div className="message-body"><div className="message-meta"><strong>{message.title}</strong>{message.time && <time>{formatTime(message.time)}</time>}</div>{isAgent && message.input && <><button className="agent-input-row" onClick={() => setShowInput((current) => !current)}><span className="agent-step-icon"><ArrowRight size={14} /></span><span className="agent-input-copy"><small>{text('输入', 'Input')}</small>{compactText(message.input, 220)}</span><span className="agent-chevron">{showInput ? <ChevronUp size={14} /> : <ChevronDown size={14} />}</span></button>{showInput && <div className="agent-input-expanded"><MessageText text={message.input} /></div>}<div className="agent-output-label">{message.kind === 'plan' ? text('计划摘要', 'Plan summary') : message.kind === 'verification' ? text('验证结论', 'Verification result') : text('执行结果', 'Execution result')}</div></>}{message.activity && message.activity.length > 0 && <TrajectorySteps steps={message.activity} />}<MessageText text={displayText} />{message.artifacts && <ExecutionArtifacts projection={message.artifacts} live={message.kind === 'live'} />}{(clipped || expanded) && <button type="button" className="message-expand" onClick={() => setExpanded((open) => !open)}>{expanded ? <ChevronUp size={13} /> : <ChevronDown size={13} />}<span>{expanded ? text('收起', 'Show less') : text('展开全文', 'Show full output')}</span></button>}{message.kind === 'plan' && <span className="message-hint">{text('已隐藏内部 prompt，仅保留可执行摘要', 'Internal prompts are hidden; only the actionable summary is shown')}</span>}{message.kind === 'final' && <span className={`final-badge final-authority-${message.authority || 'none'}`}>{message.authority === 'final_response' ? text('LongHorizon 最终回复', 'LongHorizon final response') : message.authority === 'report' ? text('Auditor 最终报告', 'Auditor final report') : message.authority === 'auditor' ? text('Auditor 验证', 'Auditor verification') : text('等待权威报告', 'Awaiting authoritative report')}</span>}</div></article>;
 }
 
 function ImageGallery({ images, label }: { images: string[]; label: string }) {
   const { text } = useUiLanguage();
   const [selected, setSelected] = useState<string | null>(null);
+  const stageDismiss = useBackdropDismiss(() => setSelected(null));
   const [fitToWindow, setFitToWindow] = useState(true);
   const [zoom, setZoom] = useState(1);
   const [naturalSize, setNaturalSize] = useState({ width: 0, height: 0 });
@@ -1606,14 +1821,13 @@ function ImageGallery({ images, label }: { images: string[]; label: string }) {
         <span>{fitToWindow ? text('自适应', 'Fit') : `${Math.round(zoom * 100)}%`}{naturalSize.width ? ` · ${naturalSize.width}×${naturalSize.height}` : ''}</span>
         <button type="button" className="image-lightbox-close" onClick={() => setSelected(null)} aria-label={text('关闭图片预览', 'Close image preview')}><X size={19} /></button>
       </div>
-      <div className="image-lightbox-stage" onClick={() => setSelected(null)}>
+      <div className="image-lightbox-stage" {...stageDismiss}>
         <img
           className={`image-lightbox-image ${fitToWindow ? 'image-lightbox-image-fit' : ''}`}
           src={selected}
           alt={text('放大预览', 'Enlarged preview')}
           style={!fitToWindow && naturalSize.width ? { width: `${naturalSize.width * zoom}px`, maxWidth: 'none', maxHeight: 'none' } : undefined}
           onLoad={(event) => setNaturalSize({ width: event.currentTarget.naturalWidth, height: event.currentTarget.naturalHeight })}
-          onClick={(event) => event.stopPropagation()}
         />
       </div>
     </div>, document.body)}
@@ -1687,7 +1901,7 @@ function MessageText({ text }: { text: string }) {
   })}</div>;
 }
 
-function ApprovalCard({ approval, busy, userInput, onUserInput, onApprove }: { approval: Snapshot['approvals'][number]; busy: boolean; userInput: string; onUserInput: (value: string) => void; onApprove: (id: string, action: string, userInput?: string) => void }) {
+function ApprovalCard({ approval, busy, userInput, onUserInput, extraRounds, onExtraRounds, onApprove }: { approval: Snapshot['approvals'][number]; busy: boolean; userInput: string; onUserInput: (value: string) => void; extraRounds: string; onExtraRounds: (value: string) => void; onApprove: (id: string, action: string, userInput?: string, extraRounds?: number) => void }) {
   const { text } = useUiLanguage();
   const options = approval.options.length ? approval.options : [{ value: 'continue', label: 'Continue' }, { value: 'stop', label: 'Stop', style: 'danger' }];
   const completed = approval.context?.trigger === 'completed' || approval.title === 'Task complete. Continue the run?';
@@ -1695,14 +1909,20 @@ function ApprovalCard({ approval, busy, userInput, onUserInput, onApprove }: { a
   const message = completed ? text('Manager 已确认任务完成，最终回答已显示在上方。你可以结束任务，也可以继续追加轮次。', 'The Manager confirmed the task is complete and the final answer is shown above. You can end the task or continue with another round.') : approval.message;
   const inputPlaceholder = approval.input_label && !/^Optional/i.test(approval.input_label) ? approval.input_label : text('可选：输入回答或指令', 'Optional: enter an answer or instruction');
   const optionLabel = (label: string) => /continue/i.test(label) ? text('继续运行', 'Continue run') : /end/i.test(label) ? text('结束任务', 'End task') : /stop/i.test(label) ? text('停止', 'Stop') : label;
-  return <article className="approval-card"><div className="message-avatar approval-avatar"><AlertTriangle size={12} /></div><div className="message-body"><div className="message-meta"><strong>{title}</strong><span className="approval-label">{text('需要你的输入', 'Input required')}</span></div><MessageText text={message} />{approval.allow_input && <textarea className="approval-input" value={userInput} onChange={(event) => onUserInput(event.target.value)} placeholder={inputPlaceholder} disabled={busy} />} {approval.answers.length > 0 && <div className="approval-answers" aria-label={text('快速回答', 'Quick answers')}>{approval.answers.map((answer) => <button type="button" key={answer} disabled={busy} onClick={() => onApprove(approval.approval_id, 'continue', answer)}>{answer}</button>)}</div>}<div className="approval-actions">{options.map((option) => <button key={option.value} disabled={busy} className={option.style === 'danger' ? 'danger-text' : ''} onClick={() => onApprove(approval.approval_id, option.value)}>{optionLabel(option.label)}</button>)}</div></div></article>;
+  // Older servers omit the flag; fall back to the triggers that are known to
+  // grant rounds so the input does not disappear against a mixed deployment.
+  const allowRounds = approval.allow_extra_rounds ?? ['completed', 'max_rounds', 'repeated_failure'].includes(String(approval.context?.trigger || ''));
+  const roundsValue = extraRounds.trim();
+  const roundsInvalid = roundsValue !== '' && !(/^\d+$/.test(roundsValue) && Number(roundsValue) >= 1 && Number(roundsValue) <= MAX_ROUNDS);
+  const roundsPayload = () => (roundsValue === '' || roundsInvalid ? undefined : Number(roundsValue));
+  return <article className="approval-card"><div className="message-avatar approval-avatar"><AlertTriangle size={12} /></div><div className="message-body"><div className="message-meta"><strong>{title}</strong><span className="approval-label">{text('需要你的输入', 'Input required')}</span></div><MessageText text={message} />{approval.allow_input && <textarea className="approval-input" value={userInput} onChange={(event) => onUserInput(event.target.value)} placeholder={inputPlaceholder} disabled={busy} />}{allowRounds && <label className="approval-rounds">{text('继续时追加轮数', 'Extra rounds when continuing')}<input type="number" min={1} max={MAX_ROUNDS} step={1} value={extraRounds} disabled={busy} placeholder={text('留空＝沿用原本的轮数上限', 'Blank = keep the configured round budget')} onChange={(event) => onExtraRounds(event.target.value)} /><span className={roundsInvalid ? 'approval-rounds-error' : 'approval-rounds-note'}>{roundsInvalid ? text(`请输入 1 到 ${MAX_ROUNDS} 之间的整数`, `Enter a whole number from 1 to ${MAX_ROUNDS}`) : text('只影响“继续运行”', 'Only affects “Continue run”')}</span></label>} {approval.answers.length > 0 && <div className="approval-answers" aria-label={text('快速回答', 'Quick answers')}>{approval.answers.map((answer) => <button type="button" key={answer} disabled={busy || roundsInvalid} onClick={() => onApprove(approval.approval_id, 'continue', answer, roundsPayload())}>{answer}</button>)}</div>}<div className="approval-actions">{options.map((option) => <button key={option.value} disabled={busy || (roundsInvalid && option.value !== 'stop')} className={option.style === 'danger' ? 'danger-text' : ''} onClick={() => onApprove(approval.approval_id, option.value, undefined, option.value === 'stop' ? undefined : roundsPayload())}>{optionLabel(option.label)}</button>)}</div></div></article>;
 }
 
 function RoleRuntimePicker({ role, selection, meta, onChange }: { role: typeof PUBLIC_ROLES[number]; selection: RoleSelection; meta: WebMeta | null; onChange: (value: RoleSelection) => void }) {
   const { text } = useUiLanguage();
   const agentChoices = meta?.agents?.length
-    ? meta.agents.map((item) => ({ id: item.id, label: item.label || item.id, available: item.available }))
-    : [{ id: 'codex', label: 'Codex', available: undefined }, { id: 'claude_code', label: 'Claude Code', available: undefined }, { id: 'deepseek_harness', label: 'DeepSeek Harness (CLI)', available: undefined }, { id: 'opencode', label: 'OpenCode', available: undefined }];
+    ? meta.agents.map((item) => ({ id: item.id, label: item.label || item.id, availability: agentAvailability(item), version: item.version || '', problem: item.problem || '' }))
+    : [{ id: 'codex', label: 'Codex' }, { id: 'claude_code', label: 'Claude Code' }, { id: 'deepseek_harness', label: 'DeepSeek Harness (CLI)' }, { id: 'opencode', label: 'OpenCode' }].map((item) => ({ ...item, availability: 'unknown' as const, version: '', problem: '' }));
   const discovered = normalizedModelChoices(
     meta?.models?.[selection.agent] || meta?.agents?.find((item) => item.id === selection.agent)?.models,
   );
@@ -1728,24 +1948,56 @@ function RoleRuntimePicker({ role, selection, meta, onChange }: { role: typeof P
     : role.id === 'executor'
       ? text('执行 GUI / CLI 子任务', 'Executes GUI and CLI subtasks')
       : text('独立验证与验收', 'Independent verification and acceptance');
+  const agentSuffix = (item: typeof agentChoices[number]) => item.availability === 'missing'
+    ? text(' · 未安装', ' · Not installed')
+    : item.availability === 'found_but_broken'
+      ? text(' · 已安装但无法运行', ' · Installed but not runnable')
+      : item.version ? ` · ${item.version}` : '';
+  const selectedAgentEntry = agentChoices.find((item) => item.id === selection.agent);
+  const brokenAgent = selectedAgentEntry?.availability === 'found_but_broken' ? selectedAgentEntry : null;
+  const reasoning = agentEntry(meta, selection.agent)?.reasoning;
+  const effortChoices = reasoningChoicesFor(meta, selection.agent, selection.model || '');
+  const effort = selection.reasoning_effort || '';
+  const effortSelectValue = selection.effortCustom
+    ? '__custom__'
+    : effort && effortChoices.some((choice) => choice.id === effort)
+      ? effort
+      : effort ? '__custom__' : '';
+  const effortProviderDefault = reasoning?.provider_default
+    ? text(`Provider 默认（你的 codex 配置：${reasoning.provider_default}）`, `Provider default (your codex config: ${reasoning.provider_default})`)
+    : text('Provider 默认', 'Provider default');
+  const effortNote = !reasoning?.supported
+    ? reasoning?.note || text('该 harness 未提供思考深度开关。', 'This harness exposes no reasoning-effort switch.')
+    : selection.effortCustom || (effort && !effortChoices.some((choice) => choice.id === effort))
+      ? reasoning.validation === 'silently_ignored'
+        ? text('注意：该 harness 会忽略无法识别的深度值并按默认深度继续运行，不会报错。', 'Note: this harness ignores an unrecognised value and silently continues at its default effort instead of failing.')
+        : text('自定义深度值不在检测清单中；provider 拒绝时任务会立即失败并显示原因。', 'A custom effort is not in the detected list. If the provider rejects it, the task fails immediately with the reason.')
+      : reasoning.scope === 'per_model'
+        ? text('可选深度随所选模型变化，由当前登录态检测得到。', 'The available tiers follow the selected model and come from the current session.')
+        : text(`可选深度来自 ${reasoning.source === 'cli_help' ? 'CLI 自身声明' : '内置清单'}。`, `The tiers come from ${reasoning.source === 'cli_help' ? 'the CLI itself' : 'a built-in list'}.`);
   return <section className="role-runtime-card">
     <div className="role-runtime-title"><span className="role-runtime-mark">{role.label[0]}</span><div><strong>{role.label}</strong><small>{roleDescription}</small></div></div>
     <div className="role-runtime-grid">
-      <label className="drawer-field"><span>Harness</span><select value={selection.agent} onChange={(event) => onChange({ agent: event.target.value, model: '', custom: false })}>{agentChoices.map((choice) => <option value={choice.id} key={choice.id} disabled={choice.available === false}>{choice.label}{choice.available === false ? text(' · 未安装', ' · Not installed') : ''}</option>)}</select></label>
+      <label className="drawer-field"><span>Harness</span><select value={selection.agent} onChange={(event) => onChange({ agent: event.target.value, model: '', custom: false, reasoning_effort: '', effortCustom: false })}>{agentChoices.map((choice) => <option value={choice.id} key={choice.id} disabled={choice.availability === 'missing'}>{choice.label}{agentSuffix(choice)}</option>)}</select></label>
       <label className="drawer-field"><span>Model</span><select value={selectValue} onChange={(event) => { const value = event.target.value; onChange(value === '__custom__' ? { ...selection, model: '', custom: true } : { ...selection, model: value, custom: false }); }}><option value="">{text(`Provider 默认（${providerDefault}）`, `Provider default (${providerDefault})`)}</option>{choices.map((choice) => <option value={choice.id} key={choice.id}>{choice.label}</option>)}<option value="__custom__">{text('自定义模型…', 'Custom model…')}</option></select></label>
     </div>
     {selection.custom && <input className="role-runtime-custom" autoFocus value={selection.model || ''} onChange={(event) => onChange({ ...selection, model: event.target.value })} placeholder={text('输入 provider 暴露的模型名', 'Enter a model name exposed by the provider')} />}
+    {brokenAgent && <small className="drawer-field-note agent-broken">{text('该 harness 在 PATH 上但无法运行：', 'This harness is on PATH but cannot run: ')}{compactText(brokenAgent.problem, 200)}</small>}
+    <label className="drawer-field"><span>{text('思考深度', 'Reasoning effort')}</span><select value={effortSelectValue} disabled={!reasoning?.supported} onChange={(event) => { const value = event.target.value; onChange(value === '__custom__' ? { ...selection, reasoning_effort: '', effortCustom: true } : { ...selection, reasoning_effort: value, effortCustom: false }); }}><option value="">{effortProviderDefault}</option>{effortChoices.map((choice) => <option value={choice.id} key={choice.id} title={choice.description}>{choice.label}{choice.description ? ` · ${choice.description}` : ''}</option>)}{reasoning?.supported && <option value="__custom__">{text('自定义深度…', 'Custom effort…')}</option>}</select></label>
+    {selection.effortCustom && <input className="role-runtime-custom" autoFocus value={selection.reasoning_effort || ''} onChange={(event) => onChange({ ...selection, reasoning_effort: event.target.value })} placeholder={text('输入 harness 接受的深度值', 'Enter an effort value this harness accepts')} />}
+    <small className="drawer-field-note">{effortNote}</small>
     <small className={`drawer-field-note ${discovery?.account_scoped ? 'model-detected' : ''}`}>{selection.custom ? text('自定义模型不在检测目录时仍允许尝试；若不存在、无权限或凭据错误，任务会立即失败并显示 provider 原因。', 'You may try a custom model that was not detected. If it is unavailable, unauthorized, or the credentials are invalid, the task will fail immediately with the provider reason.') : [backendScopeNote, discoveryNote].filter(Boolean).join(' ')}</small>
   </section>;
 }
 
 function DetailsDrawer({ creating, runId, snapshot, meta, selectedRound, setSelectedRound, tab, setTab, artifactList, artifactError, artifactName, artifactText, openArtifact, retryArtifacts, trajectoryRole, setTrajectoryRole, trajectoryData, trajectoryError, retryTrajectory, onClose, onCreate, onRefreshModels, controlBusy }: { creating: boolean; runId: string; snapshot: Snapshot; meta: WebMeta | null; selectedRound: number | null; setSelectedRound: (value: number) => void; tab: DetailsTab; setTab: (value: DetailsTab) => void; artifactList: ArtifactList | null; artifactError?: string; artifactName: string; artifactText: string; openArtifact: (round: number, name: string) => Promise<void>; retryArtifacts?: () => void; trajectoryRole: string; setTrajectoryRole: (value: string) => void; trajectoryData: TrajectoryView | null; trajectoryError?: string; retryTrajectory?: () => void; onClose: () => void; onCreate: (task: string, roles: Record<PublicRole, RoleRuntimeConfig>, workspace: string, maxRounds: string, promptLanguage: 'en' | 'zh') => Promise<void>; onRefreshModels: () => Promise<void>; controlBusy: boolean }) {
   const { language, text } = useUiLanguage();
+  const backdrop = useBackdropDismiss(onClose);
   const [task, setTask] = useState('');
   const [roleSelections, setRoleSelections] = useState<Record<PublicRole, RoleSelection>>({
-    manager: { agent: 'codex', model: '', custom: false },
-    executor: { agent: 'codex', model: '', custom: false },
-    auditor: { agent: 'codex', model: '', custom: false },
+    manager: { agent: 'codex', model: '', custom: false, reasoning_effort: '', effortCustom: false },
+    executor: { agent: 'codex', model: '', custom: false, reasoning_effort: '', effortCustom: false },
+    auditor: { agent: 'codex', model: '', custom: false, reasoning_effort: '', effortCustom: false },
   });
   const rolesInitialised = useRef(false);
   const [modelRefreshBusy, setModelRefreshBusy] = useState(false);
@@ -1760,7 +2012,7 @@ function DetailsDrawer({ creating, runId, snapshot, meta, selectedRound, setSele
     setRoleSelections(Object.fromEntries(PUBLIC_ROLES.map(({ id }) => {
       const configured = meta.defaults?.roles?.[id];
       const roleAgent = configured?.agent || fallbackAgent;
-      return [id, { agent: roleAgent, model: configured?.model || '', custom: false }];
+      return [id, { agent: roleAgent, model: configured?.model || '', custom: false, reasoning_effort: configured?.reasoning_effort || '', effortCustom: false }];
     })) as Record<PublicRole, RoleSelection>);
     rolesInitialised.current = true;
   }, [meta]);
@@ -1775,11 +2027,18 @@ function DetailsDrawer({ creating, runId, snapshot, meta, selectedRound, setSele
   const hiddenRounds = Math.max(0, snapshot.rounds.length - roundChoices.length);
   const roles = snapshot.rounds.find((round) => round.round_index === selectedRound)?.roles || [];
   const events = dedupeEvents(snapshot.events).slice(-80);
-  const resolvedRoles = Object.fromEntries(PUBLIC_ROLES.map(({ id }) => [id, {
-    agent: roleSelections[id].agent,
-    model: roleSelections[id].model?.trim() || defaultModel(meta, roleSelections[id].agent),
-  }])) as Record<PublicRole, RoleRuntimeConfig>;
-  return <div className="drawer-backdrop" onClick={onClose}><aside className={`details-drawer ${creating ? 'create-drawer' : ''}`} role="dialog" aria-modal="true" aria-label={creating ? text('创建新任务', 'Create new task') : text('会话详情', 'Task details')} onClick={(event) => event.stopPropagation()}>
+  const resolvedRoles = Object.fromEntries(PUBLIC_ROLES.map(({ id }) => {
+    const selection = roleSelections[id];
+    const effort = selection.reasoning_effort?.trim() || '';
+    return [id, {
+      agent: selection.agent,
+      model: selection.model?.trim() || defaultModel(meta, selection.agent),
+      // Omitted rather than sent empty so the backend keeps "follow the
+      // provider default" distinct from an explicit value.
+      ...(effort ? { reasoning_effort: effort } : {}),
+    }];
+  })) as Record<PublicRole, RoleRuntimeConfig>;
+  return <div className="drawer-backdrop" {...backdrop}><aside className={`details-drawer ${creating ? 'create-drawer' : ''}`} role="dialog" aria-modal="true" aria-label={creating ? text('创建新任务', 'Create new task') : text('会话详情', 'Task details')}>
     <div className="drawer-header"><div><div className="drawer-eyebrow">{creating ? text('新任务', 'NEW TASK') : text('会话详情', 'TASK DETAILS')}</div><h2>{creating ? text('创建 LongHorizon 任务', 'Create a LongHorizon task') : text('详情', 'Details')}</h2></div><button className="drawer-close" onClick={onClose} aria-label={text('关闭', 'Close')}><X size={18} /></button></div>
     {creating ? <>
       <p className="drawer-copy">{text('任务会由真实 worker 执行。右侧状态面板会持续显示进度，中间区域只保留可读的步骤结果。', 'A real worker will execute the task. The status panel tracks progress while the conversation shows readable step results.')}</p>
@@ -1790,7 +2049,7 @@ function DetailsDrawer({ creating, runId, snapshot, meta, selectedRound, setSele
       <label className="drawer-field"><span>{text('最大轮次', 'Max rounds')} <small>1–{MAX_ROUNDS}</small></span><input inputMode="numeric" type="text" pattern="[0-9]*" value={maxRounds} onChange={(event) => setMaxRounds(event.target.value.replace(/\D+/gu, ''))} onBlur={() => setMaxRounds(String(normaliseMaxRounds(maxRounds)))} /></label>
       <label className="drawer-field"><span>{text('角色提示词语言', 'Agent prompt language')}</span><select value={promptLanguage} onChange={(event) => setPromptLanguage(event.target.value as 'en' | 'zh')}><option value="zh">中文</option><option value="en">English</option></select><small>{text('仅控制 Manager、Executor 和 Auditor 的工作提示词，与界面语言无关。', 'Controls only the Manager, Executor, and Auditor prompts; it is independent of the interface language.')}</small></label>
       <label className="drawer-field"><span>Workspace <small>{text('可选', 'optional')}</small></span><input value={workspace} onChange={(event) => setWorkspace(event.target.value)} placeholder={text('使用 Web 服务的工作区根目录', 'Use the Web server workspace root')} /></label>
-      <div className="drawer-actions"><button onClick={onClose}>{text('取消', 'Cancel')}</button><button className="primary-action" disabled={!task.trim() || controlBusy || PUBLIC_ROLES.some(({ id }) => !roleSelections[id].agent || roleSelections[id].custom && !roleSelections[id].model?.trim())} onClick={() => void onCreate(task.trim(), resolvedRoles, workspace.trim(), maxRounds, promptLanguage)}>{controlBusy ? text('正在启动…', 'Starting…') : text('开始任务', 'Start task')}</button></div>
+      <div className="drawer-actions"><button onClick={onClose}>{text('取消', 'Cancel')}</button><button className="primary-action" disabled={!task.trim() || controlBusy || PUBLIC_ROLES.some(({ id }) => !roleSelections[id].agent || roleSelections[id].custom && !roleSelections[id].model?.trim() || roleSelections[id].effortCustom && !roleSelections[id].reasoning_effort?.trim())} onClick={() => void onCreate(task.trim(), resolvedRoles, workspace.trim(), maxRounds, promptLanguage)}>{controlBusy ? text('正在启动…', 'Starting…') : text('开始任务', 'Start task')}</button></div>
     </> : <>
       <div className="details-tabs" role="tablist" aria-label={text('详情类别', 'Detail categories')}><button id="details-tab-artifacts" role="tab" aria-controls="details-panel-artifacts" aria-selected={tab === 'artifacts'} tabIndex={tab === 'artifacts' ? 0 : -1} className={tab === 'artifacts' ? 'active' : ''} onClick={() => setTab('artifacts')}>{text('运行记录', 'Run records')}</button><button id="details-tab-trajectory" role="tab" aria-controls="details-panel-trajectory" aria-selected={tab === 'trajectory'} tabIndex={tab === 'trajectory' ? 0 : -1} className={tab === 'trajectory' ? 'active' : ''} onClick={() => setTab('trajectory')}>{text('执行轨迹', 'Trajectory')}</button><button id="details-tab-events" role="tab" aria-controls="details-panel-events" aria-selected={tab === 'events'} tabIndex={tab === 'events' ? 0 : -1} className={tab === 'events' ? 'active' : ''} onClick={() => setTab('events')}>{text('事件', 'Events')}</button></div>
       <div className="drawer-rounds"><span>{text('轮次', 'Rounds')}</span>{hiddenRounds > 0 && <button className="drawer-round-more" onClick={() => setRoundLimit((limit) => Math.min(snapshot.rounds.length, limit + MAX_TRAJECTORY_ROUNDS))}>{text(`+${hiddenRounds} 更早`, `+${hiddenRounds} earlier`)}</button>}{roundChoices.map((round) => <button className={round.round_index === selectedRound ? 'active' : ''} key={round.round_index} onClick={() => setSelectedRound(round.round_index)}>R{round.round_index}</button>)}</div>
@@ -1803,13 +2062,14 @@ function DetailsDrawer({ creating, runId, snapshot, meta, selectedRound, setSele
 
 function AuthDialog({ onClose, onSaved }: { onClose: () => void; onSaved: () => void }) {
   const { text } = useUiLanguage();
+  const backdrop = useBackdropDismiss(onClose);
   const [token, setToken] = useState(storedAuthToken);
   const save = () => {
     setStoredAuthToken(token.trim());
     onSaved();
   };
-  return <div className="auth-backdrop" onClick={onClose}>
-    <form className="auth-dialog" role="dialog" aria-modal="true" aria-label={text('连接设置', 'Connection settings')} onClick={(event) => event.stopPropagation()} onSubmit={(event) => { event.preventDefault(); save(); }}>
+  return <div className="auth-backdrop" {...backdrop}>
+    <form className="auth-dialog" role="dialog" aria-modal="true" aria-label={text('连接设置', 'Connection settings')} onSubmit={(event) => { event.preventDefault(); save(); }}>
       <div className="auth-dialog-head"><span className="auth-dialog-icon"><KeyRound size={16} /></span><div><span className="drawer-eyebrow">CONNECTION</span><h2>{text('连接设置', 'Connection settings')}</h2></div><button type="button" className="drawer-close" onClick={onClose} aria-label={text('关闭', 'Close')}><X size={18} /></button></div>
       <p className="auth-dialog-copy">{text('如果 Web 服务配置了 ', 'If the Web service uses ')}<code>LH_HARNESS_WEB_TOKEN</code>{text('，在这里填写 Bearer 令牌即可连接。令牌只保存在当前浏览器标签页。', ', enter the Bearer token here. The token is stored only in the current browser tab.')}</p>
       <label className="drawer-field"><span>{text('访问令牌', 'Access token')}</span><input autoFocus type="password" value={token} onChange={(event) => setToken(event.target.value)} placeholder={text('粘贴 Web 服务令牌', 'Paste the Web service token')} autoComplete="off" /></label>

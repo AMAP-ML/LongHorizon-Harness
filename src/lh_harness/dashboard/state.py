@@ -26,7 +26,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from ..types import DEFAULT_LOG_DIR
+from ..types import DEFAULT_LOG_DIR, MAX_ROUNDS
 from ..supervisor.control_bus import ControlBus, _ensure_dir_fd_nofollow, _open_private_regular_at
 from ..supervisor.lifecycle import ACTIVE_STATUSES, TERMINAL_STATUSES, canonical_lifecycle_status
 from ..utils.run_boundary import safe_run_dir, safe_run_logs, safe_run_role, safe_run_rounds
@@ -59,6 +59,31 @@ _MAX_ROUND_COUNT = 10_000
 _MAX_ROUND_INDEX = 1_000_000
 
 
+def _normalise_extra_rounds(value: Any) -> int:
+    """Clamp an operator-supplied extra-round count to a safe budget.
+
+    ``0`` means "use the manager's configured budget".  The value crosses the
+    HTTP boundary and is replayed from an on-disk command, so anything that is
+    not a plain in-range integer is rejected as 0 rather than trusted.
+    """
+
+    if value is None or isinstance(value, bool):
+        return 0
+    if isinstance(value, str):
+        text = value.strip()
+        if not text:
+            return 0
+        try:
+            value = int(text, 10)
+        except ValueError:
+            return 0
+    if not isinstance(value, int):
+        return 0
+    if value <= 0:
+        return 0
+    return min(value, MAX_ROUNDS)
+
+
 @dataclass
 class ApprovalOption:
     """One selectable answer shown as a button in the approval dialog."""
@@ -89,12 +114,15 @@ class Approval:
     answers: list[str] = field(default_factory=list)  # quick-answer choices (e.g. 是/否)
     allow_input: bool = True
     input_label: str = ""
+    # Round-budget gates additionally offer a number: how many rounds to grant.
+    allow_extra_rounds: bool = False
     context: dict[str, Any] = field(default_factory=dict)
     status: str = "pending"  # pending | resolved
     # --- response ---
     action: str = ""
     reason: str = ""
     user_input: str = ""
+    extra_rounds: int = 0  # 0 -> use the manager's configured budget
     created_at: float = field(default_factory=time.time)
     resolved_at: float | None = None
 
@@ -111,12 +139,14 @@ class Approval:
             "answers": list(self.answers),
             "allow_input": self.allow_input,
             "input_label": self.input_label,
+            "allow_extra_rounds": self.allow_extra_rounds,
             "context": self.context,
             "round_index": self.round_index,
             "status": self.status,
             "action": self.action,
             "reason": self.reason,
             "user_input": self.user_input,
+            "extra_rounds": self.extra_rounds,
             "created_at": self.created_at,
             "resolved_at": self.resolved_at,
         }
@@ -747,6 +777,7 @@ class DashboardState:
         answers: list[str] | None = None,
         allow_input: bool = True,
         input_label: str = "",
+        allow_extra_rounds: bool = False,
         context: dict[str, Any] | None = None,
     ) -> Approval:
         approval = Approval(
@@ -757,6 +788,7 @@ class DashboardState:
             answers=list(answers or []),
             allow_input=allow_input,
             input_label=input_label,
+            allow_extra_rounds=allow_extra_rounds,
             context=context or {},
         )
         with self._lock:
@@ -774,6 +806,7 @@ class DashboardState:
         action: str,
         reason: str = "",
         user_input: str = "",
+        extra_rounds: int | None = None,
         command_id: str | None = None,
         expected_revision: int | None = None,
     ) -> bool:
@@ -783,6 +816,7 @@ class DashboardState:
         normalized_action = str(action or "").strip()
         normalized_reason = reason.strip()
         normalized_input = user_input.strip()
+        normalized_extra = _normalise_extra_rounds(extra_rounds)
         # The worker only understands the option values it issued.  Accept a
         # small backwards-compatible default vocabulary when an old approval
         # record omitted options, but never silently turn an arbitrary action
@@ -798,12 +832,19 @@ class DashboardState:
                 return False
             if not approval.allow_input and normalized_input:
                 return False
+            if not approval.allow_extra_rounds and normalized_extra:
+                return False
         payload = {
             "approval_id": approval_id,
             "action": normalized_action,
             "reason": normalized_reason,
             "user_input": normalized_input,
         }
+        if normalized_extra:
+            # Only present when the operator chose a value: the payload doubles
+            # as the idempotency fingerprint, so an unconditional new key would
+            # make a retry of a pre-upgrade command look like a different one.
+            payload["extra_rounds"] = normalized_extra
         # The approval id is the durable uniqueness key.  Browser retries may
         # carry different Idempotency-Key values (or none at all), but one
         # checkpoint must never enqueue two decisions.  ControlBus serialises
@@ -910,11 +951,13 @@ class DashboardState:
             answers=[str(item) for item in record.get("answers", [])],
             allow_input=bool(record.get("allow_input", True)),
             input_label=str(record.get("input_label", "")),
+            allow_extra_rounds=bool(record.get("allow_extra_rounds", False)),
             context=dict(record.get("context", {})) if isinstance(record.get("context"), dict) else {},
             status=str(record.get("status", "pending")),
             action=str(record.get("action", "")),
             reason=str(record.get("reason", "")),
             user_input=str(record.get("user_input", "")),
+            extra_rounds=_normalise_extra_rounds(record.get("extra_rounds")),
             created_at=float(record.get("created_at", time.time())),
             resolved_at=float(record["resolved_at"]) if record.get("resolved_at") else None,
         )
@@ -954,12 +997,18 @@ class DashboardState:
                 if not allowed:
                     allowed = {"continue", "stop"}
                 user_input = str(payload.get("user_input", "")).strip()
-                if action not in allowed or (not approval.allow_input and user_input):
+                extra_rounds = _normalise_extra_rounds(payload.get("extra_rounds"))
+                if (
+                    action not in allowed
+                    or (not approval.allow_input and user_input)
+                    or (not approval.allow_extra_rounds and extra_rounds)
+                ):
                     self.control_bus.receipt(command, "rejected", message="invalid approval response")
                     continue
                 approval.action = action
                 approval.reason = str(payload.get("reason", "")).strip()
                 approval.user_input = user_input
+                approval.extra_rounds = extra_rounds
                 approval.status = "resolved"
                 approval.resolved_at = time.time()
                 snapshot = approval.to_dict()

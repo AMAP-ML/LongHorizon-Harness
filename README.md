@@ -36,6 +36,7 @@ LongHorizon-Harness turns existing agents into long-running computer-use systems
 
 ## ✨ News
 
+- **[v0.1.7 · 2026-08-20]** A finished run is no longer a dead end: the workbench is now a conversation. Read the reply, type a follow-up, and the run continues on its own round ledger instead of replanning from scratch. A message you send mid-round is claimed by the very next round, so stopping and continuing never drops it. Also adds `--reasoning-effort` for every role (with `--manager-reasoning-effort` and friends to override one), forwarded to whichever backend exposes it. The transcript now reads in strict chronological order, and a graceful stop escalates to a force stop only when a worker ignores it.
 - **[v0.1.6 · 2026-08-15]** Added [OpenCode](https://github.com/anomalyco/opencode) CLI support. LongHorizon-Harness can now run `opencode run prompt` as `--agent opencode`, with role-scoped read/write permissions, OpenCode API endpoint overrides, normalized JSON results, and CLI/config/doctor integration. The Web workbench can select OpenCode Harness and its model independently for each role.
 - **[v0.1.5 · 2026-08-14]** Added phase-1 [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness) CLI support. LongHorizon-Harness can now run `dsh --profile headless` as `--agent deepseek_harness`, with an isolated `DSH_HOME`, role-scoped read/write permissions, DeepSeek API endpoint overrides, normalized JSONL results, and CLI/config/doctor integration. The Web workbench can select DeepSeek Harness and its model independently for each role. GUI computer-use and MCP support will follow in a later phase; see [the CLI setup](#5-or-run-a-task-from-the-command-line).
 - **[v0.1.4 · 2026-08-11]** The new Dashboard has landed: a React/FastAPI workbench you can drive entirely from the browser. Start a task, choose a backend and model per role, answer approvals, send an instruction mid-run, and stop or restart a run. Launch it with `lh-harness web`; see [Run a task in the browser](#4-run-a-task-in-the-browser-recommended).
@@ -236,7 +237,7 @@ This creates `./.lh-harness/config.toml` without replacing an existing file; use
 lh-harness web --workspace-root .
 ```
 
-This opens the workbench at `http://127.0.0.1:8799/`. Everything happens there: start a task, pick a backend and model per role, answer approval requests, send an instruction mid-run, and stop or restart a run. `--workspace-root` sets the default working directory for tasks created there; the remaining options are listed under [Dashboard commands](#dashboard-commands).
+This opens the workbench at `http://127.0.0.1:8799/`. Everything happens there: start a task, pick a backend and model per role, answer approval requests, send an instruction mid-run, stop or restart a run, and keep asking follow-up questions after it finishes — a follow-up continues the same run from the rounds it already completed. `--workspace-root` sets the default working directory for tasks created there; the remaining options are listed under [Dashboard commands](#dashboard-commands).
 
 #### 5. Or run a task from the command line
 
@@ -327,6 +328,7 @@ Task text, run IDs, and API keys are deliberately **not** configurable here; the
 |---|---|---|
 | `agent` | `"codex"` | Backend for every role unless a role overrides it: `codex`, `claude_code`, `opencode`, or `deepseek_harness`. |
 | `model` | `"gpt-5.6-sol"` | Model for every role unless a role overrides it. Must be a model the chosen backend exposes. |
+| `reasoning_effort` | commented out | Reasoning depth for every role unless a role overrides it, forwarded to whichever backend exposes it. Unset keeps the provider's own setting. |
 | `env` | `"local"` | Execution environment. Only `local` today. |
 | `runs_root` | `"./.lh-harness/runs"` | Where run directories are created. Each run gets `<runs_root>/<run-id>/`. |
 | `workspace` | commented out | Working directory the agents operate in. Defaults to the directory `lh-harness` was started from, so a task acts on your real project; set it to isolate the run somewhere else. |
@@ -354,13 +356,13 @@ Per-episode limits in seconds. One episode is a single role invocation, not the 
 
 ##### `[run.roles.*]`
 
-Each role can take its own `agent` and `model`, so you can pay for a strong model only where it matters: a capable Manager and Auditor with a cheaper Executor, for example. Every field is commented out by default, meaning "inherit".
+Each role can take its own `agent`, `model`, and `reasoning_effort`, so you can pay for a strong model only where it matters: a capable Manager and Auditor with a cheaper Executor, for example. Every field is commented out by default, meaning "inherit".
 
 Resolution walks the chain until it finds a value:
 
 ```
-gui_executor → executor → [run].agent / [run].model
-cli_auditor  → auditor  → [run].agent / [run].model
+gui_executor → executor → [run].agent / [run].model / [run].reasoning_effort
+cli_auditor  → auditor  → [run].agent / [run].model / [run].reasoning_effort
 ```
 
 | Section | Falls back to | Covers |

@@ -49,6 +49,67 @@ export function roundSummary(round: RoundView): string {
   return parts.join(' · ') || (round.in_progress ? 'In progress' : 'Recorded');
 }
 
+export type TranscriptKind = 'plan' | 'assistant' | 'verification' | 'live' | 'user' | 'final';
+
+export interface TranscriptOrder {
+  kind: TranscriptKind;
+  round?: number;
+  sortRound?: number;
+  sortTime?: number;
+}
+
+/** Order inside one round for entries that carry no usable timestamp. */
+const TRANSCRIPT_STAGE_RANK: Record<TranscriptKind, number> = {
+  plan: 1, assistant: 2, verification: 3, live: 4, user: 5, final: 6,
+};
+
+/**
+ * Order a transcript strictly by time, the way a chat log reads.
+ *
+ * A timestamped entry is placed by its own time, so a reply the operator sent
+ * after an answer can never be shown above it. Entries without a time keep the
+ * durable round/stage order and are anchored next to their round's timeline.
+ */
+export function sortTranscript<T extends TranscriptOrder>(items: readonly T[]): T[] {
+  const timeline = new Map<number, number>();
+  for (const item of items) {
+    const round = item.round;
+    const time = item.sortTime;
+    if (round === undefined || !time) continue;
+    // Anchor untimed entries to the earliest time seen in their round so they
+    // stay adjacent to it instead of collapsing to the top of the transcript.
+    const earliest = timeline.get(round);
+    if (earliest === undefined || time < earliest) timeline.set(round, time);
+  }
+  const effectiveTime = (item: TranscriptOrder): number => {
+    // Pinned entries win over their own timestamp: a resumed run restamps
+    // `started_at` to the reopen time, which would drag the original request to
+    // the bottom of the transcript.
+    if (item.sortRound !== undefined) {
+      if (item.sortRound < 0) return Number.NEGATIVE_INFINITY;
+      if (item.sortRound === Number.MAX_SAFE_INTEGER) return Number.POSITIVE_INFINITY;
+    }
+    if (item.sortTime) return item.sortTime;
+    const round = item.sortRound ?? item.round;
+    return round === undefined ? Number.NEGATIVE_INFINITY : timeline.get(round) ?? Number.NEGATIVE_INFINITY;
+  };
+  return items
+    .map((item, index) => ({ item, index }))
+    .sort((left, right) => {
+      const leftTime = effectiveTime(left.item);
+      const rightTime = effectiveTime(right.item);
+      if (leftTime !== rightTime) return leftTime - rightTime;
+      const leftRound = left.item.sortRound ?? left.item.round ?? 0;
+      const rightRound = right.item.sortRound ?? right.item.round ?? 0;
+      if (leftRound !== rightRound) return leftRound - rightRound;
+      const leftRank = TRANSCRIPT_STAGE_RANK[left.item.kind];
+      const rightRank = TRANSCRIPT_STAGE_RANK[right.item.kind];
+      if (leftRank !== rightRank) return leftRank - rightRank;
+      return left.index - right.index;
+    })
+    .map((entry) => entry.item);
+}
+
 /**
  * Prefer the Manager's persisted plan over its internal route token.
  *

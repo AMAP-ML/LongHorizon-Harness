@@ -7,6 +7,7 @@ import re
 import shlex
 
 from ..agent_logs import visible_output as extract_opencode_visible_output
+from ..agent_registry import normalise_reasoning_effort
 from ..environment.base import Environment
 from ..types import (
     DEFAULT_OPENCODE_MODEL,
@@ -42,6 +43,7 @@ class OpenCodeAdapter(CommandAgentAdapter):
         workspace_path: str = DEFAULT_WORKSPACE_PATH,
         prompt_dir: str = f"{DEFAULT_TMP_DIR}/prompts",
         effort: str | None = None,
+        reasoning_effort: str | None = None,
         role: str = "cli_executor",
         hidden_paths: tuple[str, ...] = (),
     ) -> None:
@@ -50,9 +52,11 @@ class OpenCodeAdapter(CommandAgentAdapter):
             raise ValueError("OpenCode model must not be empty")
         if "\x00" in normalized_model or len(normalized_model) > 256:
             raise ValueError("OpenCode model contains invalid characters or is too long")
-        normalized_effort = (effort or "").strip()
-        if len(normalized_effort) > 64:
-            raise ValueError("OpenCode reasoning effort is too long")
+        # One shared validator for every backend: a length check alone would let
+        # a quote or newline through into the command line.
+        normalized_effort = normalise_reasoning_effort(
+            reasoning_effort if reasoning_effort is not None else effort
+        )
 
         opencode_binary = resolve_opencode_binary() or "opencode"
         env_parts: list[str] = []

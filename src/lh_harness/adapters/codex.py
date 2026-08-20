@@ -7,6 +7,7 @@ import shlex
 
 from ..types import DEFAULT_CODEX_MODEL, DEFAULT_TMP_DIR, DEFAULT_WORKSPACE_PATH
 from ..agent_logs import visible_output as extract_codex_visible_output
+from ..agent_registry import normalise_reasoning_effort
 from ..utils.agent_cli import resolve_codex_binary
 from .cli_agent import CommandAgentAdapter
 
@@ -34,7 +35,9 @@ class CodexAdapter(CommandAgentAdapter):
         add_dirs: list[str] | None = None,
         sandbox_mode: str | None = None,
         hidden_paths: tuple[str, ...] = (),
+        reasoning_effort: str | None = None,
     ) -> None:
+        effort = normalise_reasoning_effort(reasoning_effort)
         env_parts: list[str] = []
         if api_key:
             quoted_key = shlex.quote(api_key)
@@ -62,6 +65,13 @@ class CodexAdapter(CommandAgentAdapter):
 
         for override in _config_overrides(base_url=base_url, api_key=api_key):
             command_parts.extend(["-c", shlex.quote(override)])
+
+        # Codex has no `--effort` flag; the reasoning depth is a config value.
+        # Passing nothing leaves the user's own ~/.codex/config.toml in charge.
+        if effort:
+            command_parts.extend(
+                ["-c", shlex.quote(f"model_reasoning_effort={json.dumps(effort)}")]
+            )
 
         # MCP support is opt-in and uses Codex's own format: a TOML file holding
         # `[mcp_servers.*]` tables, replayed as `-c mcp_servers.<name>=...`

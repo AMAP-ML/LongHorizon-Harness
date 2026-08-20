@@ -6,6 +6,7 @@ import sys
 from collections.abc import Callable, Sequence
 
 from ..agent_logs import visible_output as extract_visible_output
+from ..agent_registry import normalise_reasoning_effort
 from ..types import DEFAULT_DEEPSEEK_HARNESS_MODEL
 from ..utils.agent_cli import resolve_dsh_binary
 from .cli_agent import CommandAgentAdapter
@@ -44,12 +45,16 @@ class DeepSeekHarnessAdapter(CommandAgentAdapter):
         add_dirs: Sequence[str] = (),
         hidden_paths: Sequence[str] = (),
         visible_output_parser: Callable[[str], str] | None = None,
+        reasoning_effort: str | None = None,
     ) -> None:
         normalized_model = model.strip()
         if not normalized_model:
             raise ValueError("DeepSeek Harness model must not be empty")
         if "\x00" in normalized_model or len(normalized_model) > 256:
             raise ValueError("DeepSeek Harness model contains invalid characters or is too long")
+        # Rejected rather than ignored: silently dropping it would make the
+        # workbench claim a reasoning depth the run never applied.
+        normalise_reasoning_effort(reasoning_effort, agent_id="deepseek_harness")
         if add_dirs:
             raise ValueError(
                 "DeepSeek Harness phase-1 CLI integration does not support additional directories"

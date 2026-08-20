@@ -23,7 +23,7 @@ from fastapi.staticfiles import StaticFiles
 from ..dashboard.state import DashboardState
 from ..model_catalog import discover_model_catalog
 from ..supervisor.service import IdempotencyConflict, RunSupervisor
-from ..supervisor.lifecycle import TERMINAL_STATUSES, canonical_lifecycle_status
+from ..supervisor.lifecycle import TERMINAL_STATUSES, canonical_lifecycle_status, resume_epoch
 from ..supervisor.control_bus import CommandConflict, RevisionConflict
 from ..types import DEFAULT_CODEX_MODEL, DEFAULT_MAX_ROUNDS, MAX_ROUNDS
 from ..utils.agent_cli import resolve_codex_binary, resolve_dsh_binary, resolve_opencode_binary
@@ -437,6 +437,29 @@ def _strict_optional_revision(value: Any) -> int | None:
     raise HTTPException(status_code=422, detail="expected_revision must be an integer")
 
 
+def _optional_extra_rounds(value: Any) -> int | None:
+    """Parse an optional extra-round grant from a request body.
+
+    Rejecting an out-of-range value at the boundary (rather than clamping it)
+    keeps an obvious operator mistake visible instead of silently granting a
+    different budget than the one that was typed.
+    """
+
+    if value is None or value == "":
+        return None
+    detail = f"extra_rounds must be an integer from 1 to {MAX_ROUNDS}"
+    if isinstance(value, bool) or isinstance(value, float):
+        raise HTTPException(status_code=422, detail=detail)
+    if isinstance(value, str):
+        text = value.strip()
+        if not text or len(text) > 16 or not re.fullmatch(r"\d+", text):
+            raise HTTPException(status_code=422, detail=detail)
+        value = int(text, 10)
+    if not isinstance(value, int) or not 1 <= value <= MAX_ROUNDS:
+        raise HTTPException(status_code=422, detail=detail)
+    return value
+
+
 def _body_text(value: Any, *, field: str, required: bool = False, max_chars: int = 100_000) -> str:
     if value is None:
         text = ""
@@ -470,12 +493,14 @@ def _public_owner(owner: dict[str, Any]) -> dict[str, Any]:
         "started_at",
         "agent",
         "model",
+        "reasoning_effort",
         "role_configs",
         "max_rounds",
         "prompt_language",
         "workspace",
         "resumed_from",
         "resume_kind",
+        "resume_epoch",
     }
     result = {key: owner[key] for key in allowed if key in owner}
     if isinstance(owner.get("task"), str):
@@ -537,6 +562,17 @@ def _snapshot_for(registry: StateRegistry, state: DashboardState, run_id: str) -
     for field in ("completion_satisfied", "completion_authority", "exit_code", "failure_reason", "finished_at", "started_at"):
         if field in managed and managed.get(field) is not None:
             result["run"][field] = managed[field]
+    # Lets a client tell "stopping normally" from "SIGTERM was ignored" and only
+    # then offer the force-kill escalation.
+    for field in ("requested_action", "stop_requested_at"):
+        if managed.get(field) is not None:
+            result["run"][field] = managed[field]
+    # Clients keep lifecycle monotonic to survive REST/WS races, so a resumed
+    # run needs an explicit generation counter: without it a reopened run looks
+    # like a stale "running" frame arriving after a terminal one and is dropped.
+    epoch = resume_epoch(managed) or resume_epoch(owner)
+    if epoch:
+        result["run"]["resume_epoch"] = epoch
     if status in TERMINAL_STATUSES:
         # Supervisor lifecycle is authoritative even when the worker died
         # before its final round directory was marked closed. Do not expose a
@@ -580,6 +616,7 @@ def _stream_projection_signature(snapshot: dict[str, Any]) -> tuple[Any, ...]:
         snapshot.get("run", {}).get("status"),
         snapshot.get("run", {}).get("finished_at"),
         snapshot.get("run", {}).get("exit_code"),
+        snapshot.get("run", {}).get("resume_epoch"),
         snapshot.get("active_round"),
         snapshot.get("active_role"),
         snapshot.get("controls", {}).get("can_inject"),
@@ -735,6 +772,9 @@ def create_app(
             task = _body_text(body.get("task", body.get("instructions", "")), field="task", required=True)
             agent = _body_text(body.get("agent", "codex"), field="agent", required=True, max_chars=64)
             model = _body_text(body.get("model"), field="model", max_chars=256) or None
+            reasoning_effort = _body_text(
+                body.get("reasoning_effort"), field="reasoning_effort", max_chars=64
+            ) or None
             role_configs = body.get("roles")
             workspace = _body_text(body.get("workspace"), field="workspace", max_chars=4096) or None
             run_id_value = _body_text(body.get("run_id"), field="run_id", max_chars=128) or None
@@ -760,6 +800,7 @@ def create_app(
                 max_rounds=max_rounds,
                 prompt_language=prompt_language,
                 run_id=run_id_value,
+                reasoning_effort=reasoning_effort,
                 idempotency_key=_bounded_command_id(request.headers.get("Idempotency-Key")),
             )
         except IdempotencyConflict as exc:
@@ -1045,6 +1086,7 @@ def create_app(
                 action=_body_text(body.get("action", body.get("decision", "continue")), field="action", required=True, max_chars=128),
                 reason=_body_text(body.get("reason", body.get("note", "")), field="reason", max_chars=10_000),
                 user_input=_body_text(body.get("user_input", body.get("instructions", "")), field="user_input", max_chars=50_000),
+                extra_rounds=_optional_extra_rounds(body.get("extra_rounds")),
                 command_id=_bounded_command_id(request.headers.get("Idempotency-Key")),
                 expected_revision=expected_revision_int,
             )
@@ -1081,12 +1123,24 @@ def create_app(
             raise HTTPException(status_code=409, detail=str(exc)) from exc
 
     @app.post("/api/runs/{run_id}/resume")
-    def resume(run_id: str, request: Request) -> dict[str, Any]:
+    def resume(
+        run_id: str,
+        request: Request,
+        body: dict[str, Any] = Body(default_factory=dict),
+    ) -> dict[str, Any]:
         _state_or_404(registry, run_id)
         if supervisor is None or bool(getattr(supervisor, "attached_only", False)):
             raise HTTPException(status_code=501, detail="resume requires the standalone Web supervisor")
+        mode = _body_text(body.get("mode", "continue"), field="mode", max_chars=16) or "continue"
+        if mode not in {"continue", "retry"}:
+            raise HTTPException(status_code=422, detail="mode must be continue or retry")
         try:
-            created = supervisor.resume(run_id, idempotency_key=_bounded_command_id(request.headers.get("Idempotency-Key")))
+            created = supervisor.resume(
+                run_id,
+                mode=mode,
+                extra_rounds=_optional_extra_rounds(body.get("extra_rounds")),
+                idempotency_key=_bounded_command_id(request.headers.get("Idempotency-Key")),
+            )
             if isinstance(created.get("owner"), dict):
                 created = {**created, "owner": _public_owner(created["owner"])}
             return {"ok": True, "run": created}

@@ -133,9 +133,13 @@ class AgentCli:
         return bool(self.path) and not self.problem
 
 
-def probe_agent_cli(binary: str, *, timeout: int = 15) -> AgentCli:
-    """Locate `binary` and confirm `--version` succeeds."""
-    path = resolve_agent_binary(binary)
+def probe_agent_cli(binary: str, *, timeout: int = 15, path: str | None = None) -> AgentCli:
+    """Locate `binary` and confirm `--version` succeeds.
+
+    ``path`` skips resolution so a caller that already chose an installation
+    verifies that exact one instead of whatever discovery would pick now.
+    """
+    path = path or resolve_agent_binary(binary)
     if not path:
         return AgentCli(binary, problem=f"`{binary}` was not found")
 

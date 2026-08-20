@@ -294,7 +294,8 @@ def test_web_meta_exposes_opencode_backend_and_default_model(
     monkeypatch,
     tmp_path: Path,
 ) -> None:
-    binary = _executable(tmp_path / "bin" / "opencode", "exit 0\n")
+    # Availability is proven by running `--version`, so the stub answers it.
+    binary = _executable(tmp_path / "bin" / "opencode", 'echo "1.18.15"\nexit 0\n')
     monkeypatch.setattr(web_server, "resolve_opencode_binary", lambda: binary)
 
     client = TestClient(web_server.create_app(runs_root=tmp_path / "runs"))
@@ -303,6 +304,7 @@ def test_web_meta_exposes_opencode_backend_and_default_model(
 
     assert agent["label"] == "OpenCode"
     assert agent["available"] is True
+    assert agent["availability"] == "usable"
     assert agent["binary"] == binary
     assert agent["default_model"] == DEFAULT_OPENCODE_MODEL
     assert meta["models"]["opencode"][0]["id"] == DEFAULT_OPENCODE_MODEL

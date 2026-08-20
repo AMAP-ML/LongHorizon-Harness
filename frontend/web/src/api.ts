@@ -56,6 +56,12 @@ export function isNotFound(reason: unknown): boolean {
     : /(?:^|\s)404(?:\s|$)/u.test(String(reason ?? ''));
 }
 
+export function isConflict(reason: unknown): boolean {
+  return reason instanceof ApiError
+    ? reason.status === 409
+    : /(?:^|\s)409(?:\s|$)/u.test(String(reason ?? ''));
+}
+
 async function responseError(response: Response): Promise<ApiError> {
   let message = `${response.status} ${response.statusText}`.trim();
   try {
@@ -110,15 +116,47 @@ export interface WebMeta {
   capabilities: Record<string, boolean>;
   endpoint: string;
   /** Server-discovered agent/model catalogue. Older servers may omit these. */
-  agents?: Array<{ id: string; label?: string; available?: boolean; default_model?: string; models?: ModelChoice[]; discovery?: ModelDiscovery }>;
+  agents?: AgentChoice[];
   models?: Record<string, ModelChoice[]>;
   defaults?: { agent?: string; model?: string; roles?: Record<string, RoleRuntimeConfig> };
   model_discovery?: Record<string, ModelDiscovery>;
 }
 
-export interface ModelChoice { id: string; label?: string; availability?: string; is_default?: boolean; reasoning_efforts?: string[] }
+export interface AgentChoice {
+  id: string;
+  label?: string;
+  /** Kept for older servers; prefer `availability`, which separates "installed but broken". */
+  available?: boolean;
+  availability?: 'usable' | 'found_but_broken' | 'missing';
+  version?: string;
+  problem?: string;
+  binary?: string | null;
+  capabilities?: string[];
+  default_model?: string;
+  models?: ModelChoice[];
+  discovery?: ModelDiscovery;
+  reasoning?: ReasoningSupport;
+}
+
+export interface ReasoningSupport {
+  supported: boolean;
+  note?: string;
+  transport?: 'codex_config' | 'cli_flag';
+  flag?: string;
+  /** `per_model` means the choices follow the selected model, not the agent. */
+  scope?: 'per_model' | 'per_agent';
+  source?: 'model_catalog' | 'cli_help' | 'declared';
+  allow_custom?: boolean;
+  choices?: Array<{ id: string; label?: string }>;
+  /** What the backend applies when the harness sends nothing. */
+  provider_default?: string;
+  /** `silently_ignored` backends accept an unknown value and run at their default. */
+  validation?: 'provider_error' | 'silently_ignored';
+}
+
+export interface ModelChoice { id: string; label?: string; availability?: string; is_default?: boolean; reasoning_efforts?: string[]; reasoning_effort_details?: Array<{ id: string; description?: string }> }
 export interface ModelDiscovery { status?: string; source?: string; account_scoped?: boolean; refreshed_at?: string | number | null; warning?: string }
-export interface RoleRuntimeConfig { agent: string; model?: string }
+export interface RoleRuntimeConfig { agent: string; model?: string; reasoning_effort?: string }
 
 export async function getJson<T>(path: string): Promise<T> {
   const response = await fetch(path, { headers: authHeaders() });
@@ -213,9 +251,18 @@ export async function postInstruction(runId: string, instructions: string, reque
   if (!response.ok) throw await responseError(response);
 }
 
-export async function resolveApproval(runId: string, approvalId: string, action: string, userInput = '', requestKey = idempotencyKey('approval')): Promise<void> {
+export async function resolveApproval(
+  runId: string,
+  approvalId: string,
+  action: string,
+  userInput = '',
+  requestKey = idempotencyKey('approval'),
+  extraRounds?: number,
+): Promise<void> {
+  const payload: Record<string, unknown> = { action, user_input: userInput };
+  if (extraRounds !== undefined) payload.extra_rounds = extraRounds;
   const response = await fetch(`/api/runs/${encodeURIComponent(runId)}/approvals/${encodeURIComponent(approvalId)}/resolve`, {
-    method: 'POST', headers: { 'Content-Type': 'application/json', ...authHeaders(), 'Idempotency-Key': requestKey }, body: JSON.stringify({ action, user_input: userInput }),
+    method: 'POST', headers: { 'Content-Type': 'application/json', ...authHeaders(), 'Idempotency-Key': requestKey }, body: JSON.stringify(payload),
   });
   if (!response.ok) throw await responseError(response);
 }
@@ -259,9 +306,19 @@ export async function abortRun(runId: string, requestKey = idempotencyKey('abort
   if (!response.ok) throw await responseError(response);
 }
 
-export async function resumeRun(runId: string, requestKey = idempotencyKey('resume')): Promise<{ id: string }> {
+export type ResumeMode = 'continue' | 'retry';
+
+export async function resumeRun(
+  runId: string,
+  requestKey = idempotencyKey('resume'),
+  options: { mode?: ResumeMode; extraRounds?: number } = {},
+): Promise<{ id: string }> {
+  const payload: Record<string, unknown> = { mode: options.mode ?? 'continue' };
+  if (options.extraRounds !== undefined) payload.extra_rounds = options.extraRounds;
   const response = await fetch(`/api/runs/${encodeURIComponent(runId)}/resume`, {
-    method: 'POST', headers: { 'Content-Type': 'application/json', ...authHeaders(), 'Idempotency-Key': requestKey }, body: '{}',
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', ...authHeaders(), 'Idempotency-Key': requestKey },
+    body: JSON.stringify(payload),
   });
   if (!response.ok) throw await responseError(response);
   const data = await response.json() as { run: { id: string } };

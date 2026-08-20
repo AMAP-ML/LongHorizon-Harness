@@ -40,6 +40,9 @@ class _Trigger:
     message: str
     options: list[ApprovalOption]
     input_label: str = "Optional: add instructions for the next manager round"
+    # Gates raised because the run ran out of budget (or is looping) let the
+    # operator say how many more rounds to grant before continuing.
+    allow_extra_rounds: bool = False
 
 
 _TRIGGERS: dict[str, _Trigger] = {
@@ -47,11 +50,13 @@ _TRIGGERS: dict[str, _Trigger] = {
         "Task complete. Continue the run?",
         "The manager confirmed task completion. Continue to add rounds and inject instructions, or end this run.",
         [_CONTINUE, _STOP_FINISH],
+        allow_extra_rounds=True,
     ),
     "max_rounds": _Trigger(
         "Round limit reached. Continue the run?",
         "The configured round budget is exhausted before completion. Continue to add rounds, or end this run.",
         [_CONTINUE, _STOP_FINISH],
+        allow_extra_rounds=True,
     ),
     "needs_input": _Trigger(
         "Manager needs your decision",
@@ -68,6 +73,7 @@ _TRIGGERS: dict[str, _Trigger] = {
         "Repeated failures require operator input",
         "The manager produced invalid routes or rejected completions over several rounds and may be looping. Add instructions and continue, or stop this run.",
         [_CONTINUE, _STOP_ABORT],
+        allow_extra_rounds=True,
     ),
 }
 
@@ -145,6 +151,7 @@ def make_human_hook(
             options=list(spec.options),
             answers=answers,
             input_label=spec.input_label,
+            allow_extra_rounds=spec.allow_extra_rounds,
             context={
                 "phase": "end_of_round",
                 "trigger": kind,
@@ -169,7 +176,10 @@ def make_human_hook(
         return {
             "action": resolved.action,  # "continue" | "stop"
             "instructions": "\n".join(parts),
-            "extra_rounds": default_extra_rounds,  # 0 -> manager default budget
+            # The operator's own choice wins; 0 falls back to the caller's
+            # default, which in turn falls back to the manager's configured
+            # budget.  Without this the dialog's round input was ignored.
+            "extra_rounds": resolved.extra_rounds or default_extra_rounds,
             "reason": resolved.reason,
         }
 

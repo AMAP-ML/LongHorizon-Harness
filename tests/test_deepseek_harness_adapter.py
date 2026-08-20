@@ -156,7 +156,8 @@ def test_web_meta_exposes_deepseek_backend_and_default_model(
     monkeypatch,
     tmp_path: Path,
 ) -> None:
-    binary = _executable(tmp_path / "bin" / "dsh", "exit 0\n")
+    # Availability is proven by running `--version`, so the stub answers it.
+    binary = _executable(tmp_path / "bin" / "dsh", 'echo "dsh 0.9.1"\nexit 0\n')
     monkeypatch.setattr(web_server, "resolve_dsh_binary", lambda: binary)
 
     client = TestClient(web_server.create_app(runs_root=tmp_path / "runs"))
@@ -165,6 +166,8 @@ def test_web_meta_exposes_deepseek_backend_and_default_model(
 
     assert agent["label"] == "DeepSeek Harness (CLI)"
     assert agent["available"] is True
+    assert agent["availability"] == "usable"
+    assert agent["version"] == "0.9.1"
     assert agent["binary"] == binary
     assert agent["default_model"] == "deepseek-v4-flash"
     assert meta["models"]["deepseek_harness"][0]["id"] == "deepseek-v4-flash"

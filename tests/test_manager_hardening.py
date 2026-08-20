@@ -160,6 +160,42 @@ async def test_dashboard_instructions_are_kept_for_manager_and_final_reply(tmp_p
 
 
 @pytest.mark.asyncio
+async def test_reopening_a_run_withdraws_the_round_reply_the_dashboard_reads(tmp_path: Path) -> None:
+    async def human_hook(_context: dict[str, object]) -> dict[str, object]:
+        return {"action": "continue"}
+
+    role_dir = tmp_path / "role_orchestration"
+    round_dir = role_dir / "rounds" / "round_002"
+    round_dir.mkdir(parents=True)
+    (role_dir / "final_response.txt").write_text("withdrawn answer", encoding="utf-8")
+    (round_dir / "final_response.txt").write_text("withdrawn answer", encoding="utf-8")
+    (round_dir / "manager_plan.txt").write_text("plan kept for auditing", encoding="utf-8")
+
+    ctx = _GateContext(
+        config=SimpleNamespace(max_total_episodes=4),
+        task="original task",
+        rounds=[],
+        human_hook=human_hook,
+        log_dir=tmp_path,
+        events_path=tmp_path / "events.jsonl",
+        round_budget=4,
+        role_dir=role_dir,
+        final_response="withdrawn answer",
+        response_round=2,
+    )
+
+    assert await _human_gate(ctx, "progress", 2, "verified state") is False
+
+    assert ctx.final_response == ""
+    # Both published copies go, so the round stops advertising a reply it no
+    # longer stands behind.
+    assert not (role_dir / "final_response.txt").exists()
+    assert not (round_dir / "final_response.txt").exists()
+    assert (round_dir / "manager_plan.txt").exists()
+    assert DashboardState(tmp_path).snapshot()["final_response"] == ""
+
+
+@pytest.mark.asyncio
 async def test_provider_failure_stops_without_round_limit_approval(tmp_path: Path) -> None:
     message = "The 'bad-model' model is not supported when using Codex with a ChatGPT account."
 

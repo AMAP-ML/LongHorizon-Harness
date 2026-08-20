@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from typing import Any
 
 from ..dashboard.state import DashboardState
@@ -11,6 +12,8 @@ from .events import EventTailer
 
 _PROVENANCE_FIELDS = ("agent", "model", "role_configs", "workspace", "max_rounds", "prompt_language")
 _MAX_FINAL_RESPONSE_CHARS = 512 * 1024
+# Mirrors agent_registry's rule; owner records are untrusted input here.
+_REASONING_EFFORT_RE = re.compile(r"^[A-Za-z0-9._:-]{1,64}$")
 
 
 def _final_response(
@@ -104,6 +107,9 @@ def _safe_role_configs(value: object) -> dict[str, dict[str, str]]:
         if not isinstance(model, str) or not model.strip() or len(model.strip()) > 256 or "\x00" in model:
             continue
         result[role] = {"agent": agent, "model": model.strip()}
+        effort = raw.get("reasoning_effort")
+        if isinstance(effort, str) and _REASONING_EFFORT_RE.match(effort.strip()):
+            result[role]["reasoning_effort"] = effort.strip()
     return result if len(result) == 3 else {}
 
 
