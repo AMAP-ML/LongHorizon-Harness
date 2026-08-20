@@ -94,6 +94,21 @@ def test_manager_route_rejects_undelimited_suffix() -> None:
     assert parse_role_manager_next_step("Next: done later") != MANAGER_NEXT_DONE
 
 
+@pytest.mark.parametrize(
+    "line",
+    [
+        # The prompt shows every route inside backticks, and models copy that
+        # formatting literally; bold was already accepted, so a code span must
+        # not be the one markdown wrapper that voids an otherwise valid route.
+        "`Next: cli`",
+        "**`Next: cli`**",
+        "`Next: cli` — routed to the CLI executor",
+    ],
+)
+def test_manager_route_accepts_code_span_wrapping(line: str) -> None:
+    assert parse_role_manager_next_step(line) == MANAGER_NEXT_CLI
+
+
 @pytest.mark.parametrize("language", ["en", "zh"])
 def test_manager_prompt_exposes_total_and_remaining_round_budget(language: str) -> None:
     prompt = build_role_manager_prompt(
