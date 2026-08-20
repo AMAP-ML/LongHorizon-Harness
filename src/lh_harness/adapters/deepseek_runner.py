@@ -35,14 +35,26 @@ def _model_patch_path(prompt_path: Path) -> Path:
 def run(binary: str, prompt_path: Path, model: str) -> int:
     try:
         prompt = prompt_path.read_text(encoding="utf-8")
+        patch_lines = [
+            "- id: agent-default-model",
+            "  config:",
+            "    provider: deepseek-official",
+            f"    model: {json.dumps(model, ensure_ascii=False)}",
+        ]
+        if os.name == "nt":
+            # The dsh npm launcher is a .CMD shim, so the task positional would
+            # travel through cmd.exe and its 8191-character command-line limit;
+            # role prompts are far larger. The headless runner's `task` config
+            # normally resolves from the command line, but a later patch layer
+            # may override it with a literal, exactly like the model row above.
+            # JSON string escaping is valid YAML, so the prompt stays one line.
+            patch_lines += [
+                "- id: headless-runner",
+                "  config:",
+                f"    task: {json.dumps(prompt, ensure_ascii=False)}",
+            ]
         patch_path = _model_patch_path(prompt_path)
-        patch_path.write_text(
-            "- id: agent-default-model\n"
-            "  config:\n"
-            "    provider: deepseek-official\n"
-            f"    model: {json.dumps(model, ensure_ascii=False)}\n",
-            encoding="utf-8",
-        )
+        patch_path.write_text("\n".join(patch_lines) + "\n", encoding="utf-8")
     except (OSError, UnicodeError) as exc:
         message = f"could not prepare DeepSeek Harness prompt: {exc}"
         sys.stderr.write(message + "\n")
@@ -55,7 +67,9 @@ def run(binary: str, prompt_path: Path, model: str) -> int:
         "headless",
         "--patch",
         os.fspath(patch_path),
-        prompt,
+        # cmd.exe cannot carry the real prompt (see above); the config override
+        # supplies it, and this placeholder only satisfies the non-empty check.
+        "task delivered via --patch" if os.name == "nt" else prompt,
     ]
     try:
         completed = subprocess.run(

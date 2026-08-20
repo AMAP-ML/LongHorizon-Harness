@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import shlex
 from pathlib import Path
 
@@ -73,10 +74,19 @@ def test_deepseek_runner_passes_headless_patch_and_emits_jsonl(
     assert record["type"] == "dsh.result"
     assert record["is_error"] is False
     assert "--profile headless --patch" in record["text"]
-    assert record["text"].endswith("fix the project")
     patch_path = prompt_path.with_name(f"{prompt_path.name}.dsh-model-patch.yml")
-    assert "provider: deepseek-official" in patch_path.read_text(encoding="utf-8")
-    assert 'model: "deepseek-v4-flash"' in patch_path.read_text(encoding="utf-8")
+    patch_text = patch_path.read_text(encoding="utf-8")
+    assert "provider: deepseek-official" in patch_text
+    assert 'model: "deepseek-v4-flash"' in patch_text
+    if os.name == "nt":
+        # cmd.exe's 8191-char limit cannot carry a role prompt, so the task
+        # travels as a patch-layer config override and argv keeps a stand-in.
+        assert record["text"].endswith("task delivered via --patch")
+        assert "- id: headless-runner" in patch_text
+        assert 'task: "fix the project"' in patch_text
+    else:
+        assert record["text"].endswith("fix the project")
+        assert "headless-runner" not in patch_text
 
 
 def test_deepseek_runner_preserves_failure_and_stderr(tmp_path: Path, capfd) -> None:
