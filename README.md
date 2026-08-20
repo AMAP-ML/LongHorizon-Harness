@@ -104,7 +104,7 @@ LongHorizon-Harness is not tied to a specific model or agent backend. Existing m
 | | Layer | Supported choices |
 |---|---|---|
 | 🧠 | **Models** | Claude, GPT, Qwen, and other models exposed by an agent backend |
-| 🤖 | **Agent backends** | Claude Code, Codex CLI, OpenCode, DeepSeek Harness (`dsh`, CLI-only in phase 1), and custom `AgentAdapter` implementations |
+| 🤖 | **Agent backends** | Claude Code, Codex CLI, OpenCode, GitHub Copilot CLI (CLI-only in phase 1), DeepSeek Harness (`dsh`, CLI-only in phase 1), and custom `AgentAdapter` implementations |
 | 🎛️ | **Role assignment** | The Manager, Executor, and Auditor can each use a different model or backend |
 | 🖥️ | **Execution environments** | Local, with a pluggable `Environment` protocol |
 
@@ -188,7 +188,7 @@ Steps 1–2 are once per machine; step 3 is once per project. Then run tasks fro
 |---|---|
 | [uv](https://docs.astral.sh/uv/getting-started/installation/) | The recommended isolated install. Skip it if you prefer pip. |
 | Python 3.10 or later | Running the harness. `uv tool install` brings its own; a pip install uses yours. |
-| One agent runtime on `PATH`: [`codex`](https://github.com/openai/codex#installing-and-running-codex-cli), [`claude`](https://docs.anthropic.com/en/docs/claude-code/getting-started), [`opencode`](https://github.com/anomalyco/opencode), or [`dsh`](https://github.com/deepseek-ai/deepseek-harness) | Actually executing the work. Install more than one if you want to mix backends across roles. |
+| One agent runtime on `PATH`: [`codex`](https://github.com/openai/codex#installing-and-running-codex-cli), [`claude`](https://docs.anthropic.com/en/docs/claude-code/getting-started), [`opencode`](https://github.com/anomalyco/opencode), [`copilot`](https://docs.github.com/en/copilot/how-tos/copilot-cli/set-up-copilot-cli/install-copilot-cli), or [`dsh`](https://github.com/deepseek-ai/deepseek-harness) | Actually executing the work. Install more than one if you want to mix backends across roles. |
 | [Node.js](https://nodejs.org) 20 or later | The npm-distributed computer-use plugins. DeepSeek Harness itself currently requires Node.js `^22.19.0` or `>=24.0.0`. |
 
 > **Platform status:** Currently tested on macOS. Windows support is included but has not yet been thoroughly tested.
@@ -325,7 +325,7 @@ Task text, run IDs, and API keys are deliberately **not** configurable here; the
 
 | Field | Default | Description |
 |---|---|---|
-| `agent` | `"codex"` | Backend for every role unless a role overrides it: `codex`, `claude_code`, `opencode`, or `deepseek_harness`. |
+| `agent` | `"codex"` | Backend for every role unless a role overrides it: `codex`, `claude_code`, `opencode`, `copilot`, or `deepseek_harness`. |
 | `model` | `"gpt-5.6-sol"` | Model for every role unless a role overrides it. Must be a model the chosen backend exposes. |
 | `env` | `"local"` | Execution environment. Only `local` today. |
 | `runs_root` | `"./.lh-harness/runs"` | Where run directories are created. Each run gets `<runs_root>/<run-id>/`. |
@@ -489,7 +489,7 @@ lh-harness web --workspace-root .               # Serve the workbench for anothe
 | Option | Description |
 |---|---|
 | `--task` | Task text or `@task.md` |
-| `--agent` | `claude_code`, `codex`, `opencode`, or `deepseek_harness` (CLI-only in phase 1) |
+| `--agent` | `claude_code`, `codex`, `opencode`, `copilot` (CLI-only in phase 1), or `deepseek_harness` (CLI-only in phase 1) |
 | `--env` | `local` |
 | `--max-rounds` | Maximum number of Manage-Execute-Audit rounds; the CLI default is 30 |
 | `--dashboard` | Start live monitoring and human intervention |
