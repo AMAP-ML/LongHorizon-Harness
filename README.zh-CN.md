@@ -328,6 +328,7 @@ lh-harness check-update
 |---|---|---|
 | `agent` | `"codex"` | 所有角色使用的后端（角色可单独覆盖）：`codex`、`claude_code`、`opencode` 或 `deepseek_harness`。 |
 | `model` | `"gpt-5.6-sol"` | 所有角色使用的模型（角色可单独覆盖）。必须是所选后端支持的模型。 |
+| `effort` | `"med"` | 所有角色的 effort 等级（角色可单独覆盖）：`min`、`low`、`med`、`high`、`xhigh` 或 `max`。见 [Effort 等级](#effort-等级)。 |
 | `env` | `"local"` | 执行环境，目前只有 `local`。 |
 | `runs_root` | `"./.lh-harness/runs"` | 运行目录的根路径，每次运行生成 `<runs_root>/<run-id>/`。 |
 | `workspace` | 默认注释 | Agent 实际操作的工作目录。默认就是启动 `lh-harness` 的那个目录，任务直接作用于你的真实项目；需要隔离到别处时才设置。 |
@@ -355,13 +356,13 @@ lh-harness check-update
 
 ##### `[run.roles.*]`
 
-每个角色都可以单独指定 `agent` 与 `model`，因此可以只在关键位置使用强模型：例如 Manager 与 Auditor 用强模型、Executor 用更便宜的。所有字段默认都是注释状态，表示「继承」。
+每个角色都可以单独指定 `agent`、`model` 与 `effort`，因此可以只在关键位置使用强模型：例如 Manager 与 Auditor 用强模型、Executor 用更便宜的。所有字段默认都是注释状态，表示「继承」。
 
 取值时沿以下链路回退，直到找到值为止：
 
 ```
-gui_executor → executor → [run].agent / [run].model
-cli_auditor  → auditor  → [run].agent / [run].model
+gui_executor → executor → [run].agent / [run].model / [run].effort
+cli_auditor  → auditor  → [run].agent / [run].model / [run].effort
 ```
 
 | 配置段 | 回退到 | 作用范围 |
@@ -375,7 +376,42 @@ cli_auditor  → auditor  → [run].agent / [run].model
 | `[run.roles.cli_auditor]` | `auditor` | CLI 验收 |
 | `[run.roles.final_response]` | `manager` | 写给你的最终回复 |
 
-上述每个字段都有对应的 CLI 参数（`--agent`、`--max-rounds`、`--gui-executor-model`、`--auditor-timeout` 等）可以对单次运行覆盖。完整列表见 `lh-harness run --help`。
+##### Effort 等级
+
+`effort` 控制角色模型的思考与执行投入——沿用 Anthropic 的总控概念：effort 影响整个响应，而不仅是 thinking。所有后端共用一套归一化等级：
+
+```
+min · low · med · high · xhigh · max
+```
+
+可以全局设置、按角色设置，或对单次运行设置：
+
+```toml
+[run]
+effort = "med"
+
+[run.roles.manager]
+effort = "high"       # 角色自己的 effort 优先于 [run].effort
+```
+
+```bash
+lh-harness run --task "..." --effort med --auditor-effort low
+```
+
+每个后端会把等级翻译成自己的原生参数；后端缺少的等级会映射到最接近的支持等级：
+
+| 你写的 | Codex（`model_reasoning_effort`） | Claude Code（`CLAUDE_CODE_EFFORT_LEVEL`） | OpenCode（`--variant`） | DeepSeek Harness（`reasoningEffort`） |
+|---|---|---|---|---|
+| `min` | `minimal` | `low` | `minimal` | `low` |
+| `low` | `low` | `low` | `low` | `low` |
+| `med` | `medium` | `medium` | `medium` | `high`* |
+| `high` | `high` | `high` | `high` | `high` |
+| `xhigh` | `xhigh` | `xhigh` | `xhigh` | `high`* |
+| `max` | `xhigh`* | `max` | `max` | `max` |
+
+\* 后端没有该等级，使用最接近的支持等级；episode metadata 中记录为 `effort_effective`。
+
+上述每个字段都有对应的 CLI 参数（`--agent`、`--max-rounds`、`--gui-executor-model`、`--auditor-timeout`、`--effort`、`--manager-effort` 等）可以对单次运行覆盖。完整列表见 `lh-harness run --help`。
 
 当 Manager、Executor 或 Auditor 达到本地 episode 超时时限时，Harness 会保留已有轨迹和任务状态，并让下一轮 Manager 检查真实 workspace 后继续恢复。本地 episode 超时会显示为“Agent 执行超时”，不会再被误判为 provider 网络故障；连续超时仍会触发 Dashboard 的人工复核门禁。
 

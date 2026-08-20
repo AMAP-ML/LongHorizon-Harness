@@ -32,6 +32,7 @@ from .types import (
     DEFAULT_MAX_ROUNDS,
     DEFAULT_WORKSPACE_PATH,
     MAX_ROUNDS,
+    EFFORT_CHOICES,
     EpisodeBudget,
     HarnessConfig,
 )
@@ -418,6 +419,18 @@ def main(argv: list[str] | None = None) -> int:
         default=run_default("model"),
         help="Model for every role. Defaults to the chosen agent's own default.",
     )
+    run_parser.add_argument(
+        "--effort",
+        default=run_default("effort"),
+        choices=EFFORT_CHOICES,
+        help=(
+            "Effort for every role, translated per backend "
+            "(Codex model_reasoning_effort, Claude Code CLAUDE_CODE_EFFORT_LEVEL, "
+            "OpenCode --variant, DeepSeek Harness reasoningEffort); a level a "
+            "backend lacks maps to its nearest supported one. Defaults to each "
+            "backend's own default."
+        ),
+    )
     for role, _, scope in _ROLE_OPTIONS:
         run_parser.add_argument(
             _flag(role, "agent"),
@@ -429,6 +442,12 @@ def main(argv: list[str] | None = None) -> int:
             _flag(role, "model"),
             default=run_default(f"{role}_model"),
             help=f"Model for {scope}; defaults to {_fallback_hint(role, 'model')}.",
+        )
+        run_parser.add_argument(
+            _flag(role, "effort"),
+            default=run_default(f"{role}_effort"),
+            choices=EFFORT_CHOICES,
+            help=f"Effort for {scope}; defaults to {_fallback_hint(role, 'effort')}.",
         )
     # Only the local backend is implemented; kept as a flag so existing
     # `--env local` invocations keep working and future backends can slot in.
@@ -1684,8 +1703,9 @@ def _run_command(args: argparse.Namespace) -> int:
         # same model must never share a differently privileged adapter.
         name = _resolve_role_option(args, role, "agent")
         model = _resolve_role_model(args, role)
+        effort = _resolve_role_effort(args, role)
         effective_permission_role = permission_role or role
-        key = (effective_permission_role, name, model)
+        key = (effective_permission_role, name, model, effort)
         if key not in agent_cache:
             agent_cache[key] = _build_agent(
                 name,
@@ -1699,6 +1719,7 @@ def _run_command(args: argparse.Namespace) -> int:
                 mcp_add_dirs=args.mcp_add_dir,
                 hidden_paths=hidden_paths,
                 guard_exclude_paths=guard_exclude_paths,
+                effort=effort,
             )
         return agent_cache[key]
 
@@ -1953,6 +1974,22 @@ def _resolve_role_model(args: argparse.Namespace, role: str) -> str | None:
     return getattr(args, "model", None)
 
 
+def _resolve_role_effort(args: argparse.Namespace, role: str) -> str | None:
+    """Resolve effort down the role fallback chain.
+
+    The scale is normalized across backends, so unlike models it may safely
+    cross an explicit agent boundary and end at the global flag.
+    """
+
+    current: str | None = role
+    while current:
+        value = getattr(args, f"{current}_effort", None)
+        if value:
+            return value
+        current = _ROLE_PARENTS[current]
+    return getattr(args, "effort", None)
+
+
 def _public_role_configs_from_args(
     args: argparse.Namespace,
 ) -> dict[str, dict[str, str | None]] | None:
@@ -2089,6 +2126,7 @@ def _build_agent(
     mcp_add_dirs: list[str] | None = None,
     hidden_paths: tuple[str, ...] = (),
     guard_exclude_paths: tuple[str, ...] = (),
+    effort: str | None = None,
 ):
     if name == "codex":
         from .adapters.codex import CodexAdapter
@@ -2101,6 +2139,7 @@ def _build_agent(
             mcp_config=mcp_config,
             add_dirs=mcp_add_dirs,
             hidden_paths=hidden_paths,
+            effort=effort,
         )
         if model is not None:
             kwargs["model"] = model
@@ -2120,6 +2159,7 @@ def _build_agent(
             # The Codex adapter has no auditor snapshot guard, so the
             # exclusions are a Claude-Code-only concern for now.
             guard_exclude_paths=guard_exclude_paths,
+            effort=effort,
         )
         if model is not None:
             kwargs["model"] = model
@@ -2135,6 +2175,7 @@ def _build_agent(
             add_dirs=mcp_add_dirs,
             role=role,
             hidden_paths=hidden_paths,
+            effort=effort,
         )
         if model is not None:
             kwargs["model"] = model
@@ -2149,6 +2190,7 @@ def _build_agent(
             prompt_dir=prompt_dir,
             role=role,
             hidden_paths=hidden_paths,
+            effort=effort,
         )
         if model is not None:
             kwargs["model"] = model

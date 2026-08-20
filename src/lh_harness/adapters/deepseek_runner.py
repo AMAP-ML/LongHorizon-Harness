@@ -32,17 +32,25 @@ def _model_patch_path(prompt_path: Path) -> Path:
     return prompt_path.with_name(f"{prompt_path.name}.dsh-model-patch.yml")
 
 
-def run(binary: str, prompt_path: Path, model: str) -> int:
+def run(binary: str, prompt_path: Path, model: str, reasoning_effort: str | None = None) -> int:
     try:
         prompt = prompt_path.read_text(encoding="utf-8")
         patch_path = _model_patch_path(prompt_path)
-        patch_path.write_text(
+        patch = (
             "- id: agent-default-model\n"
             "  config:\n"
             "    provider: deepseek-official\n"
-            f"    model: {json.dumps(model, ensure_ascii=False)}\n",
-            encoding="utf-8",
+            f"    model: {json.dumps(model, ensure_ascii=False)}\n"
         )
+        if reasoning_effort:
+            # dsh patch layers merge per plugin id, so this override keeps the
+            # profile's other llm-deepseek settings (thinking stays enabled).
+            patch += (
+                "- id: llm-deepseek\n"
+                "  config:\n"
+                f"    reasoningEffort: {json.dumps(reasoning_effort)}\n"
+            )
+        patch_path.write_text(patch, encoding="utf-8")
     except (OSError, UnicodeError) as exc:
         message = f"could not prepare DeepSeek Harness prompt: {exc}"
         sys.stderr.write(message + "\n")
@@ -85,12 +93,13 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--binary", required=True)
     parser.add_argument("--prompt", required=True)
     parser.add_argument("--model", required=True)
+    parser.add_argument("--reasoning-effort", default=None)
     return parser
 
 
 def main(argv: Sequence[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
-    return run(args.binary, Path(args.prompt), args.model)
+    return run(args.binary, Path(args.prompt), args.model, args.reasoning_effort)
 
 
 if __name__ == "__main__":

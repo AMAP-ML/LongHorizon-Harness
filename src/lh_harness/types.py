@@ -33,6 +33,17 @@ DEFAULT_CODEX_MODEL = "gpt-5.6-sol"
 DEFAULT_DEEPSEEK_HARNESS_MODEL = "deepseek-v4-flash"
 DEFAULT_OPENCODE_MODEL = "opencode/deepseek-v4-flash-free"
 
+# Normalized effort scale shared by every backend, covering the union of the
+# levels the supported CLIs document.  "Effort" follows Anthropic's umbrella
+# term (distinct from the separate thinking control); on backends whose only
+# dial is reasoning-specific it drives that dial.  Each adapter translates a
+# level into its own vocabulary (Codex `model_reasoning_effort`, Claude Code
+# CLAUDE_CODE_EFFORT_LEVEL, OpenCode `--variant`, DeepSeek Harness
+# `reasoningEffort`), mapping a level its backend lacks to the nearest
+# supported one; the episode metadata records both the requested and the
+# effective value so the substitution stays visible.
+EFFORT_CHOICES: tuple[str, ...] = ("min", "low", "med", "high", "xhigh", "max")
+
 # A run is intentionally bounded at every ingress point.  Without a shared
 # ceiling, a malformed Web/CLI request can reserve an effectively unbounded
 # amount of work and disk/event pressure.  Keep this in the protocol-adjacent

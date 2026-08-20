@@ -20,6 +20,13 @@ from .cli_agent import CommandAgentAdapter
 
 _CONFIG_FILENAME_RE = re.compile(r"[^A-Za-z0-9_.-]+")
 
+# OpenCode's --variant selects a named per-model preset. OpenAI-style models
+# ship default variants named after the reasoning-effort levels themselves
+# (minimal|low|medium|high|xhigh), so the scale's "min" and "med" spell out
+# to "minimal" and "medium"; every other name passes through as-is - other providers ship a
+# subset (e.g. high/max) and take custom variants from opencode.jsonc.
+_VARIANT_FOR_EFFORT = {"min": "minimal", "med": "medium"}
+
 
 class OpenCodeAdapter(CommandAgentAdapter):
     """Run OpenCode headlessly through LongHorizon Harness.
@@ -53,6 +60,7 @@ class OpenCodeAdapter(CommandAgentAdapter):
         normalized_effort = (effort or "").strip()
         if len(normalized_effort) > 64:
             raise ValueError("OpenCode reasoning effort is too long")
+        variant = _VARIANT_FOR_EFFORT.get(normalized_effort, normalized_effort)
 
         opencode_binary = resolve_opencode_binary() or "opencode"
         env_parts: list[str] = []
@@ -78,8 +86,8 @@ class OpenCodeAdapter(CommandAgentAdapter):
             "--model",
             shlex.quote(normalized_model),
         ]
-        if normalized_effort:
-            command_parts.extend(["--variant", shlex.quote(normalized_effort)])
+        if variant:
+            command_parts.extend(["--variant", shlex.quote(variant)])
         # `opencode run` reads the prompt from stdin when no positional message
         # is given, keeping long prompts off the command line.
         command_parts.append("< {prompt_path}")
@@ -93,7 +101,8 @@ class OpenCodeAdapter(CommandAgentAdapter):
             hidden_paths=hidden_paths,
         )
         self.model = normalized_model
-        self.effort = normalized_effort
+        self.effort = normalized_effort or None
+        self.effort_effective = variant or None
         self.role = role
 
     async def run_episode(
@@ -113,7 +122,7 @@ class OpenCodeAdapter(CommandAgentAdapter):
             {
                 "opencode_role": self.role,
                 "opencode_model": self.model,
-                "opencode_variant": self.effort,
+                "opencode_variant": self.effort_effective or "",
                 "opencode_approval_mode": "yolo",
             }
         )

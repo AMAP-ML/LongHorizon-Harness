@@ -4,7 +4,7 @@ import importlib
 from pathlib import Path
 from typing import Any
 
-from .types import MAX_ROUNDS
+from .types import EFFORT_CHOICES, MAX_ROUNDS
 
 try:
     tomllib = importlib.import_module("tomllib")
@@ -39,6 +39,7 @@ _RUN_KEYS = {
     "codex_mcp_config",
     "mcp_add_dirs",
     "guard_exclude_paths",
+    "effort",
     "max_rounds",
     "dashboard",
     "dashboard_port",
@@ -62,6 +63,7 @@ CONFIG_TEMPLATE = """# LongHorizon-Harness project defaults.
 [run]
 agent = "codex"
 model = "gpt-5.6-sol"
+effort = "med"
 
 env = "local"
 runs_root = "./.lh-harness/runs"
@@ -73,6 +75,7 @@ runs_root = "./.lh-harness/runs"
 # base_url = "https://api.example.com/v1"
 
 prompt_language = "en"
+
 # Each agent reads its own format; installed plugins are loaded automatically.
 # claude_mcp_config = "/path/to/mcp.json"
 # codex_mcp_config = "/path/to/mcp.toml"
@@ -98,38 +101,50 @@ gui_executor = 1800
 cli_executor = 1800
 auditor = 300
 
+# The public roles first; the gui_*/cli_* variants below inherit from
+# executor/auditor unless overridden. A role's own effort outranks the
+# global [run] effort above.
+
 [run.roles.manager]
 # agent = "codex"
 # model = "gpt-5.6-sol"
+# effort = "med"
 
 [run.roles.executor]
 # agent = "codex"
 # model = "gpt-5.6-sol"
-
-[run.roles.gui_executor]
-# agent = "codex"
-# model = "gpt-5.6-sol"
-
-[run.roles.cli_executor]
-# agent = "codex"
-# model = "gpt-5.6-sol"
+# effort = "med"
 
 [run.roles.auditor]
 # agent = "codex"
 # model = "gpt-5.6-sol"
-
-[run.roles.gui_auditor]
-# agent = "codex"
-# model = "gpt-5.6-sol"
-
-[run.roles.cli_auditor]
-# agent = "codex"
-# model = "gpt-5.6-sol"
+# effort = "med"
 
 # Writes the closing reply to you; falls back to the manager's agent/model.
 [run.roles.final_response]
 # agent = "codex"
 # model = "gpt-5.6-sol"
+# effort = "med"
+
+[run.roles.gui_executor]
+# agent = "codex"
+# model = "gpt-5.6-sol"
+# effort = "med"
+
+[run.roles.gui_auditor]
+# agent = "codex"
+# model = "gpt-5.6-sol"
+# effort = "med"
+
+[run.roles.cli_executor]
+# agent = "codex"
+# model = "gpt-5.6-sol"
+# effort = "med"
+
+[run.roles.cli_auditor]
+# agent = "codex"
+# model = "gpt-5.6-sol"
+# effort = "med"
 """
 
 
@@ -182,6 +197,8 @@ def _flatten_run_table(run: dict[str, Any]) -> dict[str, Any]:
 
     if "agent" in run:
         defaults["agent"] = _choice(run["agent"], "run.agent", _AGENT_CHOICES)
+    if "effort" in run:
+        defaults["effort"] = _choice(run["effort"], "run.effort", set(EFFORT_CHOICES))
     if "env" in run:
         defaults["env"] = _choice(run["env"], "run.env", {"local"})
     if "prompt_language" in run:
@@ -214,7 +231,7 @@ def _flatten_run_table(run: dict[str, Any]) -> dict[str, Any]:
     for role, values in roles.items():
         if not isinstance(values, dict):
             raise ProjectConfigError(f"[run.roles.{role}] must be a TOML table")
-        unknown_role_keys = set(values) - {"agent", "model"}
+        unknown_role_keys = set(values) - {"agent", "model", "effort"}
         if unknown_role_keys:
             raise ProjectConfigError(
                 f"unknown [run.roles.{role}] key(s): {_names(unknown_role_keys)}"
@@ -226,6 +243,10 @@ def _flatten_run_table(run: dict[str, Any]) -> dict[str, Any]:
         if "model" in values:
             defaults[f"{role}_model"] = _string(
                 values["model"], f"run.roles.{role}.model"
+            )
+        if "effort" in values:
+            defaults[f"{role}_effort"] = _choice(
+                values["effort"], f"run.roles.{role}.effort", set(EFFORT_CHOICES)
             )
 
     timeouts = run.get("timeouts", {})

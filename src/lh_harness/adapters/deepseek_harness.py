@@ -10,6 +10,19 @@ from ..types import DEFAULT_DEEPSEEK_HARNESS_MODEL
 from ..utils.agent_cli import resolve_dsh_binary
 from .cli_agent import CommandAgentAdapter
 
+# The dsh llm-deepseek plugin takes `reasoningEffort: low|high|max`; DeepSeek's
+# own API docs map medium (our "med") and xhigh onto high for V4 Flash/Pro, and the scale
+# has no minimum tier below low, so "min" lands there too.  The runner writes
+# the effective value into the profile patch next to the model override.
+_DSH_EFFORTS = {
+    "min": "low",
+    "low": "low",
+    "med": "high",
+    "high": "high",
+    "xhigh": "high",
+    "max": "max",
+}
+
 _READ_ONLY_ROLES = {
     "manager",
     "final_response",
@@ -44,7 +57,15 @@ class DeepSeekHarnessAdapter(CommandAgentAdapter):
         add_dirs: Sequence[str] = (),
         hidden_paths: Sequence[str] = (),
         visible_output_parser: Callable[[str], str] | None = None,
+        effort: str | None = None,
     ) -> None:
+        if effort is not None and effort not in _DSH_EFFORTS:
+            raise ValueError(
+                "DeepSeek Harness effort must be one of "
+                f"{', '.join(_DSH_EFFORTS)}"
+            )
+        self.effort = effort
+        self.effort_effective = _DSH_EFFORTS[effort] if effort else None
         normalized_model = model.strip()
         if not normalized_model:
             raise ValueError("DeepSeek Harness model must not be empty")
@@ -83,6 +104,8 @@ class DeepSeekHarnessAdapter(CommandAgentAdapter):
             "--model",
             shlex.quote(normalized_model),
         ]
+        if self.effort_effective:
+            command.extend(["--reasoning-effort", shlex.quote(self.effort_effective)])
         super().__init__(
             command_template=" ".join(command),
             workspace_path=workspace_path,

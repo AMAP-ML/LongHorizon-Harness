@@ -327,6 +327,7 @@ Task text, run IDs, and API keys are deliberately **not** configurable here; the
 |---|---|---|
 | `agent` | `"codex"` | Backend for every role unless a role overrides it: `codex`, `claude_code`, `opencode`, or `deepseek_harness`. |
 | `model` | `"gpt-5.6-sol"` | Model for every role unless a role overrides it. Must be a model the chosen backend exposes. |
+| `effort` | `"med"` | Effort level for every role unless a role overrides it: `min`, `low`, `med`, `high`, `xhigh`, or `max`. See [Effort levels](#effort-levels). |
 | `env` | `"local"` | Execution environment. Only `local` today. |
 | `runs_root` | `"./.lh-harness/runs"` | Where run directories are created. Each run gets `<runs_root>/<run-id>/`. |
 | `workspace` | commented out | Working directory the agents operate in. Defaults to the directory `lh-harness` was started from, so a task acts on your real project; set it to isolate the run somewhere else. |
@@ -354,13 +355,13 @@ Per-episode limits in seconds. One episode is a single role invocation, not the 
 
 ##### `[run.roles.*]`
 
-Each role can take its own `agent` and `model`, so you can pay for a strong model only where it matters: a capable Manager and Auditor with a cheaper Executor, for example. Every field is commented out by default, meaning "inherit".
+Each role can take its own `agent`, `model`, and `effort`, so you can pay for a strong model only where it matters: a capable Manager and Auditor with a cheaper Executor, for example. Every field is commented out by default, meaning "inherit".
 
 Resolution walks the chain until it finds a value:
 
 ```
-gui_executor → executor → [run].agent / [run].model
-cli_auditor  → auditor  → [run].agent / [run].model
+gui_executor → executor → [run].agent / [run].model / [run].effort
+cli_auditor  → auditor  → [run].agent / [run].model / [run].effort
 ```
 
 | Section | Falls back to | Covers |
@@ -374,7 +375,42 @@ cli_auditor  → auditor  → [run].agent / [run].model
 | `[run.roles.cli_auditor]` | `auditor` | CLI audit |
 | `[run.roles.final_response]` | `manager` | The closing reply written for you |
 
-Every field above also has a CLI flag (`--agent`, `--max-rounds`, `--gui-executor-model`, `--auditor-timeout`, and so on) that overrides it for a single run. Run `lh-harness run --help` for the full list.
+##### Effort levels
+
+`effort` controls how hard a role's model works — following Anthropic's umbrella term, where effort shapes the whole response, not only its thinking. One normalized scale covers every backend:
+
+```
+min · low · med · high · xhigh · max
+```
+
+Set it for all roles at once, per role, or per run:
+
+```toml
+[run]
+effort = "med"
+
+[run.roles.manager]
+effort = "high"       # a role's own effort outranks [run].effort
+```
+
+```bash
+lh-harness run --task "..." --effort med --auditor-effort low
+```
+
+Each backend translates a level into its own dial, and a level a backend lacks maps to its nearest supported one:
+
+| You write | Codex (`model_reasoning_effort`) | Claude Code (`CLAUDE_CODE_EFFORT_LEVEL`) | OpenCode (`--variant`) | DeepSeek Harness (`reasoningEffort`) |
+|---|---|---|---|---|
+| `min` | `minimal` | `low` | `minimal` | `low` |
+| `low` | `low` | `low` | `low` | `low` |
+| `med` | `medium` | `medium` | `medium` | `high`* |
+| `high` | `high` | `high` | `high` | `high` |
+| `xhigh` | `xhigh` | `xhigh` | `xhigh` | `high`* |
+| `max` | `xhigh`* | `max` | `max` | `max` |
+
+\* The backend has no such level, so the nearest supported one is used; episode metadata records it as `effort_effective`.
+
+Every field above also has a CLI flag (`--agent`, `--max-rounds`, `--gui-executor-model`, `--auditor-timeout`, `--effort`, `--manager-effort`, and so on) that overrides it for a single run. Run `lh-harness run --help` for the full list.
 
 If a Manager, Executor, or Auditor reaches its local episode timeout, the run keeps the partial trajectory and recorded task state, then lets the next Manager round inspect the real workspace and recover. The timeout remains an agent execution timeout; it is not treated as proof of a provider network failure. Repeated timed-out rounds still trigger the Dashboard's human-review gate.
 
