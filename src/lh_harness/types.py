@@ -62,6 +62,31 @@ class EpisodeBudget:
             raise ValueError("max_duration_seconds must be at least 1")
 
 
+@dataclass(frozen=True)
+class ExecutorRoutingConfig:
+    default_tier: str
+    escalate_after_failures: int
+    escalation_tier: str
+
+    def __post_init__(self) -> None:
+        for name, value in (
+            ("default_tier", self.default_tier),
+            ("escalation_tier", self.escalation_tier),
+        ):
+            if not isinstance(value, str) or not value.strip():
+                raise ValueError(f"{name} must be a non-empty string")
+            if value != value.strip():
+                raise ValueError(f"{name} must not have leading or trailing whitespace")
+        if self.default_tier == self.escalation_tier:
+            raise ValueError("default_tier and escalation_tier must be different")
+        if (
+            isinstance(self.escalate_after_failures, bool)
+            or not isinstance(self.escalate_after_failures, int)
+            or self.escalate_after_failures < 1
+        ):
+            raise ValueError("escalate_after_failures must be an integer of at least 1")
+
+
 @dataclass
 class EpisodeResult:
     status: Literal["done", "timeout", "error", "cancelled"]
@@ -102,6 +127,7 @@ class ManagedRound:
     manager_status: dict[str, Any] = field(default_factory=dict)
     executor_status: dict[str, Any] = field(default_factory=dict)
     auditor_status: dict[str, Any] = field(default_factory=dict)
+    executor_routing: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass
@@ -124,6 +150,7 @@ class HarnessConfig:
     # English is the production default; Chinese remains available for
     # OSWorldv2-compatible role prompts and operator-facing control headers.
     prompt_language: PromptLanguage = "en"
+    executor_routing: ExecutorRoutingConfig | None = None
 
 
 def audit_report_to_dict(report: AuditReport) -> dict[str, Any]:

@@ -376,7 +376,30 @@ cli_auditor  → auditor  → [run].agent / [run].model / [run].reasoning_effort
 | `[run.roles.cli_auditor]` | `auditor` | CLI audit |
 | `[run.roles.final_response]` | `manager` | The closing reply written for you |
 
-Every field above also has a CLI flag (`--agent`, `--max-rounds`, `--gui-executor-model`, `--auditor-timeout`, and so on) that overrides it for a single run. Run `lh-harness run --help` for the full list.
+Executor routing can choose a low-cost tier first and move a repeatedly rejected subtask to a stronger backend. This example is ready to copy; the parent executor table is optional, but is useful as the fallback for tier fields that are omitted:
+
+```toml
+[run.roles.executor]
+agent = "codex"
+model = "gpt-5.6-sol"
+
+[run.roles.executor.cheap]
+model = "gpt-5.6-luna"
+
+[run.roles.executor.strong]
+agent = "claude_code"
+
+[run.executor_routing]
+default_tier = "cheap"
+escalate_after_failures = 2
+escalation_tier = "strong"
+```
+
+The Manager may choose an initial tier for a GUI or CLI subtask; omitting it selects `default_tier`, while explicitly requesting `escalation_tier` uses it immediately. A subtask is identified by its route plus the normalized `Task:` text. Only a successfully parsed final Auditor result with `Status: incomplete` or `Status: blocked` increments its failure count. Reaching the threshold changes the **next** execution of that same subtask, and escalation then remains sticky even if the Manager requests the cheaper tier. `Status: complete`, a new task, or a GUI/CLI route change resets the state. Provider errors, timeouts, cancellations, and rejected format repairs do not count; a plan without `Task:` gets a per-round identity and cannot accumulate failures across rounds.
+
+Tier fields fall back independently. If a tier omits `agent`, it inherits the concrete GUI/CLI executor chain shown above. An explicit tier `model` is always used. Repeating the route's effective `agent` while omitting `model` inherits the route model; changing `agent` while omitting `model` makes the new backend use its own default instead of inheriting a model from another backend. An empty tier table inherits both route fields. Tier tables are currently project-config-only. Tier names are 1-64 ASCII letters, digits, `_`, or `-`, and must start with a letter or digit. The ordinary role, timeout, and run fields still have CLI flags (`--agent`, `--max-rounds`, `--gui-executor-model`, `--auditor-timeout`, and so on); run `lh-harness run --help` for that list.
+
+Each executor attempt or rejected routing plan stores an `executor_routing` record in the round ledger (`rounds.jsonl` and per-round `round.json`), routing events, and the final `report.json` under `rounds`, including its task id, requested and selected tier, reason, and failure counts. Dashboard **Resume** starts a new run with `resume_kind = "retry"`: it preserves the task/config reference, rereads the current project configuration, and starts routing counts at zero. It is not checkpoint rehydration.
 
 If a Manager, Executor, or Auditor reaches its local episode timeout, the run keeps the partial trajectory and recorded task state, then lets the next Manager round inspect the real workspace and recover. The timeout remains an agent execution timeout; it is not treated as proof of a provider network failure. Repeated timed-out rounds still trigger the Dashboard's human-review gate.
 

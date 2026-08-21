@@ -9,10 +9,10 @@ import logging
 import os
 import stat as stat_module
 import time
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 import traceback
 from pathlib import Path
-from typing import Any, Awaitable, Callable
+from typing import Any, Awaitable, Callable, Literal
 
 from .adapters.base import AgentAdapter
 from .agent_logs import (
@@ -21,6 +21,12 @@ from .agent_logs import (
 )
 from .environment.base import Environment
 from .environment.remote_files import ensure_remote_dir, write_remote_text
+from .executor_routing import (
+    ExecutorRouter,
+    ExecutorRoutingDecision,
+    disabled_routing_decision,
+    is_valid_executor_tier_name,
+)
 from .runtime_signals import hard_signal_labels
 from .provider_errors import classify_agent_runtime_failure
 from .trajectory_artifacts import persist_trajectory_artifacts
@@ -39,7 +45,9 @@ from .role_prompts import (
     extract_role_manager_plan_text,
     extract_related_report_refs,
     extract_role_manager_answer_choices,
+    extract_role_manager_executor_tier,
     extract_role_manager_question,
+    extract_role_manager_task,
     extract_role_task_contract,
     extract_role_task_state,
     format_related_auditor_reports,
@@ -175,6 +183,8 @@ async def _run_impl(
     manager_agent: AgentAdapter | None = None,
     gui_executor_agent: AgentAdapter | None = None,
     cli_executor_agent: AgentAdapter | None = None,
+    gui_executor_agents: dict[str, AgentAdapter] | None = None,
+    cli_executor_agents: dict[str, AgentAdapter] | None = None,
     gui_auditor_agent: AgentAdapter | None = None,
     cli_auditor_agent: AgentAdapter | None = None,
     auditor_format_repair_agent: AgentAdapter | None = None,
@@ -219,6 +229,46 @@ async def _run_impl(
         except Exception:  # progress reporting must never break a run
             logger.debug("progress callback failed for %s", event, exc_info=True)
 
+    routing_policy = config.executor_routing
+    routing_enabled = routing_policy is not None
+    if routing_enabled:
+        if gui_executor_agents is None or cli_executor_agents is None:
+            raise ValueError(
+                "Executor routing requires both GUI and CLI executor tier maps"
+            )
+        gui_tiers = set(gui_executor_agents)
+        cli_tiers = set(cli_executor_agents)
+        if gui_tiers != cli_tiers:
+            raise ValueError("GUI and CLI executor tier maps must have identical keys")
+        if any(not is_valid_executor_tier_name(tier) for tier in gui_tiers):
+            raise ValueError(
+                "Executor tier map keys must use 1-64 ASCII letters, digits, '_' or '-'"
+            )
+        assert routing_policy is not None
+        required_tiers = {
+            routing_policy.default_tier,
+            routing_policy.escalation_tier,
+        }
+        missing_tiers = required_tiers - gui_tiers
+        if missing_tiers:
+            raise ValueError(
+                "Executor tier maps are missing configured routing tier(s): "
+                + ", ".join(sorted(missing_tiers))
+            )
+        if any(agent is None for agent in gui_executor_agents.values()) or any(
+            agent is None for agent in cli_executor_agents.values()
+        ):
+            raise ValueError("Executor tier maps cannot contain empty agent bindings")
+        available_executor_tiers = gui_tiers
+        executor_router: ExecutorRouter | None = ExecutorRouter(
+            available_executor_tiers, routing_policy
+        )
+    else:
+        if gui_executor_agents is not None or cli_executor_agents is not None:
+            raise ValueError("Executor tier maps require an executor routing policy")
+        available_executor_tiers = set()
+        executor_router = None
+
     # Role binding is resolved once at startup so the main loop can stay focused
     # on state transitions instead of adapter fallback logic.
     manager_agent = manager_agent or agent
@@ -226,16 +276,10 @@ async def _run_impl(
     cli_executor_agent = cli_executor_agent or agent
     gui_auditor_agent = gui_auditor_agent or auditor_agent or agent
     cli_auditor_agent = cli_auditor_agent or auditor_agent or agent
-    if any(
-        role_agent is None
-        for role_agent in (
-            manager_agent,
-            gui_executor_agent,
-            cli_executor_agent,
-            gui_auditor_agent,
-            cli_auditor_agent,
-        )
-    ):
+    required_role_agents = [manager_agent, gui_auditor_agent, cli_auditor_agent]
+    if not routing_enabled:
+        required_role_agents.extend((gui_executor_agent, cli_executor_agent))
+    if any(role_agent is None for role_agent in required_role_agents):
         raise ValueError("Every role needs an agent, or a default agent must be provided")
 
     # Every role reads one explicit budget. Keeping the resolved budgets in the
@@ -296,6 +340,17 @@ async def _run_impl(
             "auditor_budget": _budget_to_dict(auditor_budget),
             "resumed": bool(resume),
             "resumed_rounds": len(rounds),
+            "executor_routing": {
+                "enabled": routing_enabled,
+                "available_tiers": sorted(available_executor_tiers),
+                "default_tier": routing_policy.default_tier if routing_policy else None,
+                "escalate_after_failures": (
+                    routing_policy.escalate_after_failures if routing_policy else None
+                ),
+                "escalation_tier": (
+                    routing_policy.escalation_tier if routing_policy else None
+                ),
+            },
         },
     )
     if resume:
@@ -357,6 +412,8 @@ async def _run_impl(
             task_state=current_task_state,
             task_contract=current_task_contract,
             round_budget=gate.round_budget,
+            executor_tiers={tier: {} for tier in available_executor_tiers},
+            executor_routing=routing_policy,
             language=config.prompt_language,
             max_history_chars=config.role_history_chars,
         )
@@ -499,6 +556,22 @@ async def _run_impl(
         await _write_remote_round_text(env, config, round_index, "task_contract.txt", current_task_contract)
 
         next_step = parse_role_manager_next_step(plan_text)
+        routing_decision: ExecutorRoutingDecision | None = None
+        if next_step in {MANAGER_NEXT_GUI, MANAGER_NEXT_CLI}:
+            manager_task = extract_role_manager_task(plan_text)
+            if executor_router is None:
+                routing_decision = disabled_routing_decision(
+                    next_step=next_step,
+                    task_text=manager_task,
+                    round_index=round_index,
+                )
+            else:
+                routing_decision = executor_router.select(
+                    next_step=next_step,
+                    task_text=manager_task,
+                    requested_tier=extract_role_manager_executor_tier(plan_text),
+                    round_index=round_index,
+                )
         last_plan = plan_text
         _append_event(
             events_path,
@@ -510,6 +583,9 @@ async def _run_impl(
                 "task_state_chars": len(current_task_state),
                 "task_contract_chars": len(current_task_contract),
                 "related_report_refs": related_report_refs,
+                "executor_routing": (
+                    routing_decision.to_dict() if routing_decision is not None else None
+                ),
                 **_episode_event_fields(manager_result, event_status="completed"),
             },
         )
@@ -622,13 +698,71 @@ async def _run_impl(
                 break
             continue
 
-        executor_agent, executor_budget = _executor_binding(
-            next_step=next_step,
-            gui_executor_agent=gui_executor_agent,
-            cli_executor_agent=cli_executor_agent,
-            gui_executor_budget=gui_executor_budget,
-            cli_executor_budget=cli_executor_budget,
-        )
+        if (
+            routing_decision is not None
+            and routing_decision.enabled
+            and routing_decision.selected_tier is None
+        ):
+            allowed = ", ".join(sorted(available_executor_tiers))
+            requested = routing_decision.requested_tier
+            repair_report = (
+                f"Invalid executor tier {requested!r}. Allowed executor tiers: {allowed}. "
+                "Emit one non-empty allowed tier immediately after the GUI/CLI route, or omit the field to use the default."
+                if config.prompt_language == "en"
+                else f"执行器层级 {requested!r} 无效。允许的执行器层级: {allowed}。"
+                "请在 GUI/CLI 路由后输出一个非空的允许层级，或省略该字段以使用默认层级。"
+            )
+            record = ManagedRound(
+                round_index=round_index,
+                next_step=MANAGER_NEXT_INVALID,
+                plan_text=plan_text,
+                harness_feedback=repair_report,
+                task_state=current_task_state,
+                task_contract=current_task_contract,
+                related_report_refs=related_report_refs,
+                manager_status=_episode_status(manager_result),
+                auditor_status={"invalid_plan": True, "invalid_executor_tier": True},
+                executor_routing=routing_decision.to_dict(),
+            )
+            _write_local(round_dir / "harness_feedback.txt", repair_report)
+            await _write_remote_round_text(
+                env, config, round_index, "harness_feedback.txt", repair_report
+            )
+            rounds.append(record)
+            await _record_round(env, config, role_dir, events_path, record)
+            _append_event(
+                events_path,
+                "executor_routing_rejected",
+                {"round": round_index, "executor_routing": routing_decision.to_dict()},
+            )
+            if await _human_gate(gate, "progress", round_index, current_task_state):
+                break
+            continue
+
+        assert routing_decision is not None
+        if routing_enabled:
+            assert routing_decision.selected_tier is not None
+            tier_agents = (
+                gui_executor_agents
+                if next_step == MANAGER_NEXT_GUI
+                else cli_executor_agents
+            )
+            assert tier_agents is not None
+            executor_agent = tier_agents[routing_decision.selected_tier]
+            executor_budget = (
+                gui_executor_budget
+                if next_step == MANAGER_NEXT_GUI
+                else cli_executor_budget
+            )
+        else:
+            assert gui_executor_agent is not None and cli_executor_agent is not None
+            executor_agent, executor_budget = _executor_binding(
+                next_step=next_step,
+                gui_executor_agent=gui_executor_agent,
+                cli_executor_agent=cli_executor_agent,
+                gui_executor_budget=gui_executor_budget,
+                cli_executor_budget=cli_executor_budget,
+            )
         auditor_for_step = gui_auditor_agent if next_step == MANAGER_NEXT_GUI else cli_auditor_agent
         related_auditor_reports = format_related_auditor_reports(
             rounds,
@@ -654,7 +788,7 @@ async def _run_impl(
         _append_event(
             events_path,
             "executor_role_start",
-            {"round": round_index, "role": next_step, "prompt_chars": len(executor_prompt), "budget": _budget_to_dict(executor_budget)},
+            {"round": round_index, "role": next_step, "prompt_chars": len(executor_prompt), "budget": _budget_to_dict(executor_budget), "executor_routing": routing_decision.to_dict()},
         )
         emit("role_start", round=round_index, role=f"{next_step}_executor")
 
@@ -683,6 +817,9 @@ async def _run_impl(
         executor_output = _visible_output(executor_result).strip() or "(executor agent produced no readable natural-language output)"
         _write_local(round_dir / "executor_output.txt", executor_output)
         if executor_result.status == "cancelled":
+            routing_decision = _observe_executor_routing(
+                executor_router, routing_decision, "not_counted"
+            )
             record = ManagedRound(
                 round_index=round_index,
                 next_step=next_step,
@@ -692,6 +829,7 @@ async def _run_impl(
                 task_contract=current_task_contract,
                 related_report_refs=related_report_refs,
                 executor_status=_episode_status(executor_result),
+                executor_routing=routing_decision.to_dict(),
             )
             rounds.append(record)
             await _record_round(env, config, role_dir, events_path, record)
@@ -702,6 +840,7 @@ async def _run_impl(
                 {
                     "round": round_index,
                     "phase": "executor",
+                    "executor_routing": routing_decision.to_dict(),
                     **_episode_event_fields(executor_result, event_status="cancelled"),
                 },
             )
@@ -709,6 +848,9 @@ async def _run_impl(
         executor_failure = classify_agent_runtime_failure(executor_result)
         if executor_failure is not None:
             recoverable_timeout = executor_failure.kind == "timeout"
+            routing_decision = _observe_executor_routing(
+                executor_router, routing_decision, "not_counted"
+            )
             record = ManagedRound(
                 round_index=round_index,
                 next_step=next_step,
@@ -722,6 +864,7 @@ async def _run_impl(
                 executor_status=_failed_episode_status(
                     executor_result, executor_failure.user_message
                 ),
+                executor_routing=routing_decision.to_dict(),
             )
             _write_local(round_dir / "harness_feedback.txt", executor_failure.user_message)
             rounds.append(record)
@@ -734,6 +877,7 @@ async def _run_impl(
                     "phase": "executor",
                     "kind": executor_failure.kind,
                     "message": executor_failure.message,
+                    "executor_routing": routing_decision.to_dict(),
                     **_episode_event_fields(
                         executor_result,
                         event_status="failed",
@@ -764,6 +908,7 @@ async def _run_impl(
                 "round": round_index,
                 "role": next_step,
                 "output_chars": len(executor_output),
+                "executor_routing": routing_decision.to_dict(),
                 **_episode_event_fields(executor_result, event_status="completed"),
             },
         )
@@ -794,7 +939,7 @@ async def _run_impl(
         _append_event(
             events_path,
             "auditor_role_start",
-            {"round": round_index, "role": next_step, "prompt_chars": len(auditor_prompt), "budget": _budget_to_dict(auditor_budget)},
+            {"round": round_index, "role": next_step, "prompt_chars": len(auditor_prompt), "budget": _budget_to_dict(auditor_budget), "executor_routing": routing_decision.to_dict()},
         )
         emit("role_start", round=round_index, role=f"{next_step}_auditor")
 
@@ -821,6 +966,9 @@ async def _run_impl(
             final_screenshot=auditor_final_screenshot,
         )
         if auditor_result.status == "cancelled":
+            routing_decision = _observe_executor_routing(
+                executor_router, routing_decision, "not_counted"
+            )
             record = ManagedRound(
                 round_index=round_index,
                 next_step=next_step,
@@ -831,6 +979,7 @@ async def _run_impl(
                 related_report_refs=related_report_refs,
                 executor_status=_episode_status(executor_result),
                 auditor_status=_episode_status(auditor_result),
+                executor_routing=routing_decision.to_dict(),
             )
             rounds.append(record)
             await _record_round(env, config, role_dir, events_path, record)
@@ -841,6 +990,7 @@ async def _run_impl(
                 {
                     "round": round_index,
                     "phase": "auditor",
+                    "executor_routing": routing_decision.to_dict(),
                     **_episode_event_fields(auditor_result, event_status="cancelled"),
                 },
             )
@@ -848,6 +998,9 @@ async def _run_impl(
         auditor_failure = classify_agent_runtime_failure(auditor_result)
         if auditor_failure is not None:
             recoverable_timeout = auditor_failure.kind == "timeout"
+            routing_decision = _observe_executor_routing(
+                executor_router, routing_decision, "not_counted"
+            )
             record = ManagedRound(
                 round_index=round_index,
                 next_step=next_step,
@@ -862,6 +1015,7 @@ async def _run_impl(
                 auditor_status=_failed_episode_status(
                     auditor_result, auditor_failure.user_message
                 ),
+                executor_routing=routing_decision.to_dict(),
             )
             _write_local(round_dir / "harness_feedback.txt", auditor_failure.user_message)
             rounds.append(record)
@@ -874,6 +1028,7 @@ async def _run_impl(
                     "phase": "auditor",
                     "kind": auditor_failure.kind,
                     "message": auditor_failure.message,
+                    "executor_routing": routing_decision.to_dict(),
                     **_episode_event_fields(
                         auditor_result,
                         event_status="failed",
@@ -912,6 +1067,9 @@ async def _run_impl(
         )
         repair_status = auditor_status.get("format_repair_status")
         if isinstance(repair_status, dict) and repair_status.get("status") == "cancelled":
+            routing_decision = _observe_executor_routing(
+                executor_router, routing_decision, "not_counted"
+            )
             record = ManagedRound(
                 round_index=round_index,
                 next_step=next_step,
@@ -922,6 +1080,7 @@ async def _run_impl(
                 related_report_refs=related_report_refs,
                 executor_status=_episode_status(executor_result),
                 auditor_status=auditor_status,
+                executor_routing=routing_decision.to_dict(),
             )
             rounds.append(record)
             await _record_round(env, config, role_dir, events_path, record)
@@ -934,11 +1093,28 @@ async def _run_impl(
                     "phase": "auditor_format_repair",
                     "status": "cancelled",
                     "episode_status": repair_status,
+                    "executor_routing": routing_decision.to_dict(),
                 },
             )
             break
         _write_local(round_dir / "auditor_report.txt", auditor_report)
         await _write_remote_round_text(env, config, round_index, "auditor_report.txt", auditor_report)
+
+        audit = parse_audit_report(
+            auditor_report, round_index, language=config.prompt_language
+        )
+        repair_attempted = bool(auditor_status.get("format_repair_attempted"))
+        audit_accepted = not repair_attempted or bool(
+            auditor_status.get("format_repair_accepted")
+        )
+        routing_signal = (
+            audit.status
+            if audit_accepted and audit.status in {"complete", "incomplete", "blocked"}
+            else "not_counted"
+        )
+        routing_decision = _observe_executor_routing(
+            executor_router, routing_decision, routing_signal
+        )
 
         record = ManagedRound(
             round_index=round_index,
@@ -951,6 +1127,7 @@ async def _run_impl(
             related_report_refs=related_report_refs,
             executor_status=_episode_status(executor_result),
             auditor_status=auditor_status,
+            executor_routing=routing_decision.to_dict(),
         )
         rounds.append(record)
         await _record_round(env, config, role_dir, events_path, record)
@@ -961,10 +1138,10 @@ async def _run_impl(
                 "round": round_index,
                 "role": next_step,
                 "report_chars": len(auditor_report),
+                "executor_routing": routing_decision.to_dict(),
                 **_episode_event_fields(auditor_result, event_status="completed"),
             },
         )
-        audit = parse_audit_report(auditor_report, round_index, language=config.prompt_language)
         emit(
             "role_done",
             round=round_index,
@@ -1219,6 +1396,18 @@ def _executor_binding(
     if next_step == MANAGER_NEXT_GUI:
         return gui_executor_agent, gui_executor_budget
     return cli_executor_agent, cli_executor_budget
+
+
+def _observe_executor_routing(
+    router: ExecutorRouter | None,
+    decision: ExecutorRoutingDecision,
+    signal: Literal["complete", "incomplete", "blocked", "not_counted"],
+) -> ExecutorRoutingDecision:
+    if router is None:
+        return replace(decision, audit_signal=signal)
+    if signal not in {"complete", "incomplete", "blocked", "not_counted"}:
+        raise ValueError(f"unsupported executor routing audit signal: {signal}")
+    return router.observe(decision, signal)
 
 
 async def _run_role_episode(

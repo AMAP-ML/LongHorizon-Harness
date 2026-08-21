@@ -377,7 +377,30 @@ cli_auditor  → auditor  → [run].agent / [run].model / [run].reasoning_effort
 | `[run.roles.cli_auditor]` | `auditor` | CLI 验收 |
 | `[run.roles.final_response]` | `manager` | 写给你的最终回复 |
 
-上述每个字段都有对应的 CLI 参数（`--agent`、`--max-rounds`、`--gui-executor-model`、`--auditor-timeout` 等）可以对单次运行覆盖。完整列表见 `lh-harness run --help`。
+Executor 路由可以先使用低成本层级，并在同一子任务连续未通过时切换到更强的后端。下面的配置可以直接复制；父级 executor 表是可选的，但适合作为各 tier 省略字段时的回退来源：
+
+```toml
+[run.roles.executor]
+agent = "codex"
+model = "gpt-5.6-sol"
+
+[run.roles.executor.cheap]
+model = "gpt-5.6-luna"
+
+[run.roles.executor.strong]
+agent = "claude_code"
+
+[run.executor_routing]
+default_tier = "cheap"
+escalate_after_failures = 2
+escalation_tier = "strong"
+```
+
+Manager 可以为 GUI 或 CLI 子任务选择初始 tier；省略时使用 `default_tier`，显式请求 `escalation_tier` 时立即使用。子任务身份由 route 与规范化后的 `Task:` 文本共同确定。只有成功解析的最终 Auditor 结果为 `Status: incomplete` 或 `Status: blocked` 才会增加失败次数。达到阈值后，从同一子任务的**下一次**执行开始升级；升级具有粘性，即使 Manager 再请求低成本 tier 也不会降级。`Status: complete`、新任务或 GUI/CLI route 变化会重置状态。Provider 错误、超时、取消和未通过的格式修复都不计数；缺少 `Task:` 的计划每轮使用独立身份，不会跨轮累计。
+
+Tier 的字段分别回退。tier 未设置 `agent` 时，沿用上方 GUI/CLI executor 的具体回退链；显式配置的 tier `model` 始终生效。tier 显式重复 route 的有效 `agent` 且省略 `model` 时继承 route model；更换 `agent` 但省略 `model` 时，新后端使用自身默认模型，不会错误继承其他后端的模型。空 tier 表同时继承 route 的两个字段。tier 表目前只能写在项目配置中；tier 名必须由 1-64 位 ASCII 字母、数字、`_` 或 `-` 组成，且首位必须是字母或数字。普通角色、超时与 run 字段仍有 CLI 参数（如 `--agent`、`--max-rounds`、`--gui-executor-model`、`--auditor-timeout`）；完整列表见 `lh-harness run --help`。
+
+每次实际 executor 尝试或被拒绝的路由计划，都会在 round ledger（`rounds.jsonl` 与每轮的 `round.json`）、路由事件以及最终 `report.json` 的 `rounds` 中记录 `executor_routing`，包含 task id、请求/实际 tier、选择原因和失败计数。Dashboard 的 **Resume** 会以 `resume_kind = "retry"` 启动一个新 run：保留任务与配置引用，重新读取当前项目配置，并让路由计数从零开始；它不是 checkpoint 状态恢复。
 
 当 Manager、Executor 或 Auditor 达到本地 episode 超时时限时，Harness 会保留已有轨迹和任务状态，并让下一轮 Manager 检查真实 workspace 后继续恢复。本地 episode 超时会显示为“Agent 执行超时”，不会再被误判为 provider 网络故障；连续超时仍会触发 Dashboard 的人工复核门禁。
 
