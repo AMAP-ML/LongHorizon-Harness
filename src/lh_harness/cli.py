@@ -15,7 +15,7 @@ import traceback
 import uuid
 import webbrowser
 from pathlib import Path
-from typing import TYPE_CHECKING, Awaitable, Iterable
+from typing import TYPE_CHECKING, Awaitable, Callable, Iterable
 
 from . import HOMEPAGE, ISSUES_URL, __version__
 from .config import (
@@ -418,6 +418,12 @@ def main(argv: list[str] | None = None) -> int:
         )
 
     run_parser = add_command("run", "Run a long-horizon task through role-managed LongHorizon-Harness")
+    # Executor tiers are project-config-only: carry the parsed objects through
+    # argparse without exposing a fixed set of flags for arbitrary tier names.
+    run_parser.set_defaults(
+        executor_tiers=run_default("executor_tiers"),
+        executor_routing=run_default("executor_routing"),
+    )
     run_parser.add_argument("--task", required=True, help="Task text or @path")
     run_parser.add_argument(
         "--agent",
@@ -1626,6 +1632,7 @@ def _run_command(args: argparse.Namespace) -> int:
         harness_dir=harness_dir,
         log_dir=log_dir,
         prompt_language=args.prompt_language,
+        executor_routing=getattr(args, "executor_routing", None),
     )
     env = _build_env(args.env, tmp_dir=str(run_dir / "tmp"))
 
@@ -1716,7 +1723,7 @@ def _run_command(args: argparse.Namespace) -> int:
         if not args.dashboard_no_open:
             _open_browser_when_ready(dashboard_handle.url)
 
-    agent_cache: dict[tuple[str, str, str | None], object] = {}
+    agent_cache: dict[tuple[str, str, str | None, str | None], object] = {}
     plugin_mcp_cache: dict[str, str | None] = {}
 
     def resolve_mcp_config(agent_name: str) -> str | None:
@@ -1744,20 +1751,23 @@ def _run_command(args: argparse.Namespace) -> int:
                 plugin_mcp_cache[agent_name] = config or None
         return plugin_mcp_cache[agent_name]
 
-    def build_role_agent(role: str, *, permission_role: str | None = None):
-        # Agent and model resolve independently down the same fallback chain, so
-        # mixing backends never sends one backend the other's model id. The
-        # permission role is part of the cache key: two Claude roles using the
-        # same model must never share a differently privileged adapter.
-        name = _resolve_role_option(args, role, "agent")
-        model = _resolve_role_model(args, role)
-        effort = _resolve_role_reasoning_effort(args, role, name)
-        effective_permission_role = permission_role or role
-        key = (effective_permission_role, name, model, effort)
+    def build_bound_agent(
+        permission_role: str,
+        name: str,
+        model: str | None,
+        *,
+        reasoning_role: str | None = None,
+    ):
+        # The permission role is part of the cache key: adapters with identical
+        # provider bindings must not be shared across GUI and CLI sandboxes.
+        effort = _resolve_role_reasoning_effort(
+            args, reasoning_role or permission_role, name
+        )
+        key = (permission_role, name, model, effort)
         if key not in agent_cache:
             agent_cache[key] = _build_agent(
                 name,
-                role=effective_permission_role,
+                role=permission_role,
                 model=model,
                 api_key=args.api_key,
                 base_url=args.base_url,
@@ -1771,11 +1781,19 @@ def _run_command(args: argparse.Namespace) -> int:
             )
         return agent_cache[key]
 
+    def build_role_agent(role: str, *, permission_role: str | None = None):
+        # Agent and model resolve independently down the same fallback chain, so
+        # mixing backends never sends one backend the other's model id.
+        return build_bound_agent(
+            permission_role or role,
+            _resolve_role_option(args, role, "agent"),
+            _resolve_role_model(args, role),
+            reasoning_role=role,
+        )
+
     try:
         role_agents = {
             "manager_agent": build_role_agent("manager"),
-            "gui_executor_agent": build_role_agent("gui_executor"),
-            "cli_executor_agent": build_role_agent("cli_executor"),
             "gui_auditor_agent": build_role_agent("gui_auditor"),
             "cli_auditor_agent": build_role_agent("cli_auditor"),
             # Format repair sees only the previous auditor text and has no tools.
@@ -1787,6 +1805,7 @@ def _run_command(args: argparse.Namespace) -> int:
             ),
             "final_response_agent": build_role_agent("final_response"),
         }
+        role_agents.update(_build_executor_agent_kwargs(args, build_bound_agent))
     except BaseException as exc:
         _write_bootstrap_failure(log_dir, task, exc, max_rounds=max_rounds)
         print(f"Worker failed during agent setup: {exc}", file=sys.stderr)
@@ -2072,6 +2091,65 @@ def _resolve_role_reasoning_effort(
             return None
         current = _ROLE_PARENTS[current]
     return getattr(args, "reasoning_effort", None)
+
+
+def _resolve_executor_tier_binding(
+    args: argparse.Namespace,
+    route_role: str,
+    tier_spec: dict[str, str],
+) -> tuple[str, str | None]:
+    """Resolve one tier without carrying a model across a backend switch."""
+
+    route_agent = _resolve_role_option(args, route_role, "agent")
+    route_model = _resolve_role_model(args, route_role)
+    tier_agent = tier_spec.get("agent")
+    tier_model = tier_spec.get("model")
+    if tier_agent is None:
+        return route_agent, tier_model if tier_model is not None else route_model
+    if tier_model is not None:
+        return tier_agent, tier_model
+    # Repeating the effective backend preserves field-level inheritance. An
+    # actual provider switch starts a new model namespace and uses its default.
+    return tier_agent, route_model if tier_agent == route_agent else None
+
+
+def _build_executor_agent_kwargs(
+    args: argparse.Namespace,
+    build_agent: Callable[[str, str, str | None], object],
+) -> dict[str, object]:
+    """Build legacy singular executors or configured tier maps."""
+
+    if getattr(args, "executor_routing", None) is None:
+        return {
+            "gui_executor_agent": build_agent(
+                "gui_executor",
+                _resolve_role_option(args, "gui_executor", "agent"),
+                _resolve_role_model(args, "gui_executor"),
+            ),
+            "cli_executor_agent": build_agent(
+                "cli_executor",
+                _resolve_role_option(args, "cli_executor", "agent"),
+                _resolve_role_model(args, "cli_executor"),
+            ),
+        }
+
+    tier_specs = getattr(args, "executor_tiers", None)
+    if not isinstance(tier_specs, dict) or not tier_specs:
+        raise ValueError("executor routing requires configured executor tiers")
+
+    result: dict[str, object] = {}
+    for route_role, keyword in (
+        ("gui_executor", "gui_executor_agents"),
+        ("cli_executor", "cli_executor_agents"),
+    ):
+        result[keyword] = {
+            tier: build_agent(
+                route_role,
+                *_resolve_executor_tier_binding(args, route_role, tier_spec),
+            )
+            for tier, tier_spec in tier_specs.items()
+        }
+    return result
 
 
 def _public_role_configs_from_args(

@@ -1,10 +1,11 @@
 from __future__ import annotations
 
 import importlib
+import re
 from pathlib import Path
 from typing import Any
 
-from .types import MAX_ROUNDS
+from .types import ExecutorRoutingConfig, MAX_ROUNDS
 
 try:
     tomllib = importlib.import_module("tomllib")
@@ -45,6 +46,7 @@ _RUN_KEYS = {
     "dashboard_port",
     "roles",
     "timeouts",
+    "executor_routing",
 }
 _STRING_KEYS = {
     "model",
@@ -56,6 +58,12 @@ _STRING_KEYS = {
     "claude_mcp_config",
     "codex_mcp_config",
 }
+_EXECUTOR_ROUTING_KEYS = {
+    "default_tier",
+    "escalate_after_failures",
+    "escalation_tier",
+}
+_EXECUTOR_TIER_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$")
 
 CONFIG_TEMPLATE = """# LongHorizon-Harness project defaults.
 # Explicit CLI arguments override these values.
@@ -114,6 +122,21 @@ auditor = 300
 [run.roles.executor]
 # agent = "codex"
 # model = "gpt-5.6-sol"
+
+# Optional cost-aware executor routing. Tier-specific fields override the
+# parent executor role; omitted fields inherit from [run.roles.executor].
+# [run.roles.executor.cheap]
+# agent = "deepseek_harness"
+# model = "deepseek-v4-flash"
+#
+# [run.roles.executor.strong]
+# agent = "codex"
+# model = "gpt-5.6-sol"
+#
+# [run.executor_routing]
+# default_tier = "cheap"
+# escalate_after_failures = 2
+# escalation_tier = "strong"
 
 [run.roles.gui_executor]
 # agent = "codex"
@@ -227,7 +250,9 @@ def _flatten_run_table(run: dict[str, Any]) -> dict[str, Any]:
     for role, values in roles.items():
         if not isinstance(values, dict):
             raise ProjectConfigError(f"[run.roles.{role}] must be a TOML table")
-        unknown_role_keys = set(values) - {"agent", "model", "reasoning_effort"}
+        role_keys = {"agent", "model", "reasoning_effort"}
+        tier_names = set(values) - role_keys if role == "executor" else set()
+        unknown_role_keys = set(values) - role_keys - tier_names
         if unknown_role_keys:
             raise ProjectConfigError(
                 f"unknown [run.roles.{role}] key(s): {_names(unknown_role_keys)}"
@@ -244,6 +269,34 @@ def _flatten_run_table(run: dict[str, Any]) -> dict[str, Any]:
             defaults[f"{role}_reasoning_effort"] = _reasoning_effort(
                 values["reasoning_effort"], f"run.roles.{role}.reasoning_effort"
             )
+        if role == "executor" and tier_names:
+            defaults["executor_tiers"] = _executor_tiers(values, tier_names)
+
+    routing_value = run.get("executor_routing")
+    routing = _executor_routing(routing_value) if routing_value is not None else None
+    tiers = defaults.get("executor_tiers")
+    if tiers is not None and routing is None:
+        raise ProjectConfigError(
+            "run.executor_routing is required when run.roles.executor tiers are configured"
+        )
+    if routing is not None:
+        if tiers is None:
+            raise ProjectConfigError(
+                "run.roles.executor must configure at least two tiers when run.executor_routing is configured"
+            )
+        if len(tiers) < 2:
+            raise ProjectConfigError(
+                "run.roles.executor must configure at least two tiers when run.executor_routing is configured"
+            )
+        if routing.default_tier not in tiers:
+            raise ProjectConfigError(
+                "run.executor_routing.default_tier must reference a configured run.roles.executor tier"
+            )
+        if routing.escalation_tier not in tiers:
+            raise ProjectConfigError(
+                "run.executor_routing.escalation_tier must reference a configured run.roles.executor tier"
+            )
+        defaults["executor_routing"] = routing
 
     timeouts = run.get("timeouts", {})
     if not isinstance(timeouts, dict):
@@ -254,6 +307,72 @@ def _flatten_run_table(run: dict[str, Any]) -> dict[str, Any]:
     for role, value in timeouts.items():
         defaults[f"{role}_timeout"] = _positive_int(value, f"run.timeouts.{role}")
     return defaults
+
+
+def _executor_tiers(
+    executor_role: dict[str, Any], tier_names: set[str]
+) -> dict[str, dict[str, str]]:
+    tiers: dict[str, dict[str, str]] = {}
+    for tier_name in sorted(tier_names):
+        tier_path = f"run.roles.executor.{tier_name}"
+        if not _EXECUTOR_TIER_PATTERN.fullmatch(tier_name):
+            raise ProjectConfigError(
+                f"{tier_path} must use a 1-64 character tier name containing only letters, digits, '_' or '-', starting with a letter or digit"
+            )
+        value = executor_role[tier_name]
+        if not isinstance(value, dict):
+            raise ProjectConfigError(f"[{tier_path}] must be a TOML table")
+        unknown = set(value) - {"agent", "model"}
+        if unknown:
+            raise ProjectConfigError(
+                f"unknown [{tier_path}] key(s): {_names(unknown)}"
+            )
+        parsed: dict[str, str] = {}
+        if "agent" in value:
+            parsed["agent"] = _choice(
+                value["agent"], f"{tier_path}.agent", _AGENT_CHOICES
+            )
+        if "model" in value:
+            parsed["model"] = _string(value["model"], f"{tier_path}.model")
+        tiers[tier_name] = parsed
+    return tiers
+
+
+def _executor_routing(value: Any) -> ExecutorRoutingConfig:
+    path = "run.executor_routing"
+    if not isinstance(value, dict):
+        raise ProjectConfigError(f"[{path}] must be a TOML table")
+    unknown = set(value) - _EXECUTOR_ROUTING_KEYS
+    if unknown:
+        raise ProjectConfigError(f"unknown [{path}] key(s): {_names(unknown)}")
+    missing = _EXECUTOR_ROUTING_KEYS - set(value)
+    if missing:
+        raise ProjectConfigError(f"missing [{path}] key(s): {_names(missing)}")
+    default_tier = _tier_reference(value["default_tier"], f"{path}.default_tier")
+    escalation_tier = _tier_reference(
+        value["escalation_tier"], f"{path}.escalation_tier"
+    )
+    failures = _positive_int(
+        value["escalate_after_failures"], f"{path}.escalate_after_failures"
+    )
+    if default_tier == escalation_tier:
+        raise ProjectConfigError(
+            "run.executor_routing.default_tier and run.executor_routing.escalation_tier must be different"
+        )
+    return ExecutorRoutingConfig(
+        default_tier=default_tier,
+        escalate_after_failures=failures,
+        escalation_tier=escalation_tier,
+    )
+
+
+def _tier_reference(value: Any, name: str) -> str:
+    result = _string(value, name)
+    if not _EXECUTOR_TIER_PATTERN.fullmatch(result):
+        raise ProjectConfigError(
+            f"{name} must name a configured executor tier using letters, digits, '_' or '-'"
+        )
+    return result
 
 
 def _string(value: Any, name: str) -> str:

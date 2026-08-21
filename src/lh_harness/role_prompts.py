@@ -14,7 +14,7 @@ from .prompt_texts import (
     TASK_CONTRACT_RULES,
     USER_CLARIFICATION_NOTE,
 )
-from .types import ManagedRound, PromptLanguage, RoleNextStep
+from .types import ExecutorRoutingConfig, ManagedRound, PromptLanguage, RoleNextStep
 
 MANAGER_NEXT_GUI: RoleNextStep = "gui"
 MANAGER_NEXT_CLI: RoleNextStep = "cli"
@@ -48,6 +48,8 @@ def build_role_manager_prompt(
     task_state: str = "",
     task_contract: str = "",
     round_budget: int | None = None,
+    executor_tiers: dict[str, dict[str, str]] | None = None,
+    executor_routing: ExecutorRoutingConfig | None = None,
     language: str = "en",
     max_history_chars: int = 36_000,
 ) -> str:
@@ -58,6 +60,11 @@ def build_role_manager_prompt(
         rounds, max_chars=max_history_chars, language=lang
     )
     harness_feedback = format_harness_feedback_context(rounds, max_chars=max_history_chars)
+    routing_policy = _format_executor_routing_policy(
+        executor_tiers=executor_tiers,
+        executor_routing=executor_routing,
+        language=lang,
+    )
     if lang == "en":
         return f"""\
 {MANAGER_INSTRUCTIONS[lang].strip()}
@@ -90,6 +97,8 @@ Round budget:
 - Configured round limit: {configured_budget}
 - Rounds remaining, including this one: {remaining_rounds}
 - If only one round remains, do not schedule a prerequisite-only subtask that deliberately postpones core requirements. Route the most complete executable subtask possible, or ask/block when completion is impossible.
+
+{routing_policy}
 
 Output only the next management result.
 """
@@ -125,8 +134,36 @@ harness 任务管理反馈（不是审计，只用于协议或完成请求修正
 - 包含本轮在内的剩余轮次: {remaining_rounds}
 - 如果只剩一轮，不得安排一个明确推迟核心要求的纯前置子任务；应路由当前可完成的最完整子任务，无法完成时使用 ask 或 blocked。
 
+{routing_policy}
+
 只输出下一步任务管理结果。
 """
+
+
+def _format_executor_routing_policy(
+    *,
+    executor_tiers: dict[str, dict[str, str]] | None,
+    executor_routing: ExecutorRoutingConfig | None,
+    language: PromptLanguage,
+) -> str:
+    if executor_routing is None:
+        return ""
+    tier_names = ", ".join(sorted((executor_tiers or {}).keys()))
+    if language == "en":
+        return f"""\
+Executor routing policy:
+- Allowed executor tiers: {tier_names or "(none configured)"}
+- Default tier when `Executor tier:` is omitted: {executor_routing.default_tier}
+- Automatic escalation: after {executor_routing.escalate_after_failures} successfully parsed `Status: incomplete` or `Status: blocked` verdicts for the same subtask, the harness may force tier {executor_routing.escalation_tier}. Provider/runtime failures, timeouts, and format-repair failures do not count.
+- GUI/CLI output schema: immediately after the route line and before `Task:`, you may add `Executor tier: <name>` to select the initial tier. Omitting it uses the default; naming {executor_routing.escalation_tier} uses it immediately.
+- Output only an allowed tier name. Never add `Executor tier:` to ask/done/blocked routes."""
+    return f"""\
+执行器路由策略:
+- 允许的执行器层级: {tier_names or "（未配置）"}
+- 省略 `执行器层级:` 时的默认层级: {executor_routing.default_tier}
+- 自动升级: 同一子任务出现 {executor_routing.escalate_after_failures} 次成功解析的 `状态: incomplete` 或 `状态: blocked` 结论后，harness 可以强制使用层级 {executor_routing.escalation_tier}。provider/runtime 失败、超时和格式修复失败不计数。
+- GUI/CLI 输出格式: 路由行后、`任务:` 前可以紧接 `执行器层级: <名称>` 来选择初始层级；省略时使用默认层级，填写 {executor_routing.escalation_tier} 会立即使用该层级。
+- 只能输出允许的层级名称。请示用户/完成/阻塞路由绝不能添加 `执行器层级:`。"""
 
 
 def build_role_executor_prompt(
@@ -478,33 +515,285 @@ def format_audit_findings(
     return _clip_preserve("\n\n".join(sections), max_chars)
 
 
-def parse_role_manager_next_step(text: str) -> RoleNextStep:
-    for line in str(text or "").splitlines():
-        normalized = line.strip().strip("*").replace(" ", "").replace("　", "").lower()
-        # Models commonly append a short rationale after the required route,
-        # e.g. `Next: done — all constraints passed`. Treat only an explicitly
-        # delimited suffix as commentary so prose such as `Next: done later`
-        # remains invalid.
-        normalized = re.split(r"(?:—|–|--|//|#|[（(])", normalized, maxsplit=1)[0]
-        if normalized in {"下一步:gui任务", "下一步：gui任务", "next:gui"}:
-            return MANAGER_NEXT_GUI
-        if normalized in {"下一步:cli任务", "下一步：cli任务", "next:cli"}:
-            return MANAGER_NEXT_CLI
-        if normalized in {"下一步:请示用户", "下一步：请示用户", "下一步:请示", "下一步：请示", "下一步:询问用户", "下一步：询问用户", "next:ask"}:
-            return MANAGER_NEXT_ASK
-        if normalized in {"下一步:完成", "下一步：完成", "next:done", "next:complete"}:
-            return MANAGER_NEXT_DONE
-        if normalized in {"下一步:阻塞", "下一步：阻塞", "next:blocked"}:
-            return MANAGER_NEXT_BLOCKED
+def _parse_role_manager_route_line(line: str) -> RoleNextStep:
+    normalized = str(line or "").strip().strip("*").replace(" ", "").replace("　", "").lower()
+    # Models commonly append a short rationale after the required route,
+    # e.g. `Next: done — all constraints passed`. Treat only an explicitly
+    # delimited suffix as commentary so prose such as `Next: done later`
+    # remains invalid.
+    normalized = re.split(r"(?:—|–|--|//|#|[（(])", normalized, maxsplit=1)[0]
+    if normalized in {"下一步:gui任务", "下一步：gui任务", "next:gui"}:
+        return MANAGER_NEXT_GUI
+    if normalized in {"下一步:cli任务", "下一步：cli任务", "next:cli"}:
+        return MANAGER_NEXT_CLI
+    if normalized in {"下一步:请示用户", "下一步：请示用户", "下一步:请示", "下一步：请示", "下一步:询问用户", "下一步：询问用户", "next:ask"}:
+        return MANAGER_NEXT_ASK
+    if normalized in {"下一步:完成", "下一步：完成", "next:done", "next:complete"}:
+        return MANAGER_NEXT_DONE
+    if normalized in {"下一步:阻塞", "下一步：阻塞", "next:blocked"}:
+        return MANAGER_NEXT_BLOCKED
     return MANAGER_NEXT_INVALID
+
+
+def parse_role_manager_next_step(text: str) -> RoleNextStep:
+    """Return the same structural route authority used by tier/task parsing."""
+
+    lines = str(text or "").splitlines()
+    authority = _last_manager_route(lines)
+    if authority is not None:
+        return authority[1]
+    return MANAGER_NEXT_INVALID
+
+
+_EXECUTOR_TIER_HEADER_RE = re.compile(
+    r"(?i)^(?:\*\*)?\s*(?:executor\s+tier|执行器层级)\s*[:：]\s*(?:\*\*)?\s*(.*)$"
+)
+_MANAGER_TASK_HEADER_RE = re.compile(
+    r"(?i)^(?:\*\*)?\s*(?:task|任务)\s*[:：]\s*(?:\*\*)?\s*(.*)$"
+)
+_MANAGER_SUBTASK_BOUNDARY_RE = re.compile(
+    r"(?i)^(?:\*\*)?\s*(?:acceptance\s+criteria|related\s+audit\s+reports"
+    r"|related\s+audited\s+state|boundaries|验收标准|相关审计报告|相关已审计状态|边界)\s*[:：]"
+)
+_MANAGER_BOUNDARIES_HEADER_RE = re.compile(
+    r"(?i)^(?:\*\*)?\s*(?:boundaries|边界)\s*[:：]"
+)
+_MANAGER_BLOCK_START_RE = re.compile(
+    r"(?i)^(?:\*\*)?\s*(?:current\s+task\s+state|当前任务状态)\s*[:：]"
+)
+_MANAGER_TASK_CONTRACT_HEADER_RE = re.compile(
+    r"(?i)^(?:\*\*)?\s*(?:task\s+contract|任务契约|任务语义合同)\s*[:：]"
+)
+_MANAGER_DEPENDENCY_HEADER_RE = re.compile(
+    r"(?i)^(?:\*\*)?\s*(?:dependency\s+assessment|依赖判断)\s*[:：]"
+)
+_MANAGER_BLOCK_SEPARATOR_RE = re.compile(r"^\s*(?:-{3,}|={3,})\s*$")
+
+
+def extract_role_manager_executor_tier(plan_text: str) -> str | None:
+    """Return the optional tier header from the final executable route block.
+
+    ``None`` means the manager omitted the header. An explicitly empty header
+    remains ``""`` so the runtime can reject it instead of silently selecting
+    a default tier.
+    """
+
+    lines = str(plan_text or "").splitlines()
+    route_index = _last_executable_route_index(lines)
+    if route_index is None:
+        return None
+    for line in lines[route_index + 1 :]:
+        if not line.strip():
+            continue
+        match = _EXECUTOR_TIER_HEADER_RE.match(line.strip())
+        return match.group(1).strip() if match else None
+    return None
+
+
+def extract_role_manager_task(plan_text: str) -> str:
+    """Return the Task body from the final executable manager route block."""
+
+    lines = str(plan_text or "").splitlines()
+    route_index = _last_executable_route_index(lines)
+    if route_index is None:
+        return ""
+
+    cursor = route_index + 1
+    while cursor < len(lines) and not lines[cursor].strip():
+        cursor += 1
+    if cursor < len(lines) and _EXECUTOR_TIER_HEADER_RE.match(lines[cursor].strip()):
+        cursor += 1
+        while cursor < len(lines) and not lines[cursor].strip():
+            cursor += 1
+    if cursor >= len(lines):
+        return ""
+    task_match = _MANAGER_TASK_HEADER_RE.match(lines[cursor].strip())
+    if task_match is None:
+        return ""
+
+    collected: list[str] = []
+    inline = task_match.group(1).strip()
+    if inline:
+        collected.append(inline)
+    for line in lines[cursor + 1 :]:
+        if _MANAGER_SUBTASK_BOUNDARY_RE.match(line.strip()):
+            break
+        collected.append(line.rstrip())
+    return "\n".join(collected).strip()
+
+
+def _last_executable_route_index(lines: list[str]) -> int | None:
+    route = _last_manager_route(lines)
+    if route is None or route[1] not in {MANAGER_NEXT_GUI, MANAGER_NEXT_CLI}:
+        return None
+    return route[0]
+
+
+def _last_manager_route(
+    lines: list[str],
+) -> tuple[int, RoleNextStep, int] | None:
+    """Return the final authoritative route and its manager-block start.
+
+    Once an executable route is accepted, every following subtask section is
+    payload. Route-shaped literals inside Task, acceptance criteria, related
+    evidence, or boundaries cannot silently replace the controlling route.
+    """
+
+    last_route: tuple[int, RoleNextStep, int] | None = None
+    candidate_block_start: int | None = None
+    candidate_stage = 0  # 1=current state, 2=task contract, 3=dependency
+    candidate_short = False
+    payload_locked = False
+    boundaries_seen = False
+    index = 0
+    while index < len(lines):
+        stripped = lines[index].strip()
+        if payload_locked:
+            if _MANAGER_BOUNDARIES_HEADER_RE.match(stripped):
+                boundaries_seen = True
+            if boundaries_seen and _MANAGER_BLOCK_SEPARATOR_RE.match(stripped):
+                payload_locked = False
+                boundaries_seen = False
+                candidate_block_start = None
+                candidate_stage = 0
+                candidate_short = False
+                index += 1
+                continue
+            if _MANAGER_BLOCK_START_RE.match(stripped):
+                candidate_block_start = index
+                candidate_stage = 1
+                candidate_short = False
+                index += 1
+                continue
+            if candidate_stage == 1 and _MANAGER_TASK_CONTRACT_HEADER_RE.match(stripped):
+                candidate_stage = 2
+                index += 1
+                continue
+            if candidate_stage == 2 and _MANAGER_DEPENDENCY_HEADER_RE.match(stripped):
+                candidate_stage = 3
+                index += 1
+                continue
+            route = _parse_role_manager_route_line(lines[index])
+            if candidate_stage != 3 or route == MANAGER_NEXT_INVALID:
+                index += 1
+                continue
+            if route in {MANAGER_NEXT_GUI, MANAGER_NEXT_CLI}:
+                valid_start, _ = _subtask_protocol_start(lines, index)
+                if not valid_start:
+                    index += 1
+                    continue
+            last_route = (
+                index,
+                route,
+                candidate_block_start if candidate_block_start is not None else index,
+            )
+            candidate_block_start = None
+            candidate_stage = 0
+            candidate_short = False
+            boundaries_seen = False
+            index += 1
+            continue
+
+        if _MANAGER_BLOCK_START_RE.match(stripped):
+            candidate_block_start = index
+            candidate_stage = 1
+            candidate_short = False
+            index += 1
+            continue
+        if candidate_stage == 0 and _MANAGER_TASK_CONTRACT_HEADER_RE.match(stripped):
+            # Backward-compatible initial block: old transcripts can begin at
+            # Task contract, but this short form never reopens locked payload.
+            candidate_block_start = index
+            candidate_stage = 2
+            candidate_short = True
+            index += 1
+            continue
+        if candidate_stage == 1 and _MANAGER_TASK_CONTRACT_HEADER_RE.match(stripped):
+            candidate_stage = 2
+            index += 1
+            continue
+        if candidate_stage == 2 and _MANAGER_DEPENDENCY_HEADER_RE.match(stripped):
+            candidate_stage = 3
+            index += 1
+            continue
+        route = _parse_role_manager_route_line(lines[index])
+        if route == MANAGER_NEXT_INVALID:
+            index += 1
+            continue
+        if candidate_stage not in {0, 3} and not (
+            candidate_short and candidate_stage == 2
+        ):
+            index += 1
+            continue
+        if route in {MANAGER_NEXT_GUI, MANAGER_NEXT_CLI}:
+            valid_start, _ = _subtask_protocol_start(lines, index)
+            if not valid_start:
+                index += 1
+                continue
+            last_route = (
+                index,
+                route,
+                candidate_block_start if candidate_block_start is not None else index,
+            )
+            payload_locked = True
+            boundaries_seen = False
+            candidate_block_start = None
+            candidate_stage = 0
+            candidate_short = False
+            index += 1
+            continue
+        last_route = (
+            index,
+            route,
+            candidate_block_start if candidate_block_start is not None else index,
+        )
+        payload_locked = True
+        boundaries_seen = False
+        candidate_block_start = None
+        candidate_stage = 0
+        candidate_short = False
+        index += 1
+    return last_route
+
+
+def _subtask_protocol_start(
+    lines: list[str], route_index: int
+) -> tuple[bool, int | None]:
+    cursor = route_index + 1
+    while cursor < len(lines) and not lines[cursor].strip():
+        cursor += 1
+    if cursor >= len(lines):
+        return False, None
+    first_protocol_line = lines[cursor].strip()
+    if _MANAGER_BLOCK_START_RE.match(first_protocol_line):
+        # Legacy short plans put the maintained state after the route and may
+        # omit Task entirely. This form is authoritative only when the state
+        # header immediately follows the top-level executable route.
+        return True, None
+    if _MANAGER_TASK_HEADER_RE.match(first_protocol_line):
+        return True, cursor
+    if not _EXECUTOR_TIER_HEADER_RE.match(first_protocol_line):
+        return False, None
+    cursor += 1
+    while cursor < len(lines) and not lines[cursor].strip():
+        cursor += 1
+    task_index = (
+        cursor
+        if cursor < len(lines) and _MANAGER_TASK_HEADER_RE.match(lines[cursor].strip())
+        else None
+    )
+    return True, task_index
 
 
 def extract_role_manager_question(plan_text: str) -> str:
     """Return the `问题:` block from a `下一步: 请示用户` plan (question for the human)."""
     lines = str(plan_text or "").splitlines()
+    authority = _last_manager_route(lines)
+    if authority is None or authority[1] != MANAGER_NEXT_ASK:
+        return ""
     collecting = False
     collected: list[str] = []
-    for line in lines:
+    for line in lines[authority[0] + 1 :]:
         head = line.strip().strip("*").replace(" ", "").replace("　", "")
         if not collecting:
             if head.startswith(("问题:", "问题：")) or re.match(r"(?i)^question\s*:", line.strip().strip("*")):
@@ -529,7 +818,11 @@ def extract_role_manager_answer_choices(plan_text: str) -> list[str]:
     question is clearly yes/no, falls back to ``["是", "否"]``. Empty means the
     human just types a free-form answer.
     """
-    for line in str(plan_text or "").splitlines():
+    lines = str(plan_text or "").splitlines()
+    authority = _last_manager_route(lines)
+    if authority is None or authority[1] != MANAGER_NEXT_ASK:
+        return []
+    for line in lines[authority[0] + 1 :]:
         stripped = line.strip().strip("*")
         m = re.match(r"(?i)^\s*(?:选项|choices)\s*[:：]\s*(.+)$", stripped)
         if m:
@@ -546,11 +839,6 @@ def extract_role_manager_answer_choices(plan_text: str) -> list[str]:
     return []
 
 
-_MANAGER_ROUTE_LINE_RE = re.compile(
-    r"(?im)^\s*(?:\*\*)?\s*(?:下一步\s*[:：]\s*(?:GUI任务|CLI任务|请示用户|请示|询问用户|完成|阻塞)|next\s*:\s*(?:gui|cli|ask|done|complete|blocked))"
-)
-
-
 def extract_role_manager_plan_text(text: str) -> str:
     """Return the final state+route block from a noisy assistant transcript.
 
@@ -559,39 +847,13 @@ def extract_role_manager_plan_text(text: str) -> str:
     task-state plus route block, not wrapper transcript headings.
     """
     raw = str(text or "").strip()
-    matches = list(_MANAGER_ROUTE_LINE_RE.finditer(raw))
-    if not matches:
+    lines = raw.splitlines()
+    authority = _last_manager_route(lines)
+    if authority is None:
         return raw
-    route_start = matches[-1].start()
-    starts = [
-        position
-        for position in (
-            raw.rfind("当前任务状态", 0, route_start),
-            raw.lower().rfind("current task state", 0, route_start),
-            raw.rfind("任务契约", 0, route_start),
-            raw.lower().rfind("task contract", 0, route_start),
-        )
-        if position >= 0
-    ]
-    if starts:
-        return raw[min(starts):].strip()
-    return raw[route_start:].strip()
+    return "\n".join(lines[authority[2] :]).strip()
 
 
-_TASK_STATE_HEADER_RE = re.compile(r"(?im)^\s*(?:\*\*)?\s*(?:当前任务状态|current\s+task\s+state)\s*[:：]")
-_TASK_STATE_BOUNDARY_RE = re.compile(
-    r"(?im)^\s*(?:\*\*)?\s*(?:任务契约|task\s+contract|依赖判断|dependency\s+assessment"
-    r"|下一步\s*[:：]\s*(?:GUI任务|CLI任务|请示用户|请示|询问用户|完成|阻塞)"
-    r"|next\s*:\s*(?:gui|cli|ask|done|complete|blocked))"
-)
-_TASK_CONTRACT_HEADER_RE = re.compile(
-    r"(?im)^\s*(?:\*\*)?\s*(?:任务契约|任务语义合同|task\s+contract)\s*[:：]"
-)
-_TASK_CONTRACT_BOUNDARY_RE = re.compile(
-    r"(?im)^\s*(?:\*\*)?\s*(?:依赖判断|dependency\s+assessment"
-    r"|下一步\s*[:：]\s*(?:GUI任务|CLI任务|请示用户|请示|询问用户|完成|阻塞)"
-    r"|next\s*:\s*(?:gui|cli|ask|done|complete|blocked))"
-)
 _RELATED_REPORT_SECTION_RE = re.compile(
     r"(?ims)^\s*(?:\*\*)?\s*(?:相关(?:审计报告|已审计状态)|related\s+(?:audit\s+reports|audited\s+state))\s*[:：]\s*(.*?)(?=^\s*(?:\*\*)?\s*(?:边界|任务|验收标准|下一步|boundaries|task|acceptance\s+criteria|next)\s*[:：]|\Z)"
 )
@@ -601,31 +863,57 @@ _ROUND_REF_RE = re.compile(
 
 
 def extract_role_task_state(text: str, *, fallback: str = "") -> str:
-    raw = str(text or "").strip()
-    match = _TASK_STATE_HEADER_RE.search(raw)
-    if not match:
+    lines = str(text or "").splitlines()
+    authority = _last_manager_route(lines)
+    if authority is None:
         return fallback.strip()
-    boundary = _TASK_STATE_BOUNDARY_RE.search(raw, match.end())
-    end = boundary.start() if boundary else len(raw)
-    state = raw[match.start() : end].strip()
+    state_index, contract_index, _ = _manager_protocol_section_indices(
+        lines, authority
+    )
+    if state_index is None:
+        return fallback.strip()
+    end = (
+        contract_index
+        if contract_index is not None
+        else authority[0]
+        if state_index < authority[0]
+        else len(lines)
+    )
+    state = "\n".join(lines[state_index:end]).strip()
     return state or fallback.strip()
 
 
 def extract_role_task_contract(text: str, *, fallback: str = "") -> str:
-    raw = str(text or "").strip()
-    match = _TASK_CONTRACT_HEADER_RE.search(raw)
-    if not match:
+    lines = str(text or "").splitlines()
+    authority = _last_manager_route(lines)
+    if authority is None:
         return fallback.strip()
-    boundary = _TASK_CONTRACT_BOUNDARY_RE.search(raw, match.end())
-    end = boundary.start() if boundary else len(raw)
-    contract = raw[match.start() : end].strip()
+    _, contract_index, dependency_index = _manager_protocol_section_indices(
+        lines, authority
+    )
+    if contract_index is None:
+        return fallback.strip()
+    end = (
+        dependency_index
+        if dependency_index is not None
+        else authority[0]
+        if contract_index < authority[0]
+        else len(lines)
+    )
+    contract = "\n".join(lines[contract_index:end]).strip()
     return contract or fallback.strip()
 
 
 def extract_related_report_refs(text: str) -> list[str]:
-    raw = str(text or "")
+    lines = str(text or "").splitlines()
+    authority = _last_manager_route(lines)
+    if authority is None or authority[1] not in {MANAGER_NEXT_GUI, MANAGER_NEXT_CLI}:
+        return []
+    raw = "\n".join(lines[authority[0] + 1 :])
     sections = [m.group(1) for m in _RELATED_REPORT_SECTION_RE.finditer(raw)]
-    search_text = "\n".join(sections) if sections else raw
+    if not sections:
+        return []
+    search_text = "\n".join(sections)
     refs: list[str] = []
     seen: set[int] = set()
     for match in _ROUND_REF_RE.finditer(search_text):
@@ -638,6 +926,52 @@ def extract_related_report_refs(text: str) -> list[str]:
         seen.add(number)
         refs.append(f"round_{number:03d}")
     return refs
+
+
+def _manager_protocol_section_indices(
+    lines: list[str], authority: tuple[int, RoleNextStep, int]
+) -> tuple[int | None, int | None, int | None]:
+    """Locate structural state/contract/dependency headers for one authority."""
+
+    state_index: int | None = None
+    contract_index: int | None = None
+    dependency_index: int | None = None
+    for index in range(authority[2], authority[0]):
+        stripped = lines[index].strip()
+        if state_index is None and _MANAGER_BLOCK_START_RE.match(stripped):
+            state_index = index
+            continue
+        if contract_index is None and _MANAGER_TASK_CONTRACT_HEADER_RE.match(stripped):
+            contract_index = index
+            continue
+        if (
+            contract_index is not None
+            and dependency_index is None
+            and _MANAGER_DEPENDENCY_HEADER_RE.match(stripped)
+        ):
+            dependency_index = index
+    if state_index is None:
+        cursor = authority[0] + 1
+        while cursor < len(lines) and not lines[cursor].strip():
+            cursor += 1
+        if cursor < len(lines) and _MANAGER_BLOCK_START_RE.match(
+            lines[cursor].strip()
+        ):
+            state_index = cursor
+            for index in range(cursor + 1, len(lines)):
+                stripped = lines[index].strip()
+                if contract_index is None and _MANAGER_TASK_CONTRACT_HEADER_RE.match(
+                    stripped
+                ):
+                    contract_index = index
+                    continue
+                if (
+                    contract_index is not None
+                    and dependency_index is None
+                    and _MANAGER_DEPENDENCY_HEADER_RE.match(stripped)
+                ):
+                    dependency_index = index
+    return state_index, contract_index, dependency_index
 
 
 def format_related_auditor_reports(
