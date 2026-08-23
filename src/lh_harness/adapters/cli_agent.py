@@ -3,6 +3,7 @@ from __future__ import annotations
 import posixpath
 import re
 import shlex
+import sys
 import time
 import uuid
 from collections.abc import Callable
@@ -12,6 +13,24 @@ from ..environment.base import Environment
 from ..environment.remote_files import write_remote_text
 from ..runtime_signals import detect_runtime_signals
 from ..types import DEFAULT_TMP_DIR, DEFAULT_WORKSPACE_PATH, EpisodeBudget, EpisodeResult
+
+_IS_WINDOWS = sys.platform.startswith("win")
+
+
+def build_shell_command(workspace_path: str, command_body: str) -> str:
+    """Prefix ``command_body`` with a workspace ``cd``, for whichever shell
+    ``Environment.exec`` actually runs on this platform.
+
+    POSIX shells and ``cmd.exe`` disagree on both quoting (``shlex.quote``
+    produces single-quoted output ``cmd.exe`` cannot parse) and chaining
+    (``&&`` works on both, but the quoting around the path does not).
+    """
+    if _IS_WINDOWS:
+        # cmd.exe has no single-quote quoting mechanism; wrap in double
+        # quotes and escape any embedded double quotes instead.
+        quoted = '"{}"'.format(workspace_path.replace('"', '""'))
+        return f"cd /d {quoted} && {command_body}"
+    return f"cd {shlex.quote(workspace_path)} && {command_body}"
 
 _SECRET_NAME = r"(?:API[_-]?KEY|AUTH[_-]?TOKEN|ACCESS[_-]?TOKEN|SECRET|PASSWORD|TOKEN)"
 _SECRET_VALUE = r"(?:'[^']*'|\"[^\"]*\"|\S+)"
@@ -37,12 +56,14 @@ class CommandAgentAdapter:
         workspace_path: str = DEFAULT_WORKSPACE_PATH,
         visible_output_parser: Callable[[str], str] | None = None,
         hidden_paths: tuple[str, ...] = (),
+        env: dict[str, str] | None = None,
     ) -> None:
         self.command_template = command_template
         self.prompt_dir = prompt_dir.rstrip("/") or "."
         self.workspace_path = workspace_path.rstrip("/")
         self.visible_output_parser = visible_output_parser
         self.hidden_paths = tuple(hidden_paths)
+        self.env = env
 
     async def run_episode(
         self,
@@ -70,13 +91,14 @@ class CommandAgentAdapter:
             ("{timeout}", str(budget.max_duration_seconds)),
         ):
             command_body = command_body.replace(placeholder, value)
-        command = f"cd {shlex.quote(self.workspace_path)} && {command_body}"
+        command = build_shell_command(self.workspace_path, command_body)
         # When a live path is given (local runs), the environment mirrors stdout
         # to that file line-by-line so the dashboard shows the trajectory live.
         result = await env.exec(
             command,
             timeout=budget.max_duration_seconds,
             tee_path=live_trajectory_path,
+            env=self.env,
         )
         duration_ms = int((time.monotonic() - start) * 1000)
         if result.termination_reason == "timeout":
