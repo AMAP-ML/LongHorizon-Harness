@@ -12,6 +12,7 @@ class Environment(Protocol):
         command: str,
         timeout: int = 30,
         tee_path: str | None = None,
+        env: dict[str, str] | None = None,
     ) -> ExecResult: ...
 
     async def screenshot(self) -> bytes: ...
