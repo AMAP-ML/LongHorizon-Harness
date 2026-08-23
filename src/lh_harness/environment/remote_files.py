@@ -3,11 +3,14 @@ from __future__ import annotations
 import os
 import posixpath
 import shlex
+import sys
 import tempfile
 from pathlib import Path
 
 from .base import Environment
 from ..types import DEFAULT_TMP_DIR
+
+_IS_WINDOWS = sys.platform.startswith("win")
 
 
 async def write_remote_text(env: Environment, remote_path: str, content: str, mode: str = "0644") -> None:
@@ -33,12 +36,33 @@ async def write_remote_text(env: Environment, remote_path: str, content: str, mo
             except FileNotFoundError:
                 pass
 
+    if _IS_WINDOWS:
+        # chmod is a Unix command and isn't available through Windows cmd.exe.
+        # File permissions on Windows are governed by ACLs, not this mode bit,
+        # so there is nothing equivalent worth doing here.
+        return
+
     result = await env.exec(f"chmod {shlex.quote(mode)} {shlex.quote(remote_path)}", timeout=30)
     if result.exit_code != 0:
         raise RuntimeError(f"failed chmod {remote_path}: {result.stderr or result.stdout}")
 
 
 async def ensure_remote_dir(env: Environment, remote_path: str) -> None:
+    if _IS_WINDOWS:
+        # Windows cmd.exe's `mkdir` already creates intermediate directories
+        # (the Unix `-p` behavior is the default), but unlike `mkdir -p` it
+        # errors if the target already exists. Check first so repeated calls
+        # for the same run/tmp/prompts directory stay idempotent.
+        check = await env.exec(
+            f'if exist "{remote_path}" (exit 0) else (exit 1)', timeout=30
+        )
+        if check.exit_code == 0:
+            return
+        result = await env.exec(f'mkdir "{remote_path}"', timeout=30)
+        if result.exit_code != 0:
+            raise RuntimeError(f"failed creating {remote_path}: {result.stderr or result.stdout}")
+        return
+
     result = await env.exec(f"mkdir -p {shlex.quote(remote_path)}", timeout=30)
     if result.exit_code != 0:
         raise RuntimeError(f"failed creating {remote_path}: {result.stderr or result.stdout}")
