@@ -67,17 +67,16 @@ class DeepSeekHarnessAdapter(CommandAgentAdapter):
         )
         dsh_binary = resolve_dsh_binary() or "dsh"
 
-        environment = [
-            f"DSH_HOME={shlex.quote(isolated_home)}",
-            f"DSH_PERMISSION_MODE={shlex.quote(permission_mode)}",
-        ]
+        env_parts: dict[str, str] = {
+            "DSH_HOME": isolated_home,
+            "DSH_PERMISSION_MODE": permission_mode,
+        }
         if api_key:
-            environment.append(f"DEEPSEEK_API_KEY={shlex.quote(api_key)}")
+            env_parts["DEEPSEEK_API_KEY"] = api_key
         if base_url:
-            environment.append(f"DEEPSEEK_BASE_URL={shlex.quote(base_url)}")
+            env_parts["DEEPSEEK_BASE_URL"] = base_url
 
         command = [
-            *environment,
             shlex.quote(sys.executable),
             "-m",
             "lh_harness.adapters.deepseek_runner",
@@ -94,6 +93,7 @@ class DeepSeekHarnessAdapter(CommandAgentAdapter):
             prompt_dir=prompt_dir,
             visible_output_parser=visible_output_parser or extract_visible_output,
             hidden_paths=hidden_paths,
+            env=env_parts,
         )
         self.model = normalized_model
         self.role = role
