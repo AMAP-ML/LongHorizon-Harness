@@ -24,6 +24,7 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 
+from ..utils.process_group import SIGKILL_COMPAT, killpg_compat
 from .control_bus import (
     ControlBus,
     RevisionConflict,
@@ -1008,7 +1009,7 @@ class RunSupervisor:
             # Identity mismatch is intentionally fail-closed: never signal a
             # reused PID merely because the old owner record said it was alive.
             return reconcile_unavailable("worker is no longer running or its identity changed")
-        sig = signal.SIGKILL if action == "abort" else signal.SIGTERM
+        sig = SIGKILL_COMPAT if action == "abort" else signal.SIGTERM
         # Record an attempt for diagnostics under the same lock used by status
         # merges. Do not use it as a once-only gate: a crash after the signal
         # and before the receipt needs one safe retry.
@@ -1022,7 +1023,7 @@ class RunSupervisor:
             if str(owner.get("signal_mode") or "pgid") == "pid":
                 os.kill(pid, sig)
             else:
-                os.killpg(pgid, sig)
+                killpg_compat(pgid, sig)
         except ProcessLookupError:
             return reconcile_unavailable("worker is no longer running")
         except PermissionError:
@@ -1725,7 +1726,7 @@ class RunSupervisor:
             # unowned worker running if the durable reservation cannot be
             # promoted to a live owner.
             try:
-                os.killpg(process.pid, signal.SIGKILL)
+                killpg_compat(process.pid, SIGKILL_COMPAT)
             except OSError:
                 pass
             raise
@@ -1957,7 +1958,7 @@ class RunSupervisor:
                         None,
                     )
                     receipt = bus.receipt_for(active_command_id)
-                    active_signal = signal.SIGKILL.name if active_kind == "abort" else signal.SIGTERM.name
+                    active_signal = SIGKILL_COMPAT.name if active_kind == "abort" else signal.SIGTERM.name
                     return {
                         "command_id": active_command_id,
                         "status": str((receipt or {}).get("status") or "accepted"),
@@ -2044,7 +2045,7 @@ class RunSupervisor:
                 if str(owner.get("signal_mode") or "pgid") == "pid":
                     os.kill(owner_pid, sig)
                 else:
-                    os.killpg(pgid, sig)
+                    killpg_compat(pgid, sig)
             except ProcessLookupError:
                 # The signal raced with process exit.  Do not leave a durable
                 # ``stopping`` state behind: reconcile from the final report,
@@ -2102,7 +2103,7 @@ class RunSupervisor:
         return self._signal(run_id, signal.SIGTERM, kind="stop")
 
     def abort(self, run_id: str) -> dict[str, Any]:
-        return self._signal(run_id, signal.SIGKILL, kind="abort")
+        return self._signal(run_id, SIGKILL_COMPAT, kind="abort")
 
     def shutdown(self, *, grace_seconds: float = 5.0) -> None:
         """Stop workers launched by this supervisor before its API exits.
@@ -2135,7 +2136,7 @@ class RunSupervisor:
             if process.poll() is not None:
                 continue
             try:
-                os.killpg(process.pid, signal.SIGKILL)
+                killpg_compat(process.pid, SIGKILL_COMPAT)
             except ProcessLookupError:
                 pass
             except PermissionError:
