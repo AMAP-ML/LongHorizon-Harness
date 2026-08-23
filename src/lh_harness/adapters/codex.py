@@ -38,11 +38,10 @@ class CodexAdapter(CommandAgentAdapter):
         reasoning_effort: str | None = None,
     ) -> None:
         effort = normalise_reasoning_effort(reasoning_effort)
-        env_parts: list[str] = []
+        env_parts: dict[str, str] = {}
         if api_key:
-            quoted_key = shlex.quote(api_key)
-            env_parts.append(f"OPENAI_API_KEY={quoted_key}")
-            env_parts.append(f"CODEX_API_KEY={quoted_key}")
+            env_parts["OPENAI_API_KEY"] = api_key
+            env_parts["CODEX_API_KEY"] = api_key
 
         # Resolve once when an adapter is built.  A LongHorizon run must use
         # the same authenticated Codex installation as the desktop client when
@@ -94,13 +93,13 @@ class CodexAdapter(CommandAgentAdapter):
         # the command line and out of the process table.
         command_parts.append("-")
 
-        env_prefix = (" ".join(env_parts) + " ") if env_parts else ""
         super().__init__(
-            command_template=f"{env_prefix}{' '.join(command_parts)} < {{prompt_path}}",
+            command_template=" ".join(command_parts) + " < {prompt_path}",
             prompt_dir=prompt_dir,
             workspace_path=workspace_path,
             visible_output_parser=extract_codex_visible_output,
             hidden_paths=hidden_paths,
+            env=env_parts,
         )
 
 
