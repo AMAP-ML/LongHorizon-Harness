@@ -44,22 +44,21 @@ class ClaudeCodeAdapter(CommandAgentAdapter):
     ) -> None:
         policy = policy_for_role(role)
         effort = normalise_reasoning_effort(reasoning_effort)
-        env_parts: list[str] = []
+        env_parts: dict[str, str] = {}
         if api_key:
-            quoted_key = shlex.quote(api_key)
-            env_parts.append(f"ANTHROPIC_API_KEY={quoted_key}")
-            env_parts.append(f"ANTHROPIC_AUTH_TOKEN={quoted_key}")
+            env_parts["ANTHROPIC_API_KEY"] = api_key
+            env_parts["ANTHROPIC_AUTH_TOKEN"] = api_key
         if base_url:
             raw_url = base_url.rstrip("/")
             if raw_url.endswith("/v1"):
                 raw_url = raw_url[:-3]
-            env_parts.append(f"ANTHROPIC_BASE_URL={shlex.quote(raw_url)}")
-        env_parts.extend(
-            [
-                "CLAUDE_CODE_DISABLE_AUTO_MEMORY=1",
-                "CLAUDE_CODE_SKIP_PROMPT_HISTORY=1",
-                f"LH_HARNESS_CLAUDE_ROLE={shlex.quote(role)}",
-            ]
+            env_parts["ANTHROPIC_BASE_URL"] = raw_url
+        env_parts.update(
+            {
+                "CLAUDE_CODE_DISABLE_AUTO_MEMORY": "1",
+                "CLAUDE_CODE_SKIP_PROMPT_HISTORY": "1",
+                "LH_HARNESS_CLAUDE_ROLE": role,
+            }
         )
 
         # MCP support remains opt-in. --strict-mcp-config keeps unrelated
@@ -82,15 +81,14 @@ class ClaudeCodeAdapter(CommandAgentAdapter):
             )
 
         if is_auditor_role(role):
-            env_parts.extend(
-                [
-                    "GIT_OPTIONAL_LOCKS=0",
-                    "GIT_PAGER=cat",
-                    "PAGER=cat",
-                ]
+            env_parts.update(
+                {
+                    "GIT_OPTIONAL_LOCKS": "0",
+                    "GIT_PAGER": "cat",
+                    "PAGER": "cat",
+                }
             )
 
-        env_prefix = (" ".join(env_parts) + " ") if env_parts else ""
         command_parts = [
             "claude",
             "--print",
@@ -120,11 +118,12 @@ class ClaudeCodeAdapter(CommandAgentAdapter):
         # legitimately churn (build outputs) during an audit window.
         self.guard_exclude_paths = tuple(guard_exclude_paths)
         super().__init__(
-            command_template=f"{env_prefix}{' '.join(command_parts)} < {{prompt_path}}",
+            command_template=" ".join(command_parts) + " < {prompt_path}",
             prompt_dir=prompt_dir,
             workspace_path=workspace_path,
             visible_output_parser=extract_claude_visible_output,
             hidden_paths=hidden_paths,
+            env=env_parts,
         )
 
     async def run_episode(
