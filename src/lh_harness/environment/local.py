@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import contextlib
 import os
 import shlex
@@ -15,6 +16,7 @@ from ..types import DEFAULT_TMP_DIR, ExecResult
 from ..supervisor.control_bus import _ensure_dir_fd_nofollow, _open_private_regular_at
 from ..trajectory_artifacts import StreamingTrajectoryArtifactWriter
 from ..utils.process_group import (
+    SIGKILL_COMPAT,
     kill_process_group,
     signal_process_group,
     track_process_group,
@@ -99,6 +101,7 @@ class LocalEnvironment:
         command: str,
         timeout: int = 30,
         tee_path: str | None = None,
+        env: dict[str, str] | None = None,
     ) -> ExecResult:
         start = time.monotonic()
         proc = None
@@ -112,6 +115,8 @@ class LocalEnvironment:
             # worker sanitisation would expose that credential to the agent.
             child_env = os.environ.copy()
             child_env.pop("LH_HARNESS_WEB_TOKEN", None)
+            if env:
+                child_env.update(env)
             proc = await asyncio.create_subprocess_shell(
                 command,
                 stdout=asyncio.subprocess.PIPE,
@@ -179,7 +184,7 @@ class LocalEnvironment:
             # and an unshielded await would be cancelled before the child exits.
             await asyncio.shield(asyncio.wait_for(proc.wait(), timeout=5))
         except asyncio.TimeoutError:
-            signal_process_group(proc.pid, signal.SIGKILL)
+            signal_process_group(proc.pid, SIGKILL_COMPAT)
             with contextlib.suppress(asyncio.TimeoutError, asyncio.CancelledError):
                 await asyncio.shield(asyncio.wait_for(proc.wait(), timeout=5))
         except asyncio.CancelledError:
@@ -275,14 +280,37 @@ class LocalEnvironment:
         except OSError:
             return b""
         quoted_path = shlex.quote(str(path))
-        command = (
-            f"screencapture -x {quoted_path} 2>/dev/null"
-            if sys.platform == "darwin"
-            else (
+        if sys.platform == "darwin":
+            command = f"screencapture -x {quoted_path} 2>/dev/null"
+        elif sys.platform.startswith("win"):
+            # No screenshot CLI ships with Windows, so capture via .NET
+            # (System.Windows.Forms/System.Drawing) through PowerShell.
+            # SystemInformation.VirtualScreen covers the full multi-monitor
+            # desktop, not just the primary display. The script is passed
+            # via -EncodedCommand (UTF-16LE, base64) rather than interpolated
+            # into a quoted string, so path separators, spaces, and quotes in
+            # the temp path can never break PowerShell's own quoting rules.
+            windows_path = str(path).replace("'", "''")
+            ps_script = (
+                "Add-Type -AssemblyName System.Windows.Forms;"
+                "Add-Type -AssemblyName System.Drawing;"
+                "$b = [System.Windows.Forms.SystemInformation]::VirtualScreen;"
+                "$bmp = New-Object System.Drawing.Bitmap $b.Width, $b.Height;"
+                "$g = [System.Drawing.Graphics]::FromImage($bmp);"
+                "$g.CopyFromScreen($b.Location, [System.Drawing.Point]::Empty, $b.Size);"
+                f"$bmp.Save('{windows_path}', [System.Drawing.Imaging.ImageFormat]::Png);"
+                "$g.Dispose(); $bmp.Dispose()"
+            )
+            encoded = base64.b64encode(ps_script.encode("utf-16-le")).decode("ascii")
+            command = (
+                "powershell -NoProfile -NonInteractive -ExecutionPolicy Bypass "
+                f"-EncodedCommand {encoded}"
+            )
+        else:
+            command = (
                 f"gnome-screenshot -f {quoted_path} 2>/dev/null || "
                 f"import -window root {quoted_path} 2>/dev/null"
             )
-        )
         result = await self.exec(command, timeout=10)
         if result is not None and result.exit_code != 0:
             return b""
