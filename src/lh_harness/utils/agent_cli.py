@@ -22,6 +22,27 @@ from pathlib import Path
 # App Execution Aliases live here; they are reparse points, not real programs.
 _WINDOWS_STORE_ALIAS_DIR = os.path.join("Microsoft", "WindowsApps")
 _VERSION_RE = re.compile(r"\d+(?:\.\d+)+\S*")
+_IS_WINDOWS = sys.platform.startswith("win")
+
+
+def windows_safe_run(argv: list[str], **kwargs) -> subprocess.CompletedProcess:
+    """``subprocess.run`` that also works when ``argv[0]`` is a Windows
+    ``.cmd``/``.bat`` shim, as most npm-installed CLIs are (``claude``,
+    ``codex``, ``opencode`` all install this way via ``npm install -g``).
+
+    With ``shell=False`` (the default), Windows uses ``CreateProcess``
+    directly, which cannot execute ``.cmd``/``.bat`` files -- they are not
+    PE executables -- and fails with ``OSError: [WinError 193] %1 is not a
+    valid Win32 application`` even though ``shutil.which`` found the path.
+    ``shell=True`` on Windows routes through ``cmd.exe``, which knows how to
+    run ``.cmd``/``.bat``/``.exe`` alike; subprocess itself quotes a list
+    argv into a single command line (``list2cmdline``) before handing it to
+    the shell, so this stays exactly as safe as the non-Windows list form --
+    no manual quoting needed here.
+    """
+    if _IS_WINDOWS:
+        return subprocess.run(argv, shell=True, **kwargs)
+    return subprocess.run(argv, **kwargs)
 
 # The desktop app and the standalone npm CLI can both install a `codex`
 # executable.  The desktop binary carries the same authenticated app-server
@@ -145,7 +166,7 @@ def probe_agent_cli(binary: str, *, timeout: int = 15, path: str | None = None) 
 
     store_alias = is_windows_store_alias(path)
     try:
-        result = subprocess.run(
+        result = windows_safe_run(
             [path, "--version"],
             capture_output=True,
             text=True,
