@@ -165,14 +165,13 @@ def test_opencode_adapter_writes_endpoint_config_for_base_url(
         role="cli_auditor",
     )
 
-    tokens = shlex.split(adapter.command_template.replace("{prompt_path}", "/tmp/prompt.md"))
-    env = dict(item.split("=", 1) for item in tokens if "=" in item and item.split("=", 1)[0] in {"OPENCODE_API_KEY", "OPENCODE_CONFIG"})
-    assert env["OPENCODE_API_KEY"] == "sk-test"
-    config_path = env["OPENCODE_CONFIG"]
+    # Env vars are now passed via the env dict, not embedded in command_template
+    assert adapter.env["OPENCODE_API_KEY"] == "sk-test"
+    config_path = adapter.env["OPENCODE_CONFIG"]
     config = json.loads(Path(config_path).read_text(encoding="utf-8"))
     assert config["provider"]["opencode"]["options"]["baseURL"] == "https://api.example.com/v1"
-    assert "OPENCODE_CONFIG" in adapter.command_template
-    assert "OPENCODE_API_KEY" in adapter.command_template
+    assert "OPENCODE_CONFIG" not in adapter.command_template
+    assert "OPENCODE_API_KEY" not in adapter.command_template
 
 
 def test_opencode_jsonl_views() -> None:

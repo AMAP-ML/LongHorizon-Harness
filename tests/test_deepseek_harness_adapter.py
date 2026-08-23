@@ -56,8 +56,10 @@ def test_deepseek_adapter_quotes_binary_and_configures_isolated_home(
         role="manager",
     )
 
+    # Env vars are now passed via the env dict, not embedded in command_template
+    assert adapter.env["DSH_HOME"] == "/tmp/run with spaces/dsh-home"
+    assert adapter.env["DSH_PERMISSION_MODE"] == "read-only"
     tokens = shlex.split(adapter.command_template.replace("{prompt_path}", "/tmp/prompt.md"))
-    assert tokens[:2] == ["DSH_HOME=/tmp/run with spaces/dsh-home", "DSH_PERMISSION_MODE=read-only"]
     assert "lh_harness.adapters.deepseek_runner" in tokens
     assert tokens[tokens.index("--binary") + 1] == binary
     assert adapter.permission_mode == "read-only"
