@@ -22,6 +22,8 @@ import sys
 import threading
 import time
 
+_IS_WINDOWS = sys.platform.startswith("win")
+
 _lock = threading.Lock()
 _tracked: set[int] = set()
 _installed = False
@@ -39,12 +41,63 @@ def untrack_process_group(pid: int) -> None:
 
 
 def signal_process_group(pid: int, sig: int) -> bool:
-    """Best-effort ``killpg``; False means the group is already gone."""
+    """Best-effort ``killpg``; False means the group is already gone.
+
+    Windows has no process-group signalling API (``os.killpg`` does not
+    exist there). We approximate SIGTERM/SIGKILL with ``taskkill /T /F``,
+    which kills the process tree rooted at ``pid``. A bare probe (``sig``
+    of ``0``) is treated as "assume alive"; callers only use it to decide
+    whether to keep polling before escalating, so a false positive just
+    costs one extra sleep cycle, not correctness.
+    """
+    if _IS_WINDOWS:
+        if sig == 0:
+            return True
+        try:
+            import subprocess
+
+            subprocess.run(
+                ["taskkill", "/PID", str(pid), "/T", "/F"],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                check=False,
+            )
+        except OSError:
+            return False
+        return True
     try:
         os.killpg(pid, sig)
     except (ProcessLookupError, PermissionError, OSError):
         return False
     return True
+
+
+# signal.SIGKILL does not exist on Windows (only SIGABRT/SIGFPE/SIGILL/
+# SIGINT/SIGSEGV/SIGTERM/SIGBREAK are defined there). Callers that need a
+# "no mercy" signal value to pass around/log should use this instead of
+# referencing signal.SIGKILL directly. The actual value is moot on Windows:
+# signal_process_group()/killpg_compat() always force-kill via
+# `taskkill /F` there regardless of which signal was requested.
+SIGKILL_COMPAT = getattr(signal, "SIGKILL", signal.SIGTERM)
+
+
+def killpg_compat(pid: int, sig: int) -> None:
+    """Drop-in replacement for ``os.killpg(pid, sig)`` that also works on
+    Windows (where ``os.killpg`` does not exist).
+
+    Raises ``ProcessLookupError`` if the group/tree is already gone, matching
+    ``os.killpg``'s contract so existing ``except ProcessLookupError`` call
+    sites keep working unchanged.
+    """
+    if not _IS_WINDOWS:
+        os.killpg(pid, sig)
+        return
+    try:
+        os.kill(pid, 0)
+    except OSError as exc:
+        raise ProcessLookupError(str(exc)) from exc
+    if not signal_process_group(pid, sig):
+        raise ProcessLookupError(f"no such process group: {pid}")
 
 
 def kill_process_group(pid: int, *, grace_seconds: float = 1.0) -> None:
@@ -54,6 +107,10 @@ def kill_process_group(pid: int, *, grace_seconds: float = 1.0) -> None:
     escalate around ``await proc.wait()`` rather than block the event loop.
     """
     if not signal_process_group(pid, signal.SIGTERM):
+        return
+    if _IS_WINDOWS:
+        # taskkill above already terminated the tree; there is no softer
+        # Windows signal to wait out before escalating.
         return
     deadline = time.monotonic() + grace_seconds
     while time.monotonic() < deadline:
@@ -87,7 +144,12 @@ def _install_handlers() -> None:
     if threading.current_thread() is not threading.main_thread():
         return
 
-    for sig in (signal.SIGTERM, signal.SIGHUP):
+    signals_to_install = [signal.SIGTERM]
+    sighup = getattr(signal, "SIGHUP", None)
+    if sighup is not None:
+        signals_to_install.append(sighup)
+
+    for sig in signals_to_install:
         try:
             previous = signal.getsignal(sig)
         except (ValueError, OSError):
