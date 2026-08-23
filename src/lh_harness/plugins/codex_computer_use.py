@@ -23,7 +23,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 
-from ..utils.agent_cli import probe_agent_cli
+from ..utils.agent_cli import probe_agent_cli, windows_safe_run
 from .codex_config import codex_config_path
 from .errors import PluginError
 
@@ -317,7 +317,7 @@ def _remove_plugin(binary: str, plugin_id: str) -> None:
 
 def _run_codex(command: list[str], *, timeout: int, operation: str) -> subprocess.CompletedProcess[str]:
     try:
-        result = subprocess.run(
+        result = windows_safe_run(
             command,
             capture_output=True,
             text=True,

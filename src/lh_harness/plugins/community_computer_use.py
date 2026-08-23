@@ -20,6 +20,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from .errors import PluginError
+from ..utils.agent_cli import windows_safe_run
 from .npm import (
     NpmPackageState,
     global_package_state,
@@ -159,7 +160,7 @@ def community_plugin_activation(plugin: CommunityPlugin) -> tuple[bool | None, s
     except PluginError as exc:
         return False, str(exc)
     try:
-        result = subprocess.run(argv, capture_output=True, text=True, timeout=120, check=False)
+        result = windows_safe_run(argv, capture_output=True, text=True, timeout=120, check=False)
     except (OSError, subprocess.SubprocessError) as exc:
         return False, f"could not run `{' '.join(argv)}`: {exc}"
     detail = ((result.stdout or "") + (result.stderr or "")).strip()
@@ -236,7 +237,7 @@ def _activate(plugin: CommunityPlugin, *, on_status: StatusCallback | None) -> N
         argv = _resolve_argv(plugin, template)
         _notify(on_status, "activating", " ".join(argv))
         try:
-            result = subprocess.run(argv, timeout=600, check=False)
+            result = windows_safe_run(argv, timeout=600, check=False)
         except (OSError, subprocess.SubprocessError) as exc:
             raise PluginError(f"Could not activate {plugin.plugin_id}: {exc}") from exc
         if result.returncode != 0:

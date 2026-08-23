@@ -11,6 +11,7 @@ import shutil
 import subprocess
 from dataclasses import dataclass
 
+from ..utils.agent_cli import windows_safe_run
 from .errors import PluginError
 
 
@@ -31,7 +32,7 @@ def _tool_version(binary: str) -> str:
     if not path:
         return ""
     try:
-        result = subprocess.run(
+        result = windows_safe_run(
             [path, "--version"],
             capture_output=True,
             text=True,
@@ -110,7 +111,7 @@ def _run(
     allow_failure: bool = False,
 ) -> subprocess.CompletedProcess[str]:
     try:
-        result = subprocess.run(
+        result = windows_safe_run(
             command,
             capture_output=True,
             text=True,
