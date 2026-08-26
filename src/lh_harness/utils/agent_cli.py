@@ -149,6 +149,7 @@ def probe_agent_cli(binary: str, *, timeout: int = 15, path: str | None = None) 
             [path, "--version"],
             capture_output=True,
             text=True,
+            errors="replace",
             timeout=timeout,
             check=False,
         )

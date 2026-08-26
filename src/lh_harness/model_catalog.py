@@ -297,6 +297,7 @@ def _codex_app_server_models(binary: str) -> list[dict[str, Any]]:
         stdout=subprocess.PIPE,
         stderr=subprocess.DEVNULL,
         text=True,
+        errors="replace",
         bufsize=1,
     )
     try:

@@ -313,6 +313,7 @@ def _cli_help_text(binary: str) -> str:
             [binary, "--help"],
             capture_output=True,
             text=True,
+            errors="replace",
             timeout=_PROBE_TIMEOUT_SECONDS,
             check=False,
         )
