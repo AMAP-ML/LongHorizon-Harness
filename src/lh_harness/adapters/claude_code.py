@@ -62,8 +62,9 @@ class ClaudeCodeAdapter(CommandAgentAdapter):
             ]
         )
 
-        # MCP support remains opt-in. --strict-mcp-config keeps unrelated
-        # user/project MCP servers out of every role.
+        # MCP support remains opt-in. The --strict-mcp-config flag appended to
+        # command_parts below keeps unrelated user/project MCP servers out of
+        # every role.
         mcp_config = mcp_config or os.getenv("LH_HARNESS_CLAUDECODE_MCP_CONFIG")
         if mcp_config:
             candidate = Path(mcp_config).expanduser()
@@ -98,6 +99,10 @@ class ClaudeCodeAdapter(CommandAgentAdapter):
             "stream-json",
             "--verbose",
             "--dangerously-skip-permissions",
+            # Role isolation: without this the CLI also loads every MCP server
+            # the operator has configured at user or project scope. With it,
+            # a role sees only the servers in an explicit --mcp-config.
+            "--strict-mcp-config",
         ]
         deny_tools = [*policy.disallowed_tools, *path_deny_rules(hidden_paths)]
         if deny_tools:
