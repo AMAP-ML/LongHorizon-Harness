@@ -24,8 +24,18 @@ def _emit_result(
     }
     if error:
         record["error"] = error
-    sys.stdout.write(json.dumps(record, ensure_ascii=False) + "\n")
+    # Piped stdout may use a legacy code page. JSON escapes preserve Unicode
+    # losslessly while keeping the wire representation safe to write there.
+    sys.stdout.write(json.dumps(record, ensure_ascii=True) + "\n")
     sys.stdout.flush()
+
+
+def _write_error(message: str) -> None:
+    try:
+        sys.stderr.write(message + "\n")
+    except UnicodeEncodeError:
+        # A diagnostic must not prevent the structured error from being emitted.
+        sys.stderr.write(message.encode("ascii", "backslashreplace").decode("ascii") + "\n")
 
 
 def _model_patch_path(prompt_path: Path) -> Path:
@@ -45,7 +55,7 @@ def run(binary: str, prompt_path: Path, model: str) -> int:
         )
     except (OSError, UnicodeError) as exc:
         message = f"could not prepare DeepSeek Harness prompt: {exc}"
-        sys.stderr.write(message + "\n")
+        _write_error(message)
         _emit_result(is_error=True, exit_code=2, error=message)
         return 2
 
@@ -68,7 +78,7 @@ def run(binary: str, prompt_path: Path, model: str) -> int:
         )
     except OSError as exc:
         message = f"could not start DeepSeek Harness binary {binary!r}: {exc}"
-        sys.stderr.write(message + "\n")
+        _write_error(message)
         _emit_result(is_error=True, exit_code=127, error=message)
         return 127
 
