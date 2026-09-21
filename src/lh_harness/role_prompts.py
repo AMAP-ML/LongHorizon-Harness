@@ -478,24 +478,60 @@ def format_audit_findings(
     return _clip_preserve("\n\n".join(sections), max_chars)
 
 
+_MANAGER_ROUTE_TASK_SUFFIXES = ("task:", "任务:", "任务：")
+_MANAGER_ROUTE_TOKENS: tuple[tuple[RoleNextStep, tuple[str, ...]], ...] = (
+    (MANAGER_NEXT_GUI, ("next:gui", "下一步:gui任务", "下一步：gui任务")),
+    (MANAGER_NEXT_CLI, ("next:cli", "下一步:cli任务", "下一步：cli任务")),
+    (
+        MANAGER_NEXT_ASK,
+        (
+            "next:ask",
+            "下一步:请示用户",
+            "下一步：请示用户",
+            "下一步:请示",
+            "下一步：请示",
+            "下一步:询问用户",
+            "下一步：询问用户",
+        ),
+    ),
+    (MANAGER_NEXT_DONE, ("next:done", "next:complete", "下一步:完成", "下一步：完成")),
+    (MANAGER_NEXT_BLOCKED, ("next:blocked", "下一步:阻塞", "下一步：阻塞")),
+)
+
+
+def _normalize_manager_route_line(line: str) -> str:
+    # The prompt shows every route inside backticks, and models copy that
+    # wrapping. Strip code spans and bold markers before matching.
+    normalized = (
+        line.strip()
+        .replace("`", "")
+        .strip("*")
+        .replace(" ", "")
+        .replace("　", "")
+        .lower()
+    )
+    # Models commonly append a short rationale after the required route,
+    # e.g. `Next: done — all constraints passed`. Treat only an explicitly
+    # delimited suffix as commentary so prose such as `Next: done later`
+    # remains invalid.
+    return re.split(r"(?:—|–|--|//|#|[（(])", normalized, maxsplit=1)[0].strip("*`")
+
+
+def _line_matches_manager_route_token(normalized: str, token: str) -> bool:
+    if normalized == token:
+        return True
+    if not normalized.startswith(token):
+        return False
+    rest = normalized[len(token) :]
+    return rest.startswith(_MANAGER_ROUTE_TASK_SUFFIXES)
+
+
 def parse_role_manager_next_step(text: str) -> RoleNextStep:
     for line in str(text or "").splitlines():
-        normalized = line.strip().strip("*").replace(" ", "").replace("　", "").lower()
-        # Models commonly append a short rationale after the required route,
-        # e.g. `Next: done — all constraints passed`. Treat only an explicitly
-        # delimited suffix as commentary so prose such as `Next: done later`
-        # remains invalid.
-        normalized = re.split(r"(?:—|–|--|//|#|[（(])", normalized, maxsplit=1)[0]
-        if normalized in {"下一步:gui任务", "下一步：gui任务", "next:gui"}:
-            return MANAGER_NEXT_GUI
-        if normalized in {"下一步:cli任务", "下一步：cli任务", "next:cli"}:
-            return MANAGER_NEXT_CLI
-        if normalized in {"下一步:请示用户", "下一步：请示用户", "下一步:请示", "下一步：请示", "下一步:询问用户", "下一步：询问用户", "next:ask"}:
-            return MANAGER_NEXT_ASK
-        if normalized in {"下一步:完成", "下一步：完成", "next:done", "next:complete"}:
-            return MANAGER_NEXT_DONE
-        if normalized in {"下一步:阻塞", "下一步：阻塞", "next:blocked"}:
-            return MANAGER_NEXT_BLOCKED
+        normalized = _normalize_manager_route_line(line)
+        for next_step, tokens in _MANAGER_ROUTE_TOKENS:
+            if any(_line_matches_manager_route_token(normalized, token) for token in tokens):
+                return next_step
     return MANAGER_NEXT_INVALID
 
 
