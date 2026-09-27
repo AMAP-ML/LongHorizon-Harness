@@ -39,6 +39,21 @@ async def write_remote_text(env: Environment, remote_path: str, content: str, mo
 
 
 async def ensure_remote_dir(env: Environment, remote_path: str) -> None:
-    result = await env.exec(f"mkdir -p {shlex.quote(remote_path)}", timeout=30)
-    if result.exit_code != 0:
-        raise RuntimeError(f"failed creating {remote_path}: {result.stderr or result.stdout}")
+    # Check if this is a local environment on Windows
+    is_local_windows = (
+        hasattr(env, '__class__')
+        and env.__class__.__name__ == 'LocalEnvironment'
+        and os.name == 'nt'
+    )
+
+    if is_local_windows:
+        # For local Windows, use Python's Path.mkdir directly
+        try:
+            Path(remote_path).mkdir(parents=True, exist_ok=True)
+        except Exception as e:
+            raise RuntimeError(f"failed creating {remote_path}: {e}")
+    else:
+        # For remote or Unix systems, use mkdir -p
+        result = await env.exec(f"mkdir -p {shlex.quote(remote_path)}", timeout=30)
+        if result.exit_code != 0:
+            raise RuntimeError(f"failed creating {remote_path}: {result.stderr or result.stdout}")
