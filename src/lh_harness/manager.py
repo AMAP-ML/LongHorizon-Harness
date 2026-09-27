@@ -2406,19 +2406,37 @@ def _append_event(path: Path, event: str, payload: dict[str, Any]) -> None:
     raw_fd: int | None = None
     try:
         parent_fd = _open_nofollow(path.parent, directory=True)
-        nofollow = getattr(os, "O_NOFOLLOW", 0)
-        if not nofollow:
-            raise OSError("secure event append requires O_NOFOLLOW")
-        raw_fd = os.open(
-            path.name,
-            os.O_RDWR
-            | os.O_CREAT
-            | os.O_APPEND
-            | nofollow
-            | getattr(os, "O_CLOEXEC", 0),
-            0o600,
-            dir_fd=parent_fd,
-        )
+
+        # Windows path: use full path operations with reparse point checking
+        if sys.platform == "win32":
+            from lh_harness.supervisor.control_bus import _is_windows_symlink
+
+            # Check if file is a symlink
+            if path.exists() and _is_windows_symlink(path):
+                raise OSError("event log is a symlink")
+
+            # Open with Windows-compatible flags
+            flags = os.O_RDWR | os.O_CREAT | os.O_APPEND | os.O_BINARY
+            if hasattr(os, 'O_NOINHERIT'):
+                flags |= os.O_NOINHERIT
+
+            raw_fd = os.open(path, flags, 0o600)
+        else:
+            # Unix/Linux path using O_NOFOLLOW and dir_fd
+            nofollow = getattr(os, "O_NOFOLLOW", 0)
+            if not nofollow:
+                raise OSError("secure event append requires O_NOFOLLOW")
+            raw_fd = os.open(
+                path.name,
+                os.O_RDWR
+                | os.O_CREAT
+                | os.O_APPEND
+                | nofollow
+                | getattr(os, "O_CLOEXEC", 0),
+                0o600,
+                dir_fd=parent_fd,
+            )
+
         metadata = os.fstat(raw_fd)
         if not stat_module.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1:
             raise OSError("event log is not a private regular file")
@@ -2426,11 +2444,16 @@ def _append_event(path: Path, event: str, payload: dict[str, Any]) -> None:
         raw_fd = None
         with fh:
             flock = None
+            use_msvcrt = False
             try:
-                import fcntl
-
-                flock = fcntl
-                flock.flock(fh.fileno(), flock.LOCK_EX)
+                if sys.platform == "win32":
+                    import msvcrt
+                    use_msvcrt = True
+                    msvcrt.locking(fh.fileno(), msvcrt.LK_LOCK, 1)
+                else:
+                    import fcntl
+                    flock = fcntl
+                    flock.flock(fh.fileno(), flock.LOCK_EX)
             except (ImportError, OSError):
                 pass
             try:
@@ -2452,7 +2475,13 @@ def _append_event(path: Path, event: str, payload: dict[str, Any]) -> None:
                 except OSError:
                     pass
             finally:
-                if flock is not None:
+                if use_msvcrt:
+                    try:
+                        import msvcrt
+                        msvcrt.locking(fh.fileno(), msvcrt.LK_UNLCK, 1)
+                    except OSError:
+                        pass
+                elif flock is not None:
                     try:
                         flock.flock(fh.fileno(), flock.LOCK_UN)
                     except OSError:
