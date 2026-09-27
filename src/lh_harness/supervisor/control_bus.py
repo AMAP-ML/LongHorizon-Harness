@@ -634,29 +634,47 @@ def _append_jsonl(path: Path, record: dict[str, Any]) -> None:
 def _append_locked_handle(handle: Any, line: str) -> None:
     """Append one already-open control record while holding the process lock."""
 
-    flock = None
-    try:
-        import fcntl  # type: ignore
-        flock = fcntl
-        flock.flock(handle.fileno(), flock.LOCK_EX)
-    except (ImportError, OSError) as exc:
-        # Control commands depend on a cross-process critical section for
-        # unique revisions and idempotency. Continuing without it is a
-        # correctness failure, not a portable fallback.
-        raise RuntimeError("secure control-log locking is unavailable") from exc
-    try:
-        handle.write(line)
-        handle.flush()
-        os.fsync(handle.fileno())
-    finally:
+    if sys.platform == "win32":
+        # Windows: use msvcrt for file locking
+        import msvcrt
+        try:
+            msvcrt.locking(handle.fileno(), msvcrt.LK_LOCK, 1)
+        except OSError as exc:
+            raise RuntimeError("secure control-log locking is unavailable") from exc
+        try:
+            handle.write(line)
+            handle.flush()
+            os.fsync(handle.fileno())
+        finally:
+            try:
+                msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+            except OSError:
+                pass
+    else:
+        # Unix/Linux: use fcntl
         flock = None
         try:
             import fcntl  # type: ignore
             flock = fcntl
-        except ImportError:
+            flock.flock(handle.fileno(), flock.LOCK_EX)
+        except (ImportError, OSError) as exc:
+            # Control commands depend on a cross-process critical section for
+            # unique revisions and idempotency. Continuing without it is a
+            # correctness failure, not a portable fallback.
+            raise RuntimeError("secure control-log locking is unavailable") from exc
+        try:
+            handle.write(line)
+            handle.flush()
+            os.fsync(handle.fileno())
+        finally:
             flock = None
-        if flock is not None:
-            flock.flock(handle.fileno(), flock.LOCK_UN)
+            try:
+                import fcntl  # type: ignore
+                flock = fcntl
+            except ImportError:
+                flock = None
+            if flock is not None:
+                flock.flock(handle.fileno(), flock.LOCK_UN)
 
 
 def _read_jsonl(path: Path) -> list[dict[str, Any]]:
