@@ -176,6 +176,72 @@ def _open_worker_log(path: Path):
     """
 
     path = Path(path)
+
+    # Windows path: use reparse point checking
+    if sys.platform == "win32":
+        from lh_harness.supervisor.control_bus import _open_nofollow, _is_windows_symlink
+
+        # Ensure parent directory exists and check for symlinks
+        parent_fd = _open_nofollow(path.parent, directory=True)
+
+        try:
+            # Check if the file itself is a symlink
+            if path.exists() and _is_windows_symlink(path):
+                raise OSError(f"worker log is a symlink: {path}")
+
+            # Open the file with Windows-compatible flags
+            flags = os.O_RDWR | os.O_CREAT | os.O_BINARY
+            if hasattr(os, 'O_NOINHERIT'):
+                flags |= os.O_NOINHERIT
+
+            fd = os.open(path, flags, 0o600)
+
+            # Verify it's a regular file
+            metadata = os.fstat(fd)
+            if not stat.S_ISREG(metadata.st_mode):
+                os.close(fd)
+                raise OSError(f"worker log is not a regular file: {path}")
+
+            # Check for hard links
+            if metadata.st_nlink != 1:
+                os.close(fd)
+                raise OSError(errno.ELOOP, "worker log has multiple hard links")
+
+            # Try to set permissions (best effort on Windows)
+            try:
+                os.chmod(path, 0o600)
+            except OSError:
+                pass
+
+            # Handle log rotation if too large
+            if metadata.st_size > _MAX_WORKER_LOG_BYTES:
+                keep = max(1, min(_WORKER_LOG_KEEP_BYTES, _MAX_WORKER_LOG_BYTES))
+                start = max(0, metadata.st_size - keep)
+                os.lseek(fd, start, os.SEEK_SET)
+                tail = bytearray()
+                remaining = keep
+                while remaining:
+                    chunk = os.read(fd, remaining)
+                    if not chunk:
+                        break
+                    tail.extend(chunk)
+                    remaining -= len(chunk)
+                os.ftruncate(fd, 0)
+                os.lseek(fd, 0, os.SEEK_SET)
+                _write_all(fd, bytes(tail))
+                try:
+                    os.fsync(fd)
+                except OSError:
+                    pass
+
+            os.lseek(fd, 0, os.SEEK_END)
+            # Return file object, not descriptor
+            output = os.fdopen(fd, "a+b", buffering=0)
+            return output
+        finally:
+            os.close(parent_fd)
+
+    # Unix/Linux path using O_NOFOLLOW
     nofollow = getattr(os, "O_NOFOLLOW", 0)
     if not nofollow:
         raise OSError(errno.ENOTSUP, "worker log requires O_NOFOLLOW")
