@@ -718,6 +718,39 @@ class RunSupervisor:
         flock = None
         raw_fd: int | None = None
         parent_fd: int | None = None
+
+        # Try Windows-specific locking first
+        if sys.platform == "win32":
+            try:
+                import msvcrt  # type: ignore
+
+                # Ensure the lock directory exists
+                lock_path.parent.mkdir(parents=True, exist_ok=True)
+
+                # Open/create the lock file
+                handle = open(lock_path, "a+")
+
+                # Lock the file (LOCK_EX equivalent)
+                msvcrt.locking(handle.fileno(), msvcrt.LK_LOCK, 1)
+
+                try:
+                    yield
+                finally:
+                    # Unlock the file
+                    try:
+                        msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+                    finally:
+                        handle.close()
+                return
+            except (ImportError, OSError) as exc:
+                if handle is not None:
+                    try:
+                        handle.close()
+                    except OSError:
+                        pass
+                raise RuntimeError("secure supervisor locking is unavailable on Windows") from exc
+
+        # Unix/Linux path using fcntl
         try:
             import fcntl  # type: ignore
 
