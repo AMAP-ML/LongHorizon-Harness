@@ -41,10 +41,36 @@ def untrack_process_group(pid: int) -> None:
 def signal_process_group(pid: int, sig: int) -> bool:
     """Best-effort ``killpg``; False means the group is already gone."""
     try:
-        os.killpg(pid, sig)
-    except (ProcessLookupError, PermissionError, OSError):
+        if sys.platform == "win32":
+            # Windows doesn't have process groups like Unix
+            # Try to kill the process directly
+            import subprocess
+            if sig == signal.SIGTERM or sig == 0:
+                # For SIGTERM or signal 0 (existence check), use tasklist
+                result = subprocess.run(
+                    ['tasklist', '/FI', f'PID eq {pid}'],
+                    capture_output=True,
+                    text=True,
+                    timeout=5
+                )
+                if result.returncode != 0 or str(pid) not in result.stdout:
+                    return False
+                if sig == 0:
+                    # Just checking existence
+                    return True
+                # Actually terminate
+                subprocess.run(['taskkill', '/F', '/T', '/PID', str(pid)],
+                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            elif sig == signal.SIGKILL:
+                subprocess.run(['taskkill', '/F', '/T', '/PID', str(pid)],
+                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            return True
+        else:
+            # Unix/Linux: use killpg
+            os.killpg(pid, sig)
+            return True
+    except (ProcessLookupError, PermissionError, OSError, subprocess.TimeoutExpired):
         return False
-    return True
 
 
 def kill_process_group(pid: int, *, grace_seconds: float = 1.0) -> None:

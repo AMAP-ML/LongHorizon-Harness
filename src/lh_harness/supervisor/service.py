@@ -1194,7 +1194,13 @@ class RunSupervisor:
             if str(owner.get("signal_mode") or "pgid") == "pid":
                 os.kill(pid, sig)
             else:
-                os.killpg(pgid, sig)
+                if sys.platform == "win32":
+                    # Windows: use signal_process_group helper
+                    from ..utils.process_group import signal_process_group
+                    if not signal_process_group(pgid, sig):
+                        raise ProcessLookupError("process group not found")
+                else:
+                    os.killpg(pgid, sig)
         except ProcessLookupError:
             return reconcile_unavailable("worker is no longer running")
         except PermissionError:
@@ -1899,7 +1905,11 @@ class RunSupervisor:
             # unowned worker running if the durable reservation cannot be
             # promoted to a live owner.
             try:
-                os.killpg(process.pid, signal.SIGKILL)
+                if sys.platform == "win32":
+                    from ..utils.process_group import signal_process_group
+                    signal_process_group(process.pid, signal.SIGKILL)
+                else:
+                    os.killpg(process.pid, signal.SIGKILL)
             except OSError:
                 pass
             raise
@@ -2220,7 +2230,12 @@ class RunSupervisor:
                 if str(owner.get("signal_mode") or "pgid") == "pid":
                     os.kill(owner_pid, sig)
                 else:
-                    os.killpg(pgid, sig)
+                    if sys.platform == "win32":
+                        from ..utils.process_group import signal_process_group
+                        if not signal_process_group(pgid, sig):
+                            raise ProcessLookupError("process group not found")
+                    else:
+                        os.killpg(pgid, sig)
             except ProcessLookupError:
                 # The signal raced with process exit.  Do not leave a durable
                 # ``stopping`` state behind: reconcile from the final report,
@@ -2311,7 +2326,11 @@ class RunSupervisor:
             if process.poll() is not None:
                 continue
             try:
-                os.killpg(process.pid, signal.SIGKILL)
+                if sys.platform == "win32":
+                    from ..utils.process_group import signal_process_group
+                    signal_process_group(process.pid, signal.SIGKILL)
+                else:
+                    os.killpg(process.pid, signal.SIGKILL)
             except ProcessLookupError:
                 pass
             except PermissionError:
