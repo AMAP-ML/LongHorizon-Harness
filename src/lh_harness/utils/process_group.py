@@ -113,7 +113,12 @@ def _install_handlers() -> None:
     if threading.current_thread() is not threading.main_thread():
         return
 
-    for sig in (signal.SIGTERM, signal.SIGHUP):
+    # Windows doesn't have SIGHUP
+    signals_to_handle = [signal.SIGTERM]
+    if hasattr(signal, 'SIGHUP'):
+        signals_to_handle.append(signal.SIGHUP)
+
+    for sig in signals_to_handle:
         try:
             previous = signal.getsignal(sig)
         except (ValueError, OSError):
