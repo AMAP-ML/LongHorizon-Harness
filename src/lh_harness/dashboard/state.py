@@ -492,7 +492,12 @@ class DashboardState:
             return []
         artifacts: list[str] = []
         try:
-            with os.scandir(fd) as entries:
+            # Windows: scandir doesn't accept file descriptors, use path directly
+            if sys.platform == "win32":
+                scan_target = round_dir
+            else:
+                scan_target = fd
+            with os.scandir(scan_target) as entries:
                 for entry_number, entry in enumerate(entries):
                     if entry_number >= _MAX_ARTIFACT_SCAN:
                         break

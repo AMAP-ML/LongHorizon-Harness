@@ -360,7 +360,13 @@ def _saved_task_from_rounds(
             current = next_fd
         rounds_fd = current
         candidates: list[tuple[int, str]] = []
-        with os.scandir(rounds_fd) as entries:
+        # Windows: scandir doesn't accept file descriptors, construct path
+        if sys.platform == "win32":
+            rounds_path = runs_root / run_id / logs_path.name / role_path.name / "rounds"
+            scan_target = rounds_path
+        else:
+            scan_target = rounds_fd
+        with os.scandir(scan_target) as entries:
             for entry_number, entry in enumerate(entries):
                 if entry_number >= _MAX_ROUND_DIR_SCAN:
                     break

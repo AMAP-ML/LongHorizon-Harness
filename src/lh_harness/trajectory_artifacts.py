@@ -240,7 +240,12 @@ def _remove_role_step_images(directory: Path, role_name: str) -> None:
     except OSError:
         return
     try:
-        with os.scandir(directory_fd) as entries:
+        # Windows: scandir doesn't accept file descriptors, use path directly
+        if sys.platform == "win32":
+            scan_target = directory
+        else:
+            scan_target = directory_fd
+        with os.scandir(scan_target) as entries:
             names = [str(entry.name) for entry in entries if pattern.fullmatch(str(entry.name))]
         for name in names:
             try:

@@ -1034,7 +1034,11 @@ def iter_run_control_dirs(runs_root: str | Path) -> Iterator[Path]:
     cloexec = getattr(os, "O_CLOEXEC", 0)
     try:
         try:
-            entries = list(os.scandir(root_fd))
+            # Windows: scandir doesn't accept file descriptors, use path directly
+            if sys.platform == "win32":
+                entries = list(os.scandir(root))
+            else:
+                entries = list(os.scandir(root_fd))
         except OSError:
             return
         for entry in entries:
