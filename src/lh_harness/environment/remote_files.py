@@ -33,9 +33,27 @@ async def write_remote_text(env: Environment, remote_path: str, content: str, mo
             except FileNotFoundError:
                 pass
 
-    result = await env.exec(f"chmod {shlex.quote(mode)} {shlex.quote(remote_path)}", timeout=30)
-    if result.exit_code != 0:
-        raise RuntimeError(f"failed chmod {remote_path}: {result.stderr or result.stdout}")
+    # Check if this is a local environment on Windows
+    is_local_windows = (
+        hasattr(env, '__class__')
+        and env.__class__.__name__ == 'LocalEnvironment'
+        and os.name == 'nt'
+    )
+
+    if is_local_windows:
+        # For local Windows, use Python's os.chmod directly
+        try:
+            # Convert Unix mode string (e.g., "0644") to integer
+            mode_int = int(mode, 8) if isinstance(mode, str) else mode
+            os.chmod(remote_path, mode_int)
+        except Exception as e:
+            # Permission changes are best-effort on Windows
+            pass
+    else:
+        # For remote or Unix systems, use chmod command
+        result = await env.exec(f"chmod {shlex.quote(mode)} {shlex.quote(remote_path)}", timeout=30)
+        if result.exit_code != 0:
+            raise RuntimeError(f"failed chmod {remote_path}: {result.stderr or result.stdout}")
 
 
 async def ensure_remote_dir(env: Environment, remote_path: str) -> None:

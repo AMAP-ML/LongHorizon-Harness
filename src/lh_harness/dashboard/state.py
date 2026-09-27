@@ -18,6 +18,7 @@ import json
 import os
 import re
 import stat as stat_module
+import sys
 import threading
 import time
 import uuid
@@ -898,9 +899,13 @@ class DashboardState:
             with os.fdopen(fd, "a", encoding="utf-8") as fh:
                 fd = None
                 try:
-                    import fcntl
-
-                    fcntl.flock(fh.fileno(), fcntl.LOCK_EX)
+                    # Windows compatibility: use msvcrt.locking instead of fcntl
+                    if sys.platform == "win32":
+                        import msvcrt
+                        msvcrt.locking(fh.fileno(), msvcrt.LK_LOCK, 1)
+                    else:
+                        import fcntl
+                        fcntl.flock(fh.fileno(), fcntl.LOCK_EX)
                 except ImportError as exc:
                     raise OSError("secure approval-log locking is unavailable") from exc
                 try:
@@ -908,7 +913,12 @@ class DashboardState:
                     fh.flush()
                     os.fsync(fh.fileno())
                 finally:
-                    fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
+                    if sys.platform == "win32":
+                        import msvcrt
+                        msvcrt.locking(fh.fileno(), msvcrt.LK_UNLCK, 1)
+                    else:
+                        import fcntl
+                        fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
         except (ImportError, OSError):
             # Approval persistence is diagnostic/control state. A read-only or
             # unavailable log must not crash the manager's execution loop.
