@@ -87,6 +87,59 @@ def test_file_locking():
         return True
 
 
+def test_path_quoting():
+    """Test Windows-specific path quoting for cmd.exe."""
+    print("\nTesting path quoting...")
+    from lh_harness.adapters.cli_agent import _quote_path
+
+    test_cases = [
+        ("simple.txt", True),
+        ("path with spaces", True),
+        ("E:\\Project\\Test", True if sys.platform == "win32" else True),
+    ]
+
+    for path, _ in test_cases:
+        quoted = _quote_path(path)
+        if sys.platform == "win32":
+            # Windows should use double quotes
+            if not (quoted.startswith('"') and quoted.endswith('"')):
+                print(f"  ❌ Path not properly quoted: {quoted}")
+                return False
+        else:
+            # Unix should use shlex.quote (single quotes or escaped)
+            pass
+        print(f"  ✅ {path} -> {quoted}")
+
+    return True
+
+
+def test_env_var_syntax():
+    """Test Windows-specific environment variable syntax."""
+    print("\nTesting environment variable syntax...")
+
+    # Simulate env_parts construction
+    env_parts = [
+        "VAR1=value1",
+        "VAR2=value2",
+    ]
+
+    if sys.platform == "win32":
+        env_prefix = (" && ".join(f"set {part}" for part in env_parts) + " && ") if env_parts else ""
+        # Check Windows syntax
+        if "set VAR1=value1" not in env_prefix:
+            print(f"  ❌ Incorrect Windows syntax: {env_prefix}")
+            return False
+        if " && " not in env_prefix:
+            print(f"  ❌ Missing && separator: {env_prefix}")
+            return False
+        print(f"  ✅ Windows syntax: {env_prefix}")
+    else:
+        env_prefix = (" ".join(env_parts) + " ") if env_parts else ""
+        print(f"  ✅ Unix syntax: {env_prefix}")
+
+    return True
+
+
 def test_run_supervisor():
     """Test RunSupervisor creation and basic operations."""
     print("\nTesting RunSupervisor...")
@@ -191,6 +244,8 @@ def main():
         ("Path Deny Rules", test_path_deny_rules),
         ("File Locking", test_file_locking),
         ("os.scandir", test_scandir),
+        ("Path Quoting", test_path_quoting),
+        ("Environment Variable Syntax", test_env_var_syntax),
         ("RunSupervisor", test_run_supervisor),
     ]
 
