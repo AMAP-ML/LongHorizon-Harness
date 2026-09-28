@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import os
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Literal
@@ -85,11 +86,22 @@ def path_deny_rules(paths: tuple[str, ...] | list[str]) -> tuple[str, ...]:
     """
     rules: list[str] = []
     for raw in paths:
-        resolved = Path(raw).expanduser().resolve().as_posix().lstrip("/")
+        resolved_path = Path(raw).expanduser().resolve()
+        # On Windows, use the path as-is (with backslashes converted to forward slashes)
+        # but don't strip the drive letter
+        if sys.platform == "win32":
+            resolved = resolved_path.as_posix()
+        else:
+            resolved = resolved_path.as_posix().lstrip("/")
         if not resolved:
             continue
         for tool in ("Read", "Edit"):
-            for pattern in (f"//{resolved}", f"//{resolved}/**"):
+            # On Windows, don't add leading // for absolute paths with drive letters
+            if sys.platform == "win32" and len(resolved) > 1 and resolved[1] == ':':
+                patterns = (f"//{resolved}", f"//{resolved}/**")
+            else:
+                patterns = (f"//{resolved}", f"//{resolved}/**")
+            for pattern in patterns:
                 rule = f"{tool}({pattern})"
                 if rule not in rules:
                     rules.append(rule)
