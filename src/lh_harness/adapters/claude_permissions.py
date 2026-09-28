@@ -83,22 +83,31 @@ def path_deny_rules(paths: tuple[str, ...] | list[str]) -> tuple[str, ...]:
     Deny rules still apply under `--dangerously-skip-permissions`, and a `Read`
     deny also blocks the Edit tool. `//` anchors the pattern at the filesystem
     root; anything else would resolve against the settings source.
+
+    On Windows, drive letters are preserved without the leading // prefix since
+    Windows absolute paths already start with the drive letter.
     """
     rules: list[str] = []
     for raw in paths:
         resolved_path = Path(raw).expanduser().resolve()
-        # On Windows, use the path as-is (with backslashes converted to forward slashes)
-        # but don't strip the drive letter
-        if sys.platform == "win32":
-            resolved = resolved_path.as_posix()
+        posix_path = resolved_path.as_posix()
+
+        # On Windows, check if path has a drive letter
+        if sys.platform == "win32" and len(posix_path) > 1 and posix_path[1] == ':':
+            # For Windows absolute paths with drive letters (e.g., "E:/Project/..."),
+            # use the path directly without // prefix
+            resolved = posix_path
         else:
-            resolved = resolved_path.as_posix().lstrip("/")
+            # For Unix paths or relative paths, strip leading / and add //
+            resolved = posix_path.lstrip("/")
+
         if not resolved:
             continue
+
         for tool in ("Read", "Edit"):
-            # On Windows, don't add leading // for absolute paths with drive letters
+            # On Windows with drive letters, don't add // prefix
             if sys.platform == "win32" and len(resolved) > 1 and resolved[1] == ':':
-                patterns = (f"//{resolved}", f"//{resolved}/**")
+                patterns = (resolved, f"{resolved}/**")
             else:
                 patterns = (f"//{resolved}", f"//{resolved}/**")
             for pattern in patterns:
