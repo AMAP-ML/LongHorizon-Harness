@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import shlex
+import sys
 from pathlib import Path
 
 from ..agent_logs import visible_output as extract_claude_visible_output
@@ -91,7 +92,13 @@ class ClaudeCodeAdapter(CommandAgentAdapter):
                 ]
             )
 
-        env_prefix = (" ".join(env_parts) + " ") if env_parts else ""
+        # Build environment variable prefix for command
+        # Windows cmd.exe: use "set VAR=value && " syntax
+        # Unix: use "VAR=value " syntax
+        if sys.platform == "win32":
+            env_prefix = (" && ".join(f"set {part}" for part in env_parts) + " && ") if env_parts else ""
+        else:
+            env_prefix = (" ".join(env_parts) + " ") if env_parts else ""
         command_parts = [
             "claude",
             "--print",
