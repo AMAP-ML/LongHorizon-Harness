@@ -420,6 +420,53 @@ def _read_json(path: Path) -> dict[str, Any]:
     return _read_json_file(path, max_bytes=8 * 1024 * 1024)
 
 
+def _read_report(path: Path) -> dict[str, Any]:
+    """Read a worker report, tolerating reports that grew past the cap.
+
+    A report embeds every finished round, so a long run can legally exceed
+    the 8 MiB control-record cap that plain ``_read_json`` enforces.  The
+    lifecycle pollers treat an empty dict as *no report*, and the failure
+    path then overwrites the real report with a synthetic stub, so a report
+    that only looked missing must be read in full.  A hard ceiling keeps a
+    hostile run directory from pinning a parser on a multi-gigabyte file.
+    """
+
+    max_bytes = 256 * 1024 * 1024
+    try:
+        fd = _open_nofollow(path)
+    except OSError:
+        return {}
+    try:
+        metadata = os.fstat(fd)
+        if not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1:
+            return {}
+        size = int(metadata.st_size)
+        if size == 0:
+            return {}
+        if size > max_bytes:
+            return {}
+        raw = b""
+        remaining = size
+        while remaining > 0:
+            chunk = os.read(fd, min(remaining, 1024 * 1024))
+            if not chunk:
+                break
+            raw += chunk
+            remaining -= len(chunk)
+    except OSError:
+        return {}
+    finally:
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+    try:
+        value = json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        return {}
+    return value if isinstance(value, dict) else {}
+
+
 def _pending_approval(path: Path) -> bool:
     latest: dict[str, dict[str, Any]] = {}
     try:
@@ -969,7 +1016,7 @@ class RunSupervisor:
             authority; without one this is a failed/crashed worker.
             """
 
-            report = _read_json(self._run_logs_dir(run_id) / "report.json")
+            report = _read_report(self._run_logs_dir(run_id) / "report.json")
             lifecycle, report_status = _terminal_status_for_exit(
                 report=report,
                 returncode=0 if report else 1,
@@ -1058,7 +1105,7 @@ class RunSupervisor:
             # log/report projection remains readable, but this supervisor must
             # not infer liveness or re-enable process control.
             if status.get("managed") is False:
-                report = _read_json(self._run_logs_dir(run_id) / "report.json")
+                report = _read_report(self._run_logs_dir(run_id) / "report.json")
                 report_status = _report_status(report)
                 lifecycle = canonical_lifecycle_status(status.get("status"), default="idle")
                 if lifecycle not in TERMINAL_STATUSES and report_status in TERMINAL_STATUSES:
@@ -1084,7 +1131,7 @@ class RunSupervisor:
             process = self._processes.get(run_id)
             returncode = process.poll() if process is not None else None
             if process is not None and returncode is not None:
-                report = _read_json(self._run_logs_dir(run_id) / "report.json")
+                report = _read_report(self._run_logs_dir(run_id) / "report.json")
                 requested_action = str(status.get("requested_action") or "")
                 lifecycle, report_status = _terminal_status_for_exit(
                     report=report,
@@ -1154,7 +1201,7 @@ class RunSupervisor:
                 # Reconcile an exited worker from its durable report.  Without a
                 # process handle we cannot obtain an exit code, so a missing
                 # report is still a failure (never an implicit completion).
-                report = _read_json(self._run_logs_dir(run_id) / "report.json")
+                report = _read_report(self._run_logs_dir(run_id) / "report.json")
                 requested_action = str(status.get("requested_action") or "")
                 lifecycle, report_status = _terminal_status_for_exit(
                     report=report,
@@ -1185,7 +1232,7 @@ class RunSupervisor:
                 # Their final manager report is still authoritative for the
                 # audit outcome, but a missing report remains ``idle`` rather
                 # than being guessed as successful.
-                report = _read_json(self._run_logs_dir(run_id) / "report.json")
+                report = _read_report(self._run_logs_dir(run_id) / "report.json")
                 lifecycle, report_status = _terminal_status_for_exit(
                     report=report,
                     returncode=0 if report else 1,
@@ -1259,7 +1306,7 @@ class RunSupervisor:
                 continue
             try:
                 status = self._refresh(run_dir.name)
-                report = _read_json(logs / "report.json")
+                report = _read_report(logs / "report.json")
                 owner = _read_json(run_dir / "control" / "owner.json")
                 mtime = run_dir.stat().st_mtime
             except (OSError, RuntimeError, ValueError):
@@ -1848,7 +1895,7 @@ class RunSupervisor:
 
         self._assert_run_scope(run_id)
         bus = self._bus(run_id)
-        run_report = report if isinstance(report, dict) else _read_json(self._run_logs_dir(run_id) / "report.json")
+        run_report = report if isinstance(report, dict) else _read_report(self._run_logs_dir(run_id) / "report.json")
         with self._lifecycle_lock:
             current = bus.read_status()
             requested_action = str(current.get("requested_action") or "")
@@ -2050,7 +2097,7 @@ class RunSupervisor:
                 # The signal raced with process exit.  Do not leave a durable
                 # ``stopping`` state behind: reconcile from the final report,
                 # or record a crash when the worker vanished without one.
-                report = _read_json(self._run_logs_dir(run_id) / "report.json")
+                report = _read_report(self._run_logs_dir(run_id) / "report.json")
                 lifecycle, report_status = _terminal_status_for_exit(
                     report=report,
                     returncode=0 if report else 1,
