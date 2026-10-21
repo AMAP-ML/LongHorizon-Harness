@@ -49,32 +49,24 @@ def test_open_worker_log_does_not_bind_names_in_a_branch(monkeypatch, tmp_path: 
     )
 
 
-def test_open_worker_log_posix_path_is_reachable(monkeypatch, tmp_path: Path):
-    """Force the POSIX path and make sure it does not raise UnboundLocalError."""
-    real_platform = sys.platform
-    real_nofollow = getattr(os, "O_NOFOLLOW", 0)
-    real_cloexec = getattr(os, "O_CLOEXEC", 0)
-    real_supports = set(os.supports_dir_fd)
-    if not real_nofollow:
-        os.O_NOFOLLOW = 0x20000
-    if not real_cloexec:
-        os.O_CLOEXEC = 0x80000
-    os.supports_dir_fd = {os.open, os.mkdir}
-    monkeypatch.setattr(sys, "platform", "linux")
+def test_open_worker_log_posix_path_is_reachable_on_posix(tmp_path: Path):
+    """On a POSIX host the POSIX path must open the log.
+
+    This is skipped where the POSIX primitives do not exist. It is not faked:
+    patching ``os.supports_dir_fd`` and ``sys.platform`` to imitate Linux
+    makes the control-bus helpers take their POSIX path on a Windows host,
+    which creates files in the run directory and changes how every later
+    test in the session reads them.
+    """
+    if not hasattr(os, "O_NOFOLLOW") or os.open not in getattr(os, "supports_dir_fd", set()):
+        pytest.skip("the POSIX path is not available on this platform")
+
+    target = tmp_path / "worker.log"
+    handle = _open_worker_log(target)
     try:
-        target = tmp_path / "worker.log"
-        try:
-            handle = _open_worker_log(target)
-        except UnboundLocalError as exc:  # pragma: no cover - the regression
-            pytest.fail(f"the POSIX path raised UnboundLocalError: {exc}")
-        except OSError:
-            # A platform that lacks the POSIX primitives may still refuse,
-            # but it must not be an UnboundLocalError.
-            return
-        handle.close()
+        assert target.is_file()
     finally:
-        sys.platform = real_platform
-        os.supports_dir_fd = real_supports
+        handle.close()
 
 
 # --- 2. force must be explicit, and taskkill must be checked --------------
