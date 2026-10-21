@@ -29,6 +29,15 @@ from lh_harness.supervisor import control_bus
 from lh_harness.supervisor.service import _open_worker_log
 from lh_harness.utils import process_group as pg
 
+# The anchored-parent tests exercise native Win32 calls and only exist on
+# Windows.  They are skipped elsewhere rather than emulated: faking the
+# platform changes how the control-bus helpers behave for every later test
+# in the session.
+requires_windows = pytest.mark.skipif(
+    sys.platform != "win32",
+    reason="the anchored-parent helpers are native Win32 calls",
+)
+
 
 # --- 1. the POSIX path must not depend on the Windows branch -------------
 
@@ -158,6 +167,7 @@ def test_windows_existence_probe_still_works(monkeypatch):
 # --- 3. the private-file helper must validate before it truncates --------
 
 
+@requires_windows
 def test_private_file_helper_validates_before_opening_destructively(monkeypatch):
     """An O_TRUNC caller must not modify an alias before it is rejected.
 
@@ -200,6 +210,7 @@ def test_private_file_helper_rejects_a_hard_link(tmp_path: Path):
 # --- the anchored parent is the real guarantee ---------------------------
 
 
+@requires_windows
 def test_windows_anchored_directory_cannot_be_renamed_while_open(tmp_path: Path):
     """The directory handle must refuse a rename, not merely notice it.
 
@@ -224,6 +235,7 @@ def test_windows_anchored_directory_cannot_be_renamed_while_open(tmp_path: Path)
     os.rename(directory, tmp_path / "runs_moved")
 
 
+@requires_windows
 def test_windows_anchored_open_survives_an_ancestor_swap(tmp_path: Path):
     """A file opened relative to the anchor must stay in the original dir.
 
@@ -277,6 +289,7 @@ def test_windows_anchored_open_survives_an_ancestor_swap(tmp_path: Path):
         os.close(fd)
 
 
+@requires_windows
 def test_windows_anchored_opens_a_junction_as_itself(tmp_path: Path):
     """A junction in the anchored directory must be detectable as such."""
     import subprocess
@@ -311,6 +324,7 @@ def test_windows_anchored_opens_a_junction_as_itself(tmp_path: Path):
         os.close(fd)
 
 
+@requires_windows
 def test_windows_anchored_private_file_rejects_a_hard_link(tmp_path: Path):
     """A hard-linked target is an alias and must be refused."""
     from lh_harness.utils import windows_anchored
@@ -332,6 +346,7 @@ def test_windows_anchored_private_file_rejects_a_hard_link(tmp_path: Path):
     assert target.read_bytes() == b"original"
 
 
+@requires_windows
 def test_windows_anchored_append_writes_at_the_end_of_the_file(tmp_path: Path):
     """An append-mode descriptor must not overwrite the existing content.
 

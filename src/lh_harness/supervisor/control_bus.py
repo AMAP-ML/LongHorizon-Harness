@@ -316,12 +316,12 @@ def _open_private_regular_at(
     if not name or name in {".", ".."} or "/" in name or "\\" in name:
         raise OSError("unsafe private file name")
 
-    base_flags = flags | os.O_BINARY
-    if hasattr(os, "O_NOINHERIT"):
-        base_flags |= os.O_NOINHERIT
-
     # Windows path: open relative to the anchored parent descriptor.
     if sys.platform == "win32":
+        base_flags = flags | os.O_BINARY
+        if hasattr(os, "O_NOINHERIT"):
+            base_flags |= os.O_NOINHERIT
+
         access = windows_anchored._GENERIC_READ
         if base_flags & os.O_WRONLY:
             access = windows_anchored._GENERIC_WRITE
