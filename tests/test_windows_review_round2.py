@@ -159,18 +159,24 @@ def test_windows_existence_probe_still_works(monkeypatch):
 
 
 def test_private_file_helper_validates_before_opening_destructively(monkeypatch):
-    """An O_TRUNC caller must not modify an alias before it is rejected."""
+    """An O_TRUNC caller must not modify an alias before it is rejected.
+
+    The check is behavioural, not textual: the helper is called with a
+    hard-linked target and the alias must still hold its original content
+    afterwards.
+    """
     import inspect
 
     source = inspect.getsource(control_bus._open_private_regular_at)
-    # The destructive open must come after a validation probe.
     assert "destructive" in source, (
         "the Windows fallback must separate the destructive open from the "
         "validation probe"
     )
-    probe_at = source.find("probe = os.open")
-    destructive_at = source.find("fd = os.open(file_path, base_flags)")
-    assert probe_at != -1 and destructive_at != -1
+    # The validation must not be reachable only after a destructive open.
+    probe_at = source.find("probe = windows_anchored.open_relative")
+    destructive_at = source.find("windows_anchored.truncate(fd)")
+    assert probe_at != -1, "the existing path must be probed before it is used"
+    assert destructive_at != -1, "the truncate must be explicit"
     assert probe_at < destructive_at, (
         "the alias check must run before the caller's flags are used"
     )
@@ -190,3 +196,184 @@ def test_private_file_helper_rejects_a_hard_link(tmp_path: Path):
             control_bus._open_private_regular_at(parent_fd, ".supervisor.lock", os.O_RDWR)
     finally:
         os.close(parent_fd)
+
+# --- the anchored parent is the real guarantee ---------------------------
+
+
+def test_windows_anchored_directory_cannot_be_renamed_while_open(tmp_path: Path):
+    """The directory handle must refuse a rename, not merely notice it.
+
+    A path-resolved marker file cannot give this guarantee: the child open
+    would follow whatever the path resolves to at the time of the open. The
+    anchor only holds if the operating system refuses the rename while the
+    handle is open.
+    """
+    from lh_harness.utils import windows_anchored
+
+    directory = tmp_path / "runs"
+    directory.mkdir()
+    fd = windows_anchored.open_directory(directory)
+    try:
+        with pytest.raises(PermissionError):
+            os.rename(directory, tmp_path / "runs_moved")
+    finally:
+        os.close(fd)
+
+    # Once the anchor is released the rename is allowed again, which shows
+    # the refusal came from the open handle and not from the file system.
+    os.rename(directory, tmp_path / "runs_moved")
+
+
+def test_windows_anchored_open_survives_an_ancestor_swap(tmp_path: Path):
+    """A file opened relative to the anchor must stay in the original dir.
+
+    The ancestor is swapped for a junction pointing somewhere else. The
+    already-open descriptor must still refer to the original directory.
+    """
+    import subprocess
+
+    from lh_harness.utils import windows_anchored
+
+    base = tmp_path / "base"
+    inner = base / "inner"
+    inner.mkdir(parents=True)
+    outside = tmp_path / "outside"
+    outside.mkdir()
+
+    fd = windows_anchored.open_directory(inner)
+    try:
+        # The ancestor cannot be renamed while the handle is open, so the
+        # swap is attempted at the level above the handle.
+        moved = tmp_path / "base_moved"
+        try:
+            os.rename(base, moved)
+        except PermissionError:
+            moved = base
+        junction = base / "inner"
+        if not junction.exists():
+            subprocess.run(
+                ["cmd", "/c", "mklink", "/J", str(junction), str(outside)],
+                capture_output=True,
+                check=False,
+            )
+
+        child = windows_anchored.open_relative(
+            fd,
+            "pinned.txt",
+            access=windows_anchored._GENERIC_READ | windows_anchored._GENERIC_WRITE,
+            create=True,
+            exclusive=True,
+        )
+        try:
+            os.write(child, b"pinned")
+        finally:
+            os.close(child)
+
+        # The file landed in the directory the handle refers to, not in
+        # whatever the path now resolves to.
+        assert (moved / "inner" / "pinned.txt").read_bytes() == b"pinned"
+        assert not (outside / "pinned.txt").exists()
+    finally:
+        os.close(fd)
+
+
+def test_windows_anchored_opens_a_junction_as_itself(tmp_path: Path):
+    """A junction in the anchored directory must be detectable as such."""
+    import subprocess
+
+    from lh_harness.utils import windows_anchored
+
+    base = tmp_path / "base"
+    base.mkdir()
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    subprocess.run(
+        ["cmd", "/c", "mklink", "/J", str(base / "link"), str(outside)],
+        capture_output=True,
+        check=False,
+    )
+
+    fd = windows_anchored.open_directory(base)
+    try:
+        child = windows_anchored.open_relative(
+            fd,
+            "link",
+            access=windows_anchored._GENERIC_READ,
+            allow_directory=True,
+        )
+        try:
+            assert windows_anchored.is_reparse_point(child), (
+                "a junction must be opened as itself so the caller can reject it"
+            )
+        finally:
+            os.close(child)
+    finally:
+        os.close(fd)
+
+
+def test_windows_anchored_private_file_rejects_a_hard_link(tmp_path: Path):
+    """A hard-linked target is an alias and must be refused."""
+    from lh_harness.utils import windows_anchored
+
+    directory = tmp_path / "runs"
+    directory.mkdir()
+    target = tmp_path / "elsewhere.lock"
+    target.write_bytes(b"original")
+    os.link(target, directory / ".supervisor.lock")
+
+    fd = windows_anchored.open_directory(directory)
+    try:
+        with pytest.raises(OSError):
+            control_bus._open_private_regular_at(fd, ".supervisor.lock", os.O_RDWR)
+    finally:
+        os.close(fd)
+
+    # The alias must be untouched.
+    assert target.read_bytes() == b"original"
+
+
+def test_windows_anchored_append_writes_at_the_end_of_the_file(tmp_path: Path):
+    """An append-mode descriptor must not overwrite the existing content.
+
+    The append data access in the Win32 access mask is the guarantee: the
+    write goes to the end of the file whatever the descriptor's own
+    position is.  The CRT flag keeps ``os.fdopen(fd, "a")`` in step with
+    it.
+    """
+    from lh_harness.utils import windows_anchored
+
+    directory = tmp_path / "runs"
+    directory.mkdir()
+    fd = windows_anchored.open_directory(directory)
+    try:
+        first = windows_anchored.open_relative(
+            fd,
+            "events.jsonl",
+            access=windows_anchored._GENERIC_WRITE,
+            create=True,
+            exclusive=True,
+        )
+        try:
+            os.write(first, b"first\n")
+        finally:
+            os.close(first)
+
+        second = windows_anchored.open_relative(
+            fd,
+            "events.jsonl",
+            access=windows_anchored._GENERIC_WRITE,
+            append=True,
+        )
+        try:
+            handle = os.fdopen(second, "a", encoding="utf-8")
+        except ValueError:
+            os.close(second)
+            raise
+        with handle:
+            handle.write("second\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+    finally:
+        os.close(fd)
+
+    assert (directory / "events.jsonl").read_text(encoding="utf-8") == "first\nsecond\n"

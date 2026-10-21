@@ -21,6 +21,12 @@ from typing import Any, Callable, Iterator
 
 from ..utils.file_lock import acquire_lock, ensure_lockable, lock_handle, release_lock
 
+if sys.platform == "win32":
+    # The Windows helpers are only importable on native Windows: the
+    # module raises ImportError elsewhere so a POSIX build never
+    # depends on the Win32 API being present.
+    from ..utils import windows_anchored
+
 
 _MAX_CONTROL_RECORD_BYTES = 512 * 1024
 _MAX_CONTROL_LOG_BYTES = 16 * 1024 * 1024
@@ -41,52 +47,49 @@ def _is_windows_symlink(path: str | Path) -> bool:
 def _windows_open_nofollow(path: str | Path, *, directory: bool = False) -> int:
     """Windows implementation: open without following symlinks.
 
-    Windows doesn't have O_NOFOLLOW or dir_fd, so we verify each component
-    isn't a reparse point (symlink/junction) before proceeding.
+    Windows has no ``O_NOFOLLOW`` and no ``dir_fd``, so a directory is
+    opened as a real handle.  The handle is opened without
+    ``FILE_SHARE_DELETE``: while it is open the directory, and every
+    ancestor of it, cannot be renamed or replaced.  That is what makes the
+    descriptor an anchor rather than a snapshot of a path.
 
-    Note: Windows doesn't support opening directories with os.open(), so for
-    directories we create a temporary marker file and return its descriptor.
+    A regular file is opened relative to its parent directory handle, so
+    the final component cannot be redirected by a swapped ancestor either.
     """
-    absolute = Path(os.path.abspath(os.fspath(path)))
-    parts = absolute.parts
 
-    # Verify no component is a symlink/junction
-    current = Path(parts[0])  # Drive letter (e.g., 'C:\\')
-    for component in parts[1:]:
+    absolute = Path(os.path.abspath(os.fspath(path)))
+    if directory:
+        return windows_anchored.open_directory(absolute)
+
+    # Verify no component is a reparse point (symlink/junction).
+    current = Path(absolute.parts[0])
+    for component in absolute.parts[1:]:
         current = current / component
         if current.exists() and _is_windows_symlink(current):
             raise OSError(f"control-bus path contains symlink: {current}")
 
-    if directory:
-        # For directories on Windows, we can't use os.open()
-        # Instead, create a temporary marker file in the directory
-        if not absolute.is_dir():
-            raise OSError(f"expected directory: {path}")
-
-        # Create a hidden marker file to hold the directory open
-        marker_path = absolute / '.lh_dir_marker'
-        flags = os.O_RDWR | os.O_CREAT | os.O_BINARY
-        if hasattr(os, 'O_NOINHERIT'):
-            flags |= os.O_NOINHERIT
-
-        fd = os.open(marker_path, flags, 0o600)
-        return fd
-    else:
-        # Open regular file
-        flags = os.O_RDONLY | os.O_BINARY
-        if hasattr(os, 'O_NOINHERIT'):
-            flags |= os.O_NOINHERIT
-
-        try:
-            fd = os.open(path, flags)
-            # Verify it's a regular file
-            st = os.fstat(fd)
-            if not stat.S_ISREG(st.st_mode):
-                os.close(fd)
-                raise OSError(f"expected regular file, got non-file: {path}")
-            return fd
-        except OSError:
-            raise
+    parent_fd = windows_anchored.open_directory(absolute.parent)
+    try:
+        fd = windows_anchored.open_relative(
+            parent_fd,
+            absolute.name,
+            access=windows_anchored._GENERIC_READ,
+        )
+    except OSError:
+        raise
+    finally:
+        os.close(parent_fd)
+    try:
+        if windows_anchored.is_reparse_point(fd):
+            os.close(fd)
+            raise OSError(f"control-bus path contains symlink: {absolute}")
+        metadata = os.fstat(fd)
+        if not stat.S_ISREG(metadata.st_mode):
+            os.close(fd)
+            raise OSError(f"expected regular file, got non-file: {absolute}")
+    except BaseException:
+        raise
+    return fd
 
 
 def _windows_ensure_dir_nofollow(path: str | Path, *, mode: int = 0o700) -> int:
@@ -313,43 +316,17 @@ def _open_private_regular_at(
     if not name or name in {".", ".."} or "/" in name or "\\" in name:
         raise OSError("unsafe private file name")
 
-    # Windows path: use path-based operations with symlink checking
+    base_flags = flags | os.O_BINARY
+    if hasattr(os, "O_NOINHERIT"):
+        base_flags |= os.O_NOINHERIT
+
+    # Windows path: open relative to the anchored parent descriptor.
     if sys.platform == "win32":
-        # Get parent directory path from file descriptor
-        import msvcrt
-        import ctypes
-        from ctypes import wintypes
-
-        # Get file path from handle
-        kernel32 = ctypes.windll.kernel32
-        handle = msvcrt.get_osfhandle(parent_fd)
-
-        # Get the final path name for this handle
-        buf_size = 1024
-        buf = ctypes.create_unicode_buffer(buf_size)
-        result = kernel32.GetFinalPathNameByHandleW(
-            handle, buf, buf_size, 0  # VOLUME_NAME_DOS
-        )
-
-        if result == 0 or result > buf_size:
-            raise OSError("Failed to get parent directory path")
-
-        parent_path = Path(buf.value)
-        # Remove \\?\ prefix if present
-        path_str = str(parent_path)
-        if path_str.startswith('\\\\?\\'):
-            parent_path = Path(path_str[4:])
-
-        # If parent_path ends with .lh_dir_marker, it's our marker file
-        # Get the actual directory by going to parent
-        if parent_path.name == '.lh_dir_marker':
-            parent_path = parent_path.parent
-
-        file_path = parent_path / name
-
-        base_flags = flags | os.O_BINARY
-        if hasattr(os, "O_NOINHERIT"):
-            base_flags |= os.O_NOINHERIT
+        access = windows_anchored._GENERIC_READ
+        if base_flags & os.O_WRONLY:
+            access = windows_anchored._GENERIC_WRITE
+        elif base_flags & os.O_RDWR:
+            access = windows_anchored._GENERIC_READ | windows_anchored._GENERIC_WRITE
 
         # The caller's flags may include O_TRUNC. Opening an existing path
         # with them would truncate the target before the reparse-point and
@@ -357,80 +334,63 @@ def _open_private_regular_at(
         # before it is refused. The existing path is therefore opened
         # read-only first, validated, and only then re-opened with the
         # caller's flags.
-        destructive = bool(base_flags & (os.O_TRUNC | os.O_APPEND))
-        access = base_flags & (os.O_RDONLY | os.O_WRONLY | os.O_RDWR)
-        probe_flags = os.O_RDONLY if access != os.O_WRONLY else os.O_WRONLY
+        destructive = bool(base_flags & os.O_TRUNC)
 
-        # Retry loop for concurrent operations
         for _ in range(32):
-            fd: int | None = None
             try:
-                # Try to create exclusively
+                probe = windows_anchored.open_relative(
+                    parent_fd,
+                    name,
+                    access=windows_anchored._GENERIC_READ,
+                )
+            except FileNotFoundError:
+                # Not there yet: create it relative to the anchored parent.
                 try:
-                    fd = os.open(
-                        file_path,
-                        base_flags | os.O_CREAT | os.O_EXCL,
-                        mode,
+                    fd = windows_anchored.open_relative(
+                        parent_fd,
+                        name,
+                        access=access,
+                        create=True,
+                        exclusive=True,
+                        append=bool(base_flags & os.O_APPEND),
                     )
                 except FileExistsError:
-                    # File exists. Validate it before any destructive open.
-                    try:
-                        probe = os.open(file_path, probe_flags)
-                    except FileNotFoundError:
-                        # Disappeared between checks, retry
-                        continue
-                    try:
-                        if _is_windows_symlink(file_path):
-                            raise OSError("private file is a symlink")
-                        metadata = os.fstat(probe)
-                        if not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1:
-                            raise OSError("private file is not an unaliased regular file")
-                    finally:
-                        os.close(probe)
-
-                    if destructive:
-                        # Re-open with the caller's flags now that the path
-                        # is known to be a private regular file.
-                        try:
-                            fd = os.open(file_path, base_flags)
-                        except FileNotFoundError:
-                            continue
-                    else:
-                        fd = os.open(file_path, base_flags)
-                        try:
-                            if _is_windows_symlink(file_path):
-                                raise OSError("private file is a symlink")
-                            metadata = os.fstat(fd)
-                            if not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1:
-                                raise OSError("private file is not an unaliased regular file")
-                        except BaseException:
-                            os.close(fd)
-                            raise
-
-                # Verify it is a regular file and not an alias.
-                if _is_windows_symlink(file_path):
+                    continue
+                break
+            try:
+                if windows_anchored.is_reparse_point(probe):
                     raise OSError("private file is a symlink")
-
-                metadata = os.fstat(fd)
+                metadata = os.fstat(probe)
                 if not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1:
                     raise OSError("private file is not an unaliased regular file")
-
-                try:
-                    os.chmod(file_path, mode)
-                except OSError:
-                    pass
-
-                result = fd
-                fd = None
-                return result
             finally:
-                if fd is not None:
-                    try:
-                        os.close(fd)
-                    except OSError:
-                        pass
+                os.close(probe)
 
-        raise FileNotFoundError(name)
+            # The path is known to be a private regular file, so it is now
+            # safe to apply the caller's flags.
+            try:
+                fd = windows_anchored.open_relative(
+                    parent_fd,
+                    name,
+                    access=access,
+                    append=bool(base_flags & os.O_APPEND),
+                )
+            except FileNotFoundError:
+                continue
+            if destructive and base_flags & os.O_TRUNC:
+                windows_anchored.truncate(fd)
+            break
+
+        try:
+            if windows_anchored.is_reparse_point(fd):
+                raise OSError("private file is a symlink")
+            metadata = os.fstat(fd)
+            if not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1:
+                raise OSError("private file is not an unaliased regular file")
+        except BaseException:
+            os.close(fd)
+            raise
+        return fd
 
     # Unix/Linux path using dir_fd
     nofollow = getattr(os, "O_NOFOLLOW", 0)
@@ -481,45 +441,25 @@ def _open_private_regular_at(
 def _open_unique_temp(parent_fd: int, *, prefix: str, suffix: str) -> tuple[int, str]:
     """Create a private temporary sibling relative to an already-open dir."""
 
-    # Windows path: get parent directory from file descriptor
+    # Windows path: create the temporary file relative to the anchored
+    # parent descriptor, so a renamed ancestor cannot redirect it.
     if sys.platform == "win32":
-        import msvcrt
-        import ctypes
-        from ctypes import wintypes
-
-        # Get file path from handle
-        kernel32 = ctypes.windll.kernel32
-        handle = msvcrt.get_osfhandle(parent_fd)
-
-        # Get the final path name for this handle
-        buf_size = 1024
-        buf = ctypes.create_unicode_buffer(buf_size)
-        result = kernel32.GetFinalPathNameByHandleW(
-            handle, buf, buf_size, 0  # VOLUME_NAME_DOS
-        )
-
-        if result == 0 or result > buf_size:
-            raise OSError("Failed to get parent directory path")
-
-        parent_path = Path(buf.value)
-        # Remove \\?\ prefix if present
-        if str(parent_path).startswith('\\\\?\\'):
-            parent_path = Path(str(parent_path)[4:])
-
-        # If parent_path ends with .lh_dir_marker, it's our marker file
-        # Get the actual directory by going to parent
-        if parent_path.name == '.lh_dir_marker':
-            parent_path = parent_path.parent
-
-        flags = os.O_RDWR | os.O_CREAT | os.O_EXCL | os.O_BINARY
-        if hasattr(os, 'O_NOINHERIT'):
-            flags |= os.O_NOINHERIT
-
         for _ in range(32):
             name = f"{prefix}{uuid.uuid4().hex}{suffix}"
-            file_path = parent_path / name
             try:
-                return os.open(file_path, flags, 0o600), name
+                return (
+                    windows_anchored.open_relative(
+                        parent_fd,
+                        name,
+                        access=(
+                            windows_anchored._GENERIC_READ
+                            | windows_anchored._GENERIC_WRITE
+                        ),
+                        create=True,
+                        exclusive=True,
+                    ),
+                    name,
+                )
             except FileExistsError:
                 continue
         raise FileExistsError("could not allocate a unique control-bus temporary file")
@@ -548,7 +488,6 @@ def _atomic_bytes_write(path: Path, payload: bytes, *, mode: int = 0o600) -> Non
     parent_fd = _ensure_dir_fd_nofollow(path.parent)
     fd: int | None = None
     temporary_name: str | None = None
-    temporary_path: Path | None = None
 
     try:
         fd, temporary_name = _open_unique_temp(
@@ -557,32 +496,9 @@ def _atomic_bytes_write(path: Path, payload: bytes, *, mode: int = 0o600) -> Non
             suffix=".tmp",
         )
 
-        # Windows compatibility: use chmod instead of fchmod
-        if sys.platform == "win32":
-            # On Windows, we need the full path for chmod
-            import msvcrt
-            import ctypes
-
-            kernel32 = ctypes.windll.kernel32
-            handle = msvcrt.get_osfhandle(parent_fd)
-
-            buf_size = 1024
-            buf = ctypes.create_unicode_buffer(buf_size)
-            result = kernel32.GetFinalPathNameByHandleW(handle, buf, buf_size, 0)
-
-            if result > 0 and result <= buf_size:
-                parent_path = Path(buf.value)
-                if str(parent_path).startswith('\\\\?\\'):
-                    parent_path = Path(str(parent_path)[4:])
-                if parent_path.name == '.lh_dir_marker':
-                    parent_path = parent_path.parent
-
-                temporary_path = parent_path / temporary_name
-                try:
-                    os.chmod(temporary_path, mode)
-                except OSError:
-                    pass
-        else:
+        # Windows has no fchmod; the file is already created with the
+        # requested mode, so there is nothing to change.
+        if sys.platform != "win32":
             try:
                 os.fchmod(fd, mode)
             except OSError:
@@ -594,15 +510,16 @@ def _atomic_bytes_write(path: Path, payload: bytes, *, mode: int = 0o600) -> Non
             handle.flush()
             os.fsync(handle.fileno())
 
-        # Windows compatibility: use os.replace with full paths
         if sys.platform == "win32":
-            if temporary_path is None:
-                raise OSError("Failed to determine temporary file path on Windows")
-            os.replace(temporary_path, path)
-            temporary_name = None
+            # ``os.replace`` has no ``dir_fd`` form on Windows, so the
+            # rename is done through the anchored parent descriptor.  The
+            # parent handle is still open, so the directory cannot have
+            # been renamed and the final path still points at it.
+            parent_path = windows_anchored.final_path(parent_fd)
+            os.replace(parent_path / temporary_name, parent_path / path.name)
         else:
             os.replace(temporary_name, path.name, src_dir_fd=parent_fd, dst_dir_fd=parent_fd)
-            temporary_name = None
+        temporary_name = None
 
         try:
             os.fsync(parent_fd)
@@ -616,8 +533,9 @@ def _atomic_bytes_write(path: Path, payload: bytes, *, mode: int = 0o600) -> Non
                 pass
         if temporary_name is not None:
             try:
-                if sys.platform == "win32" and temporary_path is not None:
-                    os.unlink(temporary_path)
+                if sys.platform == "win32":
+                    parent_path = windows_anchored.final_path(parent_fd)
+                    os.unlink(parent_path / temporary_name)
                 else:
                     os.unlink(temporary_name, dir_fd=parent_fd)
             except OSError:
