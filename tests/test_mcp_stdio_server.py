@@ -468,6 +468,15 @@ def test_cli_serves_the_protocol_over_stdio(tmp_path: Path):
     finally:
         proc.stdin.close()
         try:
-            proc.wait(timeout=15)
+            exit_code = proc.wait(timeout=15)
         except subprocess.TimeoutExpired:  # pragma: no cover - defensive
             proc.kill()
+            raise
+
+    # Closing stdin ends the session. The server must exit cleanly: a
+    # non-zero status or a traceback on stderr means the entry point and the
+    # transport disagree about who owns the event loop.
+    assert exit_code == 0, f"server exited with {exit_code}"
+    stderr = proc.stderr.read() or ""
+    assert "Traceback" not in stderr, stderr
+    assert "coroutine was expected" not in stderr, stderr

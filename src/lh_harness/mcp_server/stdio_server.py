@@ -437,24 +437,25 @@ def _write_response(response: dict[str, Any]) -> None:
     sys.stdout.flush()
 
 
-def run_mcp_server(
+async def run_mcp_server(
     *,
     state_root: str = "~/.lh-harness",
     transport: str = "stdio",
-    log_level: str = "INFO",
-) -> int:
-    """Entry point for ``lh-harness mcp-server``."""
+) -> None:
+    """Serve the MCP server until stdin closes.
 
-    logging.basicConfig(
-        level=getattr(logging, str(log_level).upper(), logging.INFO),
-        stream=sys.stderr,
-    )
+    This is a coroutine so the caller owns the event loop: the CLI wraps it in
+    ``asyncio.run``. Logging is the caller's business, because the caller
+    decides where the handler goes -- stdout belongs to the protocol.
+    """
+
     if transport != "stdio":
         raise ValueError(f"unsupported transport: {transport}")
     server = LongHorizonMCPServer(state_root=state_root)
-    asyncio.run(serve_stdio(server))
-    return 0
+    await serve_stdio(server)
 
 
 if __name__ == "__main__":  # pragma: no cover - manual entry point
-    raise SystemExit(run_mcp_server(state_root=os.environ.get("LH_HARNESS_STATE_ROOT", "~/.lh-harness")))
+    asyncio.run(
+        run_mcp_server(state_root=os.environ.get("LH_HARNESS_STATE_ROOT", "~/.lh-harness"))
+    )
