@@ -412,3 +412,22 @@ async def test_late_crash_report_preserves_completed_rounds(tmp_path: Path) -> N
 
     persisted = json.loads((log_dir / "report.json").read_text(encoding="utf-8"))
     assert persisted == result
+
+
+def test_resolve_run_id_prefers_the_persisted_identity(tmp_path: Path) -> None:
+    from lh_harness.utils.run_boundary import resolve_run_id
+
+    log_dir = tmp_path / "custom" / "logs"
+    log_dir.mkdir(parents=True)
+    (log_dir / "run_id.txt").write_text("20261021T000000Z_abcd1234", encoding="utf-8")
+
+    assert resolve_run_id(log_dir) == "20261021T000000Z_abcd1234"
+
+
+def test_resolve_run_id_falls_back_for_legacy_logs(tmp_path: Path) -> None:
+    from lh_harness.utils.run_boundary import resolve_run_id
+
+    log_dir = tmp_path / "legacy-run" / "logs"
+    log_dir.mkdir(parents=True)
+
+    assert resolve_run_id(log_dir) == ""

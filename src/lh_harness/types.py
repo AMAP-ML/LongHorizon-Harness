@@ -118,6 +118,9 @@ class HarnessConfig:
     workspace_path: str = DEFAULT_WORKSPACE_PATH
     harness_dir: str = DEFAULT_HARNESS_DIR
     log_dir: str = DEFAULT_LOG_DIR
+    # The reserved run identity readers validate event ids against. Empty keeps
+    # the legacy path-derived stamp for direct callers.
+    run_id: str = ""
     auditor_output_chars: int = 24_000
     role_verified_context_chars: int = 60_000
     role_history_chars: int = 100_000
