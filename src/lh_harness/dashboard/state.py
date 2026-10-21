@@ -30,6 +30,7 @@ from typing import Any
 from ..types import DEFAULT_LOG_DIR, MAX_ROUNDS
 from ..supervisor.control_bus import ControlBus, _ensure_dir_fd_nofollow, _open_private_regular_at
 from ..supervisor.lifecycle import ACTIVE_STATUSES, TERMINAL_STATUSES, canonical_lifecycle_status
+from ..utils.file_lock import lock_handle
 from ..utils.run_boundary import safe_run_dir, safe_run_logs, safe_run_role, safe_run_rounds
 
 from ..agent_logs import parse_trajectory as parse_agent_trajectory
@@ -903,27 +904,13 @@ class DashboardState:
             fd = _open_private_regular_at(parent_fd, path.name, os.O_WRONLY | os.O_APPEND)
             with os.fdopen(fd, "a", encoding="utf-8") as fh:
                 fd = None
-                try:
-                    # Windows compatibility: use msvcrt.locking instead of fcntl
-                    if sys.platform == "win32":
-                        import msvcrt
-                        msvcrt.locking(fh.fileno(), msvcrt.LK_LOCK, 1)
-                    else:
-                        import fcntl
-                        fcntl.flock(fh.fileno(), fcntl.LOCK_EX)
-                except ImportError as exc:
-                    raise OSError("secure approval-log locking is unavailable") from exc
-                try:
+                # lock_handle seeks to a fixed byte before both operations, so
+                # concurrent appenders contend on the same range instead of
+                # each locking whatever offset the append left them at.
+                with lock_handle(fh):
                     fh.write(line)
                     fh.flush()
                     os.fsync(fh.fileno())
-                finally:
-                    if sys.platform == "win32":
-                        import msvcrt
-                        msvcrt.locking(fh.fileno(), msvcrt.LK_UNLCK, 1)
-                    else:
-                        import fcntl
-                        fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
         except (ImportError, OSError):
             # Approval persistence is diagnostic/control state. A read-only or
             # unavailable log must not crash the manager's execution loop.

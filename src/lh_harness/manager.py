@@ -25,6 +25,7 @@ from .environment.remote_files import ensure_remote_dir, write_remote_text
 from .runtime_signals import hard_signal_labels
 from .provider_errors import classify_agent_runtime_failure
 from .trajectory_artifacts import persist_trajectory_artifacts
+from .utils.file_lock import lock_handle
 from .role_prompts import (
     MANAGER_NEXT_BLOCKED,
     MANAGER_NEXT_CLI,
@@ -2443,50 +2444,26 @@ def _append_event(path: Path, event: str, payload: dict[str, Any]) -> None:
             raise OSError("event log is not a private regular file")
         fh = os.fdopen(raw_fd, "a+", encoding="utf-8")
         raw_fd = None
-        with fh:
-            flock = None
-            use_msvcrt = False
+        with fh, lock_handle(fh):
+            # Event ids embed a sequence number derived by counting existing
+            # lines, so the lock must cover both the count and the append.
+            fh.seek(0)
+            sequence = sum(1 for line in fh if line.strip()) + 1
+            fh.seek(0, 2)
+            run_id = path.parents[2].name if len(path.parents) > 2 else "local"
+            record = {
+                "schema_version": 1,
+                "event_id": f"{run_id}:{sequence:06d}",
+                "ts": time.time(),
+                "event": event,
+                **_json_safe(payload),
+            }
+            fh.write(json.dumps(record, ensure_ascii=False, sort_keys=True) + "\n")
+            fh.flush()
             try:
-                if sys.platform == "win32":
-                    import msvcrt
-                    use_msvcrt = True
-                    msvcrt.locking(fh.fileno(), msvcrt.LK_LOCK, 1)
-                else:
-                    import fcntl
-                    flock = fcntl
-                    flock.flock(fh.fileno(), flock.LOCK_EX)
-            except (ImportError, OSError):
+                os.fsync(fh.fileno())
+            except OSError:
                 pass
-            try:
-                fh.seek(0)
-                sequence = sum(1 for line in fh if line.strip()) + 1
-                fh.seek(0, 2)
-                run_id = path.parents[2].name if len(path.parents) > 2 else "local"
-                record = {
-                    "schema_version": 1,
-                    "event_id": f"{run_id}:{sequence:06d}",
-                    "ts": time.time(),
-                    "event": event,
-                    **_json_safe(payload),
-                }
-                fh.write(json.dumps(record, ensure_ascii=False, sort_keys=True) + "\n")
-                fh.flush()
-                try:
-                    os.fsync(fh.fileno())
-                except OSError:
-                    pass
-            finally:
-                if use_msvcrt:
-                    try:
-                        import msvcrt
-                        msvcrt.locking(fh.fileno(), msvcrt.LK_UNLCK, 1)
-                    except OSError:
-                        pass
-                elif flock is not None:
-                    try:
-                        flock.flock(fh.fileno(), flock.LOCK_UN)
-                    except OSError:
-                        pass
     finally:
         if raw_fd is not None:
             try:

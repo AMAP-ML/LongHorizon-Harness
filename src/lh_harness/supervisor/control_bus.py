@@ -19,6 +19,8 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Callable, Iterator
 
+from ..utils.file_lock import acquire_lock, ensure_lockable, lock_handle, release_lock
+
 
 _MAX_CONTROL_RECORD_BYTES = 512 * 1024
 _MAX_CONTROL_LOG_BYTES = 16 * 1024 * 1024
@@ -634,47 +636,14 @@ def _append_jsonl(path: Path, record: dict[str, Any]) -> None:
 def _append_locked_handle(handle: Any, line: str) -> None:
     """Append one already-open control record while holding the process lock."""
 
-    if sys.platform == "win32":
-        # Windows: use msvcrt for file locking
-        import msvcrt
-        try:
-            msvcrt.locking(handle.fileno(), msvcrt.LK_LOCK, 1)
-        except OSError as exc:
-            raise RuntimeError("secure control-log locking is unavailable") from exc
-        try:
-            handle.write(line)
-            handle.flush()
-            os.fsync(handle.fileno())
-        finally:
-            try:
-                msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
-            except OSError:
-                pass
-    else:
-        # Unix/Linux: use fcntl
-        flock = None
-        try:
-            import fcntl  # type: ignore
-            flock = fcntl
-            flock.flock(handle.fileno(), flock.LOCK_EX)
-        except (ImportError, OSError) as exc:
-            # Control commands depend on a cross-process critical section for
-            # unique revisions and idempotency. Continuing without it is a
-            # correctness failure, not a portable fallback.
-            raise RuntimeError("secure control-log locking is unavailable") from exc
-        try:
-            handle.write(line)
-            handle.flush()
-            os.fsync(handle.fileno())
-        finally:
-            flock = None
-            try:
-                import fcntl  # type: ignore
-                flock = fcntl
-            except ImportError:
-                flock = None
-            if flock is not None:
-                flock.flock(handle.fileno(), flock.LOCK_UN)
+    # Control commands depend on a cross-process critical section for unique
+    # revisions and idempotency. Continuing without it is a correctness
+    # failure, not a portable fallback, so lock_handle raises rather than
+    # degrading.
+    with lock_handle(handle):
+        handle.write(line)
+        handle.flush()
+        os.fsync(handle.fileno())
 
 
 def _read_jsonl(path: Path) -> list[dict[str, Any]]:
@@ -791,51 +760,33 @@ class ControlBus:
         """
 
         with self._lock:
-            lock_handle = None
             # Directory-boundary failures are surfaced as OSError so callers
             # can distinguish an invalid/symlinked run layout from a platform
             # that cannot provide a process lock.  Once the anchored parent
             # exists, lock setup failures below are normalized to RuntimeError.
             parent_fd: int | None = _ensure_dir_fd_nofollow(self.root)
             lock_fd: int | None = None
-            flock = None
-            use_msvcrt = False
+            handle = None
 
             try:
-                # Windows path: use msvcrt.locking()
-                if sys.platform == "win32":
-                    import msvcrt
+                # Keep the directory descriptor returned by the no-follow
+                # creation walk.  Reopening ``self.root`` by path here would
+                # reintroduce a swap window between validation and lock open.
+                lock_fd = _open_private_regular_at(parent_fd, self.lock_path.name, os.O_RDWR)
+                handle = os.fdopen(lock_fd, "a+")
+                lock_fd = None
+                # acquire_lock seeks to a fixed byte on Windows, so a freshly
+                # created (zero-length) lock file still has a range to take.
+                acquire_lock(handle)
+                ensure_lockable(handle)
 
-                    use_msvcrt = True
-                    lock_fd = _open_private_regular_at(parent_fd, self.lock_path.name, os.O_RDWR)
-                    lock_handle = os.fdopen(lock_fd, "a+")
-                    lock_fd = None
-
-                    # Acquire exclusive lock using msvcrt
-                    msvcrt.locking(lock_handle.fileno(), msvcrt.LK_LOCK, 1)
-                else:
-                    # Unix/Linux path: use fcntl
-                    import fcntl  # type: ignore
-
-                    flock = fcntl
-                    # Keep the directory descriptor returned by the no-follow
-                    # creation walk.  Reopening ``self.root`` by path here would
-                    # reintroduce a swap window between validation and lock open.
-                    nofollow = getattr(os, "O_NOFOLLOW", 0)
-                    if not nofollow:
-                        raise OSError("secure control-bus locking is unavailable")
-                    lock_fd = _open_private_regular_at(parent_fd, self.lock_path.name, os.O_RDWR)
-                    lock_handle = os.fdopen(lock_fd, "a+")
-                    lock_fd = None
-                    flock.flock(lock_handle.fileno(), flock.LOCK_EX)
-
-            except (ImportError, OSError) as exc:
-                if lock_handle is not None:
+            except (ImportError, OSError, RuntimeError) as exc:
+                if handle is not None:
                     try:
-                        lock_handle.close()
+                        handle.close()
                     except OSError:
                         pass
-                    lock_handle = None
+                    handle = None
                 if lock_fd is not None:
                     try:
                         os.close(lock_fd)
@@ -850,15 +801,11 @@ class ControlBus:
             try:
                 yield
             finally:
-                if lock_handle is not None:
+                if handle is not None:
                     try:
-                        if use_msvcrt:
-                            import msvcrt
-                            msvcrt.locking(lock_handle.fileno(), msvcrt.LK_UNLCK, 1)
-                        elif flock is not None:
-                            flock.flock(lock_handle.fileno(), flock.LOCK_UN)
+                        release_lock(handle)
                     finally:
-                        lock_handle.close()
+                        handle.close()
                 if parent_fd is not None:
                     try:
                         os.close(parent_fd)

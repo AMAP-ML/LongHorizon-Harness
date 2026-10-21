@@ -18,13 +18,39 @@ from __future__ import annotations
 import atexit
 import os
 import signal
+import subprocess  # module scope: the except tuple in signal_process_group
 import sys
 import threading
 import time
 
+_TASK_TIMEOUT = 5
+
 _lock = threading.Lock()
 _tracked: set[int] = set()
 _installed = False
+
+
+def hard_kill_sig() -> int:
+    """Return the uncatchable-kill signal number for this platform.
+
+    ``signal.SIGKILL`` exists on POSIX but *not* on native Windows, so it must
+    never be evaluated as an attribute there. Callers that escalate should use
+    this instead; on Windows the result is SIGTERM, and
+    ``signal_process_group`` maps that onto ``taskkill /F``.
+    """
+
+    return getattr(signal, "SIGKILL", signal.SIGTERM)
+
+
+def hard_kill_sig_name() -> str:
+    """Return the name of the platform's hard-kill signal.
+
+    ``signal.SIGKILL.name`` is what control-plane records carry, but the
+    attribute does not exist on native Windows, so the name must be derived
+    from the resolved signal rather than the constant.
+    """
+
+    return signal.Signals(hard_kill_sig()).name
 
 
 def track_process_group(pid: int) -> None:
@@ -42,33 +68,30 @@ def signal_process_group(pid: int, sig: int) -> bool:
     """Best-effort ``killpg``; False means the group is already gone."""
     try:
         if sys.platform == "win32":
-            # Windows doesn't have process groups like Unix
-            # Try to kill the process directly
-            import subprocess
-            if sig == signal.SIGTERM or sig == 0:
-                # For SIGTERM or signal 0 (existence check), use tasklist
+            # Windows has neither process groups nor SIGKILL, so termination is
+            # expressed through taskkill. ``sig`` is only meaningful as 0
+            # (existence probe), SIGTERM (soft: WM_CLOSE), or anything else
+            # (hard: /F), which is what hard_kill_sig() yields here.
+            if sig == 0:
                 result = subprocess.run(
                     ['tasklist', '/FI', f'PID eq {pid}'],
                     capture_output=True,
                     text=True,
-                    timeout=5
+                    timeout=_TASK_TIMEOUT,
                 )
-                if result.returncode != 0 or str(pid) not in result.stdout:
-                    return False
-                if sig == 0:
-                    # Just checking existence
-                    return True
-                # Actually terminate
-                subprocess.run(['taskkill', '/F', '/T', '/PID', str(pid)],
-                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-            elif sig == signal.SIGKILL:
-                subprocess.run(['taskkill', '/F', '/T', '/PID', str(pid)],
-                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                return result.returncode == 0 and str(pid) in result.stdout
+            argv = ['taskkill', '/T', '/PID', str(pid)]
+            if sig != signal.SIGTERM:
+                argv.insert(1, '/F')
+            subprocess.run(
+                argv,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=_TASK_TIMEOUT,
+            )
             return True
-        else:
-            # Unix/Linux: use killpg
-            os.killpg(pid, sig)
-            return True
+        os.killpg(pid, sig)
+        return True
     except (ProcessLookupError, PermissionError, OSError, subprocess.TimeoutExpired):
         return False
 
@@ -88,7 +111,7 @@ def kill_process_group(pid: int, *, grace_seconds: float = 1.0) -> None:
         if not signal_process_group(pid, 0):
             return
         time.sleep(0.05)
-    signal_process_group(pid, signal.SIGKILL)
+    signal_process_group(pid, hard_kill_sig())
 
 
 def kill_all_tracked() -> None:
