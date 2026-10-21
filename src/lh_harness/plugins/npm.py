@@ -35,6 +35,7 @@ def _tool_version(binary: str) -> str:
             [path, "--version"],
             capture_output=True,
             text=True,
+            errors="replace",
             timeout=10,
             check=False,
         )
@@ -114,6 +115,7 @@ def _run(
             command,
             capture_output=True,
             text=True,
+            errors="replace",
             timeout=timeout,
             check=False,
         )
