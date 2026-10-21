@@ -521,6 +521,12 @@ Dashboard 会展示每一轮的任务规划、执行结果、审计证据和返�
 | 📁 **工作区** | 执行过程中产生的文件和交付物 |
 | ✅ **最终报告** | 经过验证的任务结果 |
 
+## Windows 说明
+
+Windows 已支持（CI 含 \windows-latest\ 全量测试矩阵）。控制台编码、Store
+版 CLI 别名、代理与 GUI 会话等注意事项见
+[docs/windows-troubleshooting.md](docs/windows-troubleshooting.md)。
+
 ## 评测复现
 
 `eval/` 提供三个固定版本的评测复现套件：

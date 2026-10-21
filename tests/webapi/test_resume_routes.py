@@ -29,7 +29,7 @@ class FakeProcess:
 def client(monkeypatch, tmp_path: Path):
     process = FakeProcess()
     monkeypatch.setattr("lh_harness.supervisor.service.subprocess.Popen", lambda *a, **k: process)
-    monkeypatch.setattr("lh_harness.supervisor.service.os.killpg", lambda *a, **k: None)
+    monkeypatch.setattr("lh_harness.supervisor.service._signal_worker", lambda *a, **k: None)
     root = tmp_path / "runs"
     workspace = tmp_path / "workspace"
     workspace.mkdir()

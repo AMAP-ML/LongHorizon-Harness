@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import re
 from typing import Any
 
@@ -202,9 +203,11 @@ def audit_report_from_episode_result(
             action_guidance=_text("runtime_failed_guidance", language),
         )
 
-    report_text = compact_auditor_report_text(
-        extract_auditor_report_text(_episode_visible_output(result))
-    )
+    visible_raw = _episode_visible_output(result)
+    structured = _extract_structured_audit(visible_raw)
+    report_text = compact_auditor_report_text(extract_auditor_report_text(visible_raw))
+    if structured is None:
+        structured = _extract_structured_audit(report_text)
     if not _has_valid_control_header(report_text):
         report_text = _invalid_control_header_report(report_text, language=language)
     status = infer_report_status(report_text)
@@ -212,6 +215,12 @@ def audit_report_from_episode_result(
     action_guidance = extract_action_guidance(report_text)
     integrity_status, integrity_findings = infer_integrity_findings(report_text)
     contract_audit_status = infer_contract_audit_status(report_text)
+    if structured:
+        status = structured.get("status", status)
+        integrity_status = structured.get("integrity_status", integrity_status)
+        contract_audit_status = structured.get("contract_audit_status", contract_audit_status)
+        if "integrity_findings" in structured:
+            integrity_findings = structured["integrity_findings"]
     artifact_actions = extract_deleted_artifact_actions(report_text) if integrity_status == "violation" else []
     if result.metadata.get("verifier_workspace_mutation_detected"):
         paths = _mutation_paths(result.metadata.get("verifier_workspace_mutations"))
@@ -292,17 +301,37 @@ def audit_report_from_episode_result(
 
 
 def parse_audit_report(raw: str, round_index: int, *, language: str = "en") -> AuditReport:
+    structured = _extract_structured_audit(raw)
     report_text = compact_auditor_report_text(extract_auditor_report_text(raw))
+    if structured is None:
+        structured = _extract_structured_audit(report_text)
     if not _has_valid_control_header(report_text):
         report_text = _invalid_control_header_report(report_text, language=language)
     status = infer_report_status(report_text)
     integrity_status, integrity_findings = infer_integrity_findings(report_text)
     contract_audit_status = infer_contract_audit_status(report_text)
+    if structured:
+        # The fenced JSON verdict is the machine-readable authority; each
+        # field falls back to the control-header inference independently.
+        status = structured.get("status", status)
+        integrity_status = structured.get("integrity_status", integrity_status)
+        contract_audit_status = structured.get("contract_audit_status", contract_audit_status)
+        if "integrity_findings" in structured:
+            integrity_findings = structured["integrity_findings"]
     report_text, status, contract_audit_status = _apply_acceptance_constraint_guard(
         report_text, status, contract_audit_status, language=language
     )
     if (integrity_status == "violation" or contract_audit_status != "aligned") and status == "complete":
         status = "incomplete"
+    if integrity_status == "violation":
+        declared = structured.get("deleted_artifacts") if structured else None
+        artifact_actions = (
+            _normalize_structured_deletions(declared)
+            if declared is not None
+            else extract_deleted_artifact_actions(report_text)
+        )
+    else:
+        artifact_actions = []
     return AuditReport(
         round_id=f"round_{round_index}",
         status=status,
@@ -312,7 +341,7 @@ def parse_audit_report(raw: str, round_index: int, *, language: str = "en") -> A
         integrity_status=integrity_status,
         contract_audit_status=contract_audit_status,
         integrity_findings=integrity_findings,
-        artifact_actions=extract_deleted_artifact_actions(report_text) if integrity_status == "violation" else [],
+        artifact_actions=artifact_actions,
     )
 
 
@@ -346,6 +375,70 @@ def infer_report_status(text: str) -> str:
 
 def infer_contract_audit_status(text: str) -> str:
     return _parse_contract_audit_control_header(text) or "unknown"
+
+
+_STRUCTURED_AUDIT_RE = re.compile(r"```json\s*\n(.*?)```", re.S)
+_AUDIT_STATUS_VALUES = frozenset({"complete", "incomplete", "blocked"})
+_AUDIT_INTEGRITY_VALUES = frozenset({"clean", "suspect", "violation"})
+_AUDIT_CONTRACT_VALUES = frozenset({"aligned", "unknown", "needs_revision", "invalid"})
+
+
+def _extract_structured_audit(text: str) -> dict[str, Any] | None:
+    """Return the last valid fenced ```json audit summary, or ``None``.
+
+    The auditor prompt asks for a machine-readable verdict block after the
+    prose sections.  Every field is validated independently so a partially
+    broken block still contributes its trustworthy fields, and reports from
+    older prompts (no JSON at all) keep parsing exactly as before.
+    """
+
+    if "```json" not in str(text or ""):
+        return None
+    for match in reversed(list(_STRUCTURED_AUDIT_RE.finditer(text))):
+        try:
+            payload = json.loads(match.group(1))
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(payload, dict):
+            continue
+        structured: dict[str, Any] = {}
+        if payload.get("status") in _AUDIT_STATUS_VALUES:
+            structured["status"] = payload["status"]
+        if payload.get("integrity_status") in _AUDIT_INTEGRITY_VALUES:
+            structured["integrity_status"] = payload["integrity_status"]
+        if payload.get("contract_audit_status") in _AUDIT_CONTRACT_VALUES:
+            structured["contract_audit_status"] = payload["contract_audit_status"]
+        findings = payload.get("integrity_findings")
+        if isinstance(findings, list):
+            structured["integrity_findings"] = [item for item in findings if isinstance(item, dict)]
+        deleted = payload.get("deleted_artifacts")
+        if isinstance(deleted, list):
+            structured["deleted_artifacts"] = [item for item in deleted if isinstance(item, dict)]
+        if structured:
+            return structured
+    return None
+
+
+def _normalize_structured_deletions(entries: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Shape structured `deleted_artifacts` like the regex-declared ledger."""
+
+    actions: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for item in entries:
+        path = str(item.get("path") or "").strip()
+        if not path or path in seen:
+            continue
+        seen.add(path)
+        actions.append(
+            {
+                "action": "delete",
+                "status": "delete_declared_unverified",
+                "path": path,
+                "reason": str(item.get("reason") or ""),
+                "declaration": "structured audit summary",
+            }
+        )
+    return actions
 
 
 def _apply_acceptance_constraint_guard(

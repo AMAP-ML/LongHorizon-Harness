@@ -9,6 +9,7 @@ from ..agent_logs import visible_output as extract_visible_output
 from ..agent_registry import normalise_reasoning_effort
 from ..types import DEFAULT_DEEPSEEK_HARNESS_MODEL
 from ..utils.agent_cli import resolve_dsh_binary
+from ..utils.platform_shell import env_prefix, shell_quote
 from .cli_agent import CommandAgentAdapter
 
 _READ_ONLY_ROLES = {
@@ -68,28 +69,27 @@ class DeepSeekHarnessAdapter(CommandAgentAdapter):
         dsh_binary = resolve_dsh_binary() or "dsh"
 
         environment = [
-            f"DSH_HOME={shlex.quote(isolated_home)}",
-            f"DSH_PERMISSION_MODE={shlex.quote(permission_mode)}",
+            ("DSH_HOME", isolated_home),
+            ("DSH_PERMISSION_MODE", permission_mode),
         ]
         if api_key:
-            environment.append(f"DEEPSEEK_API_KEY={shlex.quote(api_key)}")
+            environment.append(("DEEPSEEK_API_KEY", api_key))
         if base_url:
-            environment.append(f"DEEPSEEK_BASE_URL={shlex.quote(base_url)}")
+            environment.append(("DEEPSEEK_BASE_URL", base_url))
 
         command = [
-            *environment,
             shlex.quote(sys.executable),
             "-m",
             "lh_harness.adapters.deepseek_runner",
             "--binary",
-            shlex.quote(dsh_binary),
+            shell_quote(dsh_binary),
             "--prompt",
             "{prompt_path}",
             "--model",
-            shlex.quote(normalized_model),
+            shell_quote(normalized_model),
         ]
         super().__init__(
-            command_template=" ".join(command),
+            command_template=f"{env_prefix(environment)}{' '.join(command)}",
             workspace_path=workspace_path,
             prompt_dir=prompt_dir,
             visible_output_parser=visible_output_parser or extract_visible_output,

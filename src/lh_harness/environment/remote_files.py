@@ -10,8 +10,16 @@ from .base import Environment
 from ..types import DEFAULT_TMP_DIR
 
 
+def _remote_parent(path: str) -> str:
+    """Parent of a remote path, handling both POSIX and Windows separators."""
+
+    normalized = str(path).rstrip("/\\")
+    cut = max(normalized.rfind("/"), normalized.rfind("\\"))
+    return normalized[:cut] if cut > 0 else ""
+
+
 async def write_remote_text(env: Environment, remote_path: str, content: str, mode: str = "0644") -> None:
-    parent = posixpath.dirname(remote_path.rstrip("/"))
+    parent = _remote_parent(remote_path)
     if parent:
         await ensure_remote_dir(env, parent)
 
@@ -33,12 +41,20 @@ async def write_remote_text(env: Environment, remote_path: str, content: str, mo
             except FileNotFoundError:
                 pass
 
-    result = await env.exec(f"chmod {shlex.quote(mode)} {shlex.quote(remote_path)}", timeout=30)
+    native_chmod = getattr(env, "chmod", None)
+    if callable(native_chmod):
+        await native_chmod(str(remote_path), mode)
+        return
+    result = await env.exec(f"chmod {shlex.quote(mode)} {shlex.quote(str(remote_path))}", timeout=30)
     if result.exit_code != 0:
         raise RuntimeError(f"failed chmod {remote_path}: {result.stderr or result.stdout}")
 
 
 async def ensure_remote_dir(env: Environment, remote_path: str) -> None:
-    result = await env.exec(f"mkdir -p {shlex.quote(remote_path)}", timeout=30)
+    native_ensure = getattr(env, "ensure_dir", None)
+    if callable(native_ensure):
+        await native_ensure(str(remote_path))
+        return
+    result = await env.exec(f"mkdir -p {shlex.quote(str(remote_path))}", timeout=30)
     if result.exit_code != 0:
         raise RuntimeError(f"failed creating {remote_path}: {result.stderr or result.stdout}")

@@ -51,7 +51,12 @@ def state_path() -> Path:
 
 def mcp_config_path(plugin_id: str, agent: str) -> Path:
     # Each agent gets its own native format; nothing is translated at run time.
-    suffix = "toml" if agent == "codex" else "mcp.json"
+    if agent == "codex":
+        suffix = "toml"
+    elif agent == "opencode":
+        suffix = "opencode.json"
+    else:
+        suffix = "mcp.json"
     return plugin_dir(plugin_id) / agent / f"{plugin_id}.{suffix}"
 
 
@@ -70,7 +75,20 @@ def write_mcp_config(
 
         _atomic_write(target, mcp_server_block(server_name, command, args))
         return target
-    entry: dict[str, object] = {"command": command}
+    if agent == "opencode":
+        # OpenCode reads MCP servers from the `mcp` key of its config file;
+        # the harness merges this payload into OPENCODE_CONFIG at run time.
+        entry: dict[str, object] = {
+            "type": "local",
+            "command": command,
+            "enabled": True,
+        }
+        if args:
+            entry["args"] = list(args)
+        payload = {"mcp": {server_name: entry}}
+        _atomic_write(target, json.dumps(payload, indent=2, ensure_ascii=False) + "\n")
+        return target
+    entry = {"command": command}
     if args:
         entry["args"] = list(args)
     payload = {"mcpServers": {server_name: entry}}

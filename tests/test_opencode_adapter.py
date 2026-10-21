@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import shlex
 from pathlib import Path
 
@@ -18,10 +19,9 @@ from lh_harness.webapi import server as web_server
 
 
 def _executable(path: Path, body: str) -> str:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text("#!/bin/sh\n" + body, encoding="utf-8")
-    path.chmod(0o755)
-    return str(path)
+    from tests.conftest import write_executable_stub
+
+    return write_executable_stub(path, body)
 
 
 # Real events captured from `opencode run --format json` on v1.18.18.
@@ -166,7 +166,17 @@ def test_opencode_adapter_writes_endpoint_config_for_base_url(
     )
 
     tokens = shlex.split(adapter.command_template.replace("{prompt_path}", "/tmp/prompt.md"))
-    env = dict(item.split("=", 1) for item in tokens if "=" in item and item.split("=", 1)[0] in {"OPENCODE_API_KEY", "OPENCODE_CONFIG"})
+    template = adapter.command_template.replace("{prompt_path}", "/tmp/prompt.md")
+    if os.name == "nt":
+        # cmd serialization: `set "K=V"&& ` segments instead of leading tokens.
+        import re as _re
+
+        env = dict(
+            (m.group(1), m.group(2))
+            for m in _re.finditer(r'set "(OPENCODE_API_KEY|OPENCODE_CONFIG)=([^"]*)"', template)
+        )
+    else:
+        env = dict(item.split("=", 1) for item in tokens if "=" in item and item.split("=", 1)[0] in {"OPENCODE_API_KEY", "OPENCODE_CONFIG"})
     assert env["OPENCODE_API_KEY"] == "sk-test"
     config_path = env["OPENCODE_CONFIG"]
     config = json.loads(Path(config_path).read_text(encoding="utf-8"))

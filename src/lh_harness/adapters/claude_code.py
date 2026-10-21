@@ -23,6 +23,7 @@ from ..types import (
     EpisodeBudget,
     EpisodeResult,
 )
+from ..utils.platform_shell import env_prefix, shell_quote
 from .cli_agent import CommandAgentAdapter
 
 
@@ -44,21 +45,20 @@ class ClaudeCodeAdapter(CommandAgentAdapter):
     ) -> None:
         policy = policy_for_role(role)
         effort = normalise_reasoning_effort(reasoning_effort)
-        env_parts: list[str] = []
+        env_assignments: list[tuple[str, str]] = []
         if api_key:
-            quoted_key = shlex.quote(api_key)
-            env_parts.append(f"ANTHROPIC_API_KEY={quoted_key}")
-            env_parts.append(f"ANTHROPIC_AUTH_TOKEN={quoted_key}")
+            env_assignments.append(("ANTHROPIC_API_KEY", api_key))
+            env_assignments.append(("ANTHROPIC_AUTH_TOKEN", api_key))
         if base_url:
             raw_url = base_url.rstrip("/")
             if raw_url.endswith("/v1"):
                 raw_url = raw_url[:-3]
-            env_parts.append(f"ANTHROPIC_BASE_URL={shlex.quote(raw_url)}")
-        env_parts.extend(
+            env_assignments.append(("ANTHROPIC_BASE_URL", raw_url))
+        env_assignments.extend(
             [
-                "CLAUDE_CODE_DISABLE_AUTO_MEMORY=1",
-                "CLAUDE_CODE_SKIP_PROMPT_HISTORY=1",
-                f"LH_HARNESS_CLAUDE_ROLE={shlex.quote(role)}",
+                ("CLAUDE_CODE_DISABLE_AUTO_MEMORY", "1"),
+                ("CLAUDE_CODE_SKIP_PROMPT_HISTORY", "1"),
+                ("LH_HARNESS_CLAUDE_ROLE", role),
             ]
         )
 
@@ -83,15 +83,15 @@ class ClaudeCodeAdapter(CommandAgentAdapter):
             )
 
         if is_auditor_role(role):
-            env_parts.extend(
+            env_assignments.extend(
                 [
-                    "GIT_OPTIONAL_LOCKS=0",
-                    "GIT_PAGER=cat",
-                    "PAGER=cat",
+                    ("GIT_OPTIONAL_LOCKS", "0"),
+                    ("GIT_PAGER", "cat"),
+                    ("PAGER", "cat"),
                 ]
             )
 
-        env_prefix = (" ".join(env_parts) + " ") if env_parts else ""
+        env_prefix_text = env_prefix(env_assignments)
         command_parts = [
             "claude",
             "--print",
@@ -107,15 +107,15 @@ class ClaudeCodeAdapter(CommandAgentAdapter):
         deny_tools = [*policy.disallowed_tools, *path_deny_rules(hidden_paths)]
         if deny_tools:
             command_parts.append("--disallowedTools")
-            command_parts.extend(shlex.quote(tool) for tool in deny_tools)
+            command_parts.extend(shell_quote(tool) for tool in deny_tools)
         self.computer_mcp_configured = bool(policy.load_computer_mcp and mcp_config)
         if self.computer_mcp_configured:
-            command_parts.extend(["--mcp-config", shlex.quote(mcp_config)])
-        command_parts.extend(["--model", shlex.quote(model)])
+            command_parts.extend(["--mcp-config", shell_quote(mcp_config)])
+        command_parts.extend(["--model", shell_quote(model)])
         # Claude Code warns and continues at its default when the value is not
         # one it knows, so an unusable effort will not fail the run here.
         if effort:
-            command_parts.extend(["--effort", shlex.quote(effort)])
+            command_parts.extend(["--effort", shell_quote(effort)])
 
         self.role = role
         self.policy = policy
@@ -125,7 +125,7 @@ class ClaudeCodeAdapter(CommandAgentAdapter):
         # legitimately churn (build outputs) during an audit window.
         self.guard_exclude_paths = tuple(guard_exclude_paths)
         super().__init__(
-            command_template=f"{env_prefix}{' '.join(command_parts)} < {{prompt_path}}",
+            command_template=f"{env_prefix_text}{' '.join(command_parts)} < {{prompt_path}}",
             prompt_dir=prompt_dir,
             workspace_path=workspace_path,
             visible_output_parser=extract_claude_visible_output,

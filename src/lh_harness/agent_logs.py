@@ -718,6 +718,46 @@ def _opencode_result_step(
     return result
 
 
+def token_usage(raw: str) -> dict[str, Any]:
+    """Sum provider token usage across every record in a trajectory.
+
+    Understands the two shapes the adapters emit: Codex/Claude top-level
+    ``usage`` objects and OpenCode ``part.tokens`` maps (with ``cache.read``
+    and ``cost``).  Unknown shapes contribute nothing, so the helper is safe
+    to run over any backend's stdout.
+    """
+
+    totals: dict[str, Any] = {
+        "input_tokens": 0,
+        "cached_input_tokens": 0,
+        "output_tokens": 0,
+        "reasoning_tokens": 0,
+        "cost_usd": 0.0,
+    }
+    for record in _json_records(raw):
+        part = record.get("part") if isinstance(record.get("part"), dict) else {}
+        tokens = part.get("tokens") if isinstance(part.get("tokens"), dict) else {}
+        cache = tokens.get("cache") if isinstance(tokens.get("cache"), dict) else {}
+        usage = record.get("usage") if isinstance(record.get("usage"), dict) else {}
+        samples = {
+            "input_tokens": (tokens.get("input"), usage.get("input_tokens")),
+            "cached_input_tokens": (cache.get("read"), usage.get("cached_input_tokens")),
+            "output_tokens": (tokens.get("output"), usage.get("output_tokens")),
+            "reasoning_tokens": (tokens.get("reasoning"), usage.get("reasoning_tokens")),
+        }
+        for key, values in samples.items():
+            for value in values:
+                if isinstance(value, (int, float)) and not isinstance(value, bool):
+                    totals[key] += value
+                    break
+        cost = part.get("cost")
+        if not isinstance(cost, (int, float)) or isinstance(cost, bool):
+            cost = usage.get("cost_usd")
+        if isinstance(cost, (int, float)) and not isinstance(cost, bool):
+            totals["cost_usd"] += cost
+    return totals
+
+
 # ----------------------------------------------------------------------------
 # Untyped chat transcripts
 # ----------------------------------------------------------------------------

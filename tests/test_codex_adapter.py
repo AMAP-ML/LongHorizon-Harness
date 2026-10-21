@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import shlex
 from pathlib import Path
 
@@ -10,6 +11,7 @@ from fastapi.testclient import TestClient
 from lh_harness.adapters import codex as codex_adapter_module
 from lh_harness.adapters.codex import CodexAdapter
 from lh_harness.utils import agent_cli
+from lh_harness.utils.platform_shell import shell_quote
 from lh_harness.utils.agent_cli import (
     is_agent_binary_available,
     resolve_agent_binary,
@@ -25,10 +27,9 @@ def _executable(path: Path) -> str:
     like a real CLI; a bare `exit 0` is correctly reported as installed but
     unusable.
     """
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text('#!/bin/sh\necho "codex-cli 1.2.3"\nexit 0\n', encoding="utf-8")
-    path.chmod(0o755)
-    return str(path)
+    from tests.conftest import write_executable_stub
+
+    return write_executable_stub(path, 'echo "codex-cli 1.2.3"\nexit 0\n')
 
 
 @pytest.mark.parametrize(
@@ -101,7 +102,7 @@ def test_codex_adapter_quotes_resolved_binary_with_spaces(monkeypatch, tmp_path:
     monkeypatch.setattr(codex_adapter_module, "resolve_codex_binary", lambda: binary)
 
     adapter = CodexAdapter(model=None)
-    expected_binary = shlex.quote(binary)
+    expected_binary = shell_quote(binary)
 
     assert adapter.command_template.startswith(f"{expected_binary} exec ")
     assert adapter.command_template.endswith(" - < {prompt_path}")
@@ -109,7 +110,10 @@ def test_codex_adapter_quotes_resolved_binary_with_spaces(monkeypatch, tmp_path:
     # Parsing the command without the prompt placeholder confirms the quoted
     # path remains one executable token when handed to a POSIX shell.
     command_without_placeholder = adapter.command_template.removesuffix(" < {prompt_path}")
-    assert shlex.split(command_without_placeholder)[0] == binary
+    if os.name == "nt":
+        assert command_without_placeholder.split(" exec ")[0].strip('"') == binary
+    else:
+        assert shlex.split(command_without_placeholder)[0] == binary
 
 
 def test_web_meta_reports_the_resolved_codex_binary(monkeypatch, tmp_path: Path) -> None:

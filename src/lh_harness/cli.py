@@ -63,7 +63,7 @@ _AGENTS = (
     ("opencode", "opencode", DEFAULT_OPENCODE_MODEL),
 )
 _AGENT_CHOICES = tuple(name for name, _, _ in _AGENTS)
-_MCP_AGENT_CHOICES = ("claude_code", "codex")
+_MCP_AGENT_CHOICES = ("claude_code", "codex", "opencode")
 # Each agent reads MCP config in its own format, so each gets its own flag.
 _MCP_CONFIG_DESTS = {"claude_code": "claude_mcp_config", "codex": "codex_mcp_config"}
 
@@ -385,7 +385,33 @@ def _fallback_hint(role: str, suffix: str) -> str:
     return ", then ".join(chain)
 
 
+def _force_utf8_stdio() -> None:
+    """Make all console/pipe output UTF-8 on Windows.
+
+    The harness's durable artifacts (reports, events, trajectories) are UTF-8;
+    without this, the same Chinese text prints as mojibake through a cp936
+    pipe and redirected logs become unreadable to every other tool in the
+    chain.  The console output codepage is switched to 65001 as well so legacy
+    conhost windows decode the bytes correctly.
+    """
+
+    if os.name != "nt":
+        return
+    try:
+        import ctypes
+
+        ctypes.windll.kernel32.SetConsoleOutputCP(65001)
+    except (OSError, AttributeError, ImportError):
+        pass
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(encoding="utf-8", errors="replace")
+        except (AttributeError, OSError, ValueError):
+            pass
+
+
 def main(argv: list[str] | None = None) -> int:
+    _force_utf8_stdio()
     raw_argv = list(sys.argv[1:] if argv is None else argv)
     run_defaults: dict[str, object] = {}
     config_error: ProjectConfigError | None = None
@@ -1722,7 +1748,8 @@ def _run_command(args: argparse.Namespace) -> int:
     def resolve_mcp_config(agent_name: str) -> str | None:
         # The agent's own --*-mcp-config wins; otherwise the installed
         # computer-use plugin with the highest priority is loaded for this agent.
-        if agent_name in {"deepseek_harness", "opencode"}:
+        # DeepSeek Harness phase 1 has no MCP integration yet.
+        if agent_name == "deepseek_harness":
             return None
         override = getattr(args, _MCP_CONFIG_DESTS[agent_name], None)
         if override:
@@ -2277,6 +2304,7 @@ def _build_agent(
             prompt_dir=prompt_dir,
             role=role,
             hidden_paths=hidden_paths,
+            mcp_config=mcp_config,
             reasoning_effort=reasoning_effort,
         )
         if model is not None:

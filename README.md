@@ -520,6 +520,12 @@ Every run is stored in an isolated `runs/<run-id>/` directory. The complete task
 | 📁 **Workspace** | Files and artifacts produced during execution |
 | ✅ **Final report** | The verified outcome of the task |
 
+## Windows Notes
+
+Windows is supported (CI runs the full suite on \windows-latest\). Console
+encoding, Store-installed CLI aliases, proxy quirks and GUI-session
+requirements are collected in [docs/windows-troubleshooting.md](docs/windows-troubleshooting.md).
+
 ## Evaluation Reproduction
 
 `eval/` provides frozen reproduction suites for three benchmarks:
