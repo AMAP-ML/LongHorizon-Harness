@@ -577,6 +577,7 @@ _RESUME_CLEARED_OWNER_KEYS = frozenset({
     "process_command",
     "signal_mode",
     "attached",
+    "managed",
 })
 
 
@@ -2441,6 +2442,7 @@ class RunSupervisor:
             "workspace": str(workspace_path),
             "resumed_from": run_id,
             "resume_kind": "continue",
+            "managed": True,
             RESUME_EPOCH_KEY: epoch,
         }
         if reasoning_effort:

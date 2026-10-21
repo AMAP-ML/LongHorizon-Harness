@@ -24,7 +24,7 @@ _ROLE_NAMES = {
     "cli_auditor",
     "final_response",
 }
-_TIMEOUT_NAMES = {"manager", "gui_executor", "cli_executor", "auditor"}
+_TIMEOUT_NAMES = {"manager", "gui_executor", "cli_executor", "auditor", "final_response"}
 _RUN_KEYS = {
     "agent",
     "model",
@@ -105,6 +105,8 @@ manager = 300
 gui_executor = 1800
 cli_executor = 1800
 auditor = 300
+# Override the closing reply budget. Unset clamps the manager timeout to 60-180s.
+# final_response = 180
 
 [run.roles.manager]
 # agent = "codex"
