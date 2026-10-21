@@ -4,8 +4,12 @@ import pytest
 
 from lh_harness.prompt_texts import AUDITOR_CONTRACT_BACKCHECK, TASK_CONTRACT_RULES
 from lh_harness.role_prompts import (
+    MANAGER_NEXT_ASK,
+    MANAGER_NEXT_BLOCKED,
     MANAGER_NEXT_CLI,
     MANAGER_NEXT_DONE,
+    MANAGER_NEXT_GUI,
+    MANAGER_NEXT_INVALID,
     build_role_auditor_prompt,
     build_role_executor_prompt,
     build_role_final_response_prompt,
@@ -92,6 +96,28 @@ def test_manager_route_accepts_delimited_rationale(line: str) -> None:
 
 def test_manager_route_rejects_undelimited_suffix() -> None:
     assert parse_role_manager_next_step("Next: done later") != MANAGER_NEXT_DONE
+    assert parse_role_manager_next_step("Next: done later") == MANAGER_NEXT_INVALID
+    assert parse_role_manager_next_step("please choose Next: cli for this") == MANAGER_NEXT_INVALID
+    assert parse_role_manager_next_step("Next: clipboard") == MANAGER_NEXT_INVALID
+
+
+@pytest.mark.parametrize(
+    ("line", "expected"),
+    [
+        ("`Next: cli`", MANAGER_NEXT_CLI),
+        ("**`Next: cli`**", MANAGER_NEXT_CLI),
+        ("`Next: cli` — routed to the CLI executor", MANAGER_NEXT_CLI),
+        ("`Next: cliTask:` Read-only CLI diagnostic", MANAGER_NEXT_CLI),
+        ("Next: cli Task: list files in the workspace", MANAGER_NEXT_CLI),
+        ("`Next: guiTask:` click the confirm button", MANAGER_NEXT_GUI),
+        ("`Next: askTask:` which output directory?", MANAGER_NEXT_ASK),
+        ("`Next: done`", MANAGER_NEXT_DONE),
+        ("`Next: blockedTask:` waiting on credentials", MANAGER_NEXT_BLOCKED),
+        ("下一步: cli任务 Task: 只读诊断", MANAGER_NEXT_CLI),
+    ],
+)
+def test_manager_route_accepts_markdown_and_same_line_task(line: str, expected: str) -> None:
+    assert parse_role_manager_next_step(line) == expected
 
 
 @pytest.mark.parametrize("language", ["en", "zh"])
