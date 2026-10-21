@@ -695,6 +695,32 @@ def main(argv: list[str] | None = None) -> int:
 
     add_command("check-update", "Check PyPI for a newer LongHorizon-Harness release")
 
+    # MCP Server command
+    mcp_server_parser = add_command(
+        "mcp-server", "Start LongHorizon-Harness as an MCP server"
+    )
+    mcp_server_parser.add_argument(
+        "--state-root",
+        default="~/.lh-harness",
+        help="Root directory for run state storage (default: ~/.lh-harness)",
+    )
+    mcp_server_parser.add_argument(
+        "--transport",
+        choices=["stdio"],
+        default="stdio",
+        help="Transport method (default: stdio)",
+    )
+    mcp_server_parser.add_argument(
+        "--log-level",
+        choices=["DEBUG", "INFO", "WARNING", "ERROR"],
+        default="INFO",
+        help="Logging level (default: INFO)",
+    )
+    mcp_server_parser.add_argument(
+        "--log-file",
+        help="Optional log file path (default: stderr only)",
+    )
+
     args = parser.parse_args(raw_argv)
     if args.command == "run":
         if config_error is not None:
@@ -716,6 +742,8 @@ def main(argv: list[str] | None = None) -> int:
         return _plugin_command(args)
     if args.command == "init":
         return _init_command(args)
+    if args.command == "mcp-server":
+        return _mcp_server_command(args)
     if args.command == "check-update":
         return _check_update_command()
 
@@ -1183,6 +1211,51 @@ def _init_command(args: argparse.Namespace) -> int:
         return 1
     print(f"Created config: {path.resolve()}")
     return 0
+
+
+def _mcp_server_command(args: argparse.Namespace) -> int:
+    """Run the MCP server.
+
+    The server speaks newline-delimited JSON-RPC over stdio, so everything it
+    writes to stdout is protocol traffic. Logging therefore goes to stderr (or
+    an explicit file) and never to stdout.
+    """
+    import asyncio
+    import logging
+    import sys
+
+    handlers: list[logging.Handler] = []
+    if args.log_file:
+        handlers.append(logging.FileHandler(args.log_file))
+    else:
+        handlers.append(logging.StreamHandler(sys.stderr))
+    logging.basicConfig(
+        level=getattr(logging, args.log_level),
+        format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+        handlers=handlers,
+    )
+
+    logger = logging.getLogger(__name__)
+    logger.info("Starting LongHorizon-Harness MCP server")
+    logger.info(f"Transport: {args.transport}")
+    logger.info(f"State root: {args.state_root}")
+
+    try:
+        from .mcp_server import run_mcp_server
+
+        asyncio.run(
+            run_mcp_server(
+                state_root=args.state_root,
+                transport=args.transport,
+            )
+        )
+        return 0
+    except KeyboardInterrupt:
+        logger.info("Server stopped by user")
+        return 0
+    except Exception as exc:
+        logger.error(f"Server error: {exc}", exc_info=True)
+        return 1
 
 
 def _check_update_command() -> int:
