@@ -14,6 +14,7 @@ from __future__ import annotations
 import json
 import os
 import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -50,10 +51,11 @@ def worker(monkeypatch, request):
     """Prevent the supervisor from actually launching an agent CLI."""
 
     # A real, long-lived child stands in for the agent CLI, so the supervisor
-    # sees a live pid. ``cmd /c ping -t`` is used because it is present on
-    # every Windows host and stays alive until it is killed.
+    # sees a live pid. The interpreter itself is used rather than a shell
+    # wrapper: ``cmd /c ping`` spawns ping.exe as a grandchild, and killing
+    # the wrapper leaves that grandchild running.
     child = subprocess.Popen(
-        [os.environ.get("COMSPEC", "cmd.exe"), "/c", "ping", "-t", "127.0.0.1", "-n", "600"],
+        [sys.executable, "-c", "import time; time.sleep(600)"],
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
     )
@@ -74,6 +76,10 @@ def worker(monkeypatch, request):
         try:
             child.kill()
         except OSError:
+            pass
+        try:
+            child.wait(timeout=10)
+        except (OSError, subprocess.TimeoutExpired):
             pass
 
     request.addfinalizer(_cleanup)
