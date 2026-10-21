@@ -111,6 +111,41 @@ def test_success_report_requires_explicit_completion_evidence(
     assert report_status == "completed"
 
 
+@pytest.mark.parametrize("outcome", ["blocked", "incomplete"])
+def test_exit_1_with_current_resumable_report_is_resumable(outcome: str) -> None:
+    lifecycle, report_status = supervisor_service._terminal_status_for_exit(
+        report={"status": outcome},
+        returncode=1,
+        report_is_current=True,
+    )
+
+    assert lifecycle == outcome
+    assert report_status == outcome
+
+
+@pytest.mark.parametrize("returncode", [-9, 137])
+def test_signal_exit_with_resumable_report_is_failed(returncode: int) -> None:
+    lifecycle, report_status = supervisor_service._terminal_status_for_exit(
+        report={"status": "incomplete"},
+        returncode=returncode,
+        report_is_current=True,
+    )
+
+    assert lifecycle == "failed"
+    assert report_status == "incomplete"
+
+
+def test_inherited_resumable_report_is_failed() -> None:
+    lifecycle, report_status = supervisor_service._terminal_status_for_exit(
+        report={"status": "incomplete"},
+        returncode=1,
+        report_is_current=False,
+    )
+
+    assert lifecycle == "failed"
+    assert report_status == "incomplete"
+
+
 def test_historical_completed_report_without_evidence_projects_failed(tmp_path: Path) -> None:
     root = tmp_path / "runs"
     run = root / "run-1"

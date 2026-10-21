@@ -38,6 +38,7 @@ from .control_bus import (
 from .lifecycle import (
     ACTIVE_STATUSES,
     MAX_RESUME_EPOCH,
+    RESUMABLE_OUTCOMES,
     RESUME_EPOCH_KEY,
     TERMINAL_STATUSES,
     canonical_lifecycle_status,
@@ -467,6 +468,24 @@ def _read_report(path: Path) -> dict[str, Any]:
     return value if isinstance(value, dict) else {}
 
 
+def _report_is_current(path: Path, started_at: object) -> bool:
+    """Return whether *path* was written by the current worker generation.
+
+    A resumed run reuses the same log directory, so a report left by the
+    previous generation must not be read as this generation's outcome.  The
+    worker's ``started_at`` is the generation boundary; a missing or
+    unreadable timestamp keeps the historical behaviour (trust the report).
+    """
+    try:
+        boundary = float(started_at)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return True
+    try:
+        return path.stat().st_mtime >= boundary
+    except OSError:
+        return False
+
+
 def _pending_approval(path: Path) -> bool:
     latest: dict[str, dict[str, Any]] = {}
     try:
@@ -497,14 +516,18 @@ def _terminal_status_for_exit(
     report: dict[str, Any],
     returncode: int | None,
     requested_action: str = "",
+    report_is_current: bool = True,
 ) -> tuple[str, str]:
     """Derive process lifecycle status and preserve the audit/report status.
 
     A zero exit code is not enough to claim success: the manager must have
-    written a successful report.  Conversely, every positive non-zero exit is
-    a worker failure even if a partial report happens to say ``complete``.
-    Only an explicit operator stop/abort is a cancellation; an unsolicited
-    signal is treated as a failure/crash.
+    written a successful report.  Conversely, a non-zero exit is a worker
+    failure unless the CLI's deliberate exit code (1) is paired with a report
+    from this generation that carries a resumable outcome
+    (``blocked``/``incomplete``).  Signals and other non-zero exits stay
+    crashes, and an inherited report from an earlier resume generation is not
+    evidence for this one.  Only an explicit operator stop/abort is a
+    cancellation.
     """
 
     action = str(requested_action or "").strip().lower()
@@ -514,6 +537,8 @@ def _terminal_status_for_exit(
     if returncode is None:
         return "running", report_status
     if returncode != 0:
+        if returncode == 1 and report_is_current and report_status in RESUMABLE_OUTCOMES:
+            return report_status, report_status
         return "failed", report_status
     # ``complete``/``completed`` is a claim about the manager's audit result,
     # not proof by itself.  The worker protocol explicitly carries the
@@ -1131,12 +1156,14 @@ class RunSupervisor:
             process = self._processes.get(run_id)
             returncode = process.poll() if process is not None else None
             if process is not None and returncode is not None:
-                report = _read_report(self._run_logs_dir(run_id) / "report.json")
+                report_path = self._run_logs_dir(run_id) / "report.json"
+                report = _read_report(report_path)
                 requested_action = str(status.get("requested_action") or "")
                 lifecycle, report_status = _terminal_status_for_exit(
                     report=report,
                     returncode=returncode,
                     requested_action=requested_action,
+                    report_is_current=_report_is_current(report_path, status.get("started_at")),
                 )
                 existing_lifecycle = canonical_lifecycle_status(status.get("status"), default="")
                 if existing_lifecycle in TERMINAL_STATUSES:
@@ -1895,7 +1922,8 @@ class RunSupervisor:
 
         self._assert_run_scope(run_id)
         bus = self._bus(run_id)
-        run_report = report if isinstance(report, dict) else _read_report(self._run_logs_dir(run_id) / "report.json")
+        report_path = self._run_logs_dir(run_id) / "report.json"
+        run_report = report if isinstance(report, dict) else _read_report(report_path)
         with self._lifecycle_lock:
             current = bus.read_status()
             requested_action = str(current.get("requested_action") or "")
@@ -1903,6 +1931,7 @@ class RunSupervisor:
                 report=run_report,
                 returncode=returncode,
                 requested_action=requested_action,
+                report_is_current=_report_is_current(report_path, current.get("started_at")),
             )
             if reason and candidate == "failed":
                 failure_reason = reason
