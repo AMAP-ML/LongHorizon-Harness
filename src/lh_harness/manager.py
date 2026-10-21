@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import contextvars
 from datetime import datetime, timezone
 import hashlib
 import json
@@ -74,6 +75,11 @@ _MAX_SAVED_TRAJECTORY_BYTES = 16 * 1024 * 1024
 _MAX_FAILURE_REPORT_BYTES = 1 * 1024 * 1024
 _MAX_FAILURE_EVENTS_BYTES = 4 * 1024 * 1024
 _MAX_FAILURE_EVENT_RECORDS = 50_000
+# The run identity readers validate event ids against. The run loop sets this
+# from ``config.run_id``; direct callers keep the legacy path-derived stamp.
+_RUN_EVENT_ID: contextvars.ContextVar[str | None] = contextvars.ContextVar(
+    "lh_run_event_id", default=None
+)
 
 
 def _invalid_completion_feedback(language: str) -> str:
@@ -218,6 +224,16 @@ async def _run_impl(
             progress(event, payload)
         except Exception:  # progress reporting must never break a run
             logger.debug("progress callback failed for %s", event, exc_info=True)
+
+    # Event ids must carry the run identity readers validate them against.
+    _RUN_EVENT_ID.set(config.run_id or None)
+    if config.run_id:
+        # Persist it so a standalone reader (``lh-harness web --log-dir``) can
+        # resolve the same identity instead of guessing from the path.
+        try:
+            _write_local(Path(config.log_dir) / "run_id.txt", config.run_id)
+        except OSError:
+            pass
 
     # Role binding is resolved once at startup so the main loop can stay focused
     # on state transitions instead of adapter fallback logic.
@@ -2437,7 +2453,13 @@ def _append_event(path: Path, event: str, payload: dict[str, Any]) -> None:
                 fh.seek(0)
                 sequence = sum(1 for line in fh if line.strip()) + 1
                 fh.seek(0, 2)
-                run_id = path.parents[2].name if len(path.parents) > 2 else "local"
+                # Event ids must carry the run identity the dashboard/API
+                # validates them against. The run loop sets it from
+                # ``config.run_id``; direct callers keep the legacy
+                # path-derived stamp.
+                run_id = _RUN_EVENT_ID.get() or (
+                    path.parents[2].name if len(path.parents) > 2 else "local"
+                )
                 record = {
                     "schema_version": 1,
                     "event_id": f"{run_id}:{sequence:06d}",

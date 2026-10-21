@@ -1630,6 +1630,9 @@ def _run_command(args: argparse.Namespace) -> int:
         workspace_path=workspace,
         harness_dir=harness_dir,
         log_dir=log_dir,
+        # The embedded dashboard validates event ids against this run id; with
+        # a custom --log-dir the worker cannot recover it from the ledger path.
+        run_id=run_id,
         prompt_language=args.prompt_language,
     )
     env = _build_env(args.env, tmp_dir=str(run_dir / "tmp"))

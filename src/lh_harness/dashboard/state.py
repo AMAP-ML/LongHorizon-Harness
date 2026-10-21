@@ -29,7 +29,7 @@ from typing import Any
 from ..types import DEFAULT_LOG_DIR, MAX_ROUNDS
 from ..supervisor.control_bus import ControlBus, _ensure_dir_fd_nofollow, _open_private_regular_at
 from ..supervisor.lifecycle import ACTIVE_STATUSES, TERMINAL_STATUSES, canonical_lifecycle_status
-from ..utils.run_boundary import safe_run_dir, safe_run_logs, safe_run_role, safe_run_rounds
+from ..utils.run_boundary import resolve_run_id, safe_run_dir, safe_run_logs, safe_run_role, safe_run_rounds
 
 from ..agent_logs import parse_trajectory as parse_agent_trajectory
 from ..role_prompts import parse_role_manager_next_step
@@ -272,6 +272,9 @@ class DashboardState:
 
     @property
     def current_run_id(self) -> str:
+        persisted = resolve_run_id(self.log_dir)
+        if persisted:
+            return persisted
         if self.runs_root is None:
             return ""
         try:
