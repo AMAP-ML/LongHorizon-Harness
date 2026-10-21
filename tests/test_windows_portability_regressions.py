@@ -304,25 +304,6 @@ def test_locking_is_byte_range_not_whole_file(tmp_path):
         msvcrt.locking(first.fileno(), msvcrt.LK_UNLCK, 1)
 
 
-def test_ensure_lockable_is_noop_on_posix(tmp_path, monkeypatch):
-    monkeypatch.setattr(file_lock.sys, "platform", "linux")
-    path = tmp_path / "empty.lock"
-    with open(path, "a+", encoding="utf-8") as fh:
-        before = path.stat().st_size
-        file_lock.ensure_lockable(fh)
-        assert path.stat().st_size == before == 0
-
-
-def test_ensure_lockable_creates_the_lock_byte_on_windows(tmp_path, monkeypatch):
-    """A zero-length file has no range to lock, so the byte must be created."""
-
-    monkeypatch.setattr(file_lock.sys, "platform", "win32")
-    path = tmp_path / "grow.lock"
-    with open(path, "a+", encoding="utf-8") as fh:
-        file_lock.ensure_lockable(fh)
-        assert path.stat().st_size >= 1
-
-
 # --- 4. The control-state boundary must survive on both platforms ---
 
 

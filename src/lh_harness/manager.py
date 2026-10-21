@@ -61,6 +61,7 @@ from .supervisor.control_bus import (
     _atomic_bytes_write,
     _ensure_dir_nofollow,
     _open_nofollow,
+    _open_private_regular_at,
 )
 from .auditor_agent import (
     VISIBLE_OUTPUT_KEYS,
@@ -2409,20 +2410,10 @@ def _append_event(path: Path, event: str, payload: dict[str, Any]) -> None:
     try:
         parent_fd = _open_nofollow(path.parent, directory=True)
 
-        # Windows path: use full path operations with reparse point checking
         if sys.platform == "win32":
-            from lh_harness.supervisor.control_bus import _is_windows_symlink
-
-            # Check if file is a symlink
-            if path.exists() and _is_windows_symlink(path):
-                raise OSError("event log is a symlink")
-
-            # Open with Windows-compatible flags
-            flags = os.O_RDWR | os.O_CREAT | os.O_APPEND | os.O_BINARY
-            if hasattr(os, 'O_NOINHERIT'):
-                flags |= os.O_NOINHERIT
-
-            raw_fd = os.open(path, flags, 0o600)
+            raw_fd = _open_private_regular_at(
+                parent_fd, path.name, os.O_RDWR | os.O_APPEND,
+            )
         else:
             # Unix/Linux path using O_NOFOLLOW and dir_fd
             nofollow = getattr(os, "O_NOFOLLOW", 0)

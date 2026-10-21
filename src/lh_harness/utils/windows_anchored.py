@@ -117,6 +117,11 @@ class _ByHandleFileInformation(ctypes.Structure):
 _kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
 _ntdll = ctypes.WinDLL("ntdll")
 
+_kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+_kernel32.CloseHandle.restype = wintypes.BOOL
+_ntdll.RtlNtStatusToDosError.argtypes = [ctypes.c_long]
+_ntdll.RtlNtStatusToDosError.restype = wintypes.ULONG
+
 _kernel32.CreateFileW.argtypes = [
     wintypes.LPCWSTR,
     wintypes.DWORD,
@@ -166,31 +171,9 @@ def _win_error(message: str) -> OSError:
 
 
 def _nt_status_to_oserror(status: int, name: str) -> OSError:
-    """Translate an ``NTSTATUS`` into an ``OSError``.
-
-    ``NtCreateFile`` does not set the Win32 last-error code, so the status
-    has to be mapped by hand.  Only the codes this module can produce are
-    mapped; anything else becomes a generic error carrying the raw status.
-    """
-
-    code = status & 0xFFFFFFFF
-    if code == 0xC0000034:  # STATUS_OBJECT_NAME_NOT_FOUND
-        return FileNotFoundError(code, f"no such file: {name}")
-    if code == 0xC0000035:  # STATUS_OBJECT_NAME_COLLISION
-        return FileExistsError(code, f"file exists: {name}")
-    if code == 0xC000003A:  # STATUS_OBJECT_NAME_INVALID
-        return OSError(code, f"invalid file name: {name}")
-    if code == 0xC0000031:  # STATUS_OBJECT_PATH_NOT_FOUND
-        return FileNotFoundError(code, f"no such path: {name}")
-    if code == 0xC00000BA:  # STATUS_FILE_IS_A_DIRECTORY
-        return IsADirectoryError(code, f"is a directory: {name}")
-    if code == 0xC0000055:  # STATUS_IO_TIMEOUT
-        return TimeoutError(code, f"timed out: {name}")
-    if code == 0xC0000022:  # STATUS_ACCESS_DENIED
-        return PermissionError(code, f"access denied: {name}")
-    if code == 0xC0000023:  # STATUS_OBJECT_PATH_SYNTAX_BAD
-        return OSError(code, f"invalid path: {name}")
-    return OSError(code, f"Windows call failed for {name} (NTSTATUS 0x{code:08X})")
+    error = ctypes.WinError(_ntdll.RtlNtStatusToDosError(status))
+    error.filename = name
+    return error
 
 
 def _describe_handle(handle: int) -> _ByHandleFileInformation:
@@ -212,11 +195,11 @@ def _handle_to_fd(handle: int, flags: int) -> int:
     of the file.
     """
 
-    fd = msvcrt.open_osfhandle(handle, flags)
-    if fd < 0:
-        raise _win_error("open_osfhandle failed")
-    msvcrt.setmode(fd, os.O_BINARY)
-    return fd
+    try:
+        return msvcrt.open_osfhandle(handle, flags | os.O_BINARY | os.O_NOINHERIT)
+    except BaseException:
+        _kernel32.CloseHandle(handle)
+        raise
 
 
 def _final_path(handle: int) -> Path:
@@ -235,7 +218,7 @@ def _final_path(handle: int) -> Path:
     return Path(text)
 
 
-def open_directory(path: str | Path) -> int:
+def _open_root(path: str | Path) -> int:
     """Open a directory and return a descriptor that anchors it.
 
     The handle is opened without ``FILE_SHARE_DELETE`` so the directory --
@@ -262,14 +245,44 @@ def open_directory(path: str | Path) -> int:
     )
     if not handle or handle == _INVALID_HANDLE_VALUE:
         raise _win_error(f"cannot open directory: {absolute}")
-    info = _describe_handle(handle)
-    if info.dwFileAttributes & _FILE_ATTRIBUTE_REPARSE_POINT:
+    try:
+        info = _describe_handle(handle)
+        if info.dwFileAttributes & _FILE_ATTRIBUTE_REPARSE_POINT:
+            raise OSError(f"control-bus path contains a reparse point: {absolute}")
+        if not info.dwFileAttributes & _FILE_ATTRIBUTE_DIRECTORY:
+            raise OSError(f"control-bus component is not a directory: {absolute}")
+    except BaseException:
         _kernel32.CloseHandle(handle)
-        raise OSError(f"control-bus path contains a reparse point: {absolute}")
-    if not info.dwFileAttributes & _FILE_ATTRIBUTE_DIRECTORY:
-        _kernel32.CloseHandle(handle)
-        raise OSError(f"control-bus component is not a directory: {absolute}")
-    return _handle_to_fd(handle, os.O_RDONLY | os.O_BINARY)
+        raise
+    return _handle_to_fd(handle, os.O_RDONLY)
+
+
+def open_directory(path: str | Path, *, create: bool = False) -> int:
+    """Walk each component relative to an opened directory, rejecting junctions.
+
+    Keeping the parent open until its child is validated avoids checking a
+    pathname and then following a replacement while opening that pathname.
+    """
+    absolute = Path(os.path.abspath(os.fspath(path)))
+    current = _open_root(absolute.anchor)
+    try:
+        for name in absolute.parts[1:]:
+            child = open_relative(
+                current, name, access=_GENERIC_READ, create=create,
+                allow_directory=True, directory_only=True,
+            )
+            try:
+                if is_reparse_point(child) or not is_directory(child):
+                    raise OSError(f"unsafe directory component: {name}")
+            except BaseException:
+                os.close(child)
+                raise
+            os.close(current)
+            current = child
+        return current
+    except BaseException:
+        os.close(current)
+        raise
 
 
 def open_relative(
@@ -280,6 +293,7 @@ def open_relative(
     create: bool = False,
     exclusive: bool = False,
     allow_directory: bool = False,
+    directory_only: bool = False,
     append: bool = False,
 ) -> int:
     """Open ``name`` relative to an anchored directory descriptor.
@@ -292,7 +306,7 @@ def open_relative(
     caller can reject it.
     """
 
-    if not name or name in {".", ".."} or "/" in name or "\\" in name:
+    if not name or name in {".", ".."} or any(c in name for c in ("/", "\\", ":", "\0")):
         raise OSError("unsafe file name")
 
     if create and exclusive:
@@ -310,10 +324,13 @@ def open_relative(
     if append:
         access |= _FILE_APPEND_DATA
 
+    name_bytes = name.encode("utf-16-le")
+    if len(name_bytes) > 65532:
+        raise OSError("file name is too long")
     buffer = ctypes.create_unicode_buffer(name)
     unicode_name = _UnicodeString(
-        len(name) * 2,
-        len(name) * 2 + 2,
+        len(name_bytes),
+        len(name_bytes) + 2,
         ctypes.cast(buffer, ctypes.c_wchar_p),
     )
     attributes = _ObjectAttributes()
@@ -336,16 +353,16 @@ def open_relative(
         (
             _FILE_SYNCHRONOUS_IO_NONALERT
             | _NT_FILE_OPEN_REPARSE_POINT
-            | (0 if allow_directory else _FILE_NON_DIRECTORY_FILE)
+            | (_FILE_DIRECTORY_FILE if directory_only else 0 if allow_directory else _FILE_NON_DIRECTORY_FILE)
         ),
         None,
         0,
     )
-    if status != 0:
+    if status < 0:
         raise _nt_status_to_oserror(status, name)
     if not handle.value:
         raise _win_error(f"cannot open relative file: {name}")
-    crt_flags = os.O_BINARY
+    crt_flags = os.O_RDWR if access & _GENERIC_WRITE else os.O_RDONLY
     if append:
         crt_flags |= os.O_APPEND
     return _handle_to_fd(handle.value, crt_flags)

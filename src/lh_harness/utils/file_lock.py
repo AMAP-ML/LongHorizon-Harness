@@ -10,9 +10,8 @@ Two consequences follow, and both are load-bearing:
   different byte and neither would exclude the other. Always ``seek(0)`` before
   locking, and again before unlocking, so both halves of the pair operate on the
   same fixed byte.
-* The locked byte must already exist. ``LK_LOCK`` against a zero-length file
-  raises rather than locking. Callers whose first write creates the file should
-  use :func:`ensure_lockable` while holding the lock.
+* Windows permits locking bytes beyond EOF, including an empty file; no
+  placeholder needs to be written to a lock or JSONL file.
 
 Two entry points:
 
@@ -23,10 +22,9 @@ Two entry points:
 
 from __future__ import annotations
 
-import os
 import sys
 from contextlib import contextmanager
-from typing import IO, Any, Iterator
+from typing import IO, Iterator
 
 # The byte range every lock in the harness contends on. Any constant works as
 # long as it is the *same* constant everywhere; 0 is the conventional choice and
@@ -108,21 +106,3 @@ def lock_handle(handle: IO[bytes] | IO[str]) -> Iterator[None]:
         release_lock(handle)
 
 
-def ensure_lockable(handle: IO[bytes] | IO[str]) -> None:
-    """Guarantee the lock byte exists so ``msvcrt.locking`` has a range to take.
-
-    No-op on POSIX, where ``flock`` has no length requirement. An empty write
-    allocates nothing, so a single placeholder byte is written -- callers that
-    append their own records after this must accept that leading byte on
-    Windows. Only call this on a file whose contents you control.
-    """
-
-    if sys.platform != "win32":
-        return
-    handle.seek(0, os.SEEK_END)
-    if handle.tell() == 0:
-        payload: Any = "\0"
-        if "b" in getattr(handle, "mode", ""):
-            payload = b"\0"
-        handle.write(payload)
-        handle.flush()

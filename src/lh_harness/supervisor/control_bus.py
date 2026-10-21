@@ -19,7 +19,7 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Callable, Iterator
 
-from ..utils.file_lock import acquire_lock, ensure_lockable, lock_handle, release_lock
+from ..utils.file_lock import acquire_lock, lock_handle, release_lock
 
 if sys.platform == "win32":
     # The Windows helpers are only importable on native Windows: the
@@ -61,13 +61,6 @@ def _windows_open_nofollow(path: str | Path, *, directory: bool = False) -> int:
     if directory:
         return windows_anchored.open_directory(absolute)
 
-    # Verify no component is a reparse point (symlink/junction).
-    current = Path(absolute.parts[0])
-    for component in absolute.parts[1:]:
-        current = current / component
-        if current.exists() and _is_windows_symlink(current):
-            raise OSError(f"control-bus path contains symlink: {current}")
-
     parent_fd = windows_anchored.open_directory(absolute.parent)
     try:
         fd = windows_anchored.open_relative(
@@ -81,15 +74,13 @@ def _windows_open_nofollow(path: str | Path, *, directory: bool = False) -> int:
         os.close(parent_fd)
     try:
         if windows_anchored.is_reparse_point(fd):
-            os.close(fd)
-            raise OSError(f"control-bus path contains symlink: {absolute}")
-        metadata = os.fstat(fd)
-        if not stat.S_ISREG(metadata.st_mode):
-            os.close(fd)
-            raise OSError(f"expected regular file, got non-file: {absolute}")
+            raise OSError(f"control-bus path contains reparse point: {absolute}")
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            raise OSError(f"expected regular file: {absolute}")
+        return fd
     except BaseException:
+        os.close(fd)
         raise
-    return fd
 
 
 def _windows_ensure_dir_nofollow(path: str | Path, *, mode: int = 0o700) -> int:
@@ -97,33 +88,7 @@ def _windows_ensure_dir_nofollow(path: str | Path, *, mode: int = 0o700) -> int:
 
     Creates directories recursively while checking for symlinks/reparse points.
     """
-    absolute = Path(os.path.abspath(os.fspath(path)))
-    parts = absolute.parts
-
-    # Build path component by component
-    current = Path(parts[0])  # Drive letter
-    for component in parts[1:]:
-        current = current / component
-
-        # Check if it exists
-        if current.exists():
-            # Verify it's not a symlink
-            if _is_windows_symlink(current):
-                raise OSError(f"control-bus path contains symlink: {current}")
-            # Verify it's a directory
-            if not current.is_dir():
-                raise OSError(f"control-bus component is not a directory: {current}")
-        else:
-            # Create the directory
-            try:
-                current.mkdir(mode=mode & 0o777)
-            except FileExistsError:
-                # Race: another process created it
-                if _is_windows_symlink(current):
-                    raise OSError(f"control-bus path contains symlink: {current}")
-
-    # Open and return descriptor for the final directory
-    return _windows_open_nofollow(path, directory=True)
+    return windows_anchored.open_directory(path, create=True)
 
 
 def _absolute_anchored_path(path: str | Path) -> Path:
@@ -316,81 +281,31 @@ def _open_private_regular_at(
     if not name or name in {".", ".."} or "/" in name or "\\" in name:
         raise OSError("unsafe private file name")
 
-    # Windows path: open relative to the anchored parent descriptor.
     if sys.platform == "win32":
-        base_flags = flags | os.O_BINARY
-        if hasattr(os, "O_NOINHERIT"):
-            base_flags |= os.O_NOINHERIT
-
         access = windows_anchored._GENERIC_READ
-        if base_flags & os.O_WRONLY:
+        if flags & os.O_WRONLY:
             access = windows_anchored._GENERIC_WRITE
-        elif base_flags & os.O_RDWR:
-            access = windows_anchored._GENERIC_READ | windows_anchored._GENERIC_WRITE
-
-        # The caller's flags may include O_TRUNC. Opening an existing path
-        # with them would truncate the target before the reparse-point and
-        # hard-link checks could reject it, so an alias could be modified
-        # before it is refused. The existing path is therefore opened
-        # read-only first, validated, and only then re-opened with the
-        # caller's flags.
-        destructive = bool(base_flags & os.O_TRUNC)
-
-        for _ in range(32):
-            try:
-                probe = windows_anchored.open_relative(
-                    parent_fd,
-                    name,
-                    access=windows_anchored._GENERIC_READ,
-                )
-            except FileNotFoundError:
-                # Not there yet: create it relative to the anchored parent.
-                try:
-                    fd = windows_anchored.open_relative(
-                        parent_fd,
-                        name,
-                        access=access,
-                        create=True,
-                        exclusive=True,
-                        append=bool(base_flags & os.O_APPEND),
-                    )
-                except FileExistsError:
-                    continue
-                break
-            try:
-                if windows_anchored.is_reparse_point(probe):
-                    raise OSError("private file is a symlink")
-                metadata = os.fstat(probe)
-                if not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1:
-                    raise OSError("private file is not an unaliased regular file")
-            finally:
-                os.close(probe)
-
-            # The path is known to be a private regular file, so it is now
-            # safe to apply the caller's flags.
-            try:
-                fd = windows_anchored.open_relative(
-                    parent_fd,
-                    name,
-                    access=access,
-                    append=bool(base_flags & os.O_APPEND),
-                )
-            except FileNotFoundError:
-                continue
-            if destructive and base_flags & os.O_TRUNC:
-                windows_anchored.truncate(fd)
-            break
-
+        elif flags & os.O_RDWR:
+            access |= windows_anchored._GENERIC_WRITE
+        # Open once without truncation. Validate the actual writable handle,
+        # then truncate that same object; a path probe followed by a reopen
+        # would let a replacement escape the validation.
+        fd = windows_anchored.open_relative(
+            parent_fd, name, access=access, create=True,
+            append=bool(flags & os.O_APPEND),
+        )
         try:
             if windows_anchored.is_reparse_point(fd):
-                raise OSError("private file is a symlink")
+                raise OSError("private file is a reparse point")
             metadata = os.fstat(fd)
             if not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1:
                 raise OSError("private file is not an unaliased regular file")
+            if flags & os.O_TRUNC:
+                windows_anchored.truncate(fd)
+            return fd
         except BaseException:
             os.close(fd)
             raise
-        return fd
 
     # Unix/Linux path using dir_fd
     nofollow = getattr(os, "O_NOFOLLOW", 0)
@@ -733,7 +648,6 @@ class ControlBus:
                 # acquire_lock seeks to a fixed byte on Windows, so a freshly
                 # created (zero-length) lock file still has a range to take.
                 acquire_lock(handle)
-                ensure_lockable(handle)
 
             except (ImportError, OSError, RuntimeError) as exc:
                 if handle is not None:

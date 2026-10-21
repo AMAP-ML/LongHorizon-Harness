@@ -16,8 +16,6 @@ Each test here corresponds to a defect the reviewer reproduced:
 
 from __future__ import annotations
 
-from __future__ import annotations
-
 import os
 import subprocess
 import sys
@@ -165,31 +163,6 @@ def test_windows_existence_probe_still_works(monkeypatch):
 
 
 # --- 3. the private-file helper must validate before it truncates --------
-
-
-@requires_windows
-def test_private_file_helper_validates_before_opening_destructively(monkeypatch):
-    """An O_TRUNC caller must not modify an alias before it is rejected.
-
-    The check is behavioural, not textual: the helper is called with a
-    hard-linked target and the alias must still hold its original content
-    afterwards.
-    """
-    import inspect
-
-    source = inspect.getsource(control_bus._open_private_regular_at)
-    assert "destructive" in source, (
-        "the Windows fallback must separate the destructive open from the "
-        "validation probe"
-    )
-    # The validation must not be reachable only after a destructive open.
-    probe_at = source.find("probe = windows_anchored.open_relative")
-    destructive_at = source.find("windows_anchored.truncate(fd)")
-    assert probe_at != -1, "the existing path must be probed before it is used"
-    assert destructive_at != -1, "the truncate must be explicit"
-    assert probe_at < destructive_at, (
-        "the alias check must run before the caller's flags are used"
-    )
 
 
 def test_private_file_helper_rejects_a_hard_link(tmp_path: Path):

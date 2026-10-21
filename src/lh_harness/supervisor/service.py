@@ -36,7 +36,7 @@ from .control_bus import (
     _read_json_file,
     _read_jsonl,
 )
-from ..utils.file_lock import acquire_lock, ensure_lockable, release_lock
+from ..utils.file_lock import acquire_lock, release_lock
 from ..utils.process_group import hard_kill_sig, hard_kill_sig_name
 from .lifecycle import (
     ACTIVE_STATUSES,
@@ -180,71 +180,9 @@ def _open_worker_log(path: Path):
 
     path = Path(path)
 
-    # Windows path: use reparse point checking
-    if sys.platform == "win32":
-        # Ensure parent directory exists and check for symlinks
-        parent_fd = _open_nofollow(path.parent, directory=True)
-
-        try:
-            # Check if the file itself is a symlink
-            if path.exists() and _is_windows_symlink(path):
-                raise OSError(f"worker log is a symlink: {path}")
-
-            # Open the file with Windows-compatible flags
-            flags = os.O_RDWR | os.O_CREAT | os.O_BINARY
-            if hasattr(os, 'O_NOINHERIT'):
-                flags |= os.O_NOINHERIT
-
-            fd = os.open(path, flags, 0o600)
-
-            # Verify it's a regular file
-            metadata = os.fstat(fd)
-            if not stat.S_ISREG(metadata.st_mode):
-                os.close(fd)
-                raise OSError(f"worker log is not a regular file: {path}")
-
-            # Check for hard links
-            if metadata.st_nlink != 1:
-                os.close(fd)
-                raise OSError(errno.ELOOP, "worker log has multiple hard links")
-
-            # Try to set permissions (best effort on Windows)
-            try:
-                os.chmod(path, 0o600)
-            except OSError:
-                pass
-
-            # Handle log rotation if too large
-            if metadata.st_size > _MAX_WORKER_LOG_BYTES:
-                keep = max(1, min(_WORKER_LOG_KEEP_BYTES, _MAX_WORKER_LOG_BYTES))
-                start = max(0, metadata.st_size - keep)
-                os.lseek(fd, start, os.SEEK_SET)
-                tail = bytearray()
-                remaining = keep
-                while remaining:
-                    chunk = os.read(fd, remaining)
-                    if not chunk:
-                        break
-                    tail.extend(chunk)
-                    remaining -= len(chunk)
-                os.ftruncate(fd, 0)
-                os.lseek(fd, 0, os.SEEK_SET)
-                _write_all(fd, bytes(tail))
-                try:
-                    os.fsync(fd)
-                except OSError:
-                    pass
-
-            os.lseek(fd, 0, os.SEEK_END)
-            # Return file object, not descriptor
-            output = os.fdopen(fd, "a+b", buffering=0)
-            return output
-        finally:
-            os.close(parent_fd)
-
     # Unix/Linux path using O_NOFOLLOW
     nofollow = getattr(os, "O_NOFOLLOW", 0)
-    if not nofollow:
+    if sys.platform != "win32" and not nofollow:
         raise OSError(errno.ENOTSUP, "worker log requires O_NOFOLLOW")
     cloexec = getattr(os, "O_CLOEXEC", 0)
     nonblock = getattr(os, "O_NONBLOCK", 0)
@@ -257,13 +195,16 @@ def _open_worker_log(path: Path):
     try:
         # ``dir_fd`` is available on the POSIX platforms supported by the
         # harness.  Fail closed if a Python build does not expose it.
-        if os.open not in getattr(os, "supports_dir_fd", set()):
+        if sys.platform != "win32" and os.open not in getattr(os, "supports_dir_fd", set()):
             raise OSError(errno.ENOTSUP, "worker log requires dir_fd support")
         # Walk every parent component with anchored no-follow opens.  Opening
         # ``path.parent`` as one pathname still follows an intermediate
         # symlink and leaves a run-directory swap window.
         parent_fd = _open_nofollow(path.parent, directory=True)
-        fd = os.open(path.name, file_flags, 0o600, dir_fd=parent_fd)
+        if sys.platform == "win32":
+            fd = _open_private_regular_at(parent_fd, path.name, os.O_RDWR)
+        else:
+            fd = os.open(path.name, file_flags, 0o600, dir_fd=parent_fd)
         metadata = os.fstat(fd)
         if not stat.S_ISREG(metadata.st_mode):
             error_code = errno.EFTYPE if hasattr(errno, "EFTYPE") else errno.EINVAL
@@ -460,6 +401,9 @@ def _pid_start_identity(pid: int) -> str | None:
 
     if pid <= 0:
         return None
+    if sys.platform == "win32":
+        from ..utils.windows_process import start_identity
+        return start_identity(pid)
     proc_stat = Path(f"/proc/{pid}/stat")
     try:
         raw = proc_stat.read_text(encoding="utf-8", errors="replace")
@@ -809,7 +753,6 @@ class RunSupervisor:
             # acquire_lock seeks to a fixed byte on Windows, so a freshly
             # created (zero-length) lock file still has a range to take.
             acquire_lock(handle)
-            ensure_lockable(handle)
         except (ImportError, OSError, RuntimeError) as exc:
             if handle is not None:
                 try:
@@ -965,6 +908,14 @@ class RunSupervisor:
         pid = int(owner.get("pid", 0) or 0)
         if pid <= 0:
             return False
+        if sys.platform == "win32":
+            current = _pid_start_identity(pid)
+            if not current:
+                return False
+            if bool(owner.get("attached")) and pid == os.getpid():
+                return True
+            # Creation time binds this PID to the durable worker identity.
+            return current == owner.get("pid_start_identity")
         try:
             os.kill(pid, 0)
         except OSError:
