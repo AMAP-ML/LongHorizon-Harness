@@ -367,8 +367,39 @@ def test_control_bus_lock_uses_the_shared_helper():
     )
 
 
-def test_open_private_regular_at_rejects_a_symlinked_lock_file(tmp_path):
-    """End-to-end: the supervisor lock refuses a symlinked lock file."""
+def _make_link(link: Path, target: Path) -> str:
+    """Create a reparse-point link to ``target`` and return how it was made.
+
+    Windows: a directory junction, which needs no elevated privilege (a
+    symlink needs SeCreateSymbolicLinkPrivilege, i.e. Developer Mode).
+    POSIX: a symlink.
+
+    Returns the kind of link created, or "" if the platform refused.
+    """
+
+    if sys.platform == "win32":
+        result = subprocess.run(
+            ["cmd.exe", "/c", "mklink", "/J", str(link), str(target)],
+            capture_output=True,
+            text=True,
+        )
+        if result.returncode == 0 and link.exists():
+            return "junction"
+        return ""
+    try:
+        link.symlink_to(target, target_is_directory=True)
+    except (OSError, NotImplementedError):
+        return ""
+    return "symlink"
+
+
+def test_open_private_regular_at_rejects_a_linked_lock_file(tmp_path):
+    """End-to-end: the supervisor lock refuses a reparse-point lock file.
+
+    A junction stands in for the symlink on Windows because creating a symlink
+    there requires Developer Mode. Both are reparse points, and the private-file
+    helper must refuse either one.
+    """
 
     from lh_harness.supervisor.control_bus import (
         _ensure_dir_fd_nofollow,
@@ -377,16 +408,17 @@ def test_open_private_regular_at_rejects_a_symlinked_lock_file(tmp_path):
 
     runs_root = tmp_path / "runs"
     runs_root.mkdir()
-    lock_path = runs_root / ".supervisor.lock"
-    try:
-        lock_path.symlink_to(tmp_path / "attacker.lock")
-    except (OSError, NotImplementedError):  # pragma: no cover - needs symlink privilege
-        pytest.skip("symlink creation not permitted on this host")
+    outside = tmp_path / "attacker"
+    outside.mkdir()
+
+    kind = _make_link(runs_root / ".supervisor.lock", outside)
+    if not kind:
+        pytest.skip("neither a junction nor a symlink could be created on this host")
 
     parent_fd = _ensure_dir_fd_nofollow(runs_root)
     try:
         with pytest.raises(OSError):
-            _open_private_regular_at(parent_fd, lock_path.name, os.O_RDWR)
+            _open_private_regular_at(parent_fd, ".supervisor.lock", os.O_RDWR)
     finally:
         os.close(parent_fd)
 
@@ -411,3 +443,25 @@ def test_open_private_regular_at_rejects_a_hard_link(tmp_path):
             _open_private_regular_at(parent_fd, ".supervisor.lock", os.O_RDWR)
     finally:
         os.close(parent_fd)
+
+
+def test_is_windows_symlink_detects_a_junction(tmp_path):
+    """The reparse-point check must see a junction as a link.
+
+    ``os.path.islink`` returns False for a junction, so the check cannot rely
+    on it; this pins the attribute-based detection it uses instead.
+    """
+
+    from lh_harness.supervisor.control_bus import _is_windows_symlink
+
+    if sys.platform != "win32":
+        pytest.skip("reparse-point detection is Windows-specific")
+
+    target = tmp_path / "target"
+    target.mkdir()
+    link = tmp_path / "link"
+    if not _make_link(link, target):
+        pytest.skip("junction creation not permitted on this host")
+
+    assert _is_windows_symlink(link) is True
+    assert _is_windows_symlink(target) is False
