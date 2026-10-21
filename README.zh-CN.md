@@ -340,7 +340,7 @@ lh-harness check-update
 | `claude_mcp_config` | 默认注释 | Claude Code 用的 `.mcp.json` 路径，会覆盖已安装的插件。 |
 | `codex_mcp_config` | 默认注释 | Codex 用的 `[mcp_servers.*]` TOML 路径，会覆盖已安装的插件。 |
 | `mcp_add_dirs` | `[]` | 额外允许 MCP server 读取的目录。Claude Code 会拒绝该项，因为其角色隔离要求任务文件必须放在工作目录内。 |
-| `max_rounds` | `30` | Manage-Execute-Audit 循环的最大轮数，达到即停止。 |
+| `max_rounds` | `25` | Manage-Execute-Audit 循环的最大轮数，达到即停止。 |
 | `dashboard` | `true` | 每次运行时启动 Web Dashboard。 |
 | `dashboard_port` | `0` | Dashboard 端口，`0` 表示由系统分配空闲端口。 |
 
@@ -494,7 +494,7 @@ lh-harness web --workspace-root .               # 为指定目录启动工作台
 | `--task` | 任务文本或 `@task.md` |
 | `--agent` | `claude_code`、`codex`、`opencode` 或 `deepseek_harness`（第一阶段仅 CLI） |
 | `--env` | `local` |
-| `--max-rounds` | Manage-Execute-Audit 循环的最大轮数；CLI 默认为 30 |
+| `--max-rounds` | Manage-Execute-Audit 循环的最大轮数；CLI 默认为 25 |
 | `--dashboard` | 启动实时监控和人工介入功能 |
 | `--no-dashboard` | 关闭项目配置中默认启用的 Dashboard |
 

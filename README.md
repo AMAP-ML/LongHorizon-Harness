@@ -339,7 +339,7 @@ Task text, run IDs, and API keys are deliberately **not** configurable here; the
 | `claude_mcp_config` | commented out | Path to a `.mcp.json` for Claude Code. Overrides the installed plugin. |
 | `codex_mcp_config` | commented out | Path to a `[mcp_servers.*]` TOML for Codex. Overrides the installed plugin. |
 | `mcp_add_dirs` | `[]` | Extra directories the MCP server may read. Claude Code rejects these, because its role isolation requires task files to live inside the workspace. |
-| `max_rounds` | `30` | Upper bound on Manage-Execute-Audit rounds before the run stops. |
+| `max_rounds` | `25` | Upper bound on Manage-Execute-Audit rounds before the run stops. |
 | `dashboard` | `true` | Start the web dashboard with each run. |
 | `dashboard_port` | `0` | Dashboard port; `0` lets the OS pick a free one. |
 
@@ -493,7 +493,7 @@ lh-harness web --workspace-root .               # Serve the workbench for anothe
 | `--task` | Task text or `@task.md` |
 | `--agent` | `claude_code`, `codex`, `opencode`, or `deepseek_harness` (CLI-only in phase 1) |
 | `--env` | `local` |
-| `--max-rounds` | Maximum number of Manage-Execute-Audit rounds; the CLI default is 30 |
+| `--max-rounds` | Maximum number of Manage-Execute-Audit rounds; the CLI default is 25 |
 | `--dashboard` | Start live monitoring and human intervention |
 | `--no-dashboard` | Disable a Dashboard enabled by the project configuration |
 
