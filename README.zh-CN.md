@@ -36,6 +36,7 @@ LongHorizon-Harness 将现有 Agent 变成可长期运行的 computer-use 系统
 
 ## ✨ News
 
+- **[v0.1.8 · 2026-10-21]** 修复历史任务恢复后审批被拒绝、Manager 路由 Markdown 解析、Claude Code MCP 隔离以及 CLI/DeepSeek 编码问题。新增 `--final-response-timeout`，可为较慢的最终回复单独设置超时。升级说明与当前 Windows 限制见 [release notes](https://github.com/AMAP-ML/LongHorizon-Harness/releases/tag/v0.1.8)。
 - **[v0.1.7 · 2026-08-20]** 任务跑完不再是终点，工作台变成了一场对话：看完回复直接追问，任务会沿用自己已完成的轮次继续跑，而不是从头重新规划。运行中发出的消息会被下一轮立即取用，先停止再继续也不会漏掉。同时新增 `--reasoning-effort` 统一设置各角色的推理强度（也可用 `--manager-reasoning-effort` 等单独覆盖），并转发给支持该能力的后端。对话现在严格按时间顺序展示，而强制中止只在 worker 忽略正常停止时才会出现。
 - **[v0.1.6 · 2026-08-15]** 新增 [OpenCode](https://github.com/anomalyco/opencode) CLI 支持。LongHorizon-Harness 现在可以通过 `--agent opencode` 调用 `opencode run prompt`，并支持按角色划分的读写权限、OpenCode API 端点覆盖、标准化 JSON 结果，以及 CLI/config/doctor 集成。Web 工作台可以为每个角色单独选择 OpenCode Harness 及其模型。
 - **[v0.1.5 · 2026-08-14]** 第一阶段已适配 [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness) CLI。LongHorizon-Harness 现在可以通过 `--agent deepseek_harness` 调用 `dsh --profile headless`，并提供隔离的 `DSH_HOME`、按角色划分的读写权限、DeepSeek API 端点覆盖、标准化 JSONL 结果以及 CLI/config/doctor 接入。Web 工作台支持为每个角色分别选择 DeepSeek Harness 及其模型；GUI computer-use 和 MCP 支持将在后续阶段补充。使用方式见 [CLI 配置说明](#5-也可以用命令行运行任务)。
@@ -193,7 +194,7 @@ LongHorizon-Harness 不只展示了几个精心挑选的成功案例。
 | `PATH` 上有一个 Agent 运行时：[`codex`](https://github.com/openai/codex#installing-and-running-codex-cli)、[`claude`](https://docs.anthropic.com/en/docs/claude-code/getting-started)、[`opencode`](https://github.com/anomalyco/opencode) 或 [`dsh`](https://github.com/deepseek-ai/deepseek-harness) | 真正执行任务。想按角色混用多个后端就安装多个。 |
 | [Node.js](https://nodejs.org) 20 或更高版本 | npm 分发的 computer-use 插件需要；DeepSeek Harness 本身目前要求 Node.js `^22.19.0` 或 `>=24.0.0`。 |
 
-> **平台状态：** 目前在 macOS 上完成了测试。v0.1.7 的控制总线和 supervisor 依赖 POSIX 原语，原生 Windows 无法正常启动任务；请使用 WSL2，并在 Linux 环境内安装 Harness 和 agent CLI。原生 Windows 支持统一在 [#70](https://github.com/AMAP-ML/LongHorizon-Harness/issues/70) 跟踪。
+> **平台状态：** 目前在 macOS 上完成了测试。v0.1.8 的控制总线和 supervisor 依赖 POSIX 原语，原生 Windows 无法正常启动任务；请使用 WSL2，并在 Linux 环境内安装 Harness 和 agent CLI。原生 Windows 支持统一在 [#70](https://github.com/AMAP-ML/LongHorizon-Harness/issues/70) 跟踪。
 
 以上都可以用 `lh-harness doctor` 一次性检查，见[检查运行环境](#检查运行环境)。
 
