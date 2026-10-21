@@ -12,6 +12,8 @@ import pytest
 pytest.importorskip("fastapi")
 from fastapi.testclient import TestClient
 
+from lh_harness.dashboard.state import DashboardState
+from lh_harness.supervisor.control_bus import ControlBus
 from lh_harness.supervisor.service import RunSupervisor
 from lh_harness.types import MAX_ROUNDS
 from lh_harness.webapi.server import create_app
@@ -74,6 +76,34 @@ def test_resume_retry_creates_a_new_run(client) -> None:
     assert response.status_code == 200
     assert response.json()["run"]["id"] != run_id
     assert response.json()["run"]["owner"]["resume_kind"] == "retry"
+
+
+@pytest.mark.parametrize("attached", [False, True])
+def test_resumed_unmanaged_run_accepts_approval(client, attached: bool) -> None:
+    api, supervisor, process = client
+    run_id = _stopped_run(api, process)
+    run_dir = supervisor.runs_root / run_id
+    bus = ControlBus(run_dir)
+    bus.write_owner({**bus.read_owner(), "managed": False, "attached": attached})
+    bus.write_status({**bus.read_status(), "managed": False})
+    assert supervisor.can_control(run_id) is False
+    process.returncode = None
+
+    response = api.post(f"/api/runs/{run_id}/resume", json={})
+
+    assert response.status_code == 200
+    assert response.json()["run"]["id"] == run_id
+    assert bus.read_owner().get("managed") is not False
+    assert bus.read_owner().get("attached") is not False
+    assert supervisor.can_control(run_id) is True
+    state = DashboardState(Path(response.json()["run"]["log_dir"]), runs_root=supervisor.runs_root)
+    approval = state.create_approval(title="Continue resumed run", message="Proceed?")
+    resolved = api.post(
+        f"/api/runs/{run_id}/approvals/{approval.approval_id}/resolve",
+        json={"action": "continue"},
+    )
+    assert resolved.status_code == 200, resolved.text
+    assert resolved.json()["status"] == "accepted"
 
 
 def test_resume_accepts_an_extra_round_grant(client) -> None:

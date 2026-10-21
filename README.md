@@ -192,7 +192,7 @@ Steps 1–2 are once per machine; step 3 is once per project. Then run tasks fro
 | One agent runtime on `PATH`: [`codex`](https://github.com/openai/codex#installing-and-running-codex-cli), [`claude`](https://docs.anthropic.com/en/docs/claude-code/getting-started), [`opencode`](https://github.com/anomalyco/opencode), or [`dsh`](https://github.com/deepseek-ai/deepseek-harness) | Actually executing the work. Install more than one if you want to mix backends across roles. |
 | [Node.js](https://nodejs.org) 20 or later | The npm-distributed computer-use plugins. DeepSeek Harness itself currently requires Node.js `^22.19.0` or `>=24.0.0`. |
 
-> **Platform status:** Currently tested on macOS. Windows support is included but has not yet been thoroughly tested.
+> **Platform status:** macOS is the currently tested platform. Native Windows runs are blocked by POSIX-only control-bus and supervisor primitives in v0.1.7; use WSL2 with the harness and agent CLI installed inside Linux. Native Windows support is tracked in [#70](https://github.com/AMAP-ML/LongHorizon-Harness/issues/70).
 
 Run `lh-harness doctor` at any point to check all of the above; see [Verify the environment](#verify-the-environment).
 
@@ -349,10 +349,13 @@ Per-episode limits in seconds. One episode is a single role invocation, not the 
 
 | Field | Default | Description |
 |---|---|---|
-| `manager` | `600` | Planning the next step. |
+| `manager` | `300` | Planning the next step. |
 | `gui_executor` | `1800` | Executing a GUI/visual subtask. |
 | `cli_executor` | `1800` | Executing a CLI/non-GUI subtask. |
-| `auditor` | `600` | Verifying a subtask. Applies to both auditors. |
+| `auditor` | `300` | Verifying a subtask. Applies to both auditors. |
+| `final_response` | unset | Closing reply; defaults to the manager timeout clamped to 60–180 seconds. An explicit value overrides that cap. |
+
+For a slower reply model, set `final_response = 1200` under `[run.timeouts]` or pass `--final-response-timeout 1200`. A final-response timeout does not invalidate completed audits; the run report is retained even if the closing reply is empty. Unknown configuration keys remain errors so misspelled budgets are not silently ignored.
 
 ##### `[run.roles.*]`
 

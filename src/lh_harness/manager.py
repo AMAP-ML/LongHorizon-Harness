@@ -1387,7 +1387,7 @@ async def _write_final_response(
         operator_instructions="\n\n".join(ctx.operator_instructions),
         language=ctx.config.prompt_language,
     )
-    budget = _final_response_budget(ctx.config.manager_budget)
+    budget = ctx.config.final_response_budget or _final_response_budget(ctx.config.manager_budget)
     # Stored per round, like the other roles, so a discarded reply keeps its own
     # artifacts and the dashboard's round trajectory viewer can reach them.
     round_dir = ctx.role_dir / "rounds" / f"round_{round_index:03d}"

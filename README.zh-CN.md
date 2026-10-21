@@ -193,7 +193,7 @@ LongHorizon-Harness 不只展示了几个精心挑选的成功案例。
 | `PATH` 上有一个 Agent 运行时：[`codex`](https://github.com/openai/codex#installing-and-running-codex-cli)、[`claude`](https://docs.anthropic.com/en/docs/claude-code/getting-started)、[`opencode`](https://github.com/anomalyco/opencode) 或 [`dsh`](https://github.com/deepseek-ai/deepseek-harness) | 真正执行任务。想按角色混用多个后端就安装多个。 |
 | [Node.js](https://nodejs.org) 20 或更高版本 | npm 分发的 computer-use 插件需要；DeepSeek Harness 本身目前要求 Node.js `^22.19.0` 或 `>=24.0.0`。 |
 
-> **平台状态：** 目前只在 macOS 上完成了测试；Windows 已支持，但尚未经过详细测试。
+> **平台状态：** 目前在 macOS 上完成了测试。v0.1.7 的控制总线和 supervisor 依赖 POSIX 原语，原生 Windows 无法正常启动任务；请使用 WSL2，并在 Linux 环境内安装 Harness 和 agent CLI。原生 Windows 支持统一在 [#70](https://github.com/AMAP-ML/LongHorizon-Harness/issues/70) 跟踪。
 
 以上都可以用 `lh-harness doctor` 一次性检查，见[检查运行环境](#检查运行环境)。
 
@@ -350,10 +350,13 @@ lh-harness check-update
 
 | 字段 | 默认值 | 说明 |
 |---|---|---|
-| `manager` | `600` | 规划下一步。 |
+| `manager` | `300` | 规划下一步。 |
 | `gui_executor` | `1800` | 执行 GUI/视觉子任务。 |
 | `cli_executor` | `1800` | 执行 CLI/非 GUI 子任务。 |
-| `auditor` | `600` | 验收子任务，两个 auditor 共用。 |
+| `auditor` | `300` | 验收子任务，两个 auditor 共用。 |
+| `final_response` | 未设置 | 最终回复；默认将 manager 超时限制在 60–180 秒内，显式配置可覆盖此上限。 |
+
+若最终回复使用的模型较慢，可在 `[run.timeouts]` 下设置 `final_response = 1200`，或传入 `--final-response-timeout 1200`。最终回复超时不会撤销已完成的验收；即使回复为空，运行报告仍会保留。未知配置项仍会报错，避免超时参数拼写错误后被静默忽略。
 
 ##### `[run.roles.*]`
 

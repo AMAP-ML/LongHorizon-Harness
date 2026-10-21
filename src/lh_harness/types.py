@@ -124,6 +124,8 @@ class HarnessConfig:
     # English is the production default; Chinese remains available for
     # OSWorldv2-compatible role prompts and operator-facing control headers.
     prompt_language: PromptLanguage = "en"
+    # None preserves the historical manager-derived 60-180 second reply budget.
+    final_response_budget: EpisodeBudget | None = None
 
 
 def audit_report_to_dict(report: AuditReport) -> dict[str, Any]:

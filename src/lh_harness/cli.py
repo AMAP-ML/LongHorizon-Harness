@@ -95,6 +95,7 @@ _BUDGET_OPTIONS = (
     ("gui_executor", 1800),
     ("cli_executor", 1800),
     ("auditor", 300),
+    ("final_response", None),
 )
 
 
@@ -1622,6 +1623,10 @@ def _run_command(args: argparse.Namespace) -> int:
         gui_executor_budget=EpisodeBudget(max_duration_seconds=args.gui_executor_timeout),
         cli_executor_budget=EpisodeBudget(max_duration_seconds=args.cli_executor_timeout),
         auditor_budget=EpisodeBudget(max_duration_seconds=args.auditor_timeout),
+        final_response_budget=(
+            EpisodeBudget(max_duration_seconds=args.final_response_timeout)
+            if args.final_response_timeout is not None else None
+        ),
         workspace_path=workspace,
         harness_dir=harness_dir,
         log_dir=log_dir,
