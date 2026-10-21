@@ -64,14 +64,22 @@ def untrack_process_group(pid: int) -> None:
         _tracked.discard(pid)
 
 
-def signal_process_group(pid: int, sig: int) -> bool:
-    """Best-effort ``killpg``; False means the group is already gone."""
+def signal_process_group(pid: int, sig: int, *, force: bool = False) -> bool:
+    """Best-effort ``killpg``; False means the group is already gone.
+
+    ``force`` asks for an uncatchable termination. It is a separate flag
+    rather than a signal number because ``signal.SIGKILL`` does not exist on
+    native Windows: the hard-kill signal there *is* ``SIGTERM``, so the
+    distinction cannot be carried by the signal alone. On Windows ``force``
+    selects ``taskkill /F``; without it the process gets the chance to close
+    its windows.
+    """
     try:
         if sys.platform == "win32":
             # Windows has neither process groups nor SIGKILL, so termination is
             # expressed through taskkill. ``sig`` is only meaningful as 0
-            # (existence probe), SIGTERM (soft: WM_CLOSE), or anything else
-            # (hard: /F), which is what hard_kill_sig() yields here.
+            # (existence probe); everything else terminates the process, and
+            # ``force`` decides whether the kill is graceful.
             if sig == 0:
                 result = subprocess.run(
                     ['tasklist', '/FI', f'PID eq {pid}'],
@@ -81,15 +89,18 @@ def signal_process_group(pid: int, sig: int) -> bool:
                 )
                 return result.returncode == 0 and str(pid) in result.stdout
             argv = ['taskkill', '/T', '/PID', str(pid)]
-            if sig != signal.SIGTERM:
+            if force:
                 argv.insert(1, '/F')
-            subprocess.run(
+            result = subprocess.run(
                 argv,
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
                 timeout=_TASK_TIMEOUT,
             )
-            return True
+            # taskkill exits non-zero when the process is already gone. That
+            # is a failure to signal, and the caller needs to know: reporting
+            # success for a process that was never killed hides a real race.
+            return result.returncode == 0
         os.killpg(pid, sig)
         return True
     except (ProcessLookupError, PermissionError, OSError, subprocess.TimeoutExpired):
@@ -111,7 +122,7 @@ def kill_process_group(pid: int, *, grace_seconds: float = 1.0) -> None:
         if not signal_process_group(pid, 0):
             return
         time.sleep(0.05)
-    signal_process_group(pid, hard_kill_sig())
+    signal_process_group(pid, hard_kill_sig(), force=True)
 
 
 def kill_all_tracked() -> None:

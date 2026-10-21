@@ -347,30 +347,67 @@ def _open_private_regular_at(
 
         file_path = parent_path / name
 
+        base_flags = flags | os.O_BINARY
+        if hasattr(os, "O_NOINHERIT"):
+            base_flags |= os.O_NOINHERIT
+
+        # The caller's flags may include O_TRUNC. Opening an existing path
+        # with them would truncate the target before the reparse-point and
+        # hard-link checks could reject it, so an alias could be modified
+        # before it is refused. The existing path is therefore opened
+        # read-only first, validated, and only then re-opened with the
+        # caller's flags.
+        destructive = bool(base_flags & (os.O_TRUNC | os.O_APPEND))
+        access = base_flags & (os.O_RDONLY | os.O_WRONLY | os.O_RDWR)
+        probe_flags = os.O_RDONLY if access != os.O_WRONLY else os.O_WRONLY
+
         # Retry loop for concurrent operations
         for _ in range(32):
             fd: int | None = None
             try:
                 # Try to create exclusively
                 try:
-                    base_flags = flags | os.O_BINARY
-                    if hasattr(os, 'O_NOINHERIT'):
-                        base_flags |= os.O_NOINHERIT
-
                     fd = os.open(
                         file_path,
                         base_flags | os.O_CREAT | os.O_EXCL,
                         mode,
                     )
                 except FileExistsError:
-                    # File exists, try to open it
+                    # File exists. Validate it before any destructive open.
                     try:
-                        fd = os.open(file_path, base_flags)
+                        probe = os.open(file_path, probe_flags)
                     except FileNotFoundError:
                         # Disappeared between checks, retry
                         continue
+                    try:
+                        if _is_windows_symlink(file_path):
+                            raise OSError("private file is a symlink")
+                        metadata = os.fstat(probe)
+                        if not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1:
+                            raise OSError("private file is not an unaliased regular file")
+                    finally:
+                        os.close(probe)
 
-                # Verify it's a regular file and check for symlinks
+                    if destructive:
+                        # Re-open with the caller's flags now that the path
+                        # is known to be a private regular file.
+                        try:
+                            fd = os.open(file_path, base_flags)
+                        except FileNotFoundError:
+                            continue
+                    else:
+                        fd = os.open(file_path, base_flags)
+                        try:
+                            if _is_windows_symlink(file_path):
+                                raise OSError("private file is a symlink")
+                            metadata = os.fstat(fd)
+                            if not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1:
+                                raise OSError("private file is not an unaliased regular file")
+                        except BaseException:
+                            os.close(fd)
+                            raise
+
+                # Verify it is a regular file and not an alias.
                 if _is_windows_symlink(file_path):
                     raise OSError("private file is a symlink")
 

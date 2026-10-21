@@ -180,7 +180,7 @@ class LocalEnvironment:
             # and an unshielded await would be cancelled before the child exits.
             await asyncio.shield(asyncio.wait_for(proc.wait(), timeout=5))
         except asyncio.TimeoutError:
-            signal_process_group(proc.pid, hard_kill_sig())
+            signal_process_group(proc.pid, hard_kill_sig(), force=True)
             with contextlib.suppress(asyncio.TimeoutError, asyncio.CancelledError):
                 await asyncio.shield(asyncio.wait_for(proc.wait(), timeout=5))
         except asyncio.CancelledError:

@@ -30,6 +30,7 @@ from .control_bus import (
     _atomic_bytes_write,
     _ensure_dir_fd_nofollow,
     _ensure_dir_nofollow,
+    _is_windows_symlink,
     _open_nofollow,
     _open_private_regular_at,
     _read_json_file,
@@ -181,8 +182,6 @@ def _open_worker_log(path: Path):
 
     # Windows path: use reparse point checking
     if sys.platform == "win32":
-        from lh_harness.supervisor.control_bus import _open_nofollow, _is_windows_symlink
-
         # Ensure parent directory exists and check for symlinks
         parent_fd = _open_nofollow(path.parent, directory=True)
 
@@ -1156,7 +1155,11 @@ class RunSupervisor:
             # Identity mismatch is intentionally fail-closed: never signal a
             # reused PID merely because the old owner record said it was alive.
             return reconcile_unavailable("worker is no longer running or its identity changed")
-        sig = hard_kill_sig() if action == "abort" else signal.SIGTERM
+        # An abort must actually abort. On POSIX that is SIGKILL; on Windows
+        # SIGKILL does not exist, so the request is carried by the ``force``
+        # flag rather than by the signal number.
+        force = action == "abort"
+        sig = hard_kill_sig() if force else signal.SIGTERM
         # Record an attempt for diagnostics under the same lock used by status
         # merges. Do not use it as a once-only gate: a crash after the signal
         # and before the receipt needs one safe retry.
@@ -1173,7 +1176,7 @@ class RunSupervisor:
                 if sys.platform == "win32":
                     # Windows: use signal_process_group helper
                     from ..utils.process_group import signal_process_group
-                    if not signal_process_group(pgid, sig):
+                    if not signal_process_group(pgid, sig, force=force):
                         raise ProcessLookupError("process group not found")
                 else:
                     os.killpg(pgid, sig)
@@ -1883,7 +1886,7 @@ class RunSupervisor:
             try:
                 if sys.platform == "win32":
                     from ..utils.process_group import signal_process_group
-                    signal_process_group(process.pid, hard_kill_sig())
+                    signal_process_group(process.pid, hard_kill_sig(), force=True)
                 else:
                     os.killpg(process.pid, hard_kill_sig())
             except OSError:
@@ -2081,6 +2084,9 @@ class RunSupervisor:
         if self.attached_only and run_id != self.attached_run_id:
             raise ValueError("attached supervisor cannot control this run")
         self._assert_run_scope(run_id)
+        # The signal number cannot carry "abort" on Windows, where the hard
+        # kill signal is SIGTERM. The action is the authority.
+        force = kind == "abort"
         bus = self._bus(run_id)
         with self._lifecycle_lock:
             current = self._refresh(run_id)
@@ -2208,7 +2214,7 @@ class RunSupervisor:
                 else:
                     if sys.platform == "win32":
                         from ..utils.process_group import signal_process_group
-                        if not signal_process_group(pgid, sig):
+                        if not signal_process_group(pgid, sig, force=force):
                             raise ProcessLookupError("process group not found")
                     else:
                         os.killpg(pgid, sig)
@@ -2304,7 +2310,7 @@ class RunSupervisor:
             try:
                 if sys.platform == "win32":
                     from ..utils.process_group import signal_process_group
-                    signal_process_group(process.pid, hard_kill_sig())
+                    signal_process_group(process.pid, hard_kill_sig(), force=True)
                 else:
                     os.killpg(process.pid, hard_kill_sig())
             except ProcessLookupError:
