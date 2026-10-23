@@ -328,20 +328,28 @@ def _open_private_regular_at(
         elif base_flags & os.O_RDWR:
             access = windows_anchored._GENERIC_READ | windows_anchored._GENERIC_WRITE
 
-        # The caller's flags may include O_TRUNC. Opening an existing path
-        # with them would truncate the target before the reparse-point and
-        # hard-link checks could reject it, so an alias could be modified
-        # before it is refused. The existing path is therefore opened
-        # read-only first, validated, and only then re-opened with the
-        # caller's flags.
+        # The caller's flags may include O_TRUNC. Truncating at open time
+        # would modify the target before the reparse-point and hard-link
+        # checks could reject it, so an alias could be destroyed before it
+        # was refused. The file is therefore opened without truncation and
+        # truncated afterwards, once the descriptor that will be used has
+        # been validated.
+        #
+        # Only one open is performed. A separate read-only probe followed
+        # by a second open left a window in which the child could be
+        # replaced: anchoring the parent does not make the probed file and
+        # the reopened file the same object. Validating the descriptor that
+        # is actually used closes that window.
         destructive = bool(base_flags & os.O_TRUNC)
+        append = bool(base_flags & os.O_APPEND)
 
         for _ in range(32):
             try:
-                probe = windows_anchored.open_relative(
+                fd = windows_anchored.open_relative(
                     parent_fd,
                     name,
-                    access=windows_anchored._GENERIC_READ,
+                    access=access,
+                    append=append,
                 )
             except FileNotFoundError:
                 # Not there yet: create it relative to the anchored parent.
@@ -352,45 +360,30 @@ def _open_private_regular_at(
                         access=access,
                         create=True,
                         exclusive=True,
-                        append=bool(base_flags & os.O_APPEND),
+                        append=append,
                     )
                 except FileExistsError:
                     continue
-                break
+            except OSError:
+                raise
+
             try:
-                if windows_anchored.is_reparse_point(probe):
+                # Validate the descriptor that will be used, before anything
+                # destructive is applied to it.
+                if windows_anchored.is_reparse_point(fd):
                     raise OSError("private file is a symlink")
-                metadata = os.fstat(probe)
+                metadata = os.fstat(fd)
                 if not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1:
                     raise OSError("private file is not an unaliased regular file")
-            finally:
-                os.close(probe)
+            except BaseException:
+                os.close(fd)
+                raise
 
-            # The path is known to be a private regular file, so it is now
-            # safe to apply the caller's flags.
-            try:
-                fd = windows_anchored.open_relative(
-                    parent_fd,
-                    name,
-                    access=access,
-                    append=bool(base_flags & os.O_APPEND),
-                )
-            except FileNotFoundError:
-                continue
-            if destructive and base_flags & os.O_TRUNC:
+            # The descriptor is now known to be a private regular file, so
+            # the caller's truncation can be applied to it.
+            if destructive:
                 windows_anchored.truncate(fd)
-            break
-
-        try:
-            if windows_anchored.is_reparse_point(fd):
-                raise OSError("private file is a symlink")
-            metadata = os.fstat(fd)
-            if not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1:
-                raise OSError("private file is not an unaliased regular file")
-        except BaseException:
-            os.close(fd)
-            raise
-        return fd
+            return fd
 
     # Unix/Linux path using dir_fd
     nofollow = getattr(os, "O_NOFOLLOW", 0)

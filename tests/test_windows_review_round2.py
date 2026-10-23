@@ -168,27 +168,91 @@ def test_windows_existence_probe_still_works(monkeypatch):
 
 
 @requires_windows
-def test_private_file_helper_validates_before_opening_destructively(monkeypatch):
-    """An O_TRUNC caller must not modify an alias before it is rejected.
+def test_private_file_helper_does_not_truncate_a_replaced_child(monkeypatch, tmp_path: Path):
+    """A child replaced during the check must not be modified.
 
-    The check is behavioural, not textual: the helper is called with a
-    hard-linked target and the alias must still hold its original content
-    afterwards.
+    The helper used to probe the path read-only, close the probe, reopen
+    the name and then truncate the reopened descriptor. A child replaced in
+    that window was truncated before the reopened descriptor was validated,
+    so an alias could be destroyed before it was refused.
+
+    The helper now opens once and keeps that descriptor, so the truncation
+    applies to the object it validated and the name is never resolved a
+    second time.
+
+    The replacement is installed at the reopen. If the helper never
+    reopens -- which is the point -- the alias is never touched.
     """
+    from lh_harness.utils import windows_anchored
+
+    directory = tmp_path / "runs"
+    directory.mkdir()
+    target = directory / ".supervisor.lock"
+    target.write_bytes(b"private")
+
+    outside = tmp_path / "elsewhere.lock"
+    outside.write_bytes(b"not mine")
+
+    parent_fd = windows_anchored.open_directory(directory)
+    real_open = windows_anchored.open_relative
+    calls = {"n": 0}
+
+    def _open_and_swap(*args, **kwargs):
+        calls["n"] += 1
+        # The replacement happens at the reopen, which is the window the
+        # old design left open: the probe had been closed and the name was
+        # resolved again. The old code truncated whatever the reopen
+        # returned, which was the alias.
+        if calls["n"] == 2:
+            try:
+                os.remove(target)
+                os.link(outside, target)
+            except OSError:
+                pass
+        return real_open(*args, **kwargs)
+
+    monkeypatch.setattr(windows_anchored, "open_relative", _open_and_swap)
+    try:
+        try:
+            control_bus._open_private_regular_at(
+                parent_fd, ".supervisor.lock", os.O_RDWR | os.O_TRUNC
+            )
+        except OSError:
+            # Refusing the file is an acceptable outcome.
+            pass
+    finally:
+        os.close(parent_fd)
+
+    assert outside.read_bytes() == b"not mine", (
+        "the alias was truncated before it was refused"
+    )
+    assert calls["n"] == 1, (
+        "the helper must open the child once: a second open resolves the "
+        "name again and reopens the window for a replacement"
+    )
+
+
+def test_private_file_helper_validates_the_descriptor_it_uses():
+    """The helper must validate the descriptor it returns, not a probe."""
     import inspect
 
     source = inspect.getsource(control_bus._open_private_regular_at)
-    assert "destructive" in source, (
-        "the Windows fallback must separate the destructive open from the "
-        "validation probe"
+    # Strip the comments: the explanation mentions the old design.
+    code = "\n".join(
+        line for line in source.splitlines() if not line.strip().startswith("#")
     )
-    # The validation must not be reachable only after a destructive open.
-    probe_at = source.find("probe = windows_anchored.open_relative")
-    destructive_at = source.find("windows_anchored.truncate(fd)")
-    assert probe_at != -1, "the existing path must be probed before it is used"
-    assert destructive_at != -1, "the truncate must be explicit"
-    assert probe_at < destructive_at, (
-        "the alias check must run before the caller's flags are used"
+    assert "probe" not in code, (
+        "the helper must not use a separate read-only probe: a child "
+        "replaced between the probe and the reopen is a different object "
+        "from the one that would be truncated"
+    )
+    validate_at = source.find("is_reparse_point(fd)")
+    truncate_at = source.find("windows_anchored.truncate(fd)")
+    assert validate_at != -1, "the descriptor that will be used must be validated"
+    assert truncate_at != -1
+    assert validate_at < truncate_at, (
+        "the truncate must come after the validation of the descriptor it "
+        "applies to"
     )
 
 
