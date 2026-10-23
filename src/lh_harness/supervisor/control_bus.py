@@ -11,6 +11,7 @@ import errno
 import json
 import os
 import stat
+import sys
 import threading
 import time
 import uuid
@@ -18,10 +19,111 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Callable, Iterator
 
+from ..utils.file_lock import acquire_lock, ensure_lockable, lock_handle, release_lock
+
+if sys.platform == "win32":
+    # The Windows helpers are only importable on native Windows: the
+    # module raises ImportError elsewhere so a POSIX build never
+    # depends on the Win32 API being present.
+    from ..utils import windows_anchored
+
 
 _MAX_CONTROL_RECORD_BYTES = 512 * 1024
 _MAX_CONTROL_LOG_BYTES = 16 * 1024 * 1024
 _TRUSTED_SYSTEM_ALIASES = frozenset({"/var", "/tmp", "/etc"})
+
+
+# Windows-specific helpers for secure path operations
+def _is_windows_symlink(path: str | Path) -> bool:
+    """Check if a path is a Windows symlink or reparse point."""
+    try:
+        attrs = os.lstat(path)
+        # Check for reparse point (includes symlinks and junctions)
+        return bool(attrs.st_file_attributes & 0x400)  # FILE_ATTRIBUTE_REPARSE_POINT
+    except (OSError, AttributeError):
+        return False
+
+
+def _windows_open_nofollow(path: str | Path, *, directory: bool = False) -> int:
+    """Windows implementation: open without following symlinks.
+
+    Windows has no ``O_NOFOLLOW`` and no ``dir_fd``, so a directory is
+    opened as a real handle.  The handle is opened without
+    ``FILE_SHARE_DELETE``: while it is open the directory, and every
+    ancestor of it, cannot be renamed or replaced.  That is what makes the
+    descriptor an anchor rather than a snapshot of a path.
+
+    A regular file is opened relative to its parent directory handle, so
+    the final component cannot be redirected by a swapped ancestor either.
+    """
+
+    absolute = Path(os.path.abspath(os.fspath(path)))
+    if directory:
+        return windows_anchored.open_directory(absolute)
+
+    # Verify no component is a reparse point (symlink/junction).
+    current = Path(absolute.parts[0])
+    for component in absolute.parts[1:]:
+        current = current / component
+        if current.exists() and _is_windows_symlink(current):
+            raise OSError(f"control-bus path contains symlink: {current}")
+
+    parent_fd = windows_anchored.open_directory(absolute.parent)
+    try:
+        fd = windows_anchored.open_relative(
+            parent_fd,
+            absolute.name,
+            access=windows_anchored._GENERIC_READ,
+        )
+    except OSError:
+        raise
+    finally:
+        os.close(parent_fd)
+    try:
+        if windows_anchored.is_reparse_point(fd):
+            os.close(fd)
+            raise OSError(f"control-bus path contains symlink: {absolute}")
+        metadata = os.fstat(fd)
+        if not stat.S_ISREG(metadata.st_mode):
+            os.close(fd)
+            raise OSError(f"expected regular file, got non-file: {absolute}")
+    except BaseException:
+        raise
+    return fd
+
+
+def _windows_ensure_dir_nofollow(path: str | Path, *, mode: int = 0o700) -> int:
+    """Windows implementation: create directory chain and return descriptor.
+
+    Creates directories recursively while checking for symlinks/reparse points.
+    """
+    absolute = Path(os.path.abspath(os.fspath(path)))
+    parts = absolute.parts
+
+    # Build path component by component
+    current = Path(parts[0])  # Drive letter
+    for component in parts[1:]:
+        current = current / component
+
+        # Check if it exists
+        if current.exists():
+            # Verify it's not a symlink
+            if _is_windows_symlink(current):
+                raise OSError(f"control-bus path contains symlink: {current}")
+            # Verify it's a directory
+            if not current.is_dir():
+                raise OSError(f"control-bus component is not a directory: {current}")
+        else:
+            # Create the directory
+            try:
+                current.mkdir(mode=mode & 0o777)
+            except FileExistsError:
+                # Race: another process created it
+                if _is_windows_symlink(current):
+                    raise OSError(f"control-bus path contains symlink: {current}")
+
+    # Open and return descriptor for the final directory
+    return _windows_open_nofollow(path, directory=True)
 
 
 def _absolute_anchored_path(path: str | Path) -> Path:
@@ -60,6 +162,11 @@ def _open_nofollow(path: str | Path, *, directory: bool = False) -> int:
     descriptors and open every component with ``O_NOFOLLOW``.
     """
 
+    # Windows path: use reparse point checking
+    if sys.platform == "win32":
+        return _windows_open_nofollow(path, directory=directory)
+
+    # Unix/Linux path using fcntl
     nofollow = getattr(os, "O_NOFOLLOW", 0)
     directory_flag = getattr(os, "O_DIRECTORY", 0)
     cloexec = getattr(os, "O_CLOEXEC", 0)
@@ -116,6 +223,11 @@ def _ensure_dir_fd_nofollow(path: str | Path, *, mode: int = 0o700) -> int:
     two operations.
     """
 
+    # Windows path: use reparse point checking
+    if sys.platform == "win32":
+        return _windows_ensure_dir_nofollow(path, mode=mode)
+
+    # Unix/Linux path using fcntl
     nofollow = getattr(os, "O_NOFOLLOW", 0)
     directory_flag = getattr(os, "O_DIRECTORY", 0)
     cloexec = getattr(os, "O_CLOEXEC", 0)
@@ -203,6 +315,77 @@ def _open_private_regular_at(
 
     if not name or name in {".", ".."} or "/" in name or "\\" in name:
         raise OSError("unsafe private file name")
+
+    # Windows path: open relative to the anchored parent descriptor.
+    if sys.platform == "win32":
+        base_flags = flags | os.O_BINARY
+        if hasattr(os, "O_NOINHERIT"):
+            base_flags |= os.O_NOINHERIT
+
+        access = windows_anchored._GENERIC_READ
+        if base_flags & os.O_WRONLY:
+            access = windows_anchored._GENERIC_WRITE
+        elif base_flags & os.O_RDWR:
+            access = windows_anchored._GENERIC_READ | windows_anchored._GENERIC_WRITE
+
+        # The caller's flags may include O_TRUNC. Truncating at open time
+        # would modify the target before the reparse-point and hard-link
+        # checks could reject it, so an alias could be destroyed before it
+        # was refused. The file is therefore opened without truncation and
+        # truncated afterwards, once the descriptor that will be used has
+        # been validated.
+        #
+        # Only one open is performed. A separate read-only probe followed
+        # by a second open left a window in which the child could be
+        # replaced: anchoring the parent does not make the probed file and
+        # the reopened file the same object. Validating the descriptor that
+        # is actually used closes that window.
+        destructive = bool(base_flags & os.O_TRUNC)
+        append = bool(base_flags & os.O_APPEND)
+
+        for _ in range(32):
+            try:
+                fd = windows_anchored.open_relative(
+                    parent_fd,
+                    name,
+                    access=access,
+                    append=append,
+                )
+            except FileNotFoundError:
+                # Not there yet: create it relative to the anchored parent.
+                try:
+                    fd = windows_anchored.open_relative(
+                        parent_fd,
+                        name,
+                        access=access,
+                        create=True,
+                        exclusive=True,
+                        append=append,
+                    )
+                except FileExistsError:
+                    continue
+            except OSError:
+                raise
+
+            try:
+                # Validate the descriptor that will be used, before anything
+                # destructive is applied to it.
+                if windows_anchored.is_reparse_point(fd):
+                    raise OSError("private file is a symlink")
+                metadata = os.fstat(fd)
+                if not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1:
+                    raise OSError("private file is not an unaliased regular file")
+            except BaseException:
+                os.close(fd)
+                raise
+
+            # The descriptor is now known to be a private regular file, so
+            # the caller's truncation can be applied to it.
+            if destructive:
+                windows_anchored.truncate(fd)
+            return fd
+
+    # Unix/Linux path using dir_fd
     nofollow = getattr(os, "O_NOFOLLOW", 0)
     if not nofollow or os.open not in getattr(os, "supports_dir_fd", set()):
         raise OSError("secure private file opening is unavailable")
@@ -251,6 +434,30 @@ def _open_private_regular_at(
 def _open_unique_temp(parent_fd: int, *, prefix: str, suffix: str) -> tuple[int, str]:
     """Create a private temporary sibling relative to an already-open dir."""
 
+    # Windows path: create the temporary file relative to the anchored
+    # parent descriptor, so a renamed ancestor cannot redirect it.
+    if sys.platform == "win32":
+        for _ in range(32):
+            name = f"{prefix}{uuid.uuid4().hex}{suffix}"
+            try:
+                return (
+                    windows_anchored.open_relative(
+                        parent_fd,
+                        name,
+                        access=(
+                            windows_anchored._GENERIC_READ
+                            | windows_anchored._GENERIC_WRITE
+                        ),
+                        create=True,
+                        exclusive=True,
+                    ),
+                    name,
+                )
+            except FileExistsError:
+                continue
+        raise FileExistsError("could not allocate a unique control-bus temporary file")
+
+    # Unix/Linux path using dir_fd
     flags = (
         os.O_RDWR
         | os.O_CREAT
@@ -274,23 +481,39 @@ def _atomic_bytes_write(path: Path, payload: bytes, *, mode: int = 0o600) -> Non
     parent_fd = _ensure_dir_fd_nofollow(path.parent)
     fd: int | None = None
     temporary_name: str | None = None
+
     try:
         fd, temporary_name = _open_unique_temp(
             parent_fd,
             prefix=f".{path.name}.",
             suffix=".tmp",
         )
-        try:
-            os.fchmod(fd, mode)
-        except OSError:
-            pass
+
+        # Windows has no fchmod; the file is already created with the
+        # requested mode, so there is nothing to change.
+        if sys.platform != "win32":
+            try:
+                os.fchmod(fd, mode)
+            except OSError:
+                pass
+
         with os.fdopen(fd, "wb") as handle:
             fd = None
             handle.write(payload)
             handle.flush()
             os.fsync(handle.fileno())
-        os.replace(temporary_name, path.name, src_dir_fd=parent_fd, dst_dir_fd=parent_fd)
+
+        if sys.platform == "win32":
+            # ``os.replace`` has no ``dir_fd`` form on Windows, so the
+            # rename is done through the anchored parent descriptor.  The
+            # parent handle is still open, so the directory cannot have
+            # been renamed and the final path still points at it.
+            parent_path = windows_anchored.final_path(parent_fd)
+            os.replace(parent_path / temporary_name, parent_path / path.name)
+        else:
+            os.replace(temporary_name, path.name, src_dir_fd=parent_fd, dst_dir_fd=parent_fd)
         temporary_name = None
+
         try:
             os.fsync(parent_fd)
         except OSError:
@@ -303,7 +526,11 @@ def _atomic_bytes_write(path: Path, payload: bytes, *, mode: int = 0o600) -> Non
                 pass
         if temporary_name is not None:
             try:
-                os.unlink(temporary_name, dir_fd=parent_fd)
+                if sys.platform == "win32":
+                    parent_path = windows_anchored.final_path(parent_fd)
+                    os.unlink(parent_path / temporary_name)
+                else:
+                    os.unlink(temporary_name, dir_fd=parent_fd)
             except OSError:
                 pass
         try:
@@ -357,29 +584,14 @@ def _append_jsonl(path: Path, record: dict[str, Any]) -> None:
 def _append_locked_handle(handle: Any, line: str) -> None:
     """Append one already-open control record while holding the process lock."""
 
-    flock = None
-    try:
-        import fcntl  # type: ignore
-        flock = fcntl
-        flock.flock(handle.fileno(), flock.LOCK_EX)
-    except (ImportError, OSError) as exc:
-        # Control commands depend on a cross-process critical section for
-        # unique revisions and idempotency. Continuing without it is a
-        # correctness failure, not a portable fallback.
-        raise RuntimeError("secure control-log locking is unavailable") from exc
-    try:
+    # Control commands depend on a cross-process critical section for unique
+    # revisions and idempotency. Continuing without it is a correctness
+    # failure, not a portable fallback, so lock_handle raises rather than
+    # degrading.
+    with lock_handle(handle):
         handle.write(line)
         handle.flush()
         os.fsync(handle.fileno())
-    finally:
-        flock = None
-        try:
-            import fcntl  # type: ignore
-            flock = fcntl
-        except ImportError:
-            flock = None
-        if flock is not None:
-            flock.flock(handle.fileno(), flock.LOCK_UN)
 
 
 def _read_jsonl(path: Path) -> list[dict[str, Any]]:
@@ -496,35 +708,33 @@ class ControlBus:
         """
 
         with self._lock:
-            lock_handle = None
             # Directory-boundary failures are surfaced as OSError so callers
             # can distinguish an invalid/symlinked run layout from a platform
             # that cannot provide a process lock.  Once the anchored parent
             # exists, lock setup failures below are normalized to RuntimeError.
             parent_fd: int | None = _ensure_dir_fd_nofollow(self.root)
             lock_fd: int | None = None
-            flock = None
-            try:
-                import fcntl  # type: ignore
+            handle = None
 
-                flock = fcntl
+            try:
                 # Keep the directory descriptor returned by the no-follow
                 # creation walk.  Reopening ``self.root`` by path here would
                 # reintroduce a swap window between validation and lock open.
-                nofollow = getattr(os, "O_NOFOLLOW", 0)
-                if not nofollow:
-                    raise OSError("secure control-bus locking is unavailable")
                 lock_fd = _open_private_regular_at(parent_fd, self.lock_path.name, os.O_RDWR)
-                lock_handle = os.fdopen(lock_fd, "a+")
+                handle = os.fdopen(lock_fd, "a+")
                 lock_fd = None
-                flock.flock(lock_handle.fileno(), flock.LOCK_EX)
-            except (ImportError, OSError) as exc:
-                if lock_handle is not None:
+                # acquire_lock seeks to a fixed byte on Windows, so a freshly
+                # created (zero-length) lock file still has a range to take.
+                acquire_lock(handle)
+                ensure_lockable(handle)
+
+            except (ImportError, OSError, RuntimeError) as exc:
+                if handle is not None:
                     try:
-                        lock_handle.close()
+                        handle.close()
                     except OSError:
                         pass
-                    lock_handle = None
+                    handle = None
                 if lock_fd is not None:
                     try:
                         os.close(lock_fd)
@@ -539,12 +749,11 @@ class ControlBus:
             try:
                 yield
             finally:
-                if lock_handle is not None:
+                if handle is not None:
                     try:
-                        if flock is not None:
-                            flock.flock(lock_handle.fileno(), flock.LOCK_UN)
+                        release_lock(handle)
                     finally:
-                        lock_handle.close()
+                        handle.close()
                 if parent_fd is not None:
                     try:
                         os.close(parent_fd)
@@ -738,7 +947,11 @@ def iter_run_control_dirs(runs_root: str | Path) -> Iterator[Path]:
     cloexec = getattr(os, "O_CLOEXEC", 0)
     try:
         try:
-            entries = list(os.scandir(root_fd))
+            # Windows: scandir doesn't accept file descriptors, use path directly
+            if sys.platform == "win32":
+                entries = list(os.scandir(root))
+            else:
+                entries = list(os.scandir(root_fd))
         except OSError:
             return
         for entry in entries:
