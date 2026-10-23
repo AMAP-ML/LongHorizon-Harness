@@ -33,6 +33,7 @@ from typing import Any, Callable, Awaitable
 
 from ..supervisor.control_bus import ControlBus
 from ..supervisor.service import RunSupervisor
+from ..utils.run_boundary import safe_run_dir
 
 logger = logging.getLogger(__name__)
 
@@ -204,9 +205,20 @@ class LongHorizonMCPServer:
         False}`` for a run it has never seen, which is indistinguishable from a
         real idle run. Checking the directory keeps "no such run" from being
         reported as a healthy-but-idle run.
+
+        The run id is validated with the supervisor's own rules before the
+        path is built. Joining an unchecked id onto the run root would let
+        a caller point at a directory outside it -- ``../../elsewhere`` or
+        an absolute path -- and the control bus would then be created there.
         """
 
-        run_dir = self.runs_root / run_id
+        try:
+            RunSupervisor._validate_run_id(run_id)
+        except ValueError as exc:
+            raise MCPToolError(f"invalid run id: {exc}") from exc
+        run_dir = safe_run_dir(self.runs_root, run_id)
+        if run_dir is None:
+            raise MCPToolError(f"invalid run id: {run_id}")
         if not run_dir.is_dir():
             raise MCPToolError(f"run not found: {run_id}")
         return run_dir
@@ -391,44 +403,111 @@ async def serve_stdio(server: LongHorizonMCPServer) -> None:
             request = json.loads(line)
         except json.JSONDecodeError as exc:
             _write_response(
-                {
-                    "jsonrpc": "2.0",
-                    "id": None,
-                    "error": {"code": -32700, "message": f"invalid JSON: {exc}"},
-                }
+                _error(None, _JSONRPC_PARSE_ERROR, f"invalid JSON: {exc}")
             )
             continue
-        _write_response(await _dispatch(server, request))
+        try:
+            response = await _dispatch(server, request)
+        except Exception as exc:  # a bad message must not end the session
+            logger.exception("dispatch failed")
+            response = _error(
+                None if not isinstance(request, dict) else request.get("id"),
+                _JSONRPC_INTERNAL_ERROR,
+                f"{type(exc).__name__}: {exc}",
+            )
+        # A notification is not answered.
+        if response is not None:
+            _write_response(response)
 
 
-async def _dispatch(server: LongHorizonMCPServer, request: dict[str, Any]) -> dict[str, Any]:
-    """Handle one JSON-RPC request."""
+_JSONRPC_PARSE_ERROR = -32700
+_JSONRPC_INVALID_REQUEST = -32600
+_JSONRPC_METHOD_NOT_FOUND = -32601
+_JSONRPC_INVALID_PARAMS = -32602
+_JSONRPC_INTERNAL_ERROR = -32603
+
+
+def _error(request_id: Any, code: int, message: str) -> dict[str, Any]:
+    """Build a JSON-RPC error response."""
+
+    return {
+        "jsonrpc": "2.0",
+        "id": request_id,
+        "error": {"code": code, "message": message},
+    }
+
+
+async def _dispatch(
+    server: LongHorizonMCPServer, request: Any
+) -> dict[str, Any] | None:
+    """Handle one JSON-RPC message.
+
+    Returns ``None`` for a notification. A notification carries no id, and
+    the protocol requires that no response is written for one -- replying to
+    ``notifications/initialized`` with "method not found" is a protocol
+    violation that makes a real client fail the handshake.
+    """
+
+    if not isinstance(request, dict):
+        return _error(None, _JSONRPC_INVALID_REQUEST, "request must be a JSON object")
 
     method = request.get("method")
     request_id = request.get("id")
+    # A message without an id is a notification and must not be answered.
+    is_notification = "id" not in request
+
+    if not isinstance(method, str) or not method:
+        if is_notification:
+            return None
+        return _error(request_id, _JSONRPC_INVALID_REQUEST, "method must be a string")
+
     if method == "initialize":
         result: dict[str, Any] = {
             "protocolVersion": "2024-11-05",
             "capabilities": {"tools": {}},
             "serverInfo": {"name": "long-horizon-harness", "version": "1"},
         }
+    elif method in {"notifications/initialized", "initialized", "notifications/cancelled"}:
+        # A lifecycle notification. The client has nothing to wait for.
+        return None
     elif method in {"tools/list", "listTools"}:
         result = {"tools": server.list_tools()}
     elif method in {"tools/call", "callTool"}:
-        params = request.get("params") or {}
-        payload = await server.handle_tool_call(
-            params.get("name"), params.get("arguments") or {}
-        )
+        params = request.get("params")
+        if params is None:
+            params = {}
+        if not isinstance(params, dict):
+            if is_notification:
+                return None
+            return _error(
+                request_id, _JSONRPC_INVALID_PARAMS, "params must be an object"
+            )
+        name = params.get("name")
+        arguments = params.get("arguments")
+        if arguments is None:
+            arguments = {}
+        if not isinstance(arguments, dict):
+            if is_notification:
+                return None
+            return _error(
+                request_id, _JSONRPC_INVALID_PARAMS, "arguments must be an object"
+            )
+        if not isinstance(name, str) or not name:
+            if is_notification:
+                return None
+            return _error(request_id, _JSONRPC_INVALID_PARAMS, "name is required")
+        payload = await server.handle_tool_call(name, arguments)
         result = {
             "content": [{"type": "text", "text": json.dumps(payload, ensure_ascii=False)}],
             "isError": not payload.get("success", True),
         }
     else:
-        return {
-            "jsonrpc": "2.0",
-            "id": request_id,
-            "error": {"code": -32601, "message": f"method not found: {method}"},
-        }
+        if is_notification:
+            return None
+        return _error(request_id, _JSONRPC_METHOD_NOT_FOUND, f"method not found: {method}")
+
+    if is_notification:
+        return None
     return {"jsonrpc": "2.0", "id": request_id, "result": result}
 
 

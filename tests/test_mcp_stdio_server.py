@@ -486,3 +486,164 @@ def test_cli_serves_the_protocol_over_stdio(tmp_path: Path):
     stderr = proc.stderr.read() or ""
     assert "Traceback" not in stderr, stderr
     assert "coroutine was expected" not in stderr, stderr
+
+
+# -- the run-directory boundary -----------------------------------------
+
+
+def test_feedback_refuses_a_run_id_that_escapes_the_run_root(server, tmp_path):
+    """A run id must not be able to point outside the configured root.
+
+    The run id used to be joined onto the run root without validation, so
+    ``../../outside`` and an absolute path both reached a directory outside
+    the root and the control bus was created there.
+    """
+    outside = tmp_path / "outside"
+    outside.mkdir()
+
+    for run_id in ("../../outside", str(outside), "..", "../.."):
+        result = _call_sync(
+            server, "lh_inject_feedback", run_id=run_id, instructions="hello"
+        )
+        assert result["success"] is False, f"{run_id!r} was accepted"
+        assert "invalid run id" in result["error"], result["error"]
+
+    # Nothing may be created or modified outside the run root.
+    assert list(outside.rglob("*")) == []
+    assert not (outside / "control").exists()
+
+
+def test_feedback_refuses_a_run_id_with_a_separator(server, tmp_path):
+    """A run id containing a path separator is not a run id."""
+    for run_id in ("a/b", "a\\b", ".", "..", ""):
+        result = _call_sync(
+            server, "lh_inject_feedback", run_id=run_id, instructions="hello"
+        )
+        assert result["success"] is False, f"{run_id!r} was accepted"
+
+
+def test_feedback_still_works_for_a_real_run(server):
+    """The boundary check must not break the normal path."""
+    run_id = _call_sync(server, "lh_start_run", task="do the thing")["run_id"]
+    result = _call_sync(
+        server, "lh_inject_feedback", run_id=run_id, instructions="hello"
+    )
+    assert result["success"] is True
+    assert result["queued"] is True
+
+    bus = ControlBus(server.runs_root / run_id)
+    records = [json.loads(line) for line in (bus.commands_path).read_text().splitlines() if line]
+    assert any(record.get("kind") == "inject_instruction" for record in records)
+
+
+# -- the JSON-RPC protocol -----------------------------------------------
+
+
+def _spawn_cli(tmp_path: Path):
+    """Start the shipped MCP command and return the process."""
+
+    import subprocess
+    import sys
+
+    return subprocess.Popen(
+        [
+            sys.executable,
+            "-m",
+            "lh_harness",
+            "mcp-server",
+            "--state-root",
+            str(tmp_path / "state"),
+        ],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        encoding="utf-8",
+    )
+
+
+def test_the_client_handshake_notification_is_not_answered(tmp_path: Path):
+    """A notification must not receive a response.
+
+    A real client sends ``notifications/initialized`` after ``initialize``.
+    Answering it with "method not found" makes the handshake fail, so the
+    notification has to be consumed silently and the next response must
+    belong to the next actual request.
+    """
+    import subprocess
+
+    proc = _spawn_cli(tmp_path)
+    try:
+        proc.stdin.write(json.dumps({"jsonrpc": "2.0", "id": 1, "method": "initialize"}) + "\n")
+        proc.stdin.flush()
+        initialize = json.loads(proc.stdout.readline())
+        assert initialize["id"] == 1
+
+        # The notification carries no id and must not be answered.
+        proc.stdin.write(
+            json.dumps({"jsonrpc": "2.0", "method": "notifications/initialized"}) + "\n"
+        )
+        proc.stdin.flush()
+
+        # The next response must belong to the next real request.
+        proc.stdin.write(json.dumps({"jsonrpc": "2.0", "id": 2, "method": "tools/list"}) + "\n")
+        proc.stdin.flush()
+        listed = json.loads(proc.stdout.readline())
+        assert listed["id"] == 2, (
+            f"the notification was answered instead of the request: {listed}"
+        )
+        assert "result" in listed
+    finally:
+        proc.stdin.close()
+        try:
+            proc.wait(timeout=15)
+        except subprocess.TimeoutExpired:  # pragma: no cover - defensive
+            proc.kill()
+            raise
+
+
+def test_an_invalid_message_does_not_end_the_session(tmp_path: Path):
+    """A malformed message must be answered with an error, not a crash.
+
+    Each invalid input is followed by a valid request, and the valid
+    request must still be answered: the session has to survive.
+    """
+    import subprocess
+
+    invalid_messages = [
+        "null",
+        json.dumps({"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": ["invalid"]}),
+        json.dumps({"jsonrpc": "2.0", "id": 2, "method": 42}),
+        json.dumps({"jsonrpc": "2.0", "id": 3}),
+    ]
+
+    proc = _spawn_cli(tmp_path)
+    try:
+        for index, raw in enumerate(invalid_messages):
+            proc.stdin.write(raw + "\n")
+            proc.stdin.flush()
+            response = json.loads(proc.stdout.readline())
+            assert "error" in response, f"message {raw!r} was not answered with an error"
+            assert response["error"]["code"] in {-32600, -32601, -32602}, response
+
+            # The session must still be alive: the next request is answered.
+            request_id = 100 + index
+            proc.stdin.write(
+                json.dumps({"jsonrpc": "2.0", "id": request_id, "method": "tools/list"}) + "\n"
+            )
+            proc.stdin.flush()
+            listed = json.loads(proc.stdout.readline())
+            assert listed["id"] == request_id, (
+                f"the session ended after {raw!r}: {listed}"
+            )
+    finally:
+        proc.stdin.close()
+        try:
+            exit_code = proc.wait(timeout=15)
+        except subprocess.TimeoutExpired:  # pragma: no cover - defensive
+            proc.kill()
+            raise
+
+    assert exit_code == 0, f"server exited with {exit_code}"
+    stderr = proc.stderr.read() or ""
+    assert "Traceback" not in stderr, stderr
