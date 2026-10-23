@@ -19,9 +19,7 @@ class _KillpgRecorder(GroupSignalRecorder):
         self._body = body
 
     def __call__(self, pid: int, sig: object, *args: object, **kwargs: object) -> bool:
-        self.pids.append(pid)
         self.signals.append(sig)
-        self.forced.append(bool(kwargs.get("force", False)))
         self._body(pid, sig)
         return True
 

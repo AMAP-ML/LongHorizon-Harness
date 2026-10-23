@@ -16,10 +16,9 @@ records the signals that were delivered.
 
 from __future__ import annotations
 
-import os
 import signal
 import sys
-from typing import Any, Callable
+from typing import Any
 
 import pytest
 
@@ -29,19 +28,9 @@ class GroupSignalRecorder:
 
     def __init__(self) -> None:
         self.signals: list[Any] = []
-        self.pids: list[int] = []
-        self.forced: list[bool] = []
-
-    @property
-    def names(self) -> list[str]:
-        """The delivered signals, by name."""
-
-        return [signal.Signals(value).name for value in self.signals]
 
     def __call__(self, pid: int, sig: Any, *args: Any, **kwargs: Any) -> bool:
-        self.pids.append(pid)
         self.signals.append(sig)
-        self.forced.append(bool(kwargs.get("force", False)))
         return True
 
 
@@ -106,9 +95,3 @@ def expected_hard_kill_name() -> str:
     """
 
     return signal.Signals(hard_kill_signal()).name
-
-
-def has_killpg() -> bool:
-    """Report whether this platform has POSIX process groups."""
-
-    return hasattr(os, "killpg")
