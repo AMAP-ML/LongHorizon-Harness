@@ -15,6 +15,7 @@ from ..types import DEFAULT_TMP_DIR, ExecResult
 from ..supervisor.control_bus import _ensure_dir_fd_nofollow, _open_private_regular_at
 from ..trajectory_artifacts import StreamingTrajectoryArtifactWriter
 from ..utils.process_group import (
+    hard_kill_sig,
     kill_process_group,
     signal_process_group,
     track_process_group,
@@ -179,7 +180,7 @@ class LocalEnvironment:
             # and an unshielded await would be cancelled before the child exits.
             await asyncio.shield(asyncio.wait_for(proc.wait(), timeout=5))
         except asyncio.TimeoutError:
-            signal_process_group(proc.pid, signal.SIGKILL)
+            signal_process_group(proc.pid, hard_kill_sig(), force=True)
             with contextlib.suppress(asyncio.TimeoutError, asyncio.CancelledError):
                 await asyncio.shield(asyncio.wait_for(proc.wait(), timeout=5))
         except asyncio.CancelledError:

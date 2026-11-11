@@ -3,6 +3,7 @@ from __future__ import annotations
 import posixpath
 import re
 import shlex
+import sys
 import time
 import uuid
 from collections.abc import Callable
@@ -19,6 +20,19 @@ _SECRET_PATTERNS = (
     re.compile(rf"\b([A-Za-z0-9_]*{_SECRET_NAME}\s*=){_SECRET_VALUE}", re.I),
     re.compile(rf"(--[A-Za-z0-9-]*{_SECRET_NAME}[= ]){_SECRET_VALUE}", re.I),
 )
+
+
+def _quote_path(path: str) -> str:
+    """Quote a path for shell command, handling Windows cmd.exe vs Unix shells.
+
+    Windows cmd.exe uses double quotes, Unix shells use single quotes (via shlex.quote).
+    """
+    if sys.platform == "win32":
+        # Windows cmd.exe: use double quotes and escape existing double quotes
+        return f'"{path.replace(chr(34), chr(34) + chr(34))}"'
+    else:
+        # Unix: use shlex.quote which uses single quotes
+        return shlex.quote(path)
 
 
 def redact_secrets(text: str) -> str:
@@ -66,11 +80,11 @@ class CommandAgentAdapter:
         # try to interpret as placeholders.
         command_body = self.command_template
         for placeholder, value in (
-            ("{prompt_path}", shlex.quote(prompt_path)),
+            ("{prompt_path}", _quote_path(prompt_path)),
             ("{timeout}", str(budget.max_duration_seconds)),
         ):
             command_body = command_body.replace(placeholder, value)
-        command = f"cd {shlex.quote(self.workspace_path)} && {command_body}"
+        command = f"cd {_quote_path(self.workspace_path)} && {command_body}"
         # When a live path is given (local runs), the environment mirrors stdout
         # to that file line-by-line so the dashboard shows the trajectory live.
         result = await env.exec(

@@ -14,6 +14,26 @@ import lh_harness.supervisor.service as supervisor_service
 from lh_harness.dashboard.state import ApprovalOption, DashboardState
 from lh_harness.supervisor.control_bus import ControlBus, RevisionConflict, iter_run_control_dirs
 from lh_harness.supervisor.service import IdempotencyConflict, RunSupervisor
+from ._signalling import (
+    GroupSignalRecorder,
+    expected_hard_kill_name,
+    hard_kill_signal,
+    patch_group_signal,
+)
+
+
+class _KillpgRecorder(GroupSignalRecorder):
+    """A recorder that also runs a custom body, for tests with a side effect."""
+
+    def __init__(self, body) -> None:
+        super().__init__()
+        self._body = body
+
+    def __call__(self, pid: int, sig: object, *args: object, **kwargs: object) -> bool:
+        self.signals.append(sig)
+        self._body(pid, sig)
+        return True
+
 
 
 class _Process:
@@ -434,7 +454,7 @@ def test_stop_keeps_stopping_state_while_stale_approval_is_present(
 
     process = _Process()
     monkeypatch.setattr("lh_harness.supervisor.service.subprocess.Popen", lambda *args, **kwargs: process)
-    monkeypatch.setattr("lh_harness.supervisor.service.os.killpg", lambda *args, **kwargs: None)
+    recorder = patch_group_signal(monkeypatch)
     supervisor = RunSupervisor(tmp_path / "runs", workspace_root=tmp_path / "workspace")
     created = supervisor.create_run(task="stop me")
     run_dir = tmp_path / "runs" / created["id"]
@@ -458,9 +478,8 @@ def test_abort_escalates_stop_and_cross_action_retries_are_idempotent(
     monkeypatch, tmp_path: Path
 ) -> None:
     process = _Process()
-    signals: list[object] = []
     monkeypatch.setattr("lh_harness.supervisor.service.subprocess.Popen", lambda *args, **kwargs: process)
-    monkeypatch.setattr("lh_harness.supervisor.service.os.killpg", lambda _pid, sig: signals.append(sig))
+    recorder = patch_group_signal(monkeypatch)
     supervisor = RunSupervisor(tmp_path / "runs", workspace_root=tmp_path / "workspace")
     created = supervisor.create_run(task="stop then abort")
 
@@ -469,9 +488,9 @@ def test_abort_escalates_stop_and_cross_action_retries_are_idempotent(
     repeated_stop = supervisor.stop(created["id"])
 
     assert stopped["signal"] == "SIGTERM"
-    assert aborted["signal"] == "SIGKILL"
+    assert aborted["signal"] == expected_hard_kill_name()
     assert repeated_stop["idempotent"] is True
-    assert signals == [supervisor_service.signal.SIGTERM, supervisor_service.signal.SIGKILL]
+    assert recorder.signals == [supervisor_service.signal.SIGTERM, hard_kill_signal()]
     status = supervisor.status(created["id"])
     assert status["status"] == "stopping"
     assert status["requested_action"] == "abort"
@@ -479,9 +498,8 @@ def test_abort_escalates_stop_and_cross_action_retries_are_idempotent(
 
 def test_stop_after_abort_returns_abort_receipt_without_conflict(monkeypatch, tmp_path: Path) -> None:
     process = _Process()
-    signals: list[object] = []
     monkeypatch.setattr("lh_harness.supervisor.service.subprocess.Popen", lambda *args, **kwargs: process)
-    monkeypatch.setattr("lh_harness.supervisor.service.os.killpg", lambda _pid, sig: signals.append(sig))
+    recorder = patch_group_signal(monkeypatch)
     supervisor = RunSupervisor(tmp_path / "runs", workspace_root=tmp_path / "workspace")
     created = supervisor.create_run(task="abort then stop")
 
@@ -489,9 +507,9 @@ def test_stop_after_abort_returns_abort_receipt_without_conflict(monkeypatch, tm
     repeated = supervisor.stop(created["id"])
 
     assert repeated["command_id"] == "lifecycle-abort"
-    assert repeated["signal"] == "SIGKILL"
+    assert repeated["signal"] == expected_hard_kill_name()
     assert repeated["idempotent"] is True
-    assert signals == [supervisor_service.signal.SIGKILL]
+    assert recorder.signals == [hard_kill_signal()]
 
 
 def test_first_role_event_promotes_starting_worker_to_running(monkeypatch, tmp_path: Path) -> None:
@@ -638,7 +656,7 @@ def test_stop_persists_intent_before_signal(monkeypatch, tmp_path: Path) -> None
     def killpg(_pid: int, _sig: object) -> None:
         observed.append(ControlBus(tmp_path / "runs" / created["id"]).read_status().get("status", ""))
 
-    monkeypatch.setattr("lh_harness.supervisor.service.os.killpg", killpg)
+    recorder = patch_group_signal(monkeypatch, recorder=_KillpgRecorder(killpg))
     supervisor = RunSupervisor(tmp_path / "runs", workspace_root=tmp_path / "workspace")
     created = supervisor.create_run(task="ordering")
     supervisor.stop(created["id"])
@@ -648,7 +666,7 @@ def test_stop_persists_intent_before_signal(monkeypatch, tmp_path: Path) -> None
 def test_signal_process_lookup_reconciles_stopping_to_failed(monkeypatch, tmp_path: Path) -> None:
     process = _Process()
     monkeypatch.setattr("lh_harness.supervisor.service.subprocess.Popen", lambda *args, **kwargs: process)
-    monkeypatch.setattr("lh_harness.supervisor.service.os.killpg", lambda *args, **kwargs: (_ for _ in ()).throw(ProcessLookupError()))
+    patch_group_signal(monkeypatch, raises=ProcessLookupError())
     supervisor = RunSupervisor(tmp_path / "runs", workspace_root=tmp_path / "workspace")
     created = supervisor.create_run(task="vanish")
 
@@ -664,7 +682,7 @@ def test_signal_process_lookup_reconciles_stopping_to_failed(monkeypatch, tmp_pa
 def test_signal_permission_failure_restores_active_state(monkeypatch, tmp_path: Path) -> None:
     process = _Process()
     monkeypatch.setattr("lh_harness.supervisor.service.subprocess.Popen", lambda *args, **kwargs: process)
-    monkeypatch.setattr("lh_harness.supervisor.service.os.killpg", lambda *args, **kwargs: (_ for _ in ()).throw(PermissionError()))
+    patch_group_signal(monkeypatch, raises=PermissionError())
     supervisor = RunSupervisor(tmp_path / "runs", workspace_root=tmp_path / "workspace")
     created = supervisor.create_run(task="permission")
 
@@ -680,8 +698,7 @@ def test_signal_permission_failure_restores_active_state(monkeypatch, tmp_path: 
 def test_pending_lifecycle_command_is_replayed_after_supervisor_restart(monkeypatch, tmp_path: Path) -> None:
     process = _Process()
     monkeypatch.setattr("lh_harness.supervisor.service.subprocess.Popen", lambda *args, **kwargs: process)
-    sent: list[object] = []
-    monkeypatch.setattr("lh_harness.supervisor.service.os.killpg", lambda pid, sig: sent.append((pid, sig)))
+    recorder = patch_group_signal(monkeypatch)
     supervisor = RunSupervisor(tmp_path / "runs", workspace_root=tmp_path / "workspace")
     created = supervisor.create_run(task="replay stop")
     bus = ControlBus(tmp_path / "runs" / created["id"])
@@ -694,7 +711,7 @@ def test_pending_lifecycle_command_is_replayed_after_supervisor_restart(monkeypa
     restarted = RunSupervisor(tmp_path / "runs", workspace_root=tmp_path / "workspace")
     monkeypatch.setattr(restarted, "_is_alive", lambda _run_id: True)
     status = restarted.status(created["id"])
-    assert sent
+    assert recorder.signals
     assert bus.receipt_for("lifecycle-stop")["status"] == "accepted"
     assert status["status"] == "stopping"
 

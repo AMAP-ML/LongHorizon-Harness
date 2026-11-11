@@ -30,11 +30,14 @@ from .control_bus import (
     _atomic_bytes_write,
     _ensure_dir_fd_nofollow,
     _ensure_dir_nofollow,
+    _is_windows_symlink,
     _open_nofollow,
     _open_private_regular_at,
     _read_json_file,
     _read_jsonl,
 )
+from ..utils.file_lock import acquire_lock, ensure_lockable, release_lock
+from ..utils.process_group import hard_kill_sig, hard_kill_sig_name
 from .lifecycle import (
     ACTIVE_STATUSES,
     MAX_RESUME_EPOCH,
@@ -176,6 +179,70 @@ def _open_worker_log(path: Path):
     """
 
     path = Path(path)
+
+    # Windows path: use reparse point checking
+    if sys.platform == "win32":
+        # Ensure parent directory exists and check for symlinks
+        parent_fd = _open_nofollow(path.parent, directory=True)
+
+        try:
+            # Check if the file itself is a symlink
+            if path.exists() and _is_windows_symlink(path):
+                raise OSError(f"worker log is a symlink: {path}")
+
+            # Open the file with Windows-compatible flags
+            flags = os.O_RDWR | os.O_CREAT | os.O_BINARY
+            if hasattr(os, 'O_NOINHERIT'):
+                flags |= os.O_NOINHERIT
+
+            fd = os.open(path, flags, 0o600)
+
+            # Verify it's a regular file
+            metadata = os.fstat(fd)
+            if not stat.S_ISREG(metadata.st_mode):
+                os.close(fd)
+                raise OSError(f"worker log is not a regular file: {path}")
+
+            # Check for hard links
+            if metadata.st_nlink != 1:
+                os.close(fd)
+                raise OSError(errno.ELOOP, "worker log has multiple hard links")
+
+            # Try to set permissions (best effort on Windows)
+            try:
+                os.chmod(path, 0o600)
+            except OSError:
+                pass
+
+            # Handle log rotation if too large
+            if metadata.st_size > _MAX_WORKER_LOG_BYTES:
+                keep = max(1, min(_WORKER_LOG_KEEP_BYTES, _MAX_WORKER_LOG_BYTES))
+                start = max(0, metadata.st_size - keep)
+                os.lseek(fd, start, os.SEEK_SET)
+                tail = bytearray()
+                remaining = keep
+                while remaining:
+                    chunk = os.read(fd, remaining)
+                    if not chunk:
+                        break
+                    tail.extend(chunk)
+                    remaining -= len(chunk)
+                os.ftruncate(fd, 0)
+                os.lseek(fd, 0, os.SEEK_SET)
+                _write_all(fd, bytes(tail))
+                try:
+                    os.fsync(fd)
+                except OSError:
+                    pass
+
+            os.lseek(fd, 0, os.SEEK_END)
+            # Return file object, not descriptor
+            output = os.fdopen(fd, "a+b", buffering=0)
+            return output
+        finally:
+            os.close(parent_fd)
+
+    # Unix/Linux path using O_NOFOLLOW
     nofollow = getattr(os, "O_NOFOLLOW", 0)
     if not nofollow:
         raise OSError(errno.ENOTSUP, "worker log requires O_NOFOLLOW")
@@ -294,7 +361,13 @@ def _saved_task_from_rounds(
             current = next_fd
         rounds_fd = current
         candidates: list[tuple[int, str]] = []
-        with os.scandir(rounds_fd) as entries:
+        # Windows: scandir doesn't accept file descriptors, construct path
+        if sys.platform == "win32":
+            rounds_path = runs_root / run_id / logs_path.name / role_path.name / "rounds"
+            scan_target = rounds_path
+        else:
+            scan_target = rounds_fd
+        with os.scandir(scan_target) as entries:
             for entry_number, entry in enumerate(entries):
                 if entry_number >= _MAX_ROUND_DIR_SCAN:
                     break
@@ -715,18 +788,17 @@ class RunSupervisor:
 
         lock_path = self.runs_root / ".supervisor.lock"
         handle = None
-        flock = None
         raw_fd: int | None = None
         parent_fd: int | None = None
-        try:
-            import fcntl  # type: ignore
 
-            flock = fcntl
+        try:
             # Idempotency is a cross-process protocol. Fail closed if the
-            # lock path is a symlink, hard-link alias, or special file.
-            nofollow = getattr(os, "O_NOFOLLOW", 0)
-            if not nofollow:
-                raise OSError("secure supervisor locking is unavailable")
+            # lock path is a symlink/reparse point, hard-link alias, or special
+            # file -- hence _open_private_regular_at rather than a plain open().
+            # It carries a Windows branch that performs the equivalent checks
+            # via lstat reparse-point attributes plus an st_nlink test, so both
+            # platforms get the same control-state boundary.
+            #
             # Hold the descriptor returned by the anchored directory walk and
             # create/open the lock relative to it.  This removes the prior
             # validate-then-reopen race on ``runs_root``.
@@ -734,8 +806,11 @@ class RunSupervisor:
             raw_fd = _open_private_regular_at(parent_fd, lock_path.name, os.O_RDWR)
             handle = os.fdopen(raw_fd, "a+")
             raw_fd = None
-            flock.flock(handle.fileno(), flock.LOCK_EX)
-        except (ImportError, OSError) as exc:
+            # acquire_lock seeks to a fixed byte on Windows, so a freshly
+            # created (zero-length) lock file still has a range to take.
+            acquire_lock(handle)
+            ensure_lockable(handle)
+        except (ImportError, OSError, RuntimeError) as exc:
             if handle is not None:
                 try:
                     handle.close()
@@ -758,8 +833,7 @@ class RunSupervisor:
         finally:
             if handle is not None:
                 try:
-                    if flock is not None:
-                        flock.flock(handle.fileno(), flock.LOCK_UN)
+                    release_lock(handle)
                 finally:
                     handle.close()
             if parent_fd is not None:
@@ -1081,7 +1155,11 @@ class RunSupervisor:
             # Identity mismatch is intentionally fail-closed: never signal a
             # reused PID merely because the old owner record said it was alive.
             return reconcile_unavailable("worker is no longer running or its identity changed")
-        sig = signal.SIGKILL if action == "abort" else signal.SIGTERM
+        # An abort must actually abort. On POSIX that is SIGKILL; on Windows
+        # SIGKILL does not exist, so the request is carried by the ``force``
+        # flag rather than by the signal number.
+        force = action == "abort"
+        sig = hard_kill_sig() if force else signal.SIGTERM
         # Record an attempt for diagnostics under the same lock used by status
         # merges. Do not use it as a once-only gate: a crash after the signal
         # and before the receipt needs one safe retry.
@@ -1095,7 +1173,13 @@ class RunSupervisor:
             if str(owner.get("signal_mode") or "pgid") == "pid":
                 os.kill(pid, sig)
             else:
-                os.killpg(pgid, sig)
+                if sys.platform == "win32":
+                    # Windows: use signal_process_group helper
+                    from ..utils.process_group import signal_process_group
+                    if not signal_process_group(pgid, sig, force=force):
+                        raise ProcessLookupError("process group not found")
+                else:
+                    os.killpg(pgid, sig)
         except ProcessLookupError:
             return reconcile_unavailable("worker is no longer running")
         except PermissionError:
@@ -1800,7 +1884,11 @@ class RunSupervisor:
             # unowned worker running if the durable reservation cannot be
             # promoted to a live owner.
             try:
-                os.killpg(process.pid, signal.SIGKILL)
+                if sys.platform == "win32":
+                    from ..utils.process_group import signal_process_group
+                    signal_process_group(process.pid, hard_kill_sig(), force=True)
+                else:
+                    os.killpg(process.pid, hard_kill_sig())
             except OSError:
                 pass
             raise
@@ -1996,6 +2084,9 @@ class RunSupervisor:
         if self.attached_only and run_id != self.attached_run_id:
             raise ValueError("attached supervisor cannot control this run")
         self._assert_run_scope(run_id)
+        # The signal number cannot carry "abort" on Windows, where the hard
+        # kill signal is SIGTERM. The action is the authority.
+        force = kind == "abort"
         bus = self._bus(run_id)
         with self._lifecycle_lock:
             current = self._refresh(run_id)
@@ -2034,7 +2125,7 @@ class RunSupervisor:
                         None,
                     )
                     receipt = bus.receipt_for(active_command_id)
-                    active_signal = signal.SIGKILL.name if active_kind == "abort" else signal.SIGTERM.name
+                    active_signal = hard_kill_sig_name() if active_kind == "abort" else signal.SIGTERM.name
                     return {
                         "command_id": active_command_id,
                         "status": str((receipt or {}).get("status") or "accepted"),
@@ -2121,7 +2212,12 @@ class RunSupervisor:
                 if str(owner.get("signal_mode") or "pgid") == "pid":
                     os.kill(owner_pid, sig)
                 else:
-                    os.killpg(pgid, sig)
+                    if sys.platform == "win32":
+                        from ..utils.process_group import signal_process_group
+                        if not signal_process_group(pgid, sig, force=force):
+                            raise ProcessLookupError("process group not found")
+                    else:
+                        os.killpg(pgid, sig)
             except ProcessLookupError:
                 # The signal raced with process exit.  Do not leave a durable
                 # ``stopping`` state behind: reconcile from the final report,
@@ -2179,7 +2275,7 @@ class RunSupervisor:
         return self._signal(run_id, signal.SIGTERM, kind="stop")
 
     def abort(self, run_id: str) -> dict[str, Any]:
-        return self._signal(run_id, signal.SIGKILL, kind="abort")
+        return self._signal(run_id, hard_kill_sig(), kind="abort")
 
     def shutdown(self, *, grace_seconds: float = 5.0) -> None:
         """Stop workers launched by this supervisor before its API exits.
@@ -2212,7 +2308,11 @@ class RunSupervisor:
             if process.poll() is not None:
                 continue
             try:
-                os.killpg(process.pid, signal.SIGKILL)
+                if sys.platform == "win32":
+                    from ..utils.process_group import signal_process_group
+                    signal_process_group(process.pid, hard_kill_sig(), force=True)
+                else:
+                    os.killpg(process.pid, hard_kill_sig())
             except ProcessLookupError:
                 pass
             except PermissionError:

@@ -23,6 +23,7 @@ from lh_harness.supervisor.service import (
     _resume_round_budget,
 )
 from lh_harness.types import MAX_ROUNDS, ManagedRound
+from .supervisor._signalling import patch_group_signal
 
 
 class FakeProcess:
@@ -258,7 +259,7 @@ def supervisor(monkeypatch, tmp_path: Path) -> RunSupervisor:
         "lh_harness.supervisor.service.subprocess.Popen",
         lambda *args, **kwargs: FakeProcess(),
     )
-    monkeypatch.setattr("lh_harness.supervisor.service.os.killpg", lambda *args, **kwargs: None)
+    patch_group_signal(monkeypatch)
     workspace = tmp_path / "workspace"
     workspace.mkdir()
     return RunSupervisor(tmp_path / "runs", workspace_root=workspace)
