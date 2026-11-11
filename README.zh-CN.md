@@ -21,7 +21,7 @@
 [![Agents](https://img.shields.io/badge/backends-Claude%20Code%20|%20Codex%20|%20OpenCode%20|%20DeepSeek-8A2BE2)](#任意模型任意-agent-后端)
 [![Benchmarks](https://img.shields.io/badge/benchmarks-WeaveBench%20|%20OSWorld%202.0%20|%20Terminal--Bench%202.1-orange)](#数百个真实任务规模化验证)
 
-[Usage](#一条命令全程可见) · [The Loop](#面向真实电脑环境的-loop-engineering) · [Computer Use](#桌面-app-与命令行一个连续任务) · [Results](#数百个真实任务规模化验证) · [Project Website](https://lh-harness.pages.dev) · [English](README.md)
+[Usage](#一条命令全程可见) · [The Loop](#面向真实电脑环境的-loop-engineering) · [Computer Use](#桌面-app-与命令行一个连续任务) · [Results](#数百个真实任务规模化验证) · [Project Website](https://lh-harness.pages.dev) · [English](README.md) · [日本語](README.ja.md)
 
 <br>
 <img src="assets/quickstart.gif" alt="Install and run LongHorizon-Harness from the command line" width="720">
