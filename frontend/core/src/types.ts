@@ -49,6 +49,8 @@ export interface OperatorMessage {
   text: string;
   created_at: number;
   status: 'queued' | 'applied' | 'rejected' | 'failed' | 'cancelled' | string;
+  /** A queued message has an append-only correction in the control log. */
+  edited?: boolean;
 }
 
 export interface RoundView {

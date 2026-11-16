@@ -1,4 +1,4 @@
-import type { ArtifactList, EventEnvelope, RunSummary, Snapshot } from '../../core/src/types';
+import type { ArtifactList, EventEnvelope, OperatorMessage, RunSummary, Snapshot } from '../../core/src/types';
 
 const WEB_TOKEN_KEY = 'lh-web-token';
 let volatileWebToken = '';
@@ -251,6 +251,23 @@ export async function postInstruction(runId: string, instructions: string, reque
   if (!response.ok) throw await responseError(response);
 }
 
+export async function editInstruction(runId: string, messageId: string, instructions: string): Promise<OperatorMessage> {
+  const response = await fetch(`/api/runs/${encodeURIComponent(runId)}/instructions/${encodeURIComponent(messageId)}`, {
+    method: 'PATCH',
+    headers: { 'Content-Type': 'application/json', ...authHeaders() },
+    body: JSON.stringify({ instructions }),
+  });
+  if (!response.ok) throw await responseError(response);
+  const data = await response.json() as { message: OperatorMessage };
+  return data.message;
+}
+
+export async function deleteInstruction(runId: string, messageId: string): Promise<void> {
+  const response = await fetch(`/api/runs/${encodeURIComponent(runId)}/instructions/${encodeURIComponent(messageId)}`, {
+    method: 'DELETE', headers: authHeaders(),
+  });
+  if (!response.ok) throw await responseError(response);
+}
 export async function resolveApproval(
   runId: string,
   approvalId: string,
