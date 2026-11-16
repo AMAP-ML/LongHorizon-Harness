@@ -24,7 +24,7 @@ from ..dashboard.state import DashboardState
 from ..model_catalog import discover_model_catalog
 from ..supervisor.service import IdempotencyConflict, RunSupervisor
 from ..supervisor.lifecycle import TERMINAL_STATUSES, canonical_lifecycle_status, resume_epoch
-from ..supervisor.control_bus import CommandConflict, RevisionConflict
+from ..supervisor.control_bus import CommandConflict, OperatorMessageConflict, RevisionConflict
 from ..types import DEFAULT_CODEX_MODEL, DEFAULT_MAX_ROUNDS, MAX_ROUNDS
 from ..utils.agent_cli import resolve_codex_binary, resolve_dsh_binary, resolve_opencode_binary
 from ..utils.run_boundary import safe_run_control, safe_run_dir, safe_run_logs, safe_run_role, safe_run_rounds
@@ -597,7 +597,7 @@ def _stream_projection_signature(snapshot: dict[str, Any]) -> tuple[Any, ...]:
     """Track snapshot-only state that must wake connected Web clients."""
 
     operator_messages = tuple(
-        (item.get("id"), item.get("status"))
+        (item.get("id"), item.get("text"), item.get("status"), item.get("edited"))
         for item in snapshot.get("operator_messages", [])
         if isinstance(item, dict)
     )
@@ -1068,6 +1068,38 @@ def create_app(
             "idempotency_key": _bounded_command_id(request.headers.get("Idempotency-Key")),
             "revision": state_for_run.control_bus.revision(),
         }
+
+    @app.patch("/api/runs/{run_id}/instructions/{message_id}")
+    def edit_instruction(
+        run_id: str,
+        message_id: str,
+        body: dict[str, Any] = Body(default_factory=dict),
+    ) -> dict[str, Any]:
+        state_for_run = _state_or_404(registry, run_id)
+        if supervisor is not None and not supervisor.can_control(run_id):
+            raise HTTPException(status_code=409, detail="run is not accepting instructions")
+        text = _body_text(body.get("instructions", body.get("text", "")), field="instructions", required=True, max_chars=50_000)
+        try:
+            message = state_for_run.edit_injection(message_id, text)
+        except OperatorMessageConflict as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail="instruction not found") from exc
+        return {"ok": True, "message": message}
+
+    @app.delete("/api/runs/{run_id}/instructions/{message_id}")
+    def delete_instruction(run_id: str, message_id: str) -> dict[str, Any]:
+        state_for_run = _state_or_404(registry, run_id)
+        if supervisor is not None and not supervisor.can_control(run_id):
+            raise HTTPException(status_code=409, detail="run is not accepting instructions")
+        try:
+            state_for_run.delete_injection(message_id)
+        except OperatorMessageConflict as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail="instruction not found") from exc
+        return {"ok": True, "id": message_id, "status": "deleted"}
+
 
     @app.post("/api/runs/{run_id}/approvals/{approval_id}/resolve")
     def resolve_approval(

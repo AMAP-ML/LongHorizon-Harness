@@ -325,6 +325,10 @@ class CommandConflict(ValueError):
     """Raised when an idempotency command id is reused with a new payload."""
 
 
+class OperatorMessageConflict(ValueError):
+    """Raised when an instruction has been claimed, delivered, or removed."""
+
+
 def _append_jsonl(path: Path, record: dict[str, Any]) -> None:
     line = json.dumps(record, ensure_ascii=False, sort_keys=True) + "\n"
     if len(line.encode("utf-8")) > _MAX_CONTROL_RECORD_BYTES:
@@ -477,6 +481,7 @@ class ControlBus:
         self.root = self.run_dir / "control"
         self.commands_path = self.root / "commands.jsonl"
         self.receipts_path = self.root / "command_receipts.jsonl"
+        self.operator_message_mutations_path = self.root / "operator_message_mutations.jsonl"
         self.status_path = self.root / "status.json"
         self.owner_path = self.root / "owner.json"
         # The lock file, rather than the commands file, is the process-wide
@@ -644,6 +649,97 @@ class ControlBus:
             for command in self.commands()
             if str(command.get("command_id")) not in receipts
         ]
+
+    def _operator_message_state_unlocked(self) -> dict[str, dict[str, Any]]:
+        state: dict[str, dict[str, Any]] = {}
+        for command in self._commands_unlocked():
+            if command.get("kind") != "inject_instruction":
+                continue
+            command_id = str(command.get("command_id") or "")
+            if not command_id:
+                continue
+            payload_value = command.get("payload")
+            payload: dict[str, Any] = payload_value if isinstance(payload_value, dict) else {}
+            state[command_id] = {
+                "id": command_id,
+                "text": str(payload.get("instructions") or "").strip(),
+                "created_at": float(command.get("created_at") or 0.0),
+                "status": "queued",
+            }
+        for mutation in _read_jsonl(self.operator_message_mutations_path):
+            command_id = str(mutation.get("message_id") or "")
+            if not command_id or command_id not in state:
+                continue
+            action = str(mutation.get("action") or "")
+            if action == "edit":
+                state[command_id]["text"] = str(mutation.get("text") or "").strip()
+                state[command_id]["edited"] = True
+            elif action == "delete":
+                state.pop(command_id, None)
+            elif action == "claim":
+                state[command_id]["status"] = "claimed"
+        for receipt in _read_jsonl(self.receipts_path):
+            command_id = str(receipt.get("command_id") or "")
+            if command_id in state and receipt.get("status") in self.terminal_receipt_statuses:
+                state[command_id]["status"] = str(receipt["status"])
+        return state
+
+    def operator_messages(self) -> list[dict[str, Any]]:
+        """Return the current operator-message projection under the bus lock."""
+
+        with self._locked():
+            return list(self._operator_message_state_unlocked().values())
+
+    def operator_message_mutations(self) -> list[dict[str, Any]]:
+        return _read_jsonl(self.operator_message_mutations_path)
+
+    def _append_operator_mutation_unlocked(
+        self, message_id: str, action: str, *, text: str = ""
+    ) -> dict[str, Any]:
+        mutation = {
+            "message_id": message_id,
+            "action": action,
+            "text": text,
+            "updated_at": time.time(),
+        }
+        _append_jsonl(self.operator_message_mutations_path, mutation)
+        return mutation
+
+    def mutate_operator_message(self, message_id: str, action: str, *, text: str = "") -> dict[str, Any]:
+        """Edit/delete a still-queued instruction under the control lock."""
+
+        message_id = str(message_id or "").strip()
+        if not message_id or action not in {"edit", "delete"}:
+            raise ValueError("invalid operator message mutation")
+        with self._locked():
+            state = self._operator_message_state_unlocked()
+            current = state.get(message_id)
+            if current is None:
+                raise KeyError(message_id)
+            if current.get("status") != "queued":
+                raise OperatorMessageConflict("instruction is no longer queued")
+            if action == "edit" and not str(text).strip():
+                raise ValueError("instruction is required")
+            return self._append_operator_mutation_unlocked(message_id, action, text=str(text).strip())
+
+    def claim_queued_instructions(self) -> list[dict[str, Any]]:
+        """Atomically claim queued instructions before the worker applies them."""
+
+        with self._locked():
+            state = self._operator_message_state_unlocked()
+            claimed: list[dict[str, Any]] = []
+            for command in self._commands_unlocked():
+                if command.get("kind") != "inject_instruction":
+                    continue
+                message_id = str(command.get("command_id") or "")
+                current = state.get(message_id)
+                if current is None or current.get("status") != "queued":
+                    continue
+                self._append_operator_mutation_unlocked(message_id, "claim")
+                payload = dict(command.get("payload") or {})
+                payload["instructions"] = current["text"]
+                claimed.append({**command, "payload": payload})
+            return claimed
 
     def receipt(
         self,

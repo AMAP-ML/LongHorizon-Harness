@@ -1099,9 +1099,9 @@ class DashboardState:
 
     def list_injections(self) -> list[str]:
         return [
-            str((item.get("payload") or {}).get("instructions", ""))
-            for item in self.control_bus.pending()
-            if item.get("kind") == "inject_instruction"
+            str(item.get("text") or "")
+            for item in self.control_bus.operator_messages()
+            if item.get("status") == "queued" and str(item.get("text") or "").strip()
         ]
 
     def list_operator_messages(self, *, limit: int = 100) -> list[dict[str, Any]]:
@@ -1113,40 +1113,40 @@ class DashboardState:
         of truth and receipts only enrich their delivery state.
         """
         bounded_limit = max(1, min(int(limit), 500))
-        receipts = {
-            str(item.get("command_id") or ""): item
-            for item in self.control_bus.receipts()
-            if item.get("command_id")
-        }
-        messages: list[dict[str, Any]] = []
-        for command in self.control_bus.commands():
-            if command.get("kind") != "inject_instruction":
-                continue
-            payload = command.get("payload") if isinstance(command.get("payload"), dict) else {}
-            text = str(payload.get("instructions") or "").strip()
-            command_id = str(command.get("command_id") or "").strip()
-            if not text or not command_id:
-                continue
-            receipt = receipts.get(command_id) or {}
-            try:
-                created_at = float(command.get("created_at") or 0.0)
-            except (TypeError, ValueError):
-                created_at = 0.0
-            messages.append(
-                {
-                    "id": command_id,
-                    "text": text[:50_000],
-                    "created_at": created_at,
-                    "status": str(receipt.get("status") or "queued"),
-                }
-            )
-        return messages[-bounded_limit:]
+        return [
+            {
+                "id": str(message["id"]),
+                "text": str(message.get("text") or "")[:50_000],
+                "created_at": float(message.get("created_at") or 0.0),
+                "status": str(message.get("status") or "queued"),
+                "edited": bool(message.get("edited")),
+            }
+            for message in self.control_bus.operator_messages()
+        ][-bounded_limit:]
+
+    def edit_injection(self, command_id: str, text: str) -> dict[str, Any]:
+        """Edit a queued instruction without rewriting the original command."""
+
+        text = (text or "").strip()
+        if not text:
+            raise ValueError("instruction is required")
+        self.control_bus.mutate_operator_message(command_id, "edit", text=text)
+        message = next(
+            (item for item in self.list_operator_messages(limit=500) if item["id"] == command_id),
+            None,
+        )
+        if message is None:
+            raise RuntimeError("edited instruction is missing")
+        return message
+
+    def delete_injection(self, command_id: str) -> None:
+        """Hide a queued instruction and prevent it from reaching the worker."""
+
+        self.control_bus.mutate_operator_message(command_id, "delete")
 
     def drain_injections(self) -> list[str]:
         drained: list[str] = []
-        for command in self.control_bus.pending():
-            if command.get("kind") != "inject_instruction":
-                continue
+        for command in self.control_bus.claim_queued_instructions():
             payload = command.get("payload") if isinstance(command.get("payload"), dict) else {}
             text = str(payload.get("instructions", "")).strip()
             if text:

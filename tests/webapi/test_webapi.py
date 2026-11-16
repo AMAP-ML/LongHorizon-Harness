@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import mimetypes
+import os
 import threading
 from pathlib import Path
 
@@ -439,6 +440,57 @@ def test_instruction_idempotency_key_conflict_is_not_silently_replayed(tmp_path:
     assert first.status_code == 200
     assert conflicting.status_code == 409
     assert state.list_injections() == ["first"]
+
+
+@pytest.mark.skipif(os.name == "nt", reason="control bus deliberately requires POSIX dir-fd locking")
+def test_queued_instruction_can_be_edited_or_deleted_without_rewriting_execution_history(tmp_path: Path) -> None:
+    root, state = _fixture(tmp_path)
+    client = TestClient(create_app(state=state, runs_root=root, run_id="run-1"), headers={"Host": "127.0.0.1"})
+    created = client.post(
+        "/api/runs/run-1/instructions",
+        headers={"Idempotency-Key": "instruction-editable"},
+        json={"instructions": "original instruction"},
+    )
+    assert created.status_code == 200
+
+    edited = client.patch(
+        "/api/runs/run-1/instructions/instruction-editable",
+        json={"instructions": "corrected instruction"},
+    )
+    assert edited.status_code == 200
+    message = edited.json()["message"]
+    assert message["id"] == "instruction-editable"
+    assert message["text"] == "corrected instruction"
+    assert message["status"] == "queued"
+    assert message["edited"] is True
+    assert state.list_injections() == ["corrected instruction"]
+    assert state.control_bus.commands()[0]["payload"] == {"instructions": "original instruction"}
+
+    deleted = client.delete("/api/runs/run-1/instructions/instruction-editable")
+    assert deleted.status_code == 200
+    assert state.list_injections() == []
+    assert state.list_operator_messages() == []
+    assert [item["action"] for item in state.control_bus.operator_message_mutations()] == ["edit", "delete"]
+
+
+@pytest.mark.skipif(os.name == "nt", reason="control bus deliberately requires POSIX dir-fd locking")
+def test_instruction_mutation_conflicts_once_the_worker_claims_the_message(tmp_path: Path) -> None:
+    root, state = _fixture(tmp_path)
+    client = TestClient(create_app(state=state, runs_root=root, run_id="run-1"), headers={"Host": "127.0.0.1"})
+    assert client.post(
+        "/api/runs/run-1/instructions",
+        headers={"Idempotency-Key": "instruction-race"},
+        json={"instructions": "do not change after claim"},
+    ).status_code == 200
+
+    claimed = state.control_bus.claim_queued_instructions()
+    assert [command["payload"]["instructions"] for command in claimed] == ["do not change after claim"]
+
+    assert client.patch(
+        "/api/runs/run-1/instructions/instruction-race",
+        json={"instructions": "too late"},
+    ).status_code == 409
+    assert client.delete("/api/runs/run-1/instructions/instruction-race").status_code == 409
 
 
 def test_websocket_starts_with_snapshot_and_replay(tmp_path: Path) -> None:

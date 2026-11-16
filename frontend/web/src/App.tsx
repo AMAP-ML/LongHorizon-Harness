@@ -45,6 +45,8 @@ import { availableCommands, isTrajectoryNoise, managerPlanSummary, managerPlanTe
 import {
   abortRun,
   createRun,
+  editInstruction,
+  deleteInstruction,
   fetchArtifact,
   fetchArtifacts,
   fetchMeta,
@@ -225,6 +227,10 @@ interface ConversationMessage {
   sortRound?: number;
   /** Whether the text is backed by the harness completion authority. */
   authority?: 'final_response' | 'auditor' | 'report' | 'none';
+  /** Durable operator instruction id, when this is an editable queued message. */
+  operatorMessageId?: string;
+  operatorStatus?: string;
+  operatorEdited?: boolean;
 }
 
 type ActivityAction = 'read' | 'edit' | 'validate' | 'search' | 'task' | 'screenshot' | 'command' | 'result' | 'note';
@@ -751,6 +757,9 @@ function conversationFor(snapshot: Snapshot, trajectoryMap: Record<string, Traje
       time,
       sortTime: time,
       sortRound: roundForTime(snapshot, time),
+      operatorMessageId: item.id,
+      operatorStatus: item.status,
+      operatorEdited: item.edited,
     });
   }
   for (const approval of snapshot.approvals) {
@@ -1171,6 +1180,33 @@ export default function App() {
     }
   }
 
+  async function editOperatorMessage(messageId: string, messageText: string) {
+    setBusy(true);
+    setError('');
+    try {
+      await editInstruction(runId, messageId, messageText);
+      await feed.refresh();
+    } catch (reason) {
+      setError(String(reason));
+      throw reason;
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function deleteOperatorMessage(messageId: string) {
+    setBusy(true);
+    setError('');
+    try {
+      await deleteInstruction(runId, messageId);
+      await feed.refresh();
+    } catch (reason) {
+      setError(String(reason));
+    } finally {
+      setBusy(false);
+    }
+  }
+
   async function sendInstruction() {
     const inputText = instruction.trim();
     if (!inputText) return;
@@ -1384,7 +1420,7 @@ export default function App() {
 
         <section className="conversation" aria-label="LongHorizon conversation" ref={conversationRef} onScroll={(event) => { const node = event.currentTarget; setFollowLatest(node.scrollHeight - node.scrollTop - node.clientHeight < 48); }}>
           {!runId && <div className="welcome"><div className="welcome-mark"><Sparkles size={20} /></div><h1>{text('你想完成什么？', 'What do you want to accomplish?')}</h1><p>{text('开始一个真实的 LongHorizon 任务。计划、中间过程、验证和最终回答会像 Codex 一样显示在这里。', 'Start a real LongHorizon task. Plans, intermediate work, verification, and the final answer will appear here as they happen.')}</p>{meta && !canCreateRun && <p className="welcome-note">{text('当前连接为只读模式；启动 ', 'This connection is read-only. Start ')}<code>lh-harness web</code>{text(' 后即可创建任务。', ' to create tasks.')}</p>}{!meta && <p className="welcome-note">{text('正在连接 Web 服务…', 'Connecting to the Web service…')}</p>}<button className="welcome-button" disabled={!canCreateRun} onClick={() => { setCreatingNew(true); setDetailsOpen(true); }}><Plus size={15} />{text('开始任务', 'Start task')}</button></div>}
-          {runId && messages.map((message) => <ConversationMessage key={message.id} message={message} />)}
+          {runId && messages.map((message) => <ConversationMessage key={message.id} message={message} busy={busy} onEdit={editOperatorMessage} onDelete={deleteOperatorMessage} />)}
           {runId && !messages.length && <div className="empty-conversation"><span className="thinking-dot" />{text('等待 LongHorizon 启动…', 'Waiting for LongHorizon to start…')}</div>}
           {['running', 'starting', 'stopping', 'aborting'].includes(snapshot.run.status) && <div className="working-line" role="status" aria-live="polite"><span className="thinking-dot" /><span>{snapshot.run.status === 'stopping' || snapshot.run.status === 'aborting' ? text('正在收尾并停止 worker', 'Finishing up and stopping the worker') : activeRole ? text(`${roleTitle(activeRole)} 正在处理`, `${roleTitle(activeRole)} is working`) : text('LongHorizon 正在处理', 'LongHorizon is working')}</span></div>}
           {statusView.awaitingHandoff && <div className="working-line" role="status" aria-live="polite"><span className="thinking-dot" /><span>{text('已提交，正在等待 worker 接手…', 'Submitted. Waiting for the worker to pick it up…')}</span></div>}
@@ -1676,7 +1712,20 @@ function ExecutionArtifacts({ projection, live }: { projection: ArtifactProjecti
   </div>;
 }
 
-function ConversationMessage({ message }: { message: ConversationMessage }) {
+function ConversationMessage({ message, busy, onEdit, onDelete }: {
+  message: ConversationMessage;
+  busy: boolean;
+  onEdit: (messageId: string, text: string) => Promise<void>;
+  onDelete: (messageId: string) => Promise<void>;
+}) {
+  const [editing, setEditing] = useState(false);
+  const [draft, setDraft] = useState(message.text);
+  const editable = Boolean(message.operatorMessageId && message.operatorStatus === 'queued');
+  const saveEdit = async () => {
+    if (!message.operatorMessageId || !draft.trim()) return;
+    await onEdit(message.operatorMessageId, draft.trim());
+    setEditing(false);
+  };
   const { text } = useUiLanguage();
   const [expanded, setExpanded] = useState(false);
   const [showInput, setShowInput] = useState(false);
@@ -1685,7 +1734,7 @@ function ConversationMessage({ message }: { message: ConversationMessage }) {
   const clipped = !expanded && message.text.length > CONVERSATION_TEXT_LIMIT;
   const displayText = clipped ? `${message.text.slice(0, CONVERSATION_TEXT_LIMIT).trimEnd()}…` : message.text;
   const isAgent = ['plan', 'assistant', 'verification'].includes(message.kind);
-  return <article className={`conversation-message message-${message.kind}`}><div className="message-avatar">{message.kind === 'user' ? text('你', 'You') : message.kind === 'final' ? <Sparkles size={12} /> : message.role.slice(0, 1)}</div><div className="message-body"><div className="message-meta"><strong>{message.title}</strong>{message.time && <time>{formatTime(message.time)}</time>}</div>{isAgent && message.input && <><button className="agent-input-row" onClick={() => setShowInput((current) => !current)}><span className="agent-step-icon"><ArrowRight size={14} /></span><span className="agent-input-copy"><small>{text('输入', 'Input')}</small>{compactText(message.input, 220)}</span><span className="agent-chevron">{showInput ? <ChevronUp size={14} /> : <ChevronDown size={14} />}</span></button>{showInput && <div className="agent-input-expanded"><MessageText text={message.input} /></div>}<div className="agent-output-label">{message.kind === 'plan' ? text('计划摘要', 'Plan summary') : message.kind === 'verification' ? text('验证结论', 'Verification result') : text('执行结果', 'Execution result')}</div></>}{message.activity && message.activity.length > 0 && <TrajectorySteps steps={message.activity} />}<MessageText text={displayText} />{message.artifacts && <ExecutionArtifacts projection={message.artifacts} live={message.kind === 'live'} />}{(clipped || expanded) && <button type="button" className="message-expand" onClick={() => setExpanded((open) => !open)}>{expanded ? <ChevronUp size={13} /> : <ChevronDown size={13} />}<span>{expanded ? text('收起', 'Show less') : text('展开全文', 'Show full output')}</span></button>}{message.kind === 'plan' && <span className="message-hint">{text('已隐藏内部 prompt，仅保留可执行摘要', 'Internal prompts are hidden; only the actionable summary is shown')}</span>}{message.kind === 'final' && <span className={`final-badge final-authority-${message.authority || 'none'}`}>{message.authority === 'final_response' ? text('LongHorizon 最终回复', 'LongHorizon final response') : message.authority === 'report' ? text('Auditor 最终报告', 'Auditor final report') : message.authority === 'auditor' ? text('Auditor 验证', 'Auditor verification') : text('等待权威报告', 'Awaiting authoritative report')}</span>}</div></article>;
+  return <article className={`conversation-message message-${message.kind}`}><div className="message-avatar">{message.kind === 'user' ? text('你', 'You') : message.kind === 'final' ? <Sparkles size={12} /> : message.role.slice(0, 1)}</div><div className="message-body"><div className="message-meta"><strong>{message.title}</strong>{message.time && <time>{formatTime(message.time)}</time>}</div>{isAgent && message.input && <><button className="agent-input-row" onClick={() => setShowInput((current) => !current)}><span className="agent-step-icon"><ArrowRight size={14} /></span><span className="agent-input-copy"><small>{text('输入', 'Input')}</small>{compactText(message.input, 220)}</span><span className="agent-chevron">{showInput ? <ChevronUp size={14} /> : <ChevronDown size={14} />}</span></button>{showInput && <div className="agent-input-expanded"><MessageText text={message.input} /></div>}<div className="agent-output-label">{message.kind === 'plan' ? text('计划摘要', 'Plan summary') : message.kind === 'verification' ? text('验证结论', 'Verification result') : text('执行结果', 'Execution result')}</div></>}{message.activity && message.activity.length > 0 && <TrajectorySteps steps={message.activity} />}{editing ? <div className="message-edit"><textarea value={draft} onChange={(event) => setDraft(event.target.value)} disabled={busy} /><button type="button" onClick={() => void saveEdit()} disabled={busy || !draft.trim()}>{text('保存', 'Save')}</button><button type="button" onClick={() => { setDraft(message.text); setEditing(false); }} disabled={busy}>{text('取消', 'Cancel')}</button></div> : <><MessageText text={displayText} />{editable && <div className="message-actions"><button type="button" onClick={() => setEditing(true)} disabled={busy}>{text('编辑', 'Edit')}</button><button type="button" onClick={() => { if (message.operatorMessageId && window.confirm(text('删除这条尚未执行的指令？', 'Delete this queued instruction?'))) void onDelete(message.operatorMessageId); }} disabled={busy}>{text('删除', 'Delete')}</button>{message.operatorEdited && <small>{text('已修改', 'Edited')}</small>}</div>}</>}{message.artifacts && <ExecutionArtifacts projection={message.artifacts} live={message.kind === 'live'} />}{(clipped || expanded) && <button type="button" className="message-expand" onClick={() => setExpanded((open) => !open)}>{expanded ? <ChevronUp size={13} /> : <ChevronDown size={13} />}<span>{expanded ? text('收起', 'Show less') : text('展开全文', 'Show full output')}</span></button>}{message.kind === 'plan' && <span className="message-hint">{text('已隐藏内部 prompt，仅保留可执行摘要', 'Internal prompts are hidden; only the actionable summary is shown')}</span>}{message.kind === 'final' && <span className={`final-badge final-authority-${message.authority || 'none'}`}>{message.authority === 'final_response' ? text('LongHorizon 最终回复', 'LongHorizon final response') : message.authority === 'report' ? text('Auditor 最终报告', 'Auditor final report') : message.authority === 'auditor' ? text('Auditor 验证', 'Auditor verification') : text('等待权威报告', 'Awaiting authoritative report')}</span>}</div></article>;
 }
 
 function ImageGallery({ images, label }: { images: string[]; label: string }) {
