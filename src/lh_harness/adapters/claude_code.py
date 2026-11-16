@@ -45,12 +45,18 @@ class ClaudeCodeAdapter(CommandAgentAdapter):
         policy = policy_for_role(role)
         effort = normalise_reasoning_effort(reasoning_effort)
         env_parts: list[str] = []
-        if api_key:
-            quoted_key = shlex.quote(api_key)
+        # An explicit argument always wins. Falling back to the environment
+        # lets a caller who has already exported ANTHROPIC_API_KEY or
+        # ANTHROPIC_BASE_URL (a proxy setup, a CI secret, a shell profile)
+        # use it without repeating the value in every invocation.
+        effective_api_key = api_key or os.getenv("ANTHROPIC_API_KEY")
+        if effective_api_key:
+            quoted_key = shlex.quote(effective_api_key)
             env_parts.append(f"ANTHROPIC_API_KEY={quoted_key}")
             env_parts.append(f"ANTHROPIC_AUTH_TOKEN={quoted_key}")
-        if base_url:
-            raw_url = base_url.rstrip("/")
+        effective_base_url = base_url or os.getenv("ANTHROPIC_BASE_URL")
+        if effective_base_url:
+            raw_url = effective_base_url.rstrip("/")
             if raw_url.endswith("/v1"):
                 raw_url = raw_url[:-3]
             env_parts.append(f"ANTHROPIC_BASE_URL={shlex.quote(raw_url)}")
