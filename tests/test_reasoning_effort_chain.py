@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import os
 import shlex
 from pathlib import Path
 
@@ -25,8 +26,13 @@ def test_codex_sends_the_effort_as_a_config_override() -> None:
 
     tokens = shlex.split(adapter.command_template.replace("< {prompt_path}", ""))
 
-    assert 'model_reasoning_effort="xhigh"' in tokens
-    assert tokens[tokens.index('model_reasoning_effort="xhigh"') - 1] == "-c"
+    override = 'model_reasoning_effort="xhigh"'
+    if os.name == "nt":
+        # shell_quote doubles embedded quotes inside the cmd token.
+        assert '-c "model_reasoning_effort=""xhigh"""' in adapter.command_template
+    else:
+        assert override in tokens
+        assert tokens[tokens.index(override) - 1] == "-c"
 
 
 def test_codex_without_an_effort_leaves_the_user_config_in_charge() -> None:
@@ -46,7 +52,7 @@ def test_claude_sends_the_effort_as_a_cli_flag() -> None:
 
     tokens = adapter.command_template.split()
 
-    assert tokens[tokens.index("--effort") + 1] == "max"
+    assert tokens[tokens.index("--effort") + 1].strip('"') == "max"
     assert adapter.reasoning_effort == "max"
 
 
@@ -60,7 +66,7 @@ def test_opencode_sends_the_effort_as_a_variant() -> None:
 
     tokens = adapter.command_template.split()
 
-    assert tokens[tokens.index("--variant") + 1] == "high"
+    assert tokens[tokens.index("--variant") + 1].strip('"') == "high"
 
 
 def test_opencode_still_accepts_the_legacy_effort_keyword() -> None:

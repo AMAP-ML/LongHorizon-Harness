@@ -9,6 +9,7 @@ from ..types import DEFAULT_CODEX_MODEL, DEFAULT_TMP_DIR, DEFAULT_WORKSPACE_PATH
 from ..agent_logs import visible_output as extract_codex_visible_output
 from ..agent_registry import normalise_reasoning_effort
 from ..utils.agent_cli import resolve_codex_binary
+from ..utils.platform_shell import env_prefix, shell_quote
 from .cli_agent import CommandAgentAdapter
 
 try:
@@ -38,18 +39,17 @@ class CodexAdapter(CommandAgentAdapter):
         reasoning_effort: str | None = None,
     ) -> None:
         effort = normalise_reasoning_effort(reasoning_effort)
-        env_parts: list[str] = []
+        env_assignments: list[tuple[str, str]] = []
         if api_key:
-            quoted_key = shlex.quote(api_key)
-            env_parts.append(f"OPENAI_API_KEY={quoted_key}")
-            env_parts.append(f"CODEX_API_KEY={quoted_key}")
+            env_assignments.append(("OPENAI_API_KEY", api_key))
+            env_assignments.append(("CODEX_API_KEY", api_key))
 
         # Resolve once when an adapter is built.  A LongHorizon run must use
         # the same authenticated Codex installation as the desktop client when
         # both the standalone PATH CLI and ChatGPT.app are present.
         codex_binary = resolve_codex_binary() or "codex"
         command_parts = [
-            shlex.quote(codex_binary),
+            shell_quote(codex_binary),
             "exec",
             "--json",
             "--skip-git-repo-check",
@@ -59,18 +59,18 @@ class CodexAdapter(CommandAgentAdapter):
         # isolated environment, so bypass Codex's own sandbox unless the caller
         # picked an explicit policy.
         if sandbox_mode:
-            command_parts.extend(["--sandbox", shlex.quote(sandbox_mode)])
+            command_parts.extend(["--sandbox", shell_quote(sandbox_mode)])
         else:
             command_parts.append("--dangerously-bypass-approvals-and-sandbox")
 
         for override in _config_overrides(base_url=base_url, api_key=api_key):
-            command_parts.extend(["-c", shlex.quote(override)])
+            command_parts.extend(["-c", shell_quote(override)])
 
         # Codex has no `--effort` flag; the reasoning depth is a config value.
         # Passing nothing leaves the user's own ~/.codex/config.toml in charge.
         if effort:
             command_parts.extend(
-                ["-c", shlex.quote(f"model_reasoning_effort={json.dumps(effort)}")]
+                ["-c", shell_quote(f"model_reasoning_effort={json.dumps(effort)}")]
             )
 
         # MCP support is opt-in and uses Codex's own format: a TOML file holding
@@ -79,24 +79,24 @@ class CodexAdapter(CommandAgentAdapter):
         mcp_config = mcp_config or os.getenv("LH_HARNESS_CODEX_MCP_CONFIG")
         if mcp_config:
             for override in mcp_server_overrides(mcp_config):
-                command_parts.extend(["-c", shlex.quote(override)])
+                command_parts.extend(["-c", shell_quote(override)])
 
         resolved_add_dirs = list(add_dirs or [])
         env_add_dirs = os.getenv("LH_HARNESS_CODEX_ADD_DIRS") or os.getenv("LH_HARNESS_MCP_ADD_DIRS")
         if env_add_dirs:
             resolved_add_dirs.extend(part for part in env_add_dirs.split(os.pathsep) if part)
         for add_dir in resolved_add_dirs:
-            command_parts.extend(["--add-dir", shlex.quote(add_dir)])
+            command_parts.extend(["--add-dir", shell_quote(add_dir)])
 
         if model:
-            command_parts.extend(["--model", shlex.quote(model)])
+            command_parts.extend(["--model", shell_quote(model)])
         # `-` makes Codex read the prompt from stdin, keeping long prompts off
         # the command line and out of the process table.
         command_parts.append("-")
 
-        env_prefix = (" ".join(env_parts) + " ") if env_parts else ""
+        env_prefix_text = env_prefix(env_assignments)
         super().__init__(
-            command_template=f"{env_prefix}{' '.join(command_parts)} < {{prompt_path}}",
+            command_template=f"{env_prefix_text}{' '.join(command_parts)} < {{prompt_path}}",
             prompt_dir=prompt_dir,
             workspace_path=workspace_path,
             visible_output_parser=extract_codex_visible_output,

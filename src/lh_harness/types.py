@@ -102,6 +102,7 @@ class ManagedRound:
     manager_status: dict[str, Any] = field(default_factory=dict)
     executor_status: dict[str, Any] = field(default_factory=dict)
     auditor_status: dict[str, Any] = field(default_factory=dict)
+    token_usage: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass

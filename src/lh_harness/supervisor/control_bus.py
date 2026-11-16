@@ -11,6 +11,7 @@ import errno
 import json
 import os
 import stat
+import tempfile
 import threading
 import time
 import uuid
@@ -22,6 +23,65 @@ from typing import Any, Callable, Iterator
 _MAX_CONTROL_RECORD_BYTES = 512 * 1024
 _MAX_CONTROL_LOG_BYTES = 16 * 1024 * 1024
 _TRUSTED_SYSTEM_ALIASES = frozenset({"/var", "/tmp", "/etc"})
+
+# Anchored no-follow walking needs O_NOFOLLOW/O_DIRECTORY plus dir-fd variants
+# of open/mkdir.  POSIX platforms provide them; Windows does not.  Callers on
+# those platforms degrade to plain path operations guarded by a best-effort
+# symlink scan instead of failing closed, because the run tree is owned by the
+# same operator who started the process.
+# The canonical definitions live in utils.platform_caps; the private aliases
+# below keep every existing importer (manager, cli, tests) working unchanged.
+from ..utils.platform_caps import SECURE_DIRFD as _SECURE_DIRFD  # noqa: E402
+from ..utils.platform_caps import validate_no_symlink_chain as _validate_no_symlink_chain  # noqa: E402
+
+
+def _anchored_parent(parent_fd: int, fallback_dir: str | Path) -> int | Path:
+    """Return the anchored descriptor when available, else the directory path."""
+
+    return parent_fd if parent_fd >= 0 else Path(fallback_dir)
+
+
+@contextmanager
+def _process_lock(handle: Any):
+    """Exclusive cross-process file lock: fcntl on POSIX, msvcrt on Windows."""
+
+    fcntl_module = None
+    msvcrt_module = None
+    fileno = handle.fileno()
+    try:
+        import fcntl as fcntl_module  # type: ignore
+    except ImportError:
+        try:
+            import msvcrt as msvcrt_module  # type: ignore
+        except ImportError as exc:
+            raise RuntimeError("cross-process file locking is unavailable") from exc
+    locked = False
+    try:
+        if fcntl_module is not None:
+            fcntl_module.flock(fileno, fcntl_module.LOCK_EX)
+            locked = True
+        else:
+            handle.seek(0)
+            deadline = time.time() + 5.0
+            while True:
+                try:
+                    msvcrt_module.locking(fileno, msvcrt_module.LK_NBLCK, 1)
+                    locked = True
+                    break
+                except OSError:
+                    if time.time() >= deadline:
+                        raise
+                    time.sleep(0.05)
+        yield
+    finally:
+        try:
+            if locked and fcntl_module is not None:
+                fcntl_module.flock(fileno, fcntl_module.LOCK_UN)
+            elif locked and msvcrt_module is not None:
+                handle.seek(0)
+                msvcrt_module.locking(fileno, msvcrt_module.LK_UNLCK, 1)
+        except OSError:
+            pass
 
 
 def _absolute_anchored_path(path: str | Path) -> Path:
@@ -64,7 +124,23 @@ def _open_nofollow(path: str | Path, *, directory: bool = False) -> int:
     directory_flag = getattr(os, "O_DIRECTORY", 0)
     cloexec = getattr(os, "O_CLOEXEC", 0)
     if not nofollow or not directory_flag or os.open not in getattr(os, "supports_dir_fd", set()):
-        raise OSError("secure control-bus path opening is unavailable")
+        if directory:
+            raise OSError("secure control-bus path opening is unavailable")
+        absolute = Path(_absolute_anchored_path(path))
+        _validate_no_symlink_chain(absolute.parent)
+        if absolute.is_symlink():
+            raise OSError("control-bus path is a symlink")
+        descriptor = os.open(str(absolute), os.O_RDONLY | getattr(os, "O_BINARY", 0))
+        try:
+            if not stat.S_ISREG(os.fstat(descriptor).st_mode):
+                raise OSError("control-bus path is not a regular file")
+        except BaseException:
+            try:
+                os.close(descriptor)
+            except OSError:
+                pass
+            raise
+        return descriptor
     absolute = _absolute_anchored_path(path)
     parts = absolute.parts
     if len(parts) < 2 or parts[0] != os.sep:
@@ -125,7 +201,15 @@ def _ensure_dir_fd_nofollow(path: str | Path, *, mode: int = 0o700) -> int:
         or os.open not in getattr(os, "supports_dir_fd", set())
         or os.mkdir not in getattr(os, "supports_dir_fd", set())
     ):
-        raise OSError("secure control-bus directory creation is unavailable")
+        target = Path(_absolute_anchored_path(path))
+        # Reject symlinked ancestors BEFORE creating anything, so a swapped
+        # run boundary cannot be followed as a side effect of the mkdir.
+        parent = target.parent
+        if str(parent) != str(target.anchor):
+            _validate_no_symlink_chain(parent)
+        target.mkdir(mode=mode, parents=True, exist_ok=True)
+        _validate_no_symlink_chain(target)
+        return -1
     absolute = _absolute_anchored_path(path)
     parts = absolute.parts
     if not parts or parts[0] != os.sep:
@@ -177,6 +261,8 @@ def _ensure_dir_nofollow(path: str | Path, *, mode: int = 0o700) -> None:
     """Create/validate a directory chain without traversing symlinks."""
 
     fd = _ensure_dir_fd_nofollow(path, mode=mode)
+    if fd < 0:
+        return None
     try:
         return None
     finally:
@@ -187,13 +273,16 @@ def _ensure_dir_nofollow(path: str | Path, *, mode: int = 0o700) -> None:
 
 
 def _open_private_regular_at(
-    parent_fd: int,
+    parent_fd: int | str | Path,
     name: str,
     flags: int,
     *,
     mode: int = 0o600,
 ) -> int:
     """Open or create one private regular file relative to ``parent_fd``.
+
+    ``parent_fd`` may also be a directory path on platforms without anchored
+    dir-fd support (the caller passes ``_anchored_parent()``'s result).
 
     macOS can transiently return ``ENOENT`` when several threads concurrently
     use ``O_CREAT | O_NOFOLLOW`` on the same new pathname.  An exclusive-create
@@ -203,6 +292,34 @@ def _open_private_regular_at(
 
     if not name or name in {".", ".."} or "/" in name or "\\" in name:
         raise OSError("unsafe private file name")
+    binary = getattr(os, "O_BINARY", 0)
+    if isinstance(parent_fd, (str, Path)):
+        base = Path(_absolute_anchored_path(parent_fd))
+        base.mkdir(mode=0o700, parents=True, exist_ok=True)
+        _validate_no_symlink_chain(base)
+        final = base / name
+        if final.is_symlink():
+            raise OSError("private file is a symlink")
+        for _ in range(32):
+            try:
+                try:
+                    descriptor = os.open(str(final), flags | os.O_CREAT | os.O_EXCL | binary, mode)
+                except FileExistsError:
+                    try:
+                        descriptor = os.open(str(final), flags | binary)
+                    except FileNotFoundError:
+                        continue
+            except OSError:
+                continue
+            metadata = os.fstat(descriptor)
+            if not stat.S_ISREG(metadata.st_mode):
+                try:
+                    os.close(descriptor)
+                except OSError:
+                    pass
+                raise OSError("private file is not an unaliased regular file")
+            return descriptor
+        raise FileNotFoundError(name)
     nofollow = getattr(os, "O_NOFOLLOW", 0)
     if not nofollow or os.open not in getattr(os, "supports_dir_fd", set()):
         raise OSError("secure private file opening is unavailable")
@@ -271,6 +388,32 @@ def _atomic_bytes_write(path: Path, payload: bytes, *, mode: int = 0o600) -> Non
     """Atomically write bytes below an anchored, no-follow parent directory."""
 
     path = Path(path)
+    if not _SECURE_DIRFD:
+        parent = Path(_absolute_anchored_path(path.parent))
+        if str(parent) != Path(parent.anchor).anchor and str(parent) != str(parent.anchor):
+            _validate_no_symlink_chain(parent)
+        parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        _validate_no_symlink_chain(parent)
+        handle_fd, temporary_text = tempfile.mkstemp(
+            prefix=f".{path.name}.", suffix=".tmp", dir=str(parent)
+        )
+        try:
+            try:
+                handle = os.fdopen(handle_fd, "wb")
+            except BaseException:
+                os.close(handle_fd)
+                raise
+            with handle:
+                handle.write(payload)
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(temporary_text, str(path))
+        finally:
+            try:
+                os.unlink(temporary_text)
+            except OSError:
+                pass
+        return
     parent_fd = _ensure_dir_fd_nofollow(path.parent)
     fd: int | None = None
     temporary_name: str | None = None
@@ -332,6 +475,24 @@ def _append_jsonl(path: Path, record: dict[str, Any]) -> None:
     # ``Path.open('a')`` follows a final symlink.  Commands and receipts are
     # control-plane data, so fail closed unless the whole parent chain and
     # final file can be opened with anchored no-follow semantics.
+    if not _SECURE_DIRFD:
+        parent = Path(_absolute_anchored_path(path.parent))
+        if str(parent) != Path(parent.anchor).anchor and str(parent) != str(parent.anchor):
+            _validate_no_symlink_chain(parent)
+        parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        _validate_no_symlink_chain(parent)
+        handle = open(str(path), "a", encoding="utf-8")
+        try:
+            metadata = os.fstat(handle.fileno())
+            if not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1:
+                raise OSError("control log is not an unaliased regular file")
+            with _process_lock(handle):
+                handle.write(line)
+                handle.flush()
+                os.fsync(handle.fileno())
+        finally:
+            handle.close()
+        return
     fd: int | None = None
     parent_fd: int | None = None
     try:
@@ -496,6 +657,31 @@ class ControlBus:
         """
 
         with self._lock:
+            if not _SECURE_DIRFD:
+                # Windows fallback: path-based lock file with an msvcrt
+                # byte-range lock.  Weaker than anchored walking, but it is a
+                # real cross-process critical section.
+                _ensure_dir_nofollow(self.root)
+                fallback_handle = open(str(self.lock_path), "a+", encoding="utf-8")
+                try:
+                    metadata = os.fstat(fallback_handle.fileno())
+                    if not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1:
+                        raise OSError("control lock is not an unaliased regular file")
+                except OSError as exc:
+                    fallback_handle.close()
+                    raise RuntimeError("secure control-bus locking is unavailable") from exc
+                lock_context = _process_lock(fallback_handle)
+                try:
+                    lock_context.__enter__()
+                except OSError as exc:
+                    fallback_handle.close()
+                    raise RuntimeError("secure control-bus locking is unavailable") from exc
+                try:
+                    yield
+                finally:
+                    lock_context.__exit__(None, None, None)
+                    fallback_handle.close()
+                return
             lock_handle = None
             # Directory-boundary failures are surfaced as OSError so callers
             # can distinguish an invalid/symlinked run layout from a platform
@@ -727,8 +913,36 @@ class ControlBus:
         return _read_json_file(self.owner_path)
 
 
+def _iter_run_control_dirs_pathbased(root: Path) -> Iterator[Path]:
+    """Windows fallback: skip symlinked run boundaries by lstat inspection."""
+
+    try:
+        entries = list(os.scandir(root))
+    except OSError:
+        return
+    for entry in entries:
+        try:
+            if entry.is_symlink():
+                continue
+            if not entry.is_dir(follow_symlinks=False):
+                continue
+            control = Path(entry.path) / "control"
+            try:
+                control_meta = os.lstat(control)
+            except OSError:
+                continue
+            if stat.S_ISLNK(control_meta.st_mode) or not stat.S_ISDIR(control_meta.st_mode):
+                continue
+        except OSError:
+            continue
+        yield root / entry.name
+
+
 def iter_run_control_dirs(runs_root: str | Path) -> Iterator[Path]:
     root = Path(runs_root).expanduser().resolve()
+    if not _SECURE_DIRFD:
+        yield from _iter_run_control_dirs_pathbased(root)
+        return
     try:
         root_fd = _open_nofollow(root, directory=True)
     except OSError:

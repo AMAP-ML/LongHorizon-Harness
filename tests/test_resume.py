@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import time
 from dataclasses import asdict
 from pathlib import Path
@@ -258,7 +259,17 @@ def supervisor(monkeypatch, tmp_path: Path) -> RunSupervisor:
         "lh_harness.supervisor.service.subprocess.Popen",
         lambda *args, **kwargs: FakeProcess(),
     )
-    monkeypatch.setattr("lh_harness.supervisor.service.os.killpg", lambda *args, **kwargs: None)
+    if hasattr(os, "killpg"):
+        monkeypatch.setattr("lh_harness.supervisor.service.os.killpg", lambda *args, **kwargs: None)
+    else:
+        # Windows has no os.killpg; the service falls back to Job Object /
+        # liveness-checked kills, so nothing needs patching here.
+        monkeypatch.setattr(
+            "lh_harness.supervisor.service.win_job.kill_tree", lambda *args, **kwargs: False
+        )
+        monkeypatch.setattr(
+            "lh_harness.supervisor.service.win_job.kill_pid_tree", lambda *args, **kwargs: False
+        )
     workspace = tmp_path / "workspace"
     workspace.mkdir()
     return RunSupervisor(tmp_path / "runs", workspace_root=workspace)

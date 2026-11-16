@@ -55,6 +55,7 @@ from .types import (
     RoleNextStep,
 )
 from .supervisor.control_bus import (
+    _SECURE_DIRFD as _SECURE_EVENT_APPEND,
     _append_jsonl as _append_jsonl_nofollow,
     _atomic_bytes_write,
     _ensure_dir_nofollow,
@@ -951,6 +952,7 @@ async def _run_impl(
             related_report_refs=related_report_refs,
             executor_status=_episode_status(executor_result),
             auditor_status=auditor_status,
+            token_usage=_round_token_usage(executor_result, auditor_result),
         )
         rounds.append(record)
         await _record_round(env, config, role_dir, events_path, record)
@@ -1551,6 +1553,7 @@ def _final_report(
     # Final status is a harness-level decision, not the last executor agent's self
     # claim. The auditor artifact remains the natural-language audit report.
     latest_report_text = _latest_auditor_report_text(rounds)
+    token_usage = _aggregate_token_usage(rounds)
     status = (
         "complete"
         if completion_satisfied
@@ -1582,7 +1585,51 @@ def _final_report(
         "final_response": final_response,
         "rounds": [asdict(item) for item in rounds],
         "elapsed_seconds": round(elapsed_seconds, 3),
+        "token_usage": token_usage,
     }
+
+
+def _aggregate_token_usage(rounds: list[ManagedRound]) -> dict[str, Any]:
+    """Sum per-round provider token usage into one report-level total."""
+
+    totals: dict[str, Any] = {
+        "input_tokens": 0,
+        "cached_input_tokens": 0,
+        "output_tokens": 0,
+        "reasoning_tokens": 0,
+        "cost_usd": 0.0,
+    }
+    for item in rounds:
+        usage = item.token_usage if isinstance(item.token_usage, dict) else {}
+        for key in list(totals):
+            value = usage.get(key)
+            if isinstance(value, (int, float)) and not isinstance(value, bool):
+                totals[key] += value
+    if not any(totals.values()):
+        return {}
+    return totals
+
+
+def _round_token_usage(*results: Any) -> dict[str, Any]:
+    """Merge token usage recorded by this round's role episodes."""
+
+    merged: dict[str, Any] = {
+        "input_tokens": 0,
+        "cached_input_tokens": 0,
+        "output_tokens": 0,
+        "reasoning_tokens": 0,
+        "cost_usd": 0.0,
+    }
+    for result in results:
+        metadata = getattr(result, "metadata", None)
+        usage = metadata.get("token_usage") if isinstance(metadata, dict) else None
+        if not isinstance(usage, dict):
+            continue
+        for key in list(merged):
+            value = usage.get(key)
+            if isinstance(value, (int, float)) and not isinstance(value, bool):
+                merged[key] += value
+    return merged
 
 
 def _read_local_bounded(path: Path, max_bytes: int, *, tail: bool = False) -> str | None:
@@ -2402,6 +2449,28 @@ def _append_event(path: Path, event: str, payload: dict[str, Any]) -> None:
     # Event ids are assigned while holding the file lock, so the same absolute
     # id survives snapshot truncation, REST replay, and a reconnect after an
     # API restart.  The legacy ``event`` field remains for old readers.
+    if not _SECURE_EVENT_APPEND:
+        # Windows fallback: plain validated append without anchored walking.
+        # The event flock below is best-effort on this platform anyway.
+        with open(str(path), "a+", encoding="utf-8") as fh:
+            fh.seek(0)
+            sequence = sum(1 for line in fh if line.strip()) + 1
+            fh.seek(0, 2)
+            run_id = path.parents[2].name if len(path.parents) > 2 else "local"
+            record = {
+                "schema_version": 1,
+                "event_id": f"{run_id}:{sequence:06d}",
+                "ts": time.time(),
+                "event": event,
+                **_json_safe(payload),
+            }
+            fh.write(json.dumps(record, ensure_ascii=False, sort_keys=True) + "\n")
+            fh.flush()
+            try:
+                os.fsync(fh.fileno())
+            except OSError:
+                pass
+        return
     parent_fd: int | None = None
     raw_fd: int | None = None
     try:

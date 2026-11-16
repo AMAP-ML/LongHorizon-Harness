@@ -241,6 +241,10 @@ def test_html_artifacts_are_attachments(tmp_path: Path) -> None:
 
 
 def test_non_raster_documents_are_attachments_and_filename_is_header_safe(tmp_path: Path) -> None:
+    if os.name == "nt":
+        # NTFS forbids quote-bearing filenames; the header-encoding half
+        # of this test is covered on POSIX CI.
+        pytest.skip("NTFS forbids quote-bearing filenames")
     root, state = _run(tmp_path)
     round_dir = root / "run-1" / "logs" / "role_management" / "rounds" / "round_001"
     # The filesystem permits both quote-bearing and non-ASCII names.  They

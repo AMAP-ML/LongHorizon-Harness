@@ -27,7 +27,14 @@ from pathlib import Path
 from typing import Any
 
 from ..types import DEFAULT_LOG_DIR, MAX_ROUNDS
-from ..supervisor.control_bus import ControlBus, _ensure_dir_fd_nofollow, _open_private_regular_at
+from ..supervisor.control_bus import (
+    ControlBus,
+    _anchored_parent,
+    _ensure_dir_fd_nofollow,
+    _open_private_regular_at,
+    _process_lock,
+    _validate_no_symlink_chain,
+)
 from ..supervisor.lifecycle import ACTIVE_STATUSES, TERMINAL_STATUSES, canonical_lifecycle_status
 from ..utils.run_boundary import safe_run_dir, safe_run_logs, safe_run_role, safe_run_rounds
 
@@ -485,11 +492,44 @@ class DashboardState:
         round_dir = self._safe_round_dir(round_index)
         if round_dir is None:
             return []
+        if os.name == "nt":
+            # os.open cannot open directories on Windows, and os.scandir(fd)
+            # is POSIX-only.  Validate the boundary by explicit symlink scan,
+            # then enumerate by path; each child is still re-verified through
+            # the no-follow file open below.
+            try:
+                _validate_no_symlink_chain(round_dir.parent)
+                if round_dir.is_symlink():
+                    raise OSError("round directory is a symlink")
+                artifacts: list[str] = []
+                with os.scandir(str(round_dir)) as entries:
+                    for entry_number, entry in enumerate(entries):
+                        if entry_number >= _MAX_ARTIFACT_SCAN:
+                            break
+                        name = str(entry.name)
+                        if len(name) > _MAX_ARTIFACT_NAME_CHARS:
+                            continue
+                        candidate = round_dir / name
+                        try:
+                            child_fd = _open_nofollow(candidate, strict_parent=True)
+                            try:
+                                mode = stat_module.S_ISREG(os.fstat(child_fd).st_mode)
+                            finally:
+                                os.close(child_fd)
+                        except OSError:
+                            continue
+                        if mode:
+                            artifacts.append(name)
+                        if len(artifacts) >= _MAX_ARTIFACT_COUNT:
+                            break
+                return artifacts
+            except OSError:
+                return []
         try:
             fd = _open_nofollow(round_dir, directory=True, strict_parent=True)
         except OSError:
             return []
-        artifacts: list[str] = []
+        artifacts = []
         try:
             with os.scandir(fd) as entries:
                 for entry_number, entry in enumerate(entries):
@@ -894,21 +934,18 @@ class DashboardState:
             # path-based mkdir followed by open would permit a swapped
             # ``role_management`` directory to redirect this append.
             parent_fd = _ensure_dir_fd_nofollow(path.parent)
-            fd = _open_private_regular_at(parent_fd, path.name, os.O_WRONLY | os.O_APPEND)
+            fd = _open_private_regular_at(
+                _anchored_parent(parent_fd, path.parent), path.name, os.O_WRONLY | os.O_APPEND
+            )
             with os.fdopen(fd, "a", encoding="utf-8") as fh:
                 fd = None
-                try:
-                    import fcntl
-
-                    fcntl.flock(fh.fileno(), fcntl.LOCK_EX)
-                except ImportError as exc:
-                    raise OSError("secure approval-log locking is unavailable") from exc
-                try:
-                    fh.write(line)
-                    fh.flush()
-                    os.fsync(fh.fileno())
-                finally:
-                    fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
+                with _process_lock(fh):
+                    try:
+                        fh.write(line)
+                        fh.flush()
+                        os.fsync(fh.fileno())
+                    finally:
+                        pass
         except (ImportError, OSError):
             # Approval persistence is diagnostic/control state. A read-only or
             # unavailable log must not crash the manager's execution loop.
@@ -919,7 +956,7 @@ class DashboardState:
                     os.close(fd)
                 except OSError:
                     pass
-            if parent_fd is not None:
+            if parent_fd is not None and parent_fd >= 0:
                 try:
                     os.close(parent_fd)
                 except OSError:
@@ -1175,13 +1212,20 @@ def _open_nofollow(path: Path, *, directory: bool = False, strict_parent: bool =
     nofollow = getattr(os, "O_NOFOLLOW", 0)
     cloexec = getattr(os, "O_CLOEXEC", 0)
     directory_flag = getattr(os, "O_DIRECTORY", 0)
-    flags = os.O_RDONLY | nofollow | cloexec | (directory_flag if directory else 0)
+    flags = os.O_RDONLY | nofollow | cloexec | getattr(os, "O_BINARY", 0) | (directory_flag if directory else 0)
     if not directory:
         # Reject a worker-created FIFO without blocking the dashboard thread
         # while opening it.  Regular files ignore O_NONBLOCK.
         flags |= getattr(os, "O_NONBLOCK", 0)
     parts = path.parts
     if not parts or parts[0] != os.sep or len(parts) == 1 or os.open not in getattr(os, "supports_dir_fd", set()):
+        if os.name == "nt":
+            # Windows: no anchored walking.  Reject symlinked ancestors and a
+            # symlinked final component explicitly before the plain open; the
+            # regular-file/nlink checks remain with the caller's fstat.
+            _validate_no_symlink_chain(path.parent)
+            if path.is_symlink():
+                raise OSError("path is a symlink")
         return os.open(path, flags)
 
     root_fd = os.open(os.sep, os.O_RDONLY | directory_flag | nofollow | cloexec)
@@ -1238,6 +1282,9 @@ def _read_file_bounded(
     try:
         metadata = os.fstat(fd)
         if not stat_module.S_ISREG(metadata.st_mode):
+            return None, False
+        if metadata.st_nlink != 1:
+            # A hard-link alias would let another boundary's file be read here.
             return None, False
         size = int(metadata.st_size)
         start = max(0, size - max_bytes) if tail else 0

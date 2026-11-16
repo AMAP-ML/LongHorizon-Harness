@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import shlex
 from pathlib import Path
 
@@ -21,10 +22,9 @@ from lh_harness.webapi import server as web_server
 
 
 def _executable(path: Path, body: str) -> str:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text("#!/bin/sh\n" + body, encoding="utf-8")
-    path.chmod(0o755)
-    return str(path)
+    from tests.conftest import write_executable_stub
+
+    return write_executable_stub(path, body)
 
 
 def test_dsh_binary_environment_override() -> None:
@@ -57,7 +57,14 @@ def test_deepseek_adapter_quotes_binary_and_configures_isolated_home(
     )
 
     tokens = shlex.split(adapter.command_template.replace("{prompt_path}", "/tmp/prompt.md"))
-    assert tokens[:2] == ["DSH_HOME=/tmp/run with spaces/dsh-home", "DSH_PERMISSION_MODE=read-only"]
+    if os.name == "nt":
+        # cmd.exe cannot prefix assignments; the platform serializer uses
+        # `set "K=V"&& ` segments instead of leading `K=V` tokens.
+        joined = adapter.command_template.replace("{prompt_path}", "/tmp/prompt.md")
+        assert 'set "DSH_HOME=' in joined and "dsh-home" in joined
+        assert 'set "DSH_PERMISSION_MODE=read-only"' in joined
+    else:
+        assert tokens[:2] == ["DSH_HOME=/tmp/run with spaces/dsh-home", "DSH_PERMISSION_MODE=read-only"]
     assert "lh_harness.adapters.deepseek_runner" in tokens
     assert tokens[tokens.index("--binary") + 1] == binary
     assert adapter.permission_mode == "read-only"
@@ -77,7 +84,11 @@ def test_deepseek_runner_passes_headless_patch_and_emits_jsonl(
     assert record["type"] == "dsh.result"
     assert record["is_error"] is False
     assert "--profile headless --patch" in record["text"]
-    assert record["text"].endswith("fix the project")
+    if os.name == "nt":
+        # cmd's `echo %*` preserves the CRT quoting of the spaced argument.
+        assert record["text"].rstrip('"').endswith("fix the project")
+    else:
+        assert record["text"].endswith("fix the project")
     patch_path = prompt_path.with_name(f"{prompt_path.name}.dsh-model-patch.yml")
     assert "provider: deepseek-official" in patch_path.read_text(encoding="utf-8")
     assert 'model: "deepseek-v4-flash"' in patch_path.read_text(encoding="utf-8")

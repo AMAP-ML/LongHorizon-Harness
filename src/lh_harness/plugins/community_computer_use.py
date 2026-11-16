@@ -33,6 +33,7 @@ StatusCallback = Callable[[str, str], None]
 
 AGENT_CODEX = "codex"
 AGENT_CLAUDE_CODE = "claude_code"
+AGENT_OPENCODE = "opencode"
 
 
 @dataclass(frozen=True)
@@ -79,7 +80,7 @@ OPEN_COMPUTER_USE = CommunityPlugin(
     mcp_server_name="open-computer-use",
     summary="Open-source Codex Computer Use alternative (macOS Swift, Windows UIA, Linux AT-SPI).",
     homepage="https://github.com/iFurySt/open-codex-computer-use",
-    agents=(AGENT_CODEX, AGENT_CLAUDE_CODE),
+    agents=(AGENT_CODEX, AGENT_CLAUDE_CODE, AGENT_OPENCODE),
     mcp_args=("mcp",),
     # Only the macOS runtime needs grants; the Windows/Linux `doctor` just
     # prints a session note and always exits 0, so checking it proves nothing.
@@ -99,7 +100,7 @@ CLAWDCURSOR = CommunityPlugin(
     mcp_server_name="clawdcursor",
     summary="Local MCP server that compiles the screen into a verified UI map and acts on element ids.",
     homepage="https://github.com/AmrDab/clawdcursor",
-    agents=(AGENT_CODEX, AGENT_CLAUDE_CODE),
+    agents=(AGENT_CODEX, AGENT_CLAUDE_CODE, AGENT_OPENCODE),
     mcp_args=("mcp", "--compact"),
     activation={
         # Consent is required on every OS; `grant` walks the macOS TCC dialogs.

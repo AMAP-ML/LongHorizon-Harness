@@ -30,10 +30,9 @@ def _clear_probe_cache():
 
 
 def _stub(path: Path, body: str) -> str:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text("#!/bin/sh\n" + body, encoding="utf-8")
-    path.chmod(0o755)
-    return str(path)
+    from tests.conftest import write_executable_stub
+
+    return write_executable_stub(path, body)
 
 
 def test_cli_agent_choices_match_the_registry() -> None:

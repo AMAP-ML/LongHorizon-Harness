@@ -17,6 +17,7 @@ from ..types import (
     EpisodeResult,
 )
 from ..utils.agent_cli import resolve_opencode_binary
+from ..utils.platform_shell import env_prefix, shell_quote
 from .cli_agent import CommandAgentAdapter
 
 _CONFIG_FILENAME_RE = re.compile(r"[^A-Za-z0-9_.-]+")
@@ -46,6 +47,7 @@ class OpenCodeAdapter(CommandAgentAdapter):
         reasoning_effort: str | None = None,
         role: str = "cli_executor",
         hidden_paths: tuple[str, ...] = (),
+        mcp_config: str | None = None,
     ) -> None:
         normalized_model = model.strip()
         if not normalized_model:
@@ -59,38 +61,45 @@ class OpenCodeAdapter(CommandAgentAdapter):
         )
 
         opencode_binary = resolve_opencode_binary() or "opencode"
-        env_parts: list[str] = []
+        env_assignments: list[tuple[str, str]] = []
         if api_key:
             # OpenCode falls back to OPENCODE_API_KEY when a provider has no
             # key of its own, so one harness credential covers every model.
-            env_parts.append(f"OPENCODE_API_KEY={shlex.quote(api_key)}")
-        if base_url:
+            env_assignments.append(("OPENCODE_API_KEY", api_key))
+        mcp_servers = _load_mcp_servers(mcp_config) if mcp_config else None
+        if base_url or mcp_servers:
             provider_id = normalized_model.split("/", 1)[0].strip() or "opencode"
-            config_path = _write_endpoint_config(prompt_dir, provider_id, base_url)
+            config_path = _write_runtime_config(
+                prompt_dir,
+                provider_id,
+                base_url,
+                mcp_servers,
+            )
             # OpenCode merges config files instead of replacing them, and
             # OPENCODE_CONFIG sits between the global and project configs, so
-            # a per-run file carrying only the provider override keeps the
-            # user's own providers, models, and MCP servers intact.
-            env_parts.append(f"OPENCODE_CONFIG={shlex.quote(config_path)}")
+            # a per-run file carrying only the provider override and the
+            # computer-use MCP servers keeps the user's own providers, models,
+            # and MCP servers intact.
+            env_assignments.append(("OPENCODE_CONFIG", config_path))
 
         command_parts = [
-            shlex.quote(opencode_binary),
+            shell_quote(opencode_binary),
             "run",
             "--format",
             "json",
             "--yolo",
             "--model",
-            shlex.quote(normalized_model),
+            shell_quote(normalized_model),
         ]
         if normalized_effort:
-            command_parts.extend(["--variant", shlex.quote(normalized_effort)])
+            command_parts.extend(["--variant", shell_quote(normalized_effort)])
         # `opencode run` reads the prompt from stdin when no positional message
         # is given, keeping long prompts off the command line.
         command_parts.append("< {prompt_path}")
 
-        env_prefix = (" ".join(env_parts) + " ") if env_parts else ""
+        env_prefix_text = env_prefix(env_assignments)
         super().__init__(
-            command_template=f"{env_prefix}{' '.join(command_parts)}",
+            command_template=f"{env_prefix_text}{' '.join(command_parts)}",
             prompt_dir=prompt_dir,
             workspace_path=workspace_path,
             visible_output_parser=extract_opencode_visible_output,
@@ -124,29 +133,58 @@ class OpenCodeAdapter(CommandAgentAdapter):
         return result
 
 
-def _write_endpoint_config(prompt_dir: str, provider_id: str, base_url: str) -> str:
-    """Write an OPENCODE_CONFIG file overriding one provider's base URL.
+def _load_mcp_servers(mcp_config: str) -> dict[str, object]:
+    """Load the `mcp` server map from a plugin-written OpenCode config file.
+
+    The computer-use plugins store one OpenCode-format JSON per agent
+    (``{"mcp": {name: {type, command, args, enabled}}}``); anything else is a
+    configuration error rather than something to silently ignore.
+    """
+
+    try:
+        with open(mcp_config, encoding="utf-8") as fh:
+            payload = json.load(fh)
+    except OSError as exc:
+        raise ValueError(f"could not read OpenCode MCP config {mcp_config!r}: {exc}") from exc
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"OpenCode MCP config {mcp_config!r} is not valid JSON: {exc}") from exc
+    servers = payload.get("mcp") if isinstance(payload, dict) else None
+    if not isinstance(servers, dict) or not servers:
+        raise ValueError(f"OpenCode MCP config {mcp_config!r} holds no `mcp` servers")
+    return servers
+
+
+def _write_runtime_config(
+    prompt_dir: str,
+    provider_id: str,
+    base_url: str | None,
+    mcp_servers: dict[str, object] | None,
+) -> str:
+    """Write an OPENCODE_CONFIG file with the provider override and/or the
+    computer-use MCP servers.
 
     The harness runs OpenCode with ``cd <workspace> && ...``, so the config
     lives inside the run's own prompt directory instead of the workspace.
     """
-    normalized_url = base_url.strip().rstrip("/")
-    if not normalized_url or "\x00" in normalized_url:
-        raise ValueError("OpenCode base URL must be a non-empty endpoint")
-    normalized_dir = prompt_dir.rstrip("/") or "."
-    safe_provider = _CONFIG_FILENAME_RE.sub("_", provider_id).strip("_") or "opencode"
-    config = {
-        "provider": {
+    config: dict[str, object] = {}
+    if base_url:
+        normalized_url = base_url.strip().rstrip("/")
+        if not normalized_url or "\x00" in normalized_url:
+            raise ValueError("OpenCode base URL must be a non-empty endpoint")
+        config["provider"] = {
             provider_id: {
                 "options": {"baseURL": normalized_url},
             }
         }
-    }
-    path = posixpath.join(normalized_dir, f"opencode-endpoint-{safe_provider}.json")
+    if mcp_servers:
+        config["mcp"] = mcp_servers
+    normalized_dir = prompt_dir.rstrip("/") or "."
+    safe_provider = _CONFIG_FILENAME_RE.sub("_", provider_id).strip("_") or "opencode"
+    path = posixpath.join(normalized_dir, f"opencode-runtime-{safe_provider}.json")
     try:
         os.makedirs(normalized_dir, exist_ok=True)
         with open(path, "w", encoding="utf-8") as fh:
             json.dump(config, fh, ensure_ascii=False, indent=2)
     except OSError as exc:
-        raise ValueError(f"could not write OpenCode endpoint config: {exc}") from exc
+        raise ValueError(f"could not write OpenCode runtime config: {exc}") from exc
     return path
