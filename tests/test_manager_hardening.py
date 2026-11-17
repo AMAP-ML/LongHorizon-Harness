@@ -69,6 +69,68 @@ def test_terminal_failure_does_not_follow_log_directory_symlink(tmp_path: Path) 
     assert not (outside / "role_orchestration").exists()
 
 
+def _seed_report(log_dir: Path, status: str, generation: str | None) -> None:
+    log_dir.mkdir(parents=True, exist_ok=True)
+    (log_dir / "report.json").write_text(
+        json.dumps({"status": status, "completion_satisfied": True}),
+        encoding="utf-8",
+    )
+    if generation is not None:
+        (log_dir / "report_generation.txt").write_text(generation, encoding="utf-8")
+
+
+def test_terminal_failure_replaces_inherited_report_on_resume(tmp_path: Path) -> None:
+    log_dir = tmp_path / "lh_harness"
+    _seed_report(log_dir, "complete", generation=None)
+
+    result = _write_terminal_failure(
+        SimpleNamespace(log_dir=str(log_dir), max_total_episodes=5),
+        "task",
+        status="failed",
+        reason="resume crashed",
+        exc=RuntimeError("boom"),
+        abort_reason="worker_exception",
+        generation="new-generation",
+    )
+
+    assert result["status"] == "failed"
+    assert json.loads((log_dir / "report.json").read_text(encoding="utf-8"))["status"] == "failed"
+
+
+def test_terminal_failure_keeps_current_generation_report(tmp_path: Path) -> None:
+    log_dir = tmp_path / "lh_harness"
+    _seed_report(log_dir, "complete", generation="same-generation")
+
+    result = _write_terminal_failure(
+        SimpleNamespace(log_dir=str(log_dir), max_total_episodes=5),
+        "task",
+        status="failed",
+        reason="remote sync failed",
+        exc=RuntimeError("boom"),
+        abort_reason="worker_exception",
+        generation="same-generation",
+    )
+
+    assert result["status"] == "complete"
+
+
+def test_terminal_failure_replaces_report_from_an_earlier_same_process_generation(tmp_path: Path) -> None:
+    log_dir = tmp_path / "lh_harness"
+    _seed_report(log_dir, "complete", generation="generation-1")
+
+    result = _write_terminal_failure(
+        SimpleNamespace(log_dir=str(log_dir), max_total_episodes=5),
+        "task",
+        status="failed",
+        reason="second in-process run crashed",
+        exc=RuntimeError("boom"),
+        abort_reason="worker_exception",
+        generation="generation-2",
+    )
+
+    assert result["status"] == "failed"
+
+
 def test_role_result_writes_osworld_style_episode_with_dashboard_role_names(tmp_path: Path) -> None:
     result_dir = tmp_path / "run-1"
     log_dir = result_dir / "lh_harness"

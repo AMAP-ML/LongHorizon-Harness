@@ -9,6 +9,7 @@ import logging
 import os
 import stat as stat_module
 import time
+import uuid
 from dataclasses import asdict, dataclass, field
 import traceback
 from pathlib import Path
@@ -138,8 +139,11 @@ async def run(*args: Any, **kwargs: Any) -> dict[str, Any]:
     task = str(kwargs.get("task") or "")
     config = kwargs.get("config")
     run_progress = _RunProgress()
+    # A unique per-invocation token, not the pid: a resumed run can reuse the
+    # process (or a pid after restart), so the pid cannot identify a generation.
+    generation = uuid.uuid4().hex
     try:
-        return await _run_impl(*args, _run_progress=run_progress, **kwargs)
+        return await _run_impl(*args, _run_progress=run_progress, _generation=generation, **kwargs)
     except asyncio.CancelledError as exc:
         return _write_terminal_failure(
             config,
@@ -149,6 +153,7 @@ async def run(*args: Any, **kwargs: Any) -> dict[str, Any]:
             exc=exc,
             abort_reason="worker_cancelled",
             progress=run_progress,
+            generation=generation,
         )
     except BaseException as exc:  # worker boundary: persist even non-Exception failures
         # KeyboardInterrupt/SystemExit are intentionally converted to a
@@ -162,6 +167,7 @@ async def run(*args: Any, **kwargs: Any) -> dict[str, Any]:
             exc=exc,
             abort_reason="worker_exception",
             progress=run_progress,
+            generation=generation,
         )
 
 
@@ -184,6 +190,7 @@ async def _run_impl(
     progress: Callable[[str, dict[str, Any]], None] | None = None,
     resume: bool = False,
     _run_progress: _RunProgress | None = None,
+    _generation: str = "",
 ) -> dict[str, Any]:
     """Run the generic LongHorizon-Harness four-role management loop.
 
@@ -998,6 +1005,9 @@ async def _run_impl(
     )
     _write_local(role_dir / "report.json", json.dumps(final, ensure_ascii=False, indent=2) + "\n")
     _write_local(log_dir / "report.json", json.dumps(final, ensure_ascii=False, indent=2) + "\n")
+    # The crash path uses this stamp to tell this generation's report apart
+    # from a terminal report a resumed generation inherited from its run dir.
+    _write_generation_stamp(log_dir, _generation)
     transcript = format_management_history(rounds, include_empty=True, max_chars=200_000)
     _write_local(role_dir / "orchestration_transcript.txt", transcript)
     _merge_episode_logs(log_dir)
@@ -1625,6 +1635,41 @@ def _read_local_bounded(path: Path, max_bytes: int, *, tail: bool = False) -> st
                 pass
 
 
+def _write_generation_stamp(log_dir: Path, generation: str) -> None:
+    """Record this invocation's generation token beside the report it wrote.
+
+    A supervised in-place resume reuses the run directory, so a stale
+    ``report.json`` from the previous generation can still be on disk when the
+    new generation crashes.  The stamp is what lets the crash path tell that
+    inherited report apart from one this generation actually produced.
+    """
+
+    if not generation:
+        return
+    try:
+        _write_local(log_dir / "report_generation.txt", generation)
+    except OSError:
+        pass
+
+
+def _report_is_current_generation(log_dir: Path, generation: str) -> bool:
+    """Whether the on-disk report was produced by this invocation.
+
+    The stamp is only written next to a report this invocation itself just
+    wrote, so a matching stamp is positive proof of authorship.  A missing or
+    unreadable stamp means the report predates this generation (the run was
+    resumed in place), which on the crash path must be replaced by the crash.
+    """
+
+    if not generation:
+        return False
+    try:
+        stamp = (log_dir / "report_generation.txt").read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return False
+    return stamp.strip() == generation
+
+
 def _write_terminal_failure(
     config: HarnessConfig | None,
     task: str,
@@ -1634,6 +1679,7 @@ def _write_terminal_failure(
     exc: BaseException,
     abort_reason: str,
     progress: _RunProgress | None = None,
+    generation: str = "",
 ) -> dict[str, Any]:
     """Best-effort local crash report and terminal event for the worker.
 
@@ -1657,9 +1703,13 @@ def _write_terminal_failure(
         except json.JSONDecodeError:
             pass
     if isinstance(existing, dict) and existing.get("status") in {"complete", "completed", "cancelled", "failed", "blocked", "incomplete"}:
-        # A failure during a post-report remote sync must not erase a valid
-        # local authority.  The supervisor can still use the existing report.
-        return existing
+        if _report_is_current_generation(log_dir, generation):
+            # A failure during a post-report remote sync must not erase a valid
+            # local authority.  The supervisor can still use the existing report.
+            return existing
+        # Otherwise the report is inherited from an earlier generation: a
+        # crashed resume must not report the predecessor's success, so the
+        # crash wins.
 
     trace = "".join(traceback.format_exception(type(exc), exc, exc.__traceback__))
     report: dict[str, Any] = {
@@ -1713,11 +1763,15 @@ def _write_terminal_failure(
             }
         )
     encoded = json.dumps(report, ensure_ascii=False, indent=2) + "\n"
+    wrote_report = False
     for target in (report_path, role_report_path):
         try:
             _atomic_bytes_write(target, encoded.encode("utf-8"))
+            wrote_report = True
         except OSError:
             pass
+    if wrote_report:
+        _write_generation_stamp(log_dir, generation)
     try:
         events_path = role_dir / "events.jsonl"
         if not any(item.get("event") == "role_harness_failed" for item in _read_jsonl_local(events_path)):
