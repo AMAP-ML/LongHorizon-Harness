@@ -27,7 +27,7 @@ from ..supervisor.lifecycle import TERMINAL_STATUSES, canonical_lifecycle_status
 from ..supervisor.control_bus import CommandConflict, RevisionConflict
 from ..types import DEFAULT_CODEX_MODEL, DEFAULT_MAX_ROUNDS, MAX_ROUNDS
 from ..utils.agent_cli import resolve_codex_binary, resolve_dsh_binary, resolve_opencode_binary
-from ..utils.run_boundary import safe_run_control, safe_run_dir, safe_run_logs, safe_run_role, safe_run_rounds
+from ..utils.run_boundary import resolve_run_id, safe_run_control, safe_run_dir, safe_run_logs, safe_run_role, safe_run_rounds
 from .events import EventTailer
 from .protocol import build_meta
 from .snapshot import _provenance, build_run_summary, build_snapshot
@@ -1203,7 +1203,9 @@ def run_web_server(
             "LH_HARNESS_WEB_TOKEN (or --auth-token)"
         )
 
-    run_id = Path(log_dir).expanduser().resolve().parent.name if log_dir else None
+    run_id = (
+        resolve_run_id(log_dir) or Path(log_dir).expanduser().resolve().parent.name
+    ) if log_dir else None
     effective_root = None if log_dir else runs_root
     supervisor = RunSupervisor(effective_root, workspace_root=workspace_root) if effective_root else None
     app = create_app(

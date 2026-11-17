@@ -236,3 +236,19 @@ def safe_run_control(
     if run is None or Path(run_dir).resolve(strict=False) != run:
         return None
     return _safe_child(root, run, "control", allow_missing=allow_missing)
+
+
+def resolve_run_id(log_dir: str | Path) -> str:
+    """Return the run identity persisted in *log_dir*, or ``""``.
+
+    The worker writes ``run_id.txt`` next to its events so a standalone reader
+    (``lh-harness web --log-dir``) validates event ids against the same
+    identity the writer used. Logs written before that file existed return an
+    empty string so callers keep their historical path-derived fallback.
+    """
+
+    path = Path(log_dir).expanduser()
+    try:
+        return (path / "run_id.txt").read_text(encoding="utf-8", errors="replace").strip()
+    except OSError:
+        return ""
