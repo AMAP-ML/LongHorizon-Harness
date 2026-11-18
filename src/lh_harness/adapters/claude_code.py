@@ -123,7 +123,16 @@ class ClaudeCodeAdapter(CommandAgentAdapter):
         # Snapshot-only exclusions: unlike hidden_paths these are not denied
         # to the agent — the guard just refrains from walking directories that
         # legitimately churn (build outputs) during an audit window.
-        self.guard_exclude_paths = tuple(guard_exclude_paths)
+        if is_auditor_role(role):
+            # Exclude VCS state from auditor snapshots: git touches .git/index
+            # and .git/info/exclude during `git status`, and those mtime changes
+            # are not task-file mutations. Issue #98.
+            vcs_exclusions = (".git",)
+            self.guard_exclude_paths = tuple(
+                dict.fromkeys([*vcs_exclusions, *guard_exclude_paths])
+            )
+        else:
+            self.guard_exclude_paths = tuple(guard_exclude_paths)
         super().__init__(
             command_template=f"{env_prefix}{' '.join(command_parts)} < {{prompt_path}}",
             prompt_dir=prompt_dir,
